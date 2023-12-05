@@ -1,0 +1,211 @@
+<html>
+<head>
+<title>featureVars.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+featureVars.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">fontTools.ttLib.tables </span><span class="s0">import </span><span class="s1">otTables </span><span class="s0">as </span><span class="s1">ot</span>
+<span class="s0">from </span><span class="s1">copy </span><span class="s0">import </span><span class="s1">deepcopy</span>
+<span class="s0">import </span><span class="s1">logging</span>
+
+
+<span class="s1">log = logging.getLogger(</span><span class="s2">&quot;fontTools.varLib.instancer&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">_featureVariationRecordIsUnique(rec</span><span class="s0">, </span><span class="s1">seen):</span>
+    <span class="s1">conditionSet = []</span>
+    <span class="s1">conditionSets = (</span>
+        <span class="s1">rec.ConditionSet.ConditionTable </span><span class="s0">if </span><span class="s1">rec.ConditionSet </span><span class="s0">is not None else </span><span class="s1">[]</span>
+    <span class="s1">)</span>
+    <span class="s0">for </span><span class="s1">cond </span><span class="s0">in </span><span class="s1">conditionSets:</span>
+        <span class="s0">if </span><span class="s1">cond.Format != </span><span class="s3">1</span><span class="s1">:</span>
+            <span class="s4"># can't tell whether this is duplicate, assume is unique</span>
+            <span class="s0">return True</span>
+        <span class="s1">conditionSet.append(</span>
+            <span class="s1">(cond.AxisIndex</span><span class="s0">, </span><span class="s1">cond.FilterRangeMinValue</span><span class="s0">, </span><span class="s1">cond.FilterRangeMaxValue)</span>
+        <span class="s1">)</span>
+    <span class="s4"># besides the set of conditions, we also include the FeatureTableSubstitution</span>
+    <span class="s4"># version to identify unique FeatureVariationRecords, even though only one</span>
+    <span class="s4"># version is currently defined. It's theoretically possible that multiple</span>
+    <span class="s4"># records with same conditions but different substitution table version be</span>
+    <span class="s4"># present in the same font for backward compatibility.</span>
+    <span class="s1">recordKey = frozenset([rec.FeatureTableSubstitution.Version] + conditionSet)</span>
+    <span class="s0">if </span><span class="s1">recordKey </span><span class="s0">in </span><span class="s1">seen:</span>
+        <span class="s0">return False</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">seen.add(recordKey)  </span><span class="s4"># side effect</span>
+        <span class="s0">return True</span>
+
+
+<span class="s0">def </span><span class="s1">_limitFeatureVariationConditionRange(condition</span><span class="s0">, </span><span class="s1">axisLimit):</span>
+    <span class="s1">minValue = condition.FilterRangeMinValue</span>
+    <span class="s1">maxValue = condition.FilterRangeMaxValue</span>
+
+    <span class="s0">if </span><span class="s1">(</span>
+        <span class="s1">minValue &gt; maxValue</span>
+        <span class="s0">or </span><span class="s1">minValue &gt; axisLimit.maximum</span>
+        <span class="s0">or </span><span class="s1">maxValue &lt; axisLimit.minimum</span>
+    <span class="s1">):</span>
+        <span class="s4"># condition invalid or out of range</span>
+        <span class="s0">return</span>
+
+    <span class="s0">return </span><span class="s1">tuple(</span>
+        <span class="s1">axisLimit.renormalizeValue(v</span><span class="s0">, </span><span class="s1">extrapolate=</span><span class="s0">False</span><span class="s1">) </span><span class="s0">for </span><span class="s1">v </span><span class="s0">in </span><span class="s1">(minValue</span><span class="s0">, </span><span class="s1">maxValue)</span>
+    <span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">_instantiateFeatureVariationRecord(</span>
+    <span class="s1">record</span><span class="s0">, </span><span class="s1">recIdx</span><span class="s0">, </span><span class="s1">axisLimits</span><span class="s0">, </span><span class="s1">fvarAxes</span><span class="s0">, </span><span class="s1">axisIndexMap</span>
+<span class="s1">):</span>
+    <span class="s1">applies = </span><span class="s0">True</span>
+    <span class="s1">shouldKeep = </span><span class="s0">False</span>
+    <span class="s1">newConditions = []</span>
+    <span class="s0">from </span><span class="s1">fontTools.varLib.instancer </span><span class="s0">import </span><span class="s1">NormalizedAxisTripleAndDistances</span>
+
+    <span class="s1">default_triple = NormalizedAxisTripleAndDistances(-</span><span class="s3">1</span><span class="s0">, </span><span class="s3">0</span><span class="s0">, </span><span class="s1">+</span><span class="s3">1</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">record.ConditionSet </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">record.ConditionSet = ot.ConditionSet()</span>
+        <span class="s1">record.ConditionSet.ConditionTable = []</span>
+        <span class="s1">record.ConditionSet.ConditionCount = </span><span class="s3">0</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">condition </span><span class="s0">in </span><span class="s1">enumerate(record.ConditionSet.ConditionTable):</span>
+        <span class="s0">if </span><span class="s1">condition.Format == </span><span class="s3">1</span><span class="s1">:</span>
+            <span class="s1">axisIdx = condition.AxisIndex</span>
+            <span class="s1">axisTag = fvarAxes[axisIdx].axisTag</span>
+
+            <span class="s1">minValue = condition.FilterRangeMinValue</span>
+            <span class="s1">maxValue = condition.FilterRangeMaxValue</span>
+            <span class="s1">triple = axisLimits.get(axisTag</span><span class="s0">, </span><span class="s1">default_triple)</span>
+
+            <span class="s0">if not </span><span class="s1">(minValue &lt;= triple.default &lt;= maxValue):</span>
+                <span class="s1">applies = </span><span class="s0">False</span>
+
+            <span class="s4"># if condition not met, remove entire record</span>
+            <span class="s0">if </span><span class="s1">triple.minimum &gt; maxValue </span><span class="s0">or </span><span class="s1">triple.maximum &lt; minValue:</span>
+                <span class="s1">newConditions = </span><span class="s0">None</span>
+                <span class="s0">break</span>
+
+            <span class="s0">if </span><span class="s1">axisTag </span><span class="s0">in </span><span class="s1">axisIndexMap:</span>
+                <span class="s4"># remap axis index</span>
+                <span class="s1">condition.AxisIndex = axisIndexMap[axisTag]</span>
+
+                <span class="s4"># remap condition limits</span>
+                <span class="s1">newRange = _limitFeatureVariationConditionRange(condition</span><span class="s0">, </span><span class="s1">triple)</span>
+                <span class="s0">if </span><span class="s1">newRange:</span>
+                    <span class="s4"># keep condition with updated limits</span>
+                    <span class="s1">minimum</span><span class="s0">, </span><span class="s1">maximum = newRange</span>
+                    <span class="s1">condition.FilterRangeMinValue = minimum</span>
+                    <span class="s1">condition.FilterRangeMaxValue = maximum</span>
+                    <span class="s1">shouldKeep = </span><span class="s0">True</span>
+                    <span class="s0">if </span><span class="s1">minimum != -</span><span class="s3">1 </span><span class="s0">or </span><span class="s1">maximum != +</span><span class="s3">1</span><span class="s1">:</span>
+                        <span class="s1">newConditions.append(condition)</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s4"># condition out of range, remove entire record</span>
+                    <span class="s1">newConditions = </span><span class="s0">None</span>
+                    <span class="s0">break</span>
+
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">log.warning(</span>
+                <span class="s2">&quot;Condition table {0} of FeatureVariationRecord {1} has &quot;</span>
+                <span class="s2">&quot;unsupported format ({2}); ignored&quot;</span><span class="s1">.format(i</span><span class="s0">, </span><span class="s1">recIdx</span><span class="s0">, </span><span class="s1">condition.Format)</span>
+            <span class="s1">)</span>
+            <span class="s1">applies = </span><span class="s0">False</span>
+            <span class="s1">newConditions.append(condition)</span>
+
+    <span class="s0">if </span><span class="s1">newConditions </span><span class="s0">is not None and </span><span class="s1">shouldKeep:</span>
+        <span class="s1">record.ConditionSet.ConditionTable = newConditions</span>
+        <span class="s0">if not </span><span class="s1">newConditions:</span>
+            <span class="s1">record.ConditionSet = </span><span class="s0">None</span>
+        <span class="s1">shouldKeep = </span><span class="s0">True</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">shouldKeep = </span><span class="s0">False</span>
+
+    <span class="s4"># Does this *always* apply?</span>
+    <span class="s1">universal = shouldKeep </span><span class="s0">and not </span><span class="s1">newConditions</span>
+
+    <span class="s0">return </span><span class="s1">applies</span><span class="s0">, </span><span class="s1">shouldKeep</span><span class="s0">, </span><span class="s1">universal</span>
+
+
+<span class="s0">def </span><span class="s1">_instantiateFeatureVariations(table</span><span class="s0">, </span><span class="s1">fvarAxes</span><span class="s0">, </span><span class="s1">axisLimits):</span>
+    <span class="s1">pinnedAxes = set(axisLimits.pinnedLocation())</span>
+    <span class="s1">axisOrder = [axis.axisTag </span><span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">fvarAxes </span><span class="s0">if </span><span class="s1">axis.axisTag </span><span class="s0">not in </span><span class="s1">pinnedAxes]</span>
+    <span class="s1">axisIndexMap = {axisTag: axisOrder.index(axisTag) </span><span class="s0">for </span><span class="s1">axisTag </span><span class="s0">in </span><span class="s1">axisOrder}</span>
+
+    <span class="s1">featureVariationApplied = </span><span class="s0">False</span>
+    <span class="s1">uniqueRecords = set()</span>
+    <span class="s1">newRecords = []</span>
+    <span class="s1">defaultsSubsts = </span><span class="s0">None</span>
+
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">record </span><span class="s0">in </span><span class="s1">enumerate(table.FeatureVariations.FeatureVariationRecord):</span>
+        <span class="s1">applies</span><span class="s0">, </span><span class="s1">shouldKeep</span><span class="s0">, </span><span class="s1">universal = _instantiateFeatureVariationRecord(</span>
+            <span class="s1">record</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s1">axisLimits</span><span class="s0">, </span><span class="s1">fvarAxes</span><span class="s0">, </span><span class="s1">axisIndexMap</span>
+        <span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">shouldKeep </span><span class="s0">and </span><span class="s1">_featureVariationRecordIsUnique(record</span><span class="s0">, </span><span class="s1">uniqueRecords):</span>
+            <span class="s1">newRecords.append(record)</span>
+
+        <span class="s0">if </span><span class="s1">applies </span><span class="s0">and not </span><span class="s1">featureVariationApplied:</span>
+            <span class="s0">assert </span><span class="s1">record.FeatureTableSubstitution.Version == </span><span class="s3">0x00010000</span>
+            <span class="s1">defaultsSubsts = deepcopy(record.FeatureTableSubstitution)</span>
+            <span class="s0">for </span><span class="s1">default</span><span class="s0">, </span><span class="s1">rec </span><span class="s0">in </span><span class="s1">zip(</span>
+                <span class="s1">defaultsSubsts.SubstitutionRecord</span><span class="s0">,</span>
+                <span class="s1">record.FeatureTableSubstitution.SubstitutionRecord</span><span class="s0">,</span>
+            <span class="s1">):</span>
+                <span class="s1">default.Feature = deepcopy(</span>
+                    <span class="s1">table.FeatureList.FeatureRecord[rec.FeatureIndex].Feature</span>
+                <span class="s1">)</span>
+                <span class="s1">table.FeatureList.FeatureRecord[rec.FeatureIndex].Feature = deepcopy(</span>
+                    <span class="s1">rec.Feature</span>
+                <span class="s1">)</span>
+            <span class="s4"># Set variations only once</span>
+            <span class="s1">featureVariationApplied = </span><span class="s0">True</span>
+
+        <span class="s4"># Further records don't have a chance to apply after a universal record</span>
+        <span class="s0">if </span><span class="s1">universal:</span>
+            <span class="s0">break</span>
+
+    <span class="s4"># Insert a catch-all record to reinstate the old features if necessary</span>
+    <span class="s0">if </span><span class="s1">featureVariationApplied </span><span class="s0">and </span><span class="s1">newRecords </span><span class="s0">and not </span><span class="s1">universal:</span>
+        <span class="s1">defaultRecord = ot.FeatureVariationRecord()</span>
+        <span class="s1">defaultRecord.ConditionSet = ot.ConditionSet()</span>
+        <span class="s1">defaultRecord.ConditionSet.ConditionTable = []</span>
+        <span class="s1">defaultRecord.ConditionSet.ConditionCount = </span><span class="s3">0</span>
+        <span class="s1">defaultRecord.FeatureTableSubstitution = defaultsSubsts</span>
+
+        <span class="s1">newRecords.append(defaultRecord)</span>
+
+    <span class="s0">if </span><span class="s1">newRecords:</span>
+        <span class="s1">table.FeatureVariations.FeatureVariationRecord = newRecords</span>
+        <span class="s1">table.FeatureVariations.FeatureVariationCount = len(newRecords)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">del </span><span class="s1">table.FeatureVariations</span>
+        <span class="s4"># downgrade table version if there are no FeatureVariations left</span>
+        <span class="s1">table.Version = </span><span class="s3">0x00010000</span>
+
+
+<span class="s0">def </span><span class="s1">instantiateFeatureVariations(varfont</span><span class="s0">, </span><span class="s1">axisLimits):</span>
+    <span class="s0">for </span><span class="s1">tableTag </span><span class="s0">in </span><span class="s1">(</span><span class="s2">&quot;GPOS&quot;</span><span class="s0">, </span><span class="s2">&quot;GSUB&quot;</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">tableTag </span><span class="s0">not in </span><span class="s1">varfont </span><span class="s0">or not </span><span class="s1">getattr(</span>
+            <span class="s1">varfont[tableTag].table</span><span class="s0">, </span><span class="s2">&quot;FeatureVariations&quot;</span><span class="s0">, None</span>
+        <span class="s1">):</span>
+            <span class="s0">continue</span>
+        <span class="s1">log.info(</span><span class="s2">&quot;Instantiating FeatureVariations of %s table&quot;</span><span class="s0">, </span><span class="s1">tableTag)</span>
+        <span class="s1">_instantiateFeatureVariations(</span>
+            <span class="s1">varfont[tableTag].table</span><span class="s0">, </span><span class="s1">varfont[</span><span class="s2">&quot;fvar&quot;</span><span class="s1">].axes</span><span class="s0">, </span><span class="s1">axisLimits</span>
+        <span class="s1">)</span>
+        <span class="s4"># remove unreferenced lookups</span>
+        <span class="s1">varfont[tableTag].prune_lookups()</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,758 @@
+<html>
+<head>
+<title>exponential_smoothing.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+exponential_smoothing.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Linear exponential smoothing models 
+ 
+Author: Chad Fulton 
+License: BSD-3 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">pandas </span><span class="s2">as </span><span class="s1">pd</span>
+<span class="s2">from </span><span class="s1">statsmodels.base.data </span><span class="s2">import </span><span class="s1">PandasData</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.genmod.generalized_linear_model </span><span class="s2">import </span><span class="s1">GLM</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.validation </span><span class="s2">import </span><span class="s1">(array_like</span><span class="s2">, </span><span class="s1">bool_like</span><span class="s2">, </span><span class="s1">float_like</span><span class="s2">,</span>
+                                          <span class="s1">string_like</span><span class="s2">, </span><span class="s1">int_like)</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.tsa.exponential_smoothing </span><span class="s2">import </span><span class="s1">initialization </span><span class="s2">as </span><span class="s1">es_init</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace </span><span class="s2">import </span><span class="s1">initialization </span><span class="s2">as </span><span class="s1">ss_init</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.kalman_filter </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">MEMORY_CONSERVE</span><span class="s2">, </span><span class="s1">MEMORY_NO_FORECAST)</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s2">import </span><span class="s1">Appender</span>
+<span class="s2">import </span><span class="s1">statsmodels.base.wrapper </span><span class="s2">as </span><span class="s1">wrap</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.iolib.summary </span><span class="s2">import </span><span class="s1">forg</span>
+<span class="s2">from </span><span class="s1">statsmodels.iolib.table </span><span class="s2">import </span><span class="s1">SimpleTable</span>
+<span class="s2">from </span><span class="s1">statsmodels.iolib.tableformatting </span><span class="s2">import </span><span class="s1">fmt_params</span>
+
+<span class="s2">from </span><span class="s1">.mlemodel </span><span class="s2">import </span><span class="s1">MLEModel</span><span class="s2">, </span><span class="s1">MLEResults</span><span class="s2">, </span><span class="s1">MLEResultsWrapper</span>
+
+
+<span class="s2">class </span><span class="s1">ExponentialSmoothing(MLEModel):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Linear exponential smoothing models 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        The observed time-series process :math:`y` 
+    trend : bool, optional 
+        Whether or not to include a trend component. Default is False. 
+    damped_trend : bool, optional 
+        Whether or not an included trend component is damped. Default is False. 
+    seasonal : int, optional 
+        The number of periods in a complete seasonal cycle for seasonal 
+        (Holt-Winters) models. For example, 4 for quarterly data with an 
+        annual cycle or 7 for daily data with a weekly cycle. Default is 
+        no seasonal effects. 
+    initialization_method : str, optional 
+        Method for initialize the recursions. One of: 
+ 
+        * 'estimated' 
+        * 'concentrated' 
+        * 'heuristic' 
+        * 'known' 
+ 
+        If 'known' initialization is used, then `initial_level` must be 
+        passed, as well as `initial_slope` and `initial_seasonal` if 
+        applicable. Default is 'estimated'. 
+    initial_level : float, optional 
+        The initial level component. Only used if initialization is 'known'. 
+    initial_trend : float, optional 
+        The initial trend component. Only used if initialization is 'known'. 
+    initial_seasonal : array_like, optional 
+        The initial seasonal component. An array of length `seasonal` 
+        or length `seasonal - 1` (in which case the last initial value 
+        is computed to make the average effect zero). Only used if 
+        initialization is 'known'. 
+    bounds : iterable[tuple], optional 
+        An iterable containing bounds for the parameters. Must contain four 
+        elements, where each element is a tuple of the form (lower, upper). 
+        Default is (0.0001, 0.9999) for the level, trend, and seasonal 
+        smoothing parameters and (0.8, 0.98) for the trend damping parameter. 
+    concentrate_scale : bool, optional 
+        Whether or not to concentrate the scale (variance of the error term) 
+        out of the likelihood. 
+ 
+    Notes 
+    ----- 
+ 
+    **Overview** 
+ 
+    The parameters and states of this model are estimated by setting up the 
+    exponential smoothing equations as a special case of a linear Gaussian 
+    state space model and applying the Kalman filter. As such, it has slightly 
+    worse performance than the dedicated exponential smoothing model, 
+    :class:`statsmodels.tsa.holtwinters.ExponentialSmoothing`, and it does not 
+    support multiplicative (nonlinear) exponential smoothing models. 
+ 
+    However, as a subclass of the state space models, this model class shares 
+    a consistent set of functionality with those models, which can make it 
+    easier to work with. In addition, it supports computing confidence 
+    intervals for forecasts and it supports concentrating the initial 
+    state out of the likelihood function. 
+ 
+    **Model timing** 
+ 
+    Typical exponential smoothing results correspond to the &quot;filtered&quot; output 
+    from state space models, because they incorporate both the transition to 
+    the new time point (adding the trend to the level and advancing the season) 
+    and updating to incorporate information from the observed datapoint. By 
+    contrast, the &quot;predicted&quot; output from state space models only incorporates 
+    the transition. 
+ 
+    One consequence is that the &quot;initial state&quot; corresponds to the &quot;filtered&quot; 
+    state at time t=0, but this is different from the usual state space 
+    initialization used in Statsmodels, which initializes the model with the 
+    &quot;predicted&quot; state at time t=1. This is important to keep in mind if 
+    setting the initial state directly (via `initialization_method='known'`). 
+ 
+    **Seasonality** 
+ 
+    In seasonal models, it is important to note that seasonals are included in 
+    the state vector of this model in the order: 
+    `[seasonal, seasonal.L1, seasonal.L2, seasonal.L3, ...]`. At time t, the 
+    `'seasonal'` state holds the seasonal factor operative at time t, while 
+    the `'seasonal.L'` state holds the seasonal factor that would have been 
+    operative at time t-1. 
+ 
+    Suppose that the seasonal order is `n_seasons = 4`. Then, because the 
+    initial state corresponds to time t=0 and the time t=1 is in the same 
+    season as time t=-3, the initial seasonal factor for time t=1 comes from 
+    the lag &quot;L3&quot; initial seasonal factor (i.e. at time t=1 this will be both 
+    the &quot;L4&quot; seasonal factor as well as the &quot;L0&quot;, or current, seasonal factor). 
+ 
+    When the initial state is estimated (`initialization_method='estimated'`), 
+    there are only `n_seasons - 1` parameters, because the seasonal factors are 
+    normalized to sum to one. The three parameters that are estimated 
+    correspond to the lags &quot;L0&quot;, &quot;L1&quot;, and &quot;L2&quot; seasonal factors as of time 
+    t=0 (alternatively, the lags &quot;L1&quot;, &quot;L2&quot;, and &quot;L3&quot; as of time t=1). 
+ 
+    When the initial state is given (`initialization_method='known'`), the 
+    initial seasonal factors for time t=0 must be given by the argument 
+    `initial_seasonal`. This can either be a length `n_seasons - 1` array -- 
+    in which case it should contain the lags &quot;L0&quot; - &quot;L2&quot; (in that order) 
+    seasonal factors as of time t=0 -- or a length `n_seasons` array, in which 
+    case it should contain the &quot;L0&quot; - &quot;L3&quot; (in that order) seasonal factors 
+    as of time t=0. 
+ 
+    Note that in the state vector and parameters, the &quot;L0&quot; seasonal is 
+    called &quot;seasonal&quot; or &quot;initial_seasonal&quot;, while the i&gt;0 lag is 
+    called &quot;seasonal.L{i}&quot;. 
+ 
+    References 
+    ---------- 
+    [1] Hyndman, Rob, Anne B. Koehler, J. Keith Ord, and Ralph D. Snyder. 
+        Forecasting with exponential smoothing: the state space approach. 
+        Springer Science &amp; Business Media, 2008. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">trend=</span><span class="s2">False, </span><span class="s1">damped_trend=</span><span class="s2">False, </span><span class="s1">seasonal=</span><span class="s2">None,</span>
+                 <span class="s1">initialization_method=</span><span class="s3">'estimated'</span><span class="s2">, </span><span class="s1">initial_level=</span><span class="s2">None,</span>
+                 <span class="s1">initial_trend=</span><span class="s2">None, </span><span class="s1">initial_seasonal=</span><span class="s2">None, </span><span class="s1">bounds=</span><span class="s2">None,</span>
+                 <span class="s1">concentrate_scale=</span><span class="s2">True, </span><span class="s1">dates=</span><span class="s2">None, </span><span class="s1">freq=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># Model definition</span>
+        <span class="s1">self.trend = bool_like(trend</span><span class="s2">, </span><span class="s3">'trend'</span><span class="s1">)</span>
+        <span class="s1">self.damped_trend = bool_like(damped_trend</span><span class="s2">, </span><span class="s3">'damped_trend'</span><span class="s1">)</span>
+        <span class="s1">self.seasonal_periods = int_like(seasonal</span><span class="s2">, </span><span class="s3">'seasonal'</span><span class="s2">, </span><span class="s1">optional=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">self.seasonal = self.seasonal_periods </span><span class="s2">is not None</span>
+        <span class="s1">self.initialization_method = string_like(</span>
+            <span class="s1">initialization_method</span><span class="s2">, </span><span class="s3">'initialization_method'</span><span class="s1">).lower()</span>
+        <span class="s1">self.concentrate_scale = bool_like(concentrate_scale</span><span class="s2">,</span>
+                                           <span class="s3">'concentrate_scale'</span><span class="s1">)</span>
+
+        <span class="s4"># TODO: add validation for bounds (e.g. have all bounds, upper &gt; lower)</span>
+        <span class="s4"># TODO: add `bounds_method` argument to choose between &quot;usual&quot; and</span>
+        <span class="s4"># &quot;admissible&quot; as in Hyndman et al. (2008)</span>
+        <span class="s1">self.bounds = bounds</span>
+        <span class="s2">if </span><span class="s1">self.bounds </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self.bounds = [(</span><span class="s5">1e-4</span><span class="s2">, </span><span class="s5">1</span><span class="s1">-</span><span class="s5">1e-4</span><span class="s1">)] * </span><span class="s5">3 </span><span class="s1">+ [(</span><span class="s5">0.8</span><span class="s2">, </span><span class="s5">0.98</span><span class="s1">)]</span>
+
+        <span class="s4"># Validation</span>
+        <span class="s2">if </span><span class="s1">self.seasonal_periods == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">'Cannot have a seasonal period of 1.'</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">self.seasonal </span><span class="s2">and </span><span class="s1">self.seasonal_periods </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">NotImplementedError(</span><span class="s3">'Unable to detect season automatically;'</span>
+                                      <span class="s3">' please specify `seasonal_periods`.'</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">self.initialization_method </span><span class="s2">not in </span><span class="s1">[</span><span class="s3">'concentrated'</span><span class="s2">, </span><span class="s3">'estimated'</span><span class="s2">,</span>
+                                              <span class="s3">'simple'</span><span class="s2">, </span><span class="s3">'heuristic'</span><span class="s2">, </span><span class="s3">'known'</span><span class="s1">]:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">'Invalid initialization method &quot;%s&quot;.'</span>
+                             <span class="s1">% initialization_method)</span>
+
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'known'</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">initial_level </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">'`initial_level` argument must be provided'</span>
+                                 <span class="s3">' when initialization method is set to'</span>
+                                 <span class="s3">' &quot;known&quot;.'</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">initial_trend </span><span class="s2">is None and </span><span class="s1">self.trend:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">'`initial_trend` argument must be provided'</span>
+                                 <span class="s3">' for models with a trend component when'</span>
+                                 <span class="s3">' initialization method is set to &quot;known&quot;.'</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">initial_seasonal </span><span class="s2">is None and </span><span class="s1">self.seasonal:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">'`initial_seasonal` argument must be provided'</span>
+                                 <span class="s3">' for models with a seasonal component when'</span>
+                                 <span class="s3">' initialization method is set to &quot;known&quot;.'</span><span class="s1">)</span>
+
+        <span class="s4"># Initialize the state space model</span>
+        <span class="s2">if not </span><span class="s1">self.seasonal </span><span class="s2">or </span><span class="s1">self.seasonal_periods </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._seasonal_periods = </span><span class="s5">0</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._seasonal_periods = self.seasonal_periods</span>
+
+        <span class="s1">k_states = </span><span class="s5">2 </span><span class="s1">+ int(self.trend) + self._seasonal_periods</span>
+        <span class="s1">k_posdef = </span><span class="s5">1</span>
+
+        <span class="s1">init = ss_init.Initialization(k_states</span><span class="s2">, </span><span class="s3">'known'</span><span class="s2">,</span>
+                                      <span class="s1">constant=[</span><span class="s5">0</span><span class="s1">] * k_states)</span>
+        <span class="s1">super(ExponentialSmoothing</span><span class="s2">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">endog</span><span class="s2">, </span><span class="s1">k_states=k_states</span><span class="s2">, </span><span class="s1">k_posdef=k_posdef</span><span class="s2">,</span>
+            <span class="s1">initialization=init</span><span class="s2">, </span><span class="s1">dates=dates</span><span class="s2">, </span><span class="s1">freq=freq)</span>
+
+        <span class="s4"># Concentrate the scale out of the likelihood function</span>
+        <span class="s2">if </span><span class="s1">self.concentrate_scale:</span>
+            <span class="s1">self.ssm.filter_concentrated = </span><span class="s2">True</span>
+
+        <span class="s4"># Setup fixed elements of the system matrices</span>
+        <span class="s4"># Observation error</span>
+        <span class="s1">self.ssm[</span><span class="s3">'design'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1.</span>
+        <span class="s1">self.ssm[</span><span class="s3">'selection'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1.</span>
+        <span class="s1">self.ssm[</span><span class="s3">'state_cov'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1.</span>
+
+        <span class="s4"># Level</span>
+        <span class="s1">self.ssm[</span><span class="s3">'design'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = </span><span class="s5">1.</span>
+        <span class="s1">self.ssm[</span><span class="s3">'transition'</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = </span><span class="s5">1.</span>
+
+        <span class="s4"># Trend</span>
+        <span class="s2">if </span><span class="s1">self.trend:</span>
+            <span class="s1">self.ssm[</span><span class="s3">'transition'</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:</span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s1">] = </span><span class="s5">1.</span>
+
+        <span class="s4"># Seasonal</span>
+        <span class="s2">if </span><span class="s1">self.seasonal:</span>
+            <span class="s1">k = </span><span class="s5">2 </span><span class="s1">+ int(self.trend)</span>
+            <span class="s1">self.ssm[</span><span class="s3">'design'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">k] = </span><span class="s5">1.</span>
+            <span class="s1">self.ssm[</span><span class="s3">'transition'</span><span class="s2">, </span><span class="s1">k</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">] = </span><span class="s5">1.</span>
+            <span class="s1">self.ssm[</span><span class="s3">'transition'</span><span class="s2">, </span><span class="s1">k + </span><span class="s5">1</span><span class="s1">:k_states</span><span class="s2">, </span><span class="s1">k:k_states - </span><span class="s5">1</span><span class="s1">] = (</span>
+                <span class="s1">np.eye(self.seasonal_periods - </span><span class="s5">1</span><span class="s1">))</span>
+
+        <span class="s4"># Initialization of the states</span>
+        <span class="s2">if </span><span class="s1">self.initialization_method != </span><span class="s3">'known'</span><span class="s1">:</span>
+            <span class="s1">msg = (</span><span class="s3">'Cannot give `%%s` argument when initialization is &quot;%s&quot;'</span>
+                   <span class="s1">% initialization_method)</span>
+            <span class="s2">if </span><span class="s1">initial_level </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(msg % </span><span class="s3">'initial_level'</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">initial_trend </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(msg % </span><span class="s3">'initial_trend'</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">initial_seasonal </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(msg % </span><span class="s3">'initial_seasonal'</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'simple'</span><span class="s1">:</span>
+            <span class="s1">initial_level</span><span class="s2">, </span><span class="s1">initial_trend</span><span class="s2">, </span><span class="s1">initial_seasonal = (</span>
+                <span class="s1">es_init._initialization_simple(</span>
+                    <span class="s1">self.endog[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">trend=</span><span class="s3">'add' </span><span class="s2">if </span><span class="s1">self.trend </span><span class="s2">else None,</span>
+                    <span class="s1">seasonal=</span><span class="s3">'add' </span><span class="s2">if </span><span class="s1">self.seasonal </span><span class="s2">else None,</span>
+                    <span class="s1">seasonal_periods=self.seasonal_periods))</span>
+        <span class="s2">elif </span><span class="s1">self.initialization_method == </span><span class="s3">'heuristic'</span><span class="s1">:</span>
+            <span class="s1">initial_level</span><span class="s2">, </span><span class="s1">initial_trend</span><span class="s2">, </span><span class="s1">initial_seasonal = (</span>
+                <span class="s1">es_init._initialization_heuristic(</span>
+                    <span class="s1">self.endog[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">trend=</span><span class="s3">'add' </span><span class="s2">if </span><span class="s1">self.trend </span><span class="s2">else None,</span>
+                    <span class="s1">seasonal=</span><span class="s3">'add' </span><span class="s2">if </span><span class="s1">self.seasonal </span><span class="s2">else None,</span>
+                    <span class="s1">seasonal_periods=self.seasonal_periods))</span>
+        <span class="s2">elif </span><span class="s1">self.initialization_method == </span><span class="s3">'known'</span><span class="s1">:</span>
+            <span class="s1">initial_level = float_like(initial_level</span><span class="s2">, </span><span class="s3">'initial_level'</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">self.trend:</span>
+                <span class="s1">initial_trend = float_like(initial_trend</span><span class="s2">, </span><span class="s3">'initial_trend'</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">self.seasonal:</span>
+                <span class="s1">initial_seasonal = array_like(initial_seasonal</span><span class="s2">,</span>
+                                              <span class="s3">'initial_seasonal'</span><span class="s1">)</span>
+
+                <span class="s2">if </span><span class="s1">len(initial_seasonal) == self.seasonal_periods - </span><span class="s5">1</span><span class="s1">:</span>
+                    <span class="s1">initial_seasonal = np.r_[initial_seasonal</span><span class="s2">,</span>
+                                             <span class="s5">0 </span><span class="s1">- np.sum(initial_seasonal)]</span>
+
+                <span class="s2">if </span><span class="s1">len(initial_seasonal) != self.seasonal_periods:</span>
+                    <span class="s2">raise </span><span class="s1">ValueError(</span>
+                        <span class="s3">'Invalid length of initial seasonal values. Must be'</span>
+                        <span class="s3">' one of s or s-1, where s is the number of seasonal'</span>
+                        <span class="s3">' periods.'</span><span class="s1">)</span>
+
+        <span class="s4"># Note that the simple and heuristic methods of computing initial</span>
+        <span class="s4"># seasonal factors return estimated seasonal factors associated with</span>
+        <span class="s4"># the first t = 1, 2, ..., `n_seasons` observations. To use these as</span>
+        <span class="s4"># the initial state, we lag them by `n_seasons`. This yields, for</span>
+        <span class="s4"># example for `n_seasons = 4`, the seasons lagged L3, L2, L1, L0.</span>
+        <span class="s4"># As described above, the state vector in this model should have</span>
+        <span class="s4"># seasonal factors ordered L0, L1, L2, L3, and as a result we need to</span>
+        <span class="s4"># reverse the order of the computed initial seasonal factors from</span>
+        <span class="s4"># these methods.</span>
+        <span class="s1">methods = [</span><span class="s3">'simple'</span><span class="s2">, </span><span class="s3">'heuristic'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">(self.initialization_method </span><span class="s2">in </span><span class="s1">methods</span>
+                <span class="s2">and </span><span class="s1">initial_seasonal </span><span class="s2">is not None</span><span class="s1">):</span>
+            <span class="s1">initial_seasonal = initial_seasonal[::-</span><span class="s5">1</span><span class="s1">]</span>
+
+        <span class="s1">self._initial_level = initial_level</span>
+        <span class="s1">self._initial_trend = initial_trend</span>
+        <span class="s1">self._initial_seasonal = initial_seasonal</span>
+        <span class="s1">self._initial_state = </span><span class="s2">None</span>
+
+        <span class="s4"># Initialize now if possible (if we have a damped trend, then</span>
+        <span class="s4"># initialization will depend on the phi parameter, and so has to be</span>
+        <span class="s4"># done at each `update`)</span>
+        <span class="s1">methods = [</span><span class="s3">'simple'</span><span class="s2">, </span><span class="s3">'heuristic'</span><span class="s2">, </span><span class="s3">'known'</span><span class="s1">]</span>
+        <span class="s2">if not </span><span class="s1">self.damped_trend </span><span class="s2">and </span><span class="s1">self.initialization_method </span><span class="s2">in </span><span class="s1">methods:</span>
+            <span class="s1">self._initialize_constant_statespace(initial_level</span><span class="s2">, </span><span class="s1">initial_trend</span><span class="s2">,</span>
+                                                 <span class="s1">initial_seasonal)</span>
+
+        <span class="s4"># Save keys for kwarg initialization</span>
+        <span class="s1">self._init_keys += [</span><span class="s3">'trend'</span><span class="s2">, </span><span class="s3">'damped_trend'</span><span class="s2">, </span><span class="s3">'seasonal'</span><span class="s2">,</span>
+                            <span class="s3">'initialization_method'</span><span class="s2">, </span><span class="s3">'initial_level'</span><span class="s2">,</span>
+                            <span class="s3">'initial_trend'</span><span class="s2">, </span><span class="s3">'initial_seasonal'</span><span class="s2">, </span><span class="s3">'bounds'</span><span class="s2">,</span>
+                            <span class="s3">'concentrate_scale'</span><span class="s2">, </span><span class="s3">'dates'</span><span class="s2">, </span><span class="s3">'freq'</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">_get_init_kwds(self):</span>
+        <span class="s1">kwds = super()._get_init_kwds()</span>
+        <span class="s1">kwds[</span><span class="s3">'seasonal'</span><span class="s1">] = self.seasonal_periods</span>
+        <span class="s2">return </span><span class="s1">kwds</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">_res_classes(self):</span>
+        <span class="s2">return </span><span class="s1">{</span><span class="s3">'fit'</span><span class="s1">: (ExponentialSmoothingResults</span><span class="s2">,</span>
+                        <span class="s1">ExponentialSmoothingResultsWrapper)}</span>
+
+    <span class="s2">def </span><span class="s1">clone(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s2">if </span><span class="s1">exog </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">NotImplementedError(</span>
+                <span class="s3">'ExponentialSmoothing does not support `exog`.'</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">self._clone_from_init_kwds(endog</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">state_names(self):</span>
+        <span class="s1">state_names = [</span><span class="s3">'error'</span><span class="s2">, </span><span class="s3">'level'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">self.trend:</span>
+            <span class="s1">state_names += [</span><span class="s3">'trend'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">self.seasonal:</span>
+            <span class="s1">state_names += (</span>
+                <span class="s1">[</span><span class="s3">'seasonal'</span><span class="s1">] + [</span><span class="s3">'seasonal.L%d' </span><span class="s1">% i</span>
+                                <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">self.seasonal_periods)])</span>
+
+        <span class="s2">return </span><span class="s1">state_names</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">param_names(self):</span>
+        <span class="s1">param_names = [</span><span class="s3">'smoothing_level'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">self.trend:</span>
+            <span class="s1">param_names += [</span><span class="s3">'smoothing_trend'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">self.seasonal:</span>
+            <span class="s1">param_names += [</span><span class="s3">'smoothing_seasonal'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">self.damped_trend:</span>
+            <span class="s1">param_names += [</span><span class="s3">'damping_trend'</span><span class="s1">]</span>
+        <span class="s2">if not </span><span class="s1">self.concentrate_scale:</span>
+            <span class="s1">param_names += [</span><span class="s3">'sigma2'</span><span class="s1">]</span>
+
+        <span class="s4"># Initialization</span>
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'estimated'</span><span class="s1">:</span>
+            <span class="s1">param_names += [</span><span class="s3">'initial_level'</span><span class="s1">]</span>
+            <span class="s2">if </span><span class="s1">self.trend:</span>
+                <span class="s1">param_names += [</span><span class="s3">'initial_trend'</span><span class="s1">]</span>
+            <span class="s2">if </span><span class="s1">self.seasonal:</span>
+                <span class="s1">param_names += (</span>
+                    <span class="s1">[</span><span class="s3">'initial_seasonal'</span><span class="s1">]</span>
+                    <span class="s1">+ [</span><span class="s3">'initial_seasonal.L%d' </span><span class="s1">% i</span>
+                       <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">self.seasonal_periods - </span><span class="s5">1</span><span class="s1">)])</span>
+
+        <span class="s2">return </span><span class="s1">param_names</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">start_params(self):</span>
+        <span class="s4"># Make sure starting parameters aren't beyond or right on the bounds</span>
+        <span class="s1">bounds = [(x[</span><span class="s5">0</span><span class="s1">] + </span><span class="s5">1e-3</span><span class="s2">, </span><span class="s1">x[</span><span class="s5">1</span><span class="s1">] - </span><span class="s5">1e-3</span><span class="s1">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self.bounds]</span>
+
+        <span class="s4"># See Hyndman p.24</span>
+        <span class="s1">start_params = [np.clip(</span><span class="s5">0.1</span><span class="s2">, </span><span class="s1">*bounds[</span><span class="s5">0</span><span class="s1">])]</span>
+        <span class="s2">if </span><span class="s1">self.trend:</span>
+            <span class="s1">start_params += [np.clip(</span><span class="s5">0.01</span><span class="s2">, </span><span class="s1">*bounds[</span><span class="s5">1</span><span class="s1">])]</span>
+        <span class="s2">if </span><span class="s1">self.seasonal:</span>
+            <span class="s1">start_params += [np.clip(</span><span class="s5">0.01</span><span class="s2">, </span><span class="s1">*bounds[</span><span class="s5">2</span><span class="s1">])]</span>
+        <span class="s2">if </span><span class="s1">self.damped_trend:</span>
+            <span class="s1">start_params += [np.clip(</span><span class="s5">0.98</span><span class="s2">, </span><span class="s1">*bounds[</span><span class="s5">3</span><span class="s1">])]</span>
+        <span class="s2">if not </span><span class="s1">self.concentrate_scale:</span>
+            <span class="s1">start_params += [np.var(self.endog)]</span>
+
+        <span class="s4"># Initialization</span>
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'estimated'</span><span class="s1">:</span>
+            <span class="s1">initial_level</span><span class="s2">, </span><span class="s1">initial_trend</span><span class="s2">, </span><span class="s1">initial_seasonal = (</span>
+                <span class="s1">es_init._initialization_simple(</span>
+                    <span class="s1">self.endog[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+                    <span class="s1">trend=</span><span class="s3">'add' </span><span class="s2">if </span><span class="s1">self.trend </span><span class="s2">else None,</span>
+                    <span class="s1">seasonal=</span><span class="s3">'add' </span><span class="s2">if </span><span class="s1">self.seasonal </span><span class="s2">else None,</span>
+                    <span class="s1">seasonal_periods=self.seasonal_periods))</span>
+            <span class="s1">start_params += [initial_level]</span>
+            <span class="s2">if </span><span class="s1">self.trend:</span>
+                <span class="s1">start_params += [initial_trend]</span>
+            <span class="s2">if </span><span class="s1">self.seasonal:</span>
+                <span class="s1">start_params += initial_seasonal.tolist()[::-</span><span class="s5">1</span><span class="s1">][:-</span><span class="s5">1</span><span class="s1">]</span>
+
+        <span class="s2">return </span><span class="s1">np.array(start_params)</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">k_params(self):</span>
+        <span class="s1">k_params = (</span>
+            <span class="s5">1 </span><span class="s1">+ int(self.trend) + int(self.seasonal) +</span>
+            <span class="s1">int(</span><span class="s2">not </span><span class="s1">self.concentrate_scale) + int(self.damped_trend))</span>
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'estimated'</span><span class="s1">:</span>
+            <span class="s1">k_params += (</span>
+                <span class="s5">1 </span><span class="s1">+ int(self.trend) +</span>
+                <span class="s1">int(self.seasonal) * (self._seasonal_periods - </span><span class="s5">1</span><span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">k_params</span>
+
+    <span class="s2">def </span><span class="s1">transform_params(self</span><span class="s2">, </span><span class="s1">unconstrained):</span>
+        <span class="s1">unconstrained = np.array(unconstrained</span><span class="s2">, </span><span class="s1">ndmin=</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">constrained = np.zeros_like(unconstrained)</span>
+
+        <span class="s4"># Alpha in (0, 1)</span>
+        <span class="s1">low</span><span class="s2">, </span><span class="s1">high = self.bounds[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">constrained[</span><span class="s5">0</span><span class="s1">] = (</span>
+            <span class="s5">1 </span><span class="s1">/ (</span><span class="s5">1 </span><span class="s1">+ np.exp(-unconstrained[</span><span class="s5">0</span><span class="s1">])) * (high - low) + low)</span>
+        <span class="s1">i = </span><span class="s5">1</span>
+
+        <span class="s4"># Beta in (0, alpha)</span>
+        <span class="s2">if </span><span class="s1">self.trend:</span>
+            <span class="s1">low</span><span class="s2">, </span><span class="s1">high = self.bounds[</span><span class="s5">1</span><span class="s1">]</span>
+            <span class="s1">high = min(high</span><span class="s2">, </span><span class="s1">constrained[</span><span class="s5">0</span><span class="s1">])</span>
+            <span class="s1">constrained[i] = (</span>
+                <span class="s5">1 </span><span class="s1">/ (</span><span class="s5">1 </span><span class="s1">+ np.exp(-unconstrained[i])) * (high - low) + low)</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+
+        <span class="s4"># Gamma in (0, 1 - alpha)</span>
+        <span class="s2">if </span><span class="s1">self.seasonal:</span>
+            <span class="s1">low</span><span class="s2">, </span><span class="s1">high = self.bounds[</span><span class="s5">2</span><span class="s1">]</span>
+            <span class="s1">high = min(high</span><span class="s2">, </span><span class="s5">1 </span><span class="s1">- constrained[</span><span class="s5">0</span><span class="s1">])</span>
+            <span class="s1">constrained[i] = (</span>
+                <span class="s5">1 </span><span class="s1">/ (</span><span class="s5">1 </span><span class="s1">+ np.exp(-unconstrained[i])) * (high - low) + low)</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+
+        <span class="s4"># Phi in bounds (e.g. default is [0.8, 0.98])</span>
+        <span class="s2">if </span><span class="s1">self.damped_trend:</span>
+            <span class="s1">low</span><span class="s2">, </span><span class="s1">high = self.bounds[</span><span class="s5">3</span><span class="s1">]</span>
+            <span class="s1">constrained[i] = (</span>
+                <span class="s5">1 </span><span class="s1">/ (</span><span class="s5">1 </span><span class="s1">+ np.exp(-unconstrained[i])) * (high - low) + low)</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+
+        <span class="s4"># sigma^2 positive</span>
+        <span class="s2">if not </span><span class="s1">self.concentrate_scale:</span>
+            <span class="s1">constrained[i] = unconstrained[i]**</span><span class="s5">2</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+
+        <span class="s4"># Initial parameters are as-is</span>
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'estimated'</span><span class="s1">:</span>
+            <span class="s1">constrained[i:] = unconstrained[i:]</span>
+
+        <span class="s2">return </span><span class="s1">constrained</span>
+
+    <span class="s2">def </span><span class="s1">untransform_params(self</span><span class="s2">, </span><span class="s1">constrained):</span>
+        <span class="s1">constrained = np.array(constrained</span><span class="s2">, </span><span class="s1">ndmin=</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">unconstrained = np.zeros_like(constrained)</span>
+
+        <span class="s4"># Alpha in (0, 1)</span>
+        <span class="s1">low</span><span class="s2">, </span><span class="s1">high = self.bounds[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">tmp = (constrained[</span><span class="s5">0</span><span class="s1">] - low) / (high - low)</span>
+        <span class="s1">unconstrained[</span><span class="s5">0</span><span class="s1">] = np.log(tmp / (</span><span class="s5">1 </span><span class="s1">- tmp))</span>
+        <span class="s1">i = </span><span class="s5">1</span>
+
+        <span class="s4"># Beta in (0, alpha)</span>
+        <span class="s2">if </span><span class="s1">self.trend:</span>
+            <span class="s1">low</span><span class="s2">, </span><span class="s1">high = self.bounds[</span><span class="s5">1</span><span class="s1">]</span>
+            <span class="s1">high = min(high</span><span class="s2">, </span><span class="s1">constrained[</span><span class="s5">0</span><span class="s1">])</span>
+            <span class="s1">tmp = (constrained[i] - low) / (high - low)</span>
+            <span class="s1">unconstrained[i] = np.log(tmp / (</span><span class="s5">1 </span><span class="s1">- tmp))</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+
+        <span class="s4"># Gamma in (0, 1 - alpha)</span>
+        <span class="s2">if </span><span class="s1">self.seasonal:</span>
+            <span class="s1">low</span><span class="s2">, </span><span class="s1">high = self.bounds[</span><span class="s5">2</span><span class="s1">]</span>
+            <span class="s1">high = min(high</span><span class="s2">, </span><span class="s5">1 </span><span class="s1">- constrained[</span><span class="s5">0</span><span class="s1">])</span>
+            <span class="s1">tmp = (constrained[i] - low) / (high - low)</span>
+            <span class="s1">unconstrained[i] = np.log(tmp / (</span><span class="s5">1 </span><span class="s1">- tmp))</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+
+        <span class="s4"># Phi in bounds (e.g. default is [0.8, 0.98])</span>
+        <span class="s2">if </span><span class="s1">self.damped_trend:</span>
+            <span class="s1">low</span><span class="s2">, </span><span class="s1">high = self.bounds[</span><span class="s5">3</span><span class="s1">]</span>
+            <span class="s1">tmp = (constrained[i] - low) / (high - low)</span>
+            <span class="s1">unconstrained[i] = np.log(tmp / (</span><span class="s5">1 </span><span class="s1">- tmp))</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+
+        <span class="s4"># sigma^2 positive</span>
+        <span class="s2">if not </span><span class="s1">self.concentrate_scale:</span>
+            <span class="s1">unconstrained[i] = constrained[i]**</span><span class="s5">0.5</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+
+        <span class="s4"># Initial parameters are as-is</span>
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'estimated'</span><span class="s1">:</span>
+            <span class="s1">unconstrained[i:] = constrained[i:]</span>
+
+        <span class="s2">return </span><span class="s1">unconstrained</span>
+
+    <span class="s2">def </span><span class="s1">_initialize_constant_statespace(self</span><span class="s2">, </span><span class="s1">initial_level</span><span class="s2">,</span>
+                                        <span class="s1">initial_trend=</span><span class="s2">None,</span>
+                                        <span class="s1">initial_seasonal=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># Note: this should be run after `update` has already put any new</span>
+        <span class="s4"># parameters into the transition matrix, since it uses the transition</span>
+        <span class="s4"># matrix explicitly.</span>
+
+        <span class="s4"># Due to timing differences, the state space representation integrates</span>
+        <span class="s4"># the trend into the level in the &quot;predicted_state&quot; (only the</span>
+        <span class="s4"># &quot;filtered_state&quot; corresponds to the timing of the exponential</span>
+        <span class="s4"># smoothing models)</span>
+
+        <span class="s4"># Initial values are interpreted as &quot;filtered&quot; values</span>
+        <span class="s1">constant = np.array([</span><span class="s5">0.</span><span class="s2">, </span><span class="s1">initial_level])</span>
+        <span class="s2">if </span><span class="s1">self.trend </span><span class="s2">and </span><span class="s1">initial_trend </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">constant = np.r_[constant</span><span class="s2">, </span><span class="s1">initial_trend]</span>
+        <span class="s2">if </span><span class="s1">self.seasonal </span><span class="s2">and </span><span class="s1">initial_seasonal </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">constant = np.r_[constant</span><span class="s2">, </span><span class="s1">initial_seasonal]</span>
+        <span class="s1">self._initial_state = constant[</span><span class="s5">1</span><span class="s1">:]</span>
+
+        <span class="s4"># Apply the prediction step to get to what we need for our Kalman</span>
+        <span class="s4"># filter implementation</span>
+        <span class="s1">constant = np.dot(self.ssm[</span><span class="s3">'transition'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">constant)</span>
+
+        <span class="s1">self.initialization.constant = constant</span>
+
+    <span class="s2">def </span><span class="s1">_initialize_stationary_cov_statespace(self):</span>
+        <span class="s1">R = self.ssm[</span><span class="s3">'selection'</span><span class="s1">]</span>
+        <span class="s1">Q = self.ssm[</span><span class="s3">'state_cov'</span><span class="s1">]</span>
+        <span class="s1">self.initialization.stationary_cov = R.dot(Q).dot(R.T)</span>
+
+    <span class="s2">def </span><span class="s1">update(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">transformed=</span><span class="s2">True, </span><span class="s1">includes_fixed=</span><span class="s2">False,</span>
+               <span class="s1">complex_step=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s1">params = self.handle_params(params</span><span class="s2">, </span><span class="s1">transformed=transformed</span><span class="s2">,</span>
+                                    <span class="s1">includes_fixed=includes_fixed)</span>
+
+        <span class="s4"># State space system matrices</span>
+        <span class="s1">self.ssm[</span><span class="s3">'selection'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1 </span><span class="s1">- params[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">self.ssm[</span><span class="s3">'selection'</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = params[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">i = </span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s1">self.trend:</span>
+            <span class="s1">self.ssm[</span><span class="s3">'selection'</span><span class="s2">, </span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = params[i]</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s1">self.seasonal:</span>
+            <span class="s1">self.ssm[</span><span class="s3">'selection'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] -= params[i]</span>
+            <span class="s1">self.ssm[</span><span class="s3">'selection'</span><span class="s2">, </span><span class="s1">i + </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = params[i]</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s1">self.damped_trend:</span>
+            <span class="s1">self.ssm[</span><span class="s3">'transition'</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:</span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s1">] = params[i]</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+        <span class="s2">if not </span><span class="s1">self.concentrate_scale:</span>
+            <span class="s1">self.ssm[</span><span class="s3">'state_cov'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = params[i]</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+
+        <span class="s4"># State initialization</span>
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'estimated'</span><span class="s1">:</span>
+            <span class="s1">initial_level = params[i]</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+            <span class="s1">initial_trend = </span><span class="s2">None</span>
+            <span class="s1">initial_seasonal = </span><span class="s2">None</span>
+
+            <span class="s2">if </span><span class="s1">self.trend:</span>
+                <span class="s1">initial_trend = params[i]</span>
+                <span class="s1">i += </span><span class="s5">1</span>
+            <span class="s2">if </span><span class="s1">self.seasonal:</span>
+                <span class="s1">initial_seasonal = params[i: i + self.seasonal_periods - </span><span class="s5">1</span><span class="s1">]</span>
+                <span class="s1">initial_seasonal = np.r_[initial_seasonal</span><span class="s2">,</span>
+                                         <span class="s5">0 </span><span class="s1">- np.sum(initial_seasonal)]</span>
+            <span class="s1">self._initialize_constant_statespace(initial_level</span><span class="s2">, </span><span class="s1">initial_trend</span><span class="s2">,</span>
+                                                 <span class="s1">initial_seasonal)</span>
+
+        <span class="s1">methods = [</span><span class="s3">'simple'</span><span class="s2">, </span><span class="s3">'heuristic'</span><span class="s2">, </span><span class="s3">'known'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">self.damped_trend </span><span class="s2">and </span><span class="s1">self.initialization_method </span><span class="s2">in </span><span class="s1">methods:</span>
+            <span class="s1">self._initialize_constant_statespace(</span>
+                <span class="s1">self._initial_level</span><span class="s2">, </span><span class="s1">self._initial_trend</span><span class="s2">,</span>
+                <span class="s1">self._initial_seasonal)</span>
+
+        <span class="s1">self._initialize_stationary_cov_statespace()</span>
+
+    <span class="s2">def </span><span class="s1">_compute_concentrated_states(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s4"># Apply the usual filter, but keep forecasts</span>
+        <span class="s1">kwargs[</span><span class="s3">'conserve_memory'</span><span class="s1">] = MEMORY_CONSERVE &amp; ~MEMORY_NO_FORECAST</span>
+        <span class="s1">super().loglike(params</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s4"># Compute the initial state vector</span>
+        <span class="s1">y_tilde = np.array(self.ssm._kalman_filter.forecast_error[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+                           <span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s4"># Need to modify our state space system matrices slightly to get them</span>
+        <span class="s4"># back into the form of the innovations framework of</span>
+        <span class="s4"># De Livera et al. (2011)</span>
+        <span class="s1">T = self[</span><span class="s3">'transition'</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:]</span>
+        <span class="s1">R = self[</span><span class="s3">'selection'</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:]</span>
+        <span class="s1">Z = self[</span><span class="s3">'design'</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:].copy()</span>
+        <span class="s1">i = </span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s1">self.trend:</span>
+            <span class="s1">Z[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = </span><span class="s5">1.</span>
+            <span class="s1">i += </span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s1">self.seasonal:</span>
+            <span class="s1">Z[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = </span><span class="s5">0.</span>
+            <span class="s1">Z[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">] = </span><span class="s5">1.</span>
+
+        <span class="s4"># Now compute the regression components as described in</span>
+        <span class="s4"># De Livera et al. (2011), equation (10).</span>
+        <span class="s1">D = T - R.dot(Z)</span>
+        <span class="s1">w = np.zeros((self.nobs</span><span class="s2">, </span><span class="s1">self.k_states - </span><span class="s5">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">dtype=D.dtype)</span>
+        <span class="s1">w[</span><span class="s5">0</span><span class="s1">] = Z</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(self.nobs - </span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">w[i + </span><span class="s5">1</span><span class="s1">] = w[i].dot(D)</span>
+        <span class="s1">mod_ols = GLM(y_tilde</span><span class="s2">, </span><span class="s1">w)</span>
+
+        <span class="s4"># If we have seasonal parameters, constrain them to sum to zero</span>
+        <span class="s4"># (otherwise the initial level gets confounded with the sum of the</span>
+        <span class="s4"># seasonals).</span>
+        <span class="s2">if </span><span class="s1">self.seasonal:</span>
+            <span class="s1">R = np.zeros_like(Z)</span>
+            <span class="s1">R[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">-self.seasonal_periods:] = </span><span class="s5">1.</span>
+            <span class="s1">q = np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">))</span>
+            <span class="s1">res_ols = mod_ols.fit_constrained((R</span><span class="s2">, </span><span class="s1">q))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">res_ols = mod_ols.fit()</span>
+
+        <span class="s4"># Separate into individual components</span>
+        <span class="s1">initial_level = res_ols.params[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">initial_trend = res_ols.params[</span><span class="s5">1</span><span class="s1">] </span><span class="s2">if </span><span class="s1">self.trend </span><span class="s2">else None</span>
+        <span class="s1">initial_seasonal = (</span>
+            <span class="s1">res_ols.params[-self.seasonal_periods:] </span><span class="s2">if </span><span class="s1">self.seasonal </span><span class="s2">else None</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">initial_level</span><span class="s2">, </span><span class="s1">initial_trend</span><span class="s2">, </span><span class="s1">initial_seasonal</span>
+
+    <span class="s1">@Appender(MLEModel.loglike.__doc__)</span>
+    <span class="s2">def </span><span class="s1">loglike(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'concentrated'</span><span class="s1">:</span>
+            <span class="s1">self._initialize_constant_statespace(</span>
+                <span class="s1">*self._compute_concentrated_states(params</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs))</span>
+            <span class="s1">llf = self.ssm.loglike()</span>
+            <span class="s1">self.ssm.initialization.constant = np.zeros(self.k_states)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">llf = super().loglike(params</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s2">return </span><span class="s1">llf</span>
+
+    <span class="s1">@Appender(MLEModel.filter.__doc__)</span>
+    <span class="s2">def </span><span class="s1">filter(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">cov_type=</span><span class="s2">None, </span><span class="s1">cov_kwds=</span><span class="s2">None,</span>
+               <span class="s1">return_ssm=</span><span class="s2">False, </span><span class="s1">results_class=</span><span class="s2">None,</span>
+               <span class="s1">results_wrapper_class=</span><span class="s2">None, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'concentrated'</span><span class="s1">:</span>
+            <span class="s1">self._initialize_constant_statespace(</span>
+                <span class="s1">*self._compute_concentrated_states(params</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs))</span>
+
+        <span class="s1">results = super().filter(</span>
+            <span class="s1">params</span><span class="s2">, </span><span class="s1">cov_type=cov_type</span><span class="s2">, </span><span class="s1">cov_kwds=cov_kwds</span><span class="s2">,</span>
+            <span class="s1">return_ssm=return_ssm</span><span class="s2">, </span><span class="s1">results_class=results_class</span><span class="s2">,</span>
+            <span class="s1">results_wrapper_class=results_wrapper_class</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'concentrated'</span><span class="s1">:</span>
+            <span class="s1">self.ssm.initialization.constant = np.zeros(self.k_states)</span>
+        <span class="s2">return </span><span class="s1">results</span>
+
+    <span class="s1">@Appender(MLEModel.smooth.__doc__)</span>
+    <span class="s2">def </span><span class="s1">smooth(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">cov_type=</span><span class="s2">None, </span><span class="s1">cov_kwds=</span><span class="s2">None,</span>
+               <span class="s1">return_ssm=</span><span class="s2">False, </span><span class="s1">results_class=</span><span class="s2">None,</span>
+               <span class="s1">results_wrapper_class=</span><span class="s2">None, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'concentrated'</span><span class="s1">:</span>
+            <span class="s1">self._initialize_constant_statespace(</span>
+                <span class="s1">*self._compute_concentrated_states(params</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs))</span>
+
+        <span class="s1">results = super().smooth(</span>
+            <span class="s1">params</span><span class="s2">, </span><span class="s1">cov_type=cov_type</span><span class="s2">, </span><span class="s1">cov_kwds=cov_kwds</span><span class="s2">,</span>
+            <span class="s1">return_ssm=return_ssm</span><span class="s2">, </span><span class="s1">results_class=results_class</span><span class="s2">,</span>
+            <span class="s1">results_wrapper_class=results_wrapper_class</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s2">if </span><span class="s1">self.initialization_method == </span><span class="s3">'concentrated'</span><span class="s1">:</span>
+            <span class="s1">self.ssm.initialization.constant = np.zeros(self.k_states)</span>
+        <span class="s2">return </span><span class="s1">results</span>
+
+
+<span class="s2">class </span><span class="s1">ExponentialSmoothingResults(MLEResults):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Results from fitting a linear exponential smoothing model 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">model</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">filter_results</span><span class="s2">, </span><span class="s1">cov_type=</span><span class="s2">None,</span>
+                 <span class="s1">**kwargs):</span>
+        <span class="s1">super().__init__(model</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">filter_results</span><span class="s2">, </span><span class="s1">cov_type</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s4"># Save the states</span>
+        <span class="s1">self.initial_state = model._initial_state</span>
+        <span class="s2">if </span><span class="s1">isinstance(self.data</span><span class="s2">, </span><span class="s1">PandasData):</span>
+            <span class="s1">index = self.data.row_labels</span>
+            <span class="s1">self.initial_state = pd.DataFrame(</span>
+                <span class="s1">[model._initial_state]</span><span class="s2">, </span><span class="s1">columns=model.state_names[</span><span class="s5">1</span><span class="s1">:])</span>
+            <span class="s2">if </span><span class="s1">model._index_dates </span><span class="s2">and </span><span class="s1">model._index_freq </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">self.initial_state.index = index.shift(-</span><span class="s5">1</span><span class="s1">)[:</span><span class="s5">1</span><span class="s1">]</span>
+
+    <span class="s1">@Appender(MLEResults.summary.__doc__)</span>
+    <span class="s2">def </span><span class="s1">summary(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s5">.05</span><span class="s2">, </span><span class="s1">start=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">specification = [</span><span class="s3">'A'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">self.model.trend </span><span class="s2">and </span><span class="s1">self.model.damped_trend:</span>
+            <span class="s1">specification.append(</span><span class="s3">'Ad'</span><span class="s1">)</span>
+        <span class="s2">elif </span><span class="s1">self.model.trend:</span>
+            <span class="s1">specification.append(</span><span class="s3">'A'</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">specification.append(</span><span class="s3">'N'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">self.model.seasonal:</span>
+            <span class="s1">specification.append(</span><span class="s3">'A'</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">specification.append(</span><span class="s3">'N'</span><span class="s1">)</span>
+
+        <span class="s1">model_name = </span><span class="s3">'ETS(' </span><span class="s1">+ </span><span class="s3">', '</span><span class="s1">.join(specification) + </span><span class="s3">')'</span>
+
+        <span class="s1">summary = super(ExponentialSmoothingResults</span><span class="s2">, </span><span class="s1">self).summary(</span>
+            <span class="s1">alpha=alpha</span><span class="s2">, </span><span class="s1">start=start</span><span class="s2">, </span><span class="s1">title=</span><span class="s3">'Exponential Smoothing Results'</span><span class="s2">,</span>
+            <span class="s1">model_name=model_name)</span>
+
+        <span class="s2">if </span><span class="s1">self.model.initialization_method != </span><span class="s3">'estimated'</span><span class="s1">:</span>
+            <span class="s1">params = np.array(self.initial_state)</span>
+            <span class="s2">if </span><span class="s1">params.ndim &gt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">params = params[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s1">names = self.model.state_names[</span><span class="s5">1</span><span class="s1">:]</span>
+            <span class="s1">param_header = [</span><span class="s3">'initialization method: %s'</span>
+                            <span class="s1">% self.model.initialization_method]</span>
+            <span class="s1">params_stubs = names</span>
+            <span class="s1">params_data = [[forg(params[i]</span><span class="s2">, </span><span class="s1">prec=</span><span class="s5">4</span><span class="s1">)]</span>
+                           <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(params))]</span>
+
+            <span class="s1">initial_state_table = SimpleTable(params_data</span><span class="s2">,</span>
+                                              <span class="s1">param_header</span><span class="s2">,</span>
+                                              <span class="s1">params_stubs</span><span class="s2">,</span>
+                                              <span class="s1">txt_fmt=fmt_params)</span>
+            <span class="s1">summary.tables.insert(-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">initial_state_table)</span>
+
+        <span class="s2">return </span><span class="s1">summary</span>
+
+
+<span class="s2">class </span><span class="s1">ExponentialSmoothingResultsWrapper(MLEResultsWrapper):</span>
+    <span class="s1">_attrs = {}</span>
+    <span class="s1">_wrap_attrs = wrap.union_dicts(MLEResultsWrapper._wrap_attrs</span><span class="s2">,</span>
+                                   <span class="s1">_attrs)</span>
+    <span class="s1">_methods = {}</span>
+    <span class="s1">_wrap_methods = wrap.union_dicts(MLEResultsWrapper._wrap_methods</span><span class="s2">,</span>
+                                     <span class="s1">_methods)</span>
+<span class="s1">wrap.populate_wrapper(ExponentialSmoothingResultsWrapper</span><span class="s2">,  </span><span class="s4"># noqa:E305</span>
+                      <span class="s1">ExponentialSmoothingResults)</span>
+</pre>
+</body>
+</html>

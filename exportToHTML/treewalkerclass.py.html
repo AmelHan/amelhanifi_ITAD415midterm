@@ -1,0 +1,641 @@
+<html>
+<head>
+<title>treewalkerclass.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+treewalkerclass.py</font>
+</center></td></tr></table>
+<pre><span class="s0">''' 
+ 
+Formulas 
+-------- 
+ 
+This follows mostly Greene notation (in slides) 
+partially ignoring factors tau or mu for now, ADDED 
+(if all tau==1, then runmnl==clogit) 
+ 
+leaf k probability : 
+ 
+Prob(k|j) = exp(b_k * X_k / mu_j)/ sum_{i in L(j)} (exp(b_i * X_i / mu_j) 
+ 
+branch j probabilities : 
+ 
+Prob(j) = exp(b_j * X_j + mu*IV_j )/ sum_{i in NB(j)} (exp(b_i * X_i + mu_i*IV_i) 
+ 
+inclusive value of branch j : 
+ 
+IV_j = log( sum_{i in L(j)} (exp(b_i * X_i / mu_j) ) 
+ 
+this is the log of the denominator of the leaf probabilities 
+ 
+L(j) : leaves at branch j, where k is child of j 
+NB(j) : set of j and it's siblings 
+ 
+Design 
+------ 
+ 
+* splitting calculation transmission between returns and changes to 
+  instance.probs 
+  - probability for each leaf is in instance.probs 
+  - inclusive values and contribution of exog on branch level need to be 
+    added separately. handed up the tree through returns 
+* question: should params array be accessed directly through 
+  `self.recursionparams[self.parinddict[name]]` or should the dictionary 
+  return the values of the params, e.g. `self.params_node_dict[name]`. 
+  The second would be easier for fixing tau=1 for degenerate branches. 
+  The easiest might be to do the latter only for the taus and default to 1 if 
+  the key ('tau_'+branchname) is not found. I also need to exclude tau for 
+  degenerate branches from params, but then I cannot change them from the 
+  outside for testing and experimentation. (?) 
+* SAS manual describes restrictions on tau (though their model is a bit 
+  different), e.g. equal tau across sibling branches, fixed tau. The also 
+  allow linear and non-linear (? not sure) restriction on params, the 
+  regression coefficients. Related to previous issue, callback without access 
+  to the underlying array, where params_node_dict returns the actual params 
+  value would provide more flexibility to impose different kinds of restrictions. 
+ 
+ 
+ 
+bugs/problems 
+------------- 
+ 
+* singleton branches return zero to `top`, not a value 
+  I'm not sure what they are supposed to return, given the split between returns 
+  and instance.probs DONE 
+* Why does 'Air' (singleton branch) get probability exactly 0.5 ? DONE 
+ 
+TODO 
+---- 
+* add tau, normalization for nested logit, currently tau is 1 (clogit) 
+  taus also needs to become part of params MOSTLY DONE 
+* add effect of branch level explanatory variables DONE 
+* write a generic multinomial logit that takes arbitrary probabilities, this 
+  would be the same for MNL, clogit and runmnl, 
+  delegate calculation of probabilities 
+* test on actual data, 
+  - tau=1 replicate clogit numbers, 
+  - transport example from Greene tests 1-level tree and degenerate sub-trees 
+  - test example for multi-level trees ??? 
+* starting values: Greene mentiones that the starting values for the nested 
+  version come from the (non-nested) MNL version. SPSS uses constant equal 
+  (? check transformation) to sample frequencies and zeros for slope 
+  coefficient as starting values for (non-nested) MNL 
+* associated test statistics 
+  - (I do not think I will fight with the gradient or hessian of the log-like.) 
+  - basic MLE statistics can be generic 
+  - tests specific to the model (?) 
+* nice printouts since I'm currently collecting a lot of information in the tree 
+  recursion and everything has names 
+ 
+The only parts that are really necessary to get a functional nested logit are 
+adding the taus (DONE) and the MLE wrapper class. The rest are enhancements. 
+ 
+I added fake tau, one fixed tau for all branches. (OBSOLETE) 
+It's not clear where the tau for leaf should be added either at 
+original assignment of self.probs, or as part of the one-step-down 
+probability correction in the bottom branches. The second would be 
+cleaner (would make treatment of leaves and branches more symmetric, 
+but requires that initial assignment in the leaf only does 
+initialization. e.g self.probs = 1.  ??? 
+ 
+DONE added taus 
+ 
+still todo: 
+- tau for degenerate branches are not identified, set to 1 for MLE 
+- rename parinddict to paramsinddict 
+ 
+ 
+Author: Josef Perktold 
+License : BSD (3-clause) 
+'''</span>
+<span class="s2">from </span><span class="s1">statsmodels.compat.python </span><span class="s2">import </span><span class="s1">lrange</span>
+
+<span class="s2">from </span><span class="s1">pprint </span><span class="s2">import </span><span class="s1">pprint</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+
+<span class="s2">def </span><span class="s1">randintw(w</span><span class="s2">, </span><span class="s1">size=</span><span class="s3">1</span><span class="s1">):</span>
+    <span class="s0">'''generate integer random variables given probabilties 
+ 
+    useful because it can be used as index into any array or sequence type 
+ 
+    Parameters 
+    ---------- 
+    w : 1d array_like 
+        sequence of weights, probabilities. The weights are normalized to add 
+        to one. 
+    size : int or tuple of ints 
+        shape of output array 
+ 
+    Returns 
+    ------- 
+    rvs : array of shape given by size 
+        random variables each distributed according to the same discrete 
+        distribution defined by (normalized) w. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; np.random.seed(0) 
+    &gt;&gt;&gt; randintw([0.4, 0.4, 0.2], size=(2,6)) 
+    array([[1, 1, 1, 1, 1, 1], 
+           [1, 2, 2, 0, 1, 1]]) 
+ 
+    &gt;&gt;&gt; np.bincount(randintw([0.6, 0.4, 0.0], size=3000))/3000. 
+    array([ 0.59566667,  0.40433333]) 
+ 
+    '''</span>
+    <span class="s4">#from Charles Harris, numpy mailing list</span>
+    <span class="s2">from </span><span class="s1">numpy.random </span><span class="s2">import </span><span class="s1">random</span>
+    <span class="s1">p = np.cumsum(w)/np.sum(w)</span>
+    <span class="s1">rvs = p.searchsorted(random(np.prod(size))).reshape(size)</span>
+    <span class="s2">return </span><span class="s1">rvs</span>
+
+<span class="s2">def </span><span class="s1">getbranches(tree):</span>
+    <span class="s0">''' 
+    walk tree to get list of branches 
+ 
+    Parameters 
+    ---------- 
+    tree : list of tuples 
+        tree as defined for RU2NMNL 
+ 
+    Returns 
+    ------- 
+    branch : list 
+        list of all branch names 
+ 
+    '''</span>
+    <span class="s2">if </span><span class="s1">isinstance(tree</span><span class="s2">, </span><span class="s1">tuple):</span>
+        <span class="s1">name</span><span class="s2">, </span><span class="s1">subtree = tree</span>
+        <span class="s1">a = [name]</span>
+        <span class="s2">for </span><span class="s1">st </span><span class="s2">in </span><span class="s1">subtree:</span>
+            <span class="s1">a.extend(getbranches(st))</span>
+        <span class="s2">return </span><span class="s1">a</span>
+    <span class="s2">return </span><span class="s1">[]</span>
+
+<span class="s2">def </span><span class="s1">getnodes(tree):</span>
+    <span class="s0">''' 
+    walk tree to get list of branches and list of leaves 
+ 
+    Parameters 
+    ---------- 
+    tree : list of tuples 
+        tree as defined for RU2NMNL 
+ 
+    Returns 
+    ------- 
+    branch : list 
+        list of all branch names 
+    leaves : list 
+        list of all leaves names 
+ 
+    '''</span>
+    <span class="s2">if </span><span class="s1">isinstance(tree</span><span class="s2">, </span><span class="s1">tuple):</span>
+        <span class="s1">name</span><span class="s2">, </span><span class="s1">subtree = tree</span>
+        <span class="s1">ab = [name]</span>
+        <span class="s1">al = []</span>
+        <span class="s4">#degenerate branches</span>
+        <span class="s2">if </span><span class="s1">len(subtree) == </span><span class="s3">1</span><span class="s1">:</span>
+            <span class="s1">adeg = [name]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">adeg = []</span>
+
+        <span class="s2">for </span><span class="s1">st </span><span class="s2">in </span><span class="s1">subtree:</span>
+            <span class="s1">b</span><span class="s2">, </span><span class="s1">l</span><span class="s2">, </span><span class="s1">d = getnodes(st)</span>
+            <span class="s1">ab.extend(b)</span>
+            <span class="s1">al.extend(l)</span>
+            <span class="s1">adeg.extend(d)</span>
+        <span class="s2">return </span><span class="s1">ab</span><span class="s2">, </span><span class="s1">al</span><span class="s2">, </span><span class="s1">adeg</span>
+    <span class="s2">return </span><span class="s1">[]</span><span class="s2">, </span><span class="s1">[tree]</span><span class="s2">, </span><span class="s1">[]</span>
+
+
+<span class="s1">testxb = </span><span class="s3">2 </span><span class="s4">#global to class to return strings instead of numbers</span>
+
+<span class="s2">class </span><span class="s1">RU2NMNL:</span>
+    <span class="s0">'''Nested Multinomial Logit with Random Utility 2 parameterization 
+ 
+ 
+    Parameters 
+    ---------- 
+    endog : ndarray 
+        not used in this part 
+    exog : dict_like 
+        dictionary access to data where keys correspond to branch and leaf 
+        names. The values are the data arrays for the exog in that node. 
+    tree : nested tuples and lists 
+        each branch, tree or subtree, is defined by a tuple 
+        (branch_name, [subtree1, subtree2, ..., subtreek]) 
+        Bottom branches have as subtrees the list of leaf names. 
+    paramsind : dictionary 
+        dictionary that maps branch and leaf names to the names of parameters, 
+        the coefficients for exogs) 
+ 
+    Methods 
+    ------- 
+    get_probs 
+ 
+    Attributes 
+    ---------- 
+    branches 
+    leaves 
+    paramsnames 
+    parinddict 
+ 
+    Notes 
+    ----- 
+    endog needs to be encoded so it is consistent with self.leaves, which 
+    defines the columns for the probability array. The ordering in leaves is 
+    determined by the ordering of the tree. 
+    In the dummy encoding of endog, the columns of endog need to have the 
+    same order as self.leaves. In the integer encoding, the integer for a 
+    choice has to correspond to the index in self.leaves. 
+    (This could be made more robust, by handling the endog encoding internally 
+    by leaf names, if endog is defined as categorical variable with 
+    associated category level names.) 
+ 
+    '''</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">tree</span><span class="s2">, </span><span class="s1">paramsind):</span>
+        <span class="s1">self.endog = endog</span>
+        <span class="s1">self.datadict = exog</span>
+        <span class="s1">self.tree = tree</span>
+        <span class="s1">self.paramsind = paramsind</span>
+
+        <span class="s1">self.branchsum = </span><span class="s5">''</span>
+        <span class="s1">self.probs = {}</span>
+        <span class="s1">self.probstxt = {}</span>
+        <span class="s1">self.branchleaves = {}</span>
+        <span class="s1">self.branchvalues = {}  </span><span class="s4">#just to keep track of returns by branches</span>
+        <span class="s1">self.branchsums = {}</span>
+        <span class="s1">self.bprobs = {}</span>
+        <span class="s1">self.branches</span><span class="s2">, </span><span class="s1">self.leaves</span><span class="s2">, </span><span class="s1">self.branches_degenerate  = getnodes(tree)</span>
+        <span class="s1">self.nbranches = len(self.branches)</span>
+
+        <span class="s4">#copied over but not quite sure yet</span>
+        <span class="s4">#unique, parameter array names,</span>
+        <span class="s4">#sorted alphabetically, order is/should be only internal</span>
+
+        <span class="s1">self.paramsnames = (sorted(set([i </span><span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">paramsind.values()</span>
+                                       <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">j])) +</span>
+                            <span class="s1">[</span><span class="s5">'tau_%s' </span><span class="s1">% bname </span><span class="s2">for </span><span class="s1">bname </span><span class="s2">in </span><span class="s1">self.branches])</span>
+
+        <span class="s1">self.nparams = len(self.paramsnames)</span>
+
+        <span class="s4">#mapping coefficient names to indices to unique/parameter array</span>
+        <span class="s1">self.paramsidx = dict((name</span><span class="s2">, </span><span class="s1">idx) </span><span class="s2">for </span><span class="s1">(idx</span><span class="s2">,</span><span class="s1">name) </span><span class="s2">in</span>
+                              <span class="s1">enumerate(self.paramsnames))</span>
+
+        <span class="s4">#mapping branch and leaf names to index in parameter array</span>
+        <span class="s1">self.parinddict = dict((k</span><span class="s2">, </span><span class="s1">[self.paramsidx[j] </span><span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">v])</span>
+                               <span class="s2">for </span><span class="s1">k</span><span class="s2">,</span><span class="s1">v </span><span class="s2">in </span><span class="s1">self.paramsind.items())</span>
+
+        <span class="s1">self.recursionparams = </span><span class="s3">1. </span><span class="s1">+ np.arange(len(self.paramsnames))</span>
+        <span class="s4">#for testing that individual parameters are used in the right place</span>
+        <span class="s1">self.recursionparams = np.zeros(len(self.paramsnames))</span>
+        <span class="s4">#self.recursionparams[2] = 1</span>
+        <span class="s1">self.recursionparams[-self.nbranches:] = </span><span class="s3">1  </span><span class="s4">#values for tau's</span>
+        <span class="s4">#self.recursionparams[-2] = 2</span>
+
+
+    <span class="s2">def </span><span class="s1">get_probs(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">''' 
+        obtain the probability array given an array of parameters 
+ 
+        This is the function that can be called by loglike or other methods 
+        that need the probabilities as function of the params. 
+ 
+        Parameters 
+        ---------- 
+        params : 1d array, (nparams,) 
+            coefficients and tau that parameterize the model. The required 
+            length can be obtained by nparams. (and will depend on the number 
+            of degenerate leaves - not yet) 
+ 
+        Returns 
+        ------- 
+        probs : ndarray, (nobs, nchoices) 
+            probabilities for all choices for each observation. The order 
+            is available by attribute leaves. See note in docstring of class 
+ 
+ 
+ 
+        '''</span>
+        <span class="s1">self.recursionparams = params</span>
+        <span class="s1">self.calc_prob(self.tree)</span>
+        <span class="s1">probs_array = np.array([self.probs[leaf] </span><span class="s2">for </span><span class="s1">leaf </span><span class="s2">in </span><span class="s1">self.leaves])</span>
+        <span class="s2">return </span><span class="s1">probs_array</span>
+        <span class="s4">#what's the ordering? Should be the same as sequence in tree.</span>
+        <span class="s4">#TODO: need a check/assert that this sequence is the same as the</span>
+        <span class="s4">#      encoding in endog</span>
+
+
+    <span class="s2">def </span><span class="s1">calc_prob(self</span><span class="s2">, </span><span class="s1">tree</span><span class="s2">, </span><span class="s1">parent=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">'''walking a tree bottom-up based on dictionary 
+        '''</span>
+
+        <span class="s4">#0.5#2 #placeholder for now</span>
+        <span class="s4">#should be tau=self.taus[name] but as part of params for optimization</span>
+        <span class="s1">endog = self.endog</span>
+        <span class="s1">datadict = self.datadict</span>
+        <span class="s1">paramsind = self.paramsind</span>
+        <span class="s1">branchsum = self.branchsum</span>
+
+
+        <span class="s2">if </span><span class="s1">isinstance(tree</span><span class="s2">, </span><span class="s1">tuple):   </span><span class="s4">#assumes leaves are int for choice index</span>
+
+            <span class="s1">name</span><span class="s2">, </span><span class="s1">subtree = tree</span>
+            <span class="s1">self.branchleaves[name] = []  </span><span class="s4">#register branch in dictionary</span>
+
+            <span class="s1">tau = self.recursionparams[self.paramsidx[</span><span class="s5">'tau_'</span><span class="s1">+name]]</span>
+            <span class="s2">if </span><span class="s1">DEBUG:</span>
+                <span class="s1">print(</span><span class="s5">'----------- starting next branch-----------'</span><span class="s1">)</span>
+                <span class="s1">print(name</span><span class="s2">, </span><span class="s1">datadict[name]</span><span class="s2">, </span><span class="s5">'tau='</span><span class="s2">, </span><span class="s1">tau)</span>
+                <span class="s1">print(</span><span class="s5">'subtree'</span><span class="s2">, </span><span class="s1">subtree)</span>
+            <span class="s1">branchvalue = []</span>
+            <span class="s2">if </span><span class="s1">testxb == </span><span class="s3">2</span><span class="s1">:</span>
+                <span class="s1">branchsum = </span><span class="s3">0</span>
+            <span class="s2">elif </span><span class="s1">testxb == </span><span class="s3">1</span><span class="s1">:</span>
+                <span class="s1">branchsum = datadict[name]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">branchsum = name</span>
+            <span class="s2">for </span><span class="s1">b </span><span class="s2">in </span><span class="s1">subtree:</span>
+                <span class="s2">if </span><span class="s1">DEBUG:</span>
+                    <span class="s1">print(b)</span>
+                <span class="s1">bv = self.calc_prob(b</span><span class="s2">, </span><span class="s1">name)</span>
+                <span class="s1">bv = np.exp(bv/tau)  </span><span class="s4">#this should not be here, when adding branch data</span>
+                <span class="s1">branchvalue.append(bv)</span>
+                <span class="s1">branchsum = branchsum + bv</span>
+            <span class="s1">self.branchvalues[name] = branchvalue </span><span class="s4">#keep track what was returned</span>
+
+            <span class="s2">if </span><span class="s1">DEBUG:</span>
+                <span class="s1">print(</span><span class="s5">'----------- returning to branch-----------'</span><span class="s1">)</span>
+                <span class="s1">print(name)</span>
+                <span class="s1">print(</span><span class="s5">'branchsum in branch'</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">branchsum)</span>
+
+            <span class="s2">if </span><span class="s1">parent:</span>
+                <span class="s2">if </span><span class="s1">DEBUG:</span>
+                    <span class="s1">print(</span><span class="s5">'parent'</span><span class="s2">, </span><span class="s1">parent)</span>
+                <span class="s1">self.branchleaves[parent].extend(self.branchleaves[name])</span>
+            <span class="s2">if </span><span class="s3">0</span><span class="s1">:  </span><span class="s4">#not name == 'top':  # not used anymore !!! ???</span>
+            <span class="s4">#if not name == 'top':</span>
+                <span class="s4">#TODO: do I need this only on the lowest branches ?</span>
+                <span class="s1">tmpsum = </span><span class="s3">0</span>
+                <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">self.branchleaves[name]:</span>
+                    <span class="s4">#similar to this is now also in return branch values</span>
+                    <span class="s4">#depends on what will be returned</span>
+                    <span class="s1">tmpsum += self.probs[k]</span>
+                    <span class="s1">iv = np.log(tmpsum)</span>
+
+                <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">self.branchleaves[name]:</span>
+                    <span class="s1">self.probstxt[k] = self.probstxt[k] + [</span><span class="s5">'*' </span><span class="s1">+ name + </span><span class="s5">'-prob' </span><span class="s1">+</span>
+                                    <span class="s5">'(%s)' </span><span class="s1">% </span><span class="s5">', '</span><span class="s1">.join(self.paramsind[name])]</span>
+
+                    <span class="s4">#TODO: does this use the denominator twice now</span>
+                    <span class="s1">self.probs[k] = self.probs[k] / tmpsum</span>
+                    <span class="s2">if </span><span class="s1">np.size(self.datadict[name])&gt;</span><span class="s3">0</span><span class="s1">:</span>
+                        <span class="s4">#not used yet, might have to move one indentation level</span>
+                        <span class="s4">#self.probs[k] = self.probs[k] / tmpsum</span>
+<span class="s4">##                            np.exp(-self.datadict[name] *</span>
+<span class="s4">##                             np.sum(self.recursionparams[self.parinddict[name]]))</span>
+                        <span class="s2">if </span><span class="s1">DEBUG:</span>
+                            <span class="s1">print(</span><span class="s5">'self.datadict[name], self.probs[k]'</span><span class="s1">)</span>
+                            <span class="s1">print(self.datadict[name]</span><span class="s2">, </span><span class="s1">self.probs[k])</span>
+                    <span class="s4">#if not name == 'top':</span>
+                    <span class="s4">#    self.probs[k] = self.probs[k] * np.exp( iv)</span>
+
+            <span class="s4">#walk one level down again to add branch probs to instance.probs</span>
+            <span class="s1">self.bprobs[name] = []</span>
+            <span class="s2">for </span><span class="s1">bidx</span><span class="s2">, </span><span class="s1">b </span><span class="s2">in </span><span class="s1">enumerate(subtree):</span>
+                <span class="s2">if </span><span class="s1">DEBUG:</span>
+                    <span class="s1">print(</span><span class="s5">'repr(b)'</span><span class="s2">, </span><span class="s1">repr(b)</span><span class="s2">, </span><span class="s1">bidx)</span>
+                <span class="s4">#if len(b) == 1: #TODO: skip leaves, check this</span>
+                <span class="s2">if not </span><span class="s1">isinstance(b</span><span class="s2">,  </span><span class="s1">tuple): </span><span class="s4"># isinstance(b, str):</span>
+                    <span class="s4">#TODO: replace this with a check for branch (tuple) instead</span>
+                    <span class="s4">#this implies name is a bottom branch,</span>
+                    <span class="s4">#possible to add special things here</span>
+                    <span class="s1">self.bprobs[name].append(self.probs[b])</span>
+                    <span class="s4">#TODO: need tau possibly here</span>
+                    <span class="s1">self.probs[b] = self.probs[b] / branchsum</span>
+                    <span class="s2">if </span><span class="s1">DEBUG:</span>
+                        <span class="s1">print(</span><span class="s5">'*********** branchsum at bottom branch'</span><span class="s2">, </span><span class="s1">branchsum)</span>
+                    <span class="s4">#self.bprobs[name].append(self.probs[b])</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">bname = b[</span><span class="s3">0</span><span class="s1">]</span>
+                    <span class="s1">branchsum2 = sum(self.branchvalues[name])</span>
+                    <span class="s2">assert </span><span class="s1">np.abs(branchsum - branchsum2).sum() &lt; </span><span class="s3">1e-8</span>
+                    <span class="s1">bprob = branchvalue[bidx]/branchsum</span>
+                    <span class="s1">self.bprobs[name].append(bprob)</span>
+
+                    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">self.branchleaves[bname]:</span>
+
+                        <span class="s2">if </span><span class="s1">DEBUG:</span>
+                            <span class="s1">print(</span><span class="s5">'branchprob'</span><span class="s2">, </span><span class="s1">bname</span><span class="s2">, </span><span class="s1">k</span><span class="s2">, </span><span class="s1">bprob</span><span class="s2">, </span><span class="s1">branchsum)</span>
+                        <span class="s4">#temporary hack with maximum to avoid zeros</span>
+                        <span class="s1">self.probs[k] = self.probs[k] * np.maximum(bprob</span><span class="s2">, </span><span class="s3">1e-4</span><span class="s1">)</span>
+
+
+            <span class="s2">if </span><span class="s1">DEBUG:</span>
+                <span class="s1">print(</span><span class="s5">'working on branch'</span><span class="s2">, </span><span class="s1">tree</span><span class="s2">, </span><span class="s1">branchsum)</span>
+            <span class="s2">if </span><span class="s1">testxb&lt;</span><span class="s3">2</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">branchsum</span>
+            <span class="s2">else</span><span class="s1">: </span><span class="s4">#this is the relevant part</span>
+                <span class="s1">self.branchsums[name] = branchsum</span>
+                <span class="s2">if </span><span class="s1">np.size(self.datadict[name])&gt;</span><span class="s3">0</span><span class="s1">:</span>
+                    <span class="s1">branchxb = np.sum(self.datadict[name] *</span>
+                                  <span class="s1">self.recursionparams[self.parinddict[name]])</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">branchxb = </span><span class="s3">0</span>
+                <span class="s2">if not </span><span class="s1">name==</span><span class="s5">'top'</span><span class="s1">:</span>
+                    <span class="s1">tau = self.recursionparams[self.paramsidx[</span><span class="s5">'tau_'</span><span class="s1">+name]]</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">tau = </span><span class="s3">1</span>
+                <span class="s1">iv = branchxb + tau * branchsum </span><span class="s4">#which tau: name or parent???</span>
+                <span class="s2">return </span><span class="s1">branchxb + tau * np.log(branchsum) </span><span class="s4">#iv</span>
+                <span class="s4">#branchsum is now IV, TODO: add effect of branch variables</span>
+
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">tau = self.recursionparams[self.paramsidx[</span><span class="s5">'tau_'</span><span class="s1">+parent]]</span>
+            <span class="s2">if </span><span class="s1">DEBUG:</span>
+                <span class="s1">print(</span><span class="s5">'parent'</span><span class="s2">, </span><span class="s1">parent)</span>
+            <span class="s1">self.branchleaves[parent].append(tree) </span><span class="s4"># register leave with parent</span>
+            <span class="s1">self.probstxt[tree] = [tree + </span><span class="s5">'-prob' </span><span class="s1">+</span>
+                                <span class="s5">'(%s)' </span><span class="s1">% </span><span class="s5">', '</span><span class="s1">.join(self.paramsind[tree])]</span>
+            <span class="s4">#this is not yet a prob, not normalized to 1, it is exp(x*b)</span>
+            <span class="s1">leafprob = np.exp(np.sum(self.datadict[tree] *</span>
+                                  <span class="s1">self.recursionparams[self.parinddict[tree]])</span>
+                              <span class="s1">/ tau)   </span><span class="s4"># fake tau for now, wrong spot ???</span>
+            <span class="s4">#it seems I get the same answer with and without tau here</span>
+            <span class="s1">self.probs[tree] = leafprob  </span><span class="s4">#= 1 #try initialization only</span>
+            <span class="s4">#TODO: where  should I add tau in the leaves</span>
+
+            <span class="s2">if </span><span class="s1">testxb == </span><span class="s3">2</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">np.log(leafprob)</span>
+            <span class="s2">elif </span><span class="s1">testxb == </span><span class="s3">1</span><span class="s1">:</span>
+                <span class="s1">leavessum = np.array(datadict[tree]) </span><span class="s4"># sum((datadict[bi] for bi in datadict[tree]))</span>
+                <span class="s2">if </span><span class="s1">DEBUG:</span>
+                    <span class="s1">print(</span><span class="s5">'final branch with'</span><span class="s2">, </span><span class="s1">tree</span><span class="s2">, </span><span class="s5">''</span><span class="s1">.join(tree)</span><span class="s2">, </span><span class="s1">leavessum) </span><span class="s4">#sum(tree)</span>
+                <span class="s2">return </span><span class="s1">leavessum  </span><span class="s4">#sum(xb[tree])</span>
+            <span class="s2">elif </span><span class="s1">testxb == </span><span class="s3">0</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s5">''</span><span class="s1">.join(tree) </span><span class="s4">#sum(tree)</span>
+
+
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s5">'__main__'</span><span class="s1">:</span>
+    <span class="s1">DEBUG = </span><span class="s3">0</span>
+
+    <span class="s1">endog = </span><span class="s3">5 </span><span class="s4"># dummy place holder</span>
+
+
+    <span class="s4">##############  Example similar to Greene</span>
+
+    <span class="s4">#get pickled data</span>
+    <span class="s4">#endog3, xifloat3 = pickle.load(open('xifloat2.pickle','rb'))</span>
+
+
+    <span class="s1">tree0 = (</span><span class="s5">'top'</span><span class="s2">,</span>
+                <span class="s1">[(</span><span class="s5">'Fly'</span><span class="s2">,</span><span class="s1">[</span><span class="s5">'Air'</span><span class="s1">])</span><span class="s2">,</span>
+                 <span class="s1">(</span><span class="s5">'Ground'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">'Train'</span><span class="s2">, </span><span class="s5">'Car'</span><span class="s2">, </span><span class="s5">'Bus'</span><span class="s1">])</span>
+                 <span class="s1">])</span>
+
+    <span class="s5">''' this is with real data from Greene's clogit example 
+    datadict = dict(zip(['Air', 'Train', 'Bus', 'Car'], 
+                        [xifloat[i]for i in range(4)])) 
+    '''</span>
+
+    <span class="s4">#for testing only (mock that returns it's own name</span>
+    <span class="s1">datadict = dict(zip([</span><span class="s5">'Air'</span><span class="s2">, </span><span class="s5">'Train'</span><span class="s2">, </span><span class="s5">'Bus'</span><span class="s2">, </span><span class="s5">'Car'</span><span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">[</span><span class="s5">'Airdata'</span><span class="s2">, </span><span class="s5">'Traindata'</span><span class="s2">, </span><span class="s5">'Busdata'</span><span class="s2">, </span><span class="s5">'Cardata'</span><span class="s1">]))</span>
+
+    <span class="s2">if </span><span class="s1">testxb:</span>
+        <span class="s1">datadict = dict(zip([</span><span class="s5">'Air'</span><span class="s2">, </span><span class="s5">'Train'</span><span class="s2">, </span><span class="s5">'Bus'</span><span class="s2">, </span><span class="s5">'Car'</span><span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">np.arange(</span><span class="s3">4</span><span class="s1">)))</span>
+
+    <span class="s1">datadict.update({</span><span class="s5">'top' </span><span class="s1">:   []</span><span class="s2">,</span>
+                     <span class="s5">'Fly' </span><span class="s1">:   []</span><span class="s2">,</span>
+                     <span class="s5">'Ground'</span><span class="s1">: []})</span>
+
+    <span class="s1">paramsind = {</span><span class="s5">'top' </span><span class="s1">:   []</span><span class="s2">,</span>
+                 <span class="s5">'Fly' </span><span class="s1">:   []</span><span class="s2">,</span>
+                 <span class="s5">'Ground'</span><span class="s1">: []</span><span class="s2">,</span>
+                 <span class="s5">'Air' </span><span class="s1">:   [</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s2">, </span><span class="s5">'ConstA'</span><span class="s2">, </span><span class="s5">'Hinc'</span><span class="s1">]</span><span class="s2">,</span>
+                 <span class="s5">'Train' </span><span class="s1">: [</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s2">, </span><span class="s5">'ConstT'</span><span class="s1">]</span><span class="s2">,</span>
+                 <span class="s5">'Bus' </span><span class="s1">:   [</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s2">, </span><span class="s5">'ConstB'</span><span class="s1">]</span><span class="s2">,</span>
+                 <span class="s5">'Car' </span><span class="s1">:   [</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s1">]</span>
+                 <span class="s1">}</span>
+
+    <span class="s1">modru = RU2NMNL(endog</span><span class="s2">, </span><span class="s1">datadict</span><span class="s2">, </span><span class="s1">tree0</span><span class="s2">, </span><span class="s1">paramsind)</span>
+    <span class="s1">modru.recursionparams[-</span><span class="s3">1</span><span class="s1">] = </span><span class="s3">2</span>
+    <span class="s1">modru.recursionparams[</span><span class="s3">1</span><span class="s1">] = </span><span class="s3">1</span>
+
+    <span class="s1">print(</span><span class="s5">'Example 1'</span><span class="s1">)</span>
+    <span class="s1">print(</span><span class="s5">'---------</span><span class="s2">\n</span><span class="s5">'</span><span class="s1">)</span>
+    <span class="s1">print(modru.calc_prob(modru.tree))</span>
+
+    <span class="s1">print(</span><span class="s5">'Tree'</span><span class="s1">)</span>
+    <span class="s1">pprint(modru.tree)</span>
+    <span class="s1">print(</span><span class="s5">'</span><span class="s2">\n</span><span class="s5">modru.probs'</span><span class="s1">)</span>
+    <span class="s1">pprint(modru.probs)</span>
+
+
+
+    <span class="s4">##############  example with many layers</span>
+
+    <span class="s1">tree2 = (</span><span class="s5">'top'</span><span class="s2">,</span>
+                <span class="s1">[(</span><span class="s5">'B1'</span><span class="s2">,</span><span class="s1">[</span><span class="s5">'a'</span><span class="s2">,</span><span class="s5">'b'</span><span class="s1">])</span><span class="s2">,</span>
+                 <span class="s1">(</span><span class="s5">'B2'</span><span class="s2">,</span>
+                       <span class="s1">[(</span><span class="s5">'B21'</span><span class="s2">,</span><span class="s1">[</span><span class="s5">'c'</span><span class="s2">, </span><span class="s5">'d'</span><span class="s1">])</span><span class="s2">,</span>
+                        <span class="s1">(</span><span class="s5">'B22'</span><span class="s2">,</span><span class="s1">[</span><span class="s5">'e'</span><span class="s2">, </span><span class="s5">'f'</span><span class="s2">, </span><span class="s5">'g'</span><span class="s1">])</span>
+                        <span class="s1">]</span>
+                  <span class="s1">)</span><span class="s2">,</span>
+                 <span class="s1">(</span><span class="s5">'B3'</span><span class="s2">,</span><span class="s1">[</span><span class="s5">'h'</span><span class="s1">])])</span>
+
+    <span class="s4">#Note: dict looses ordering</span>
+    <span class="s1">paramsind2 = {</span>
+     <span class="s5">'B1'</span><span class="s1">: []</span><span class="s2">,</span>
+     <span class="s5">'a'</span><span class="s1">: [</span><span class="s5">'consta'</span><span class="s2">, </span><span class="s5">'p'</span><span class="s1">]</span><span class="s2">,</span>
+     <span class="s5">'b'</span><span class="s1">: [</span><span class="s5">'constb'</span><span class="s2">, </span><span class="s5">'p'</span><span class="s1">]</span><span class="s2">,</span>
+     <span class="s5">'B2'</span><span class="s1">: [</span><span class="s5">'const2'</span><span class="s2">, </span><span class="s5">'x2'</span><span class="s1">]</span><span class="s2">,</span>
+     <span class="s5">'B21'</span><span class="s1">: []</span><span class="s2">,</span>
+     <span class="s5">'c'</span><span class="s1">: [</span><span class="s5">'constc'</span><span class="s2">, </span><span class="s5">'p'</span><span class="s2">, </span><span class="s5">'time'</span><span class="s1">]</span><span class="s2">,</span>
+     <span class="s5">'d'</span><span class="s1">: [</span><span class="s5">'constd'</span><span class="s2">, </span><span class="s5">'p'</span><span class="s2">, </span><span class="s5">'time'</span><span class="s1">]</span><span class="s2">,</span>
+     <span class="s5">'B22'</span><span class="s1">: [</span><span class="s5">'x22'</span><span class="s1">]</span><span class="s2">,</span>
+     <span class="s5">'e'</span><span class="s1">: [</span><span class="s5">'conste'</span><span class="s2">, </span><span class="s5">'p'</span><span class="s2">, </span><span class="s5">'hince'</span><span class="s1">]</span><span class="s2">,</span>
+     <span class="s5">'f'</span><span class="s1">: [</span><span class="s5">'constf'</span><span class="s2">, </span><span class="s5">'p'</span><span class="s2">, </span><span class="s5">'hincf'</span><span class="s1">]</span><span class="s2">,</span>
+     <span class="s5">'g'</span><span class="s1">: [          </span><span class="s5">'p'</span><span class="s2">, </span><span class="s5">'hincg'</span><span class="s1">]</span><span class="s2">,</span>
+     <span class="s5">'B3'</span><span class="s1">: []</span><span class="s2">,</span>
+     <span class="s5">'h'</span><span class="s1">: [</span><span class="s5">'consth'</span><span class="s2">, </span><span class="s5">'p'</span><span class="s2">, </span><span class="s5">'h'</span><span class="s1">]</span><span class="s2">,</span>
+     <span class="s5">'top'</span><span class="s1">: []}</span>
+
+
+    <span class="s1">datadict2 = dict([i </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">zip(</span><span class="s5">'abcdefgh'</span><span class="s2">,</span><span class="s1">lrange(</span><span class="s3">8</span><span class="s1">))])</span>
+    <span class="s1">datadict2.update({</span><span class="s5">'top'</span><span class="s1">:</span><span class="s3">1000</span><span class="s2">, </span><span class="s5">'B1'</span><span class="s1">:</span><span class="s3">100</span><span class="s2">, </span><span class="s5">'B2'</span><span class="s1">:</span><span class="s3">200</span><span class="s2">, </span><span class="s5">'B21'</span><span class="s1">:</span><span class="s3">21</span><span class="s2">,</span><span class="s5">'B22'</span><span class="s1">:</span><span class="s3">22</span><span class="s2">, </span><span class="s5">'B3'</span><span class="s1">:</span><span class="s3">300</span><span class="s1">})</span>
+    <span class="s5">''' 
+    &gt;&gt;&gt; pprint(datadict2) 
+    {'B1': 100, 
+     'B2': 200, 
+     'B21': 21, 
+     'B22': 22, 
+     'B3': 300, 
+     'a': 0.5, 
+     'b': 1, 
+     'c': 2, 
+     'd': 3, 
+     'e': 4, 
+     'f': 5, 
+     'g': 6, 
+     'h': 7, 
+     'top': 1000} 
+    '''</span>
+
+
+    <span class="s1">modru2 = RU2NMNL(endog</span><span class="s2">, </span><span class="s1">datadict2</span><span class="s2">, </span><span class="s1">tree2</span><span class="s2">, </span><span class="s1">paramsind2)</span>
+    <span class="s1">modru2.recursionparams[-</span><span class="s3">3</span><span class="s1">] = </span><span class="s3">2</span>
+    <span class="s1">modru2.recursionparams[</span><span class="s3">3</span><span class="s1">] = </span><span class="s3">1</span>
+    <span class="s1">print(</span><span class="s5">'</span><span class="s2">\n\n</span><span class="s5">Example 2'</span><span class="s1">)</span>
+    <span class="s1">print(</span><span class="s5">'---------</span><span class="s2">\n</span><span class="s5">'</span><span class="s1">)</span>
+    <span class="s1">print(modru2.calc_prob(modru2.tree))</span>
+    <span class="s1">print(</span><span class="s5">'Tree'</span><span class="s1">)</span>
+    <span class="s1">pprint(modru2.tree)</span>
+    <span class="s1">print(</span><span class="s5">'</span><span class="s2">\n</span><span class="s5">modru.probs'</span><span class="s1">)</span>
+    <span class="s1">pprint(modru2.probs)</span>
+
+
+    <span class="s1">print(</span><span class="s5">'sum of probs'</span><span class="s2">, </span><span class="s1">sum(list(modru2.probs.values())))</span>
+    <span class="s1">print(</span><span class="s5">'branchvalues'</span><span class="s1">)</span>
+    <span class="s1">print(modru2.branchvalues)</span>
+    <span class="s1">print(modru.branchvalues)</span>
+
+    <span class="s1">print(</span><span class="s5">'branch probabilities'</span><span class="s1">)</span>
+    <span class="s1">print(modru.bprobs)</span>
+
+    <span class="s1">print(</span><span class="s5">'degenerate branches'</span><span class="s1">)</span>
+    <span class="s1">print(modru.branches_degenerate)</span>
+
+    <span class="s5">''' 
+    &gt;&gt;&gt; modru.bprobs 
+    {'Fly': [], 'top': [0.0016714179077931082, 0.99832858209220687], 'Ground': []} 
+    &gt;&gt;&gt; modru2.bprobs 
+    {'top': [0.25000000000000006, 0.62499999999999989, 0.12500000000000003], 'B22': [], 'B21': [], 'B1': [], 'B2': [0.40000000000000008, 0.59999999999999998], 'B3': []} 
+    '''</span>
+
+    <span class="s1">params1 = np.array([ </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">1.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">1.</span><span class="s2">,  </span><span class="s3">1.</span><span class="s2">,  </span><span class="s3">2.</span><span class="s1">])</span>
+    <span class="s1">print(modru.get_probs(params1))</span>
+    <span class="s1">params2 = np.array([ </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">1.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,</span>
+                         <span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">0.</span><span class="s2">,  </span><span class="s3">1.</span><span class="s2">,  </span><span class="s3">1.</span><span class="s2">,  </span><span class="s3">1.</span><span class="s2">,  </span><span class="s3">2.</span><span class="s2">,  </span><span class="s3">1.</span><span class="s2">,  </span><span class="s3">1.</span><span class="s1">])</span>
+    <span class="s1">print(modru2.get_probs(params2)) </span><span class="s4">#raises IndexError</span>
+</pre>
+</body>
+</html>

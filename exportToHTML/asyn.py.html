@@ -1,0 +1,1114 @@
+<html>
+<head>
+<title>asyn.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #808080;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+asyn.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">asyncio</span>
+<span class="s0">import </span><span class="s1">asyncio.events</span>
+<span class="s0">import </span><span class="s1">functools</span>
+<span class="s0">import </span><span class="s1">inspect</span>
+<span class="s0">import </span><span class="s1">io</span>
+<span class="s0">import </span><span class="s1">numbers</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">import </span><span class="s1">threading</span>
+<span class="s0">from </span><span class="s1">contextlib </span><span class="s0">import </span><span class="s1">contextmanager</span>
+<span class="s0">from </span><span class="s1">glob </span><span class="s0">import </span><span class="s1">has_magic</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">TYPE_CHECKING</span><span class="s0">, </span><span class="s1">Iterable</span>
+
+<span class="s0">from </span><span class="s1">.callbacks </span><span class="s0">import </span><span class="s1">_DEFAULT_CALLBACK</span>
+<span class="s0">from </span><span class="s1">.exceptions </span><span class="s0">import </span><span class="s1">FSTimeoutError</span>
+<span class="s0">from </span><span class="s1">.implementations.local </span><span class="s0">import </span><span class="s1">LocalFileSystem</span><span class="s0">, </span><span class="s1">make_path_posix</span><span class="s0">, </span><span class="s1">trailing_sep</span>
+<span class="s0">from </span><span class="s1">.spec </span><span class="s0">import </span><span class="s1">AbstractBufferedFile</span><span class="s0">, </span><span class="s1">AbstractFileSystem</span>
+<span class="s0">from </span><span class="s1">.utils </span><span class="s0">import </span><span class="s1">is_exception</span><span class="s0">, </span><span class="s1">other_paths</span>
+
+<span class="s1">private = re.compile(</span><span class="s2">&quot;_[^_]&quot;</span><span class="s1">)</span>
+<span class="s1">iothread = [</span><span class="s0">None</span><span class="s1">]  </span><span class="s3"># dedicated fsspec IO thread</span>
+<span class="s1">loop = [</span><span class="s0">None</span><span class="s1">]  </span><span class="s3"># global event loop for any non-async instance</span>
+<span class="s1">_lock = </span><span class="s0">None  </span><span class="s3"># global lock placeholder</span>
+<span class="s1">get_running_loop = asyncio.get_running_loop</span>
+
+
+<span class="s0">def </span><span class="s1">get_lock():</span>
+    <span class="s4">&quot;&quot;&quot;Allocate or return a threading lock. 
+ 
+    The lock is allocated on first use to allow setting one lock per forked process. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">global </span><span class="s1">_lock</span>
+    <span class="s0">if not </span><span class="s1">_lock:</span>
+        <span class="s1">_lock = threading.Lock()</span>
+    <span class="s0">return </span><span class="s1">_lock</span>
+
+
+<span class="s0">def </span><span class="s1">reset_lock():</span>
+    <span class="s4">&quot;&quot;&quot;Reset the global lock. 
+ 
+    This should be called only on the init of a forked process to reset the lock to 
+    None, enabling the new forked process to get a new lock. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">global </span><span class="s1">_lock</span>
+
+    <span class="s1">iothread[</span><span class="s5">0</span><span class="s1">] = </span><span class="s0">None</span>
+    <span class="s1">loop[</span><span class="s5">0</span><span class="s1">] = </span><span class="s0">None</span>
+    <span class="s1">_lock = </span><span class="s0">None</span>
+
+
+<span class="s0">async def </span><span class="s1">_runner(event</span><span class="s0">, </span><span class="s1">coro</span><span class="s0">, </span><span class="s1">result</span><span class="s0">, </span><span class="s1">timeout=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s1">timeout = timeout </span><span class="s0">if </span><span class="s1">timeout </span><span class="s0">else None  </span><span class="s3"># convert 0 or 0.0 to None</span>
+    <span class="s0">if </span><span class="s1">timeout </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s1">coro = asyncio.wait_for(coro</span><span class="s0">, </span><span class="s1">timeout=timeout)</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">result[</span><span class="s5">0</span><span class="s1">] = </span><span class="s0">await </span><span class="s1">coro</span>
+    <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">ex:</span>
+        <span class="s1">result[</span><span class="s5">0</span><span class="s1">] = ex</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">event.set()</span>
+
+
+<span class="s0">def </span><span class="s1">sync(loop</span><span class="s0">, </span><span class="s1">func</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">timeout=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Make loop run coroutine until it returns. Runs in other thread 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; fsspec.asyn.sync(fsspec.asyn.get_loop(), func, *args, 
+                         timeout=timeout, **kwargs) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">timeout = timeout </span><span class="s0">if </span><span class="s1">timeout </span><span class="s0">else None  </span><span class="s3"># convert 0 or 0.0 to None</span>
+    <span class="s3"># NB: if the loop is not running *yet*, it is OK to submit work</span>
+    <span class="s3"># and we will wait for it</span>
+    <span class="s0">if </span><span class="s1">loop </span><span class="s0">is None or </span><span class="s1">loop.is_closed():</span>
+        <span class="s0">raise </span><span class="s1">RuntimeError(</span><span class="s2">&quot;Loop is not running&quot;</span><span class="s1">)</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">loop0 = asyncio.events.get_running_loop()</span>
+        <span class="s0">if </span><span class="s1">loop0 </span><span class="s0">is </span><span class="s1">loop:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError(</span><span class="s2">&quot;Calling sync() from within a running loop&quot;</span><span class="s1">)</span>
+    <span class="s0">except </span><span class="s1">NotImplementedError:</span>
+        <span class="s0">raise</span>
+    <span class="s0">except </span><span class="s1">RuntimeError:</span>
+        <span class="s0">pass</span>
+    <span class="s1">coro = func(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s1">result = [</span><span class="s0">None</span><span class="s1">]</span>
+    <span class="s1">event = threading.Event()</span>
+    <span class="s1">asyncio.run_coroutine_threadsafe(_runner(event</span><span class="s0">, </span><span class="s1">coro</span><span class="s0">, </span><span class="s1">result</span><span class="s0">, </span><span class="s1">timeout)</span><span class="s0">, </span><span class="s1">loop)</span>
+    <span class="s0">while True</span><span class="s1">:</span>
+        <span class="s3"># this loops allows thread to get interrupted</span>
+        <span class="s0">if </span><span class="s1">event.wait(</span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s0">break</span>
+        <span class="s0">if </span><span class="s1">timeout </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">timeout -= </span><span class="s5">1</span>
+            <span class="s0">if </span><span class="s1">timeout &lt; </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">FSTimeoutError</span>
+
+    <span class="s1">return_result = result[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">isinstance(return_result</span><span class="s0">, </span><span class="s1">asyncio.TimeoutError):</span>
+        <span class="s3"># suppress asyncio.TimeoutError, raise FSTimeoutError</span>
+        <span class="s0">raise </span><span class="s1">FSTimeoutError </span><span class="s0">from </span><span class="s1">return_result</span>
+    <span class="s0">elif </span><span class="s1">isinstance(return_result</span><span class="s0">, </span><span class="s1">BaseException):</span>
+        <span class="s0">raise </span><span class="s1">return_result</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">return_result</span>
+
+
+<span class="s0">def </span><span class="s1">sync_wrapper(func</span><span class="s0">, </span><span class="s1">obj=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s4">&quot;&quot;&quot;Given a function, make so can be called in async or blocking contexts 
+ 
+    Leave obj=None if defining within a class. Pass the instance if attaching 
+    as an attribute of the instance. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">@functools.wraps(func)</span>
+    <span class="s0">def </span><span class="s1">wrapper(*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self = obj </span><span class="s0">or </span><span class="s1">args[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s0">return </span><span class="s1">sync(self.loop</span><span class="s0">, </span><span class="s1">func</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">return </span><span class="s1">wrapper</span>
+
+
+<span class="s1">@contextmanager</span>
+<span class="s0">def </span><span class="s1">_selector_policy():</span>
+    <span class="s1">original_policy = asyncio.get_event_loop_policy()</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">os.name == </span><span class="s2">&quot;nt&quot; </span><span class="s0">and </span><span class="s1">hasattr(asyncio</span><span class="s0">, </span><span class="s2">&quot;WindowsSelectorEventLoopPolicy&quot;</span><span class="s1">):</span>
+            <span class="s1">asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())</span>
+
+        <span class="s0">yield</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">asyncio.set_event_loop_policy(original_policy)</span>
+
+
+<span class="s0">def </span><span class="s1">get_loop():</span>
+    <span class="s4">&quot;&quot;&quot;Create or return the default fsspec IO loop 
+ 
+    The loop will be running on a separate thread. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">loop[</span><span class="s5">0</span><span class="s1">] </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">with </span><span class="s1">get_lock():</span>
+            <span class="s3"># repeat the check just in case the loop got filled between the</span>
+            <span class="s3"># previous two calls from another thread</span>
+            <span class="s0">if </span><span class="s1">loop[</span><span class="s5">0</span><span class="s1">] </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s0">with </span><span class="s1">_selector_policy():</span>
+                    <span class="s1">loop[</span><span class="s5">0</span><span class="s1">] = asyncio.new_event_loop()</span>
+                <span class="s1">th = threading.Thread(target=loop[</span><span class="s5">0</span><span class="s1">].run_forever</span><span class="s0">, </span><span class="s1">name=</span><span class="s2">&quot;fsspecIO&quot;</span><span class="s1">)</span>
+                <span class="s1">th.daemon = </span><span class="s0">True</span>
+                <span class="s1">th.start()</span>
+                <span class="s1">iothread[</span><span class="s5">0</span><span class="s1">] = th</span>
+    <span class="s0">return </span><span class="s1">loop[</span><span class="s5">0</span><span class="s1">]</span>
+
+
+<span class="s0">if </span><span class="s1">TYPE_CHECKING:</span>
+    <span class="s0">import </span><span class="s1">resource</span>
+
+    <span class="s1">ResourceError = resource.error</span>
+<span class="s0">else</span><span class="s1">:</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">import </span><span class="s1">resource</span>
+    <span class="s0">except </span><span class="s1">ImportError:</span>
+        <span class="s1">resource = </span><span class="s0">None</span>
+        <span class="s1">ResourceError = OSError</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">ResourceError = getattr(resource</span><span class="s0">, </span><span class="s2">&quot;error&quot;</span><span class="s0">, </span><span class="s1">OSError)</span>
+
+<span class="s1">_DEFAULT_BATCH_SIZE = </span><span class="s5">128</span>
+<span class="s1">_NOFILES_DEFAULT_BATCH_SIZE = </span><span class="s5">1280</span>
+
+
+<span class="s0">def </span><span class="s1">_get_batch_size(nofiles=</span><span class="s0">False</span><span class="s1">):</span>
+    <span class="s0">from </span><span class="s1">fsspec.config </span><span class="s0">import </span><span class="s1">conf</span>
+
+    <span class="s0">if </span><span class="s1">nofiles:</span>
+        <span class="s0">if </span><span class="s2">&quot;nofiles_gather_batch_size&quot; </span><span class="s0">in </span><span class="s1">conf:</span>
+            <span class="s0">return </span><span class="s1">conf[</span><span class="s2">&quot;nofiles_gather_batch_size&quot;</span><span class="s1">]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s2">&quot;gather_batch_size&quot; </span><span class="s0">in </span><span class="s1">conf:</span>
+            <span class="s0">return </span><span class="s1">conf[</span><span class="s2">&quot;gather_batch_size&quot;</span><span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">nofiles:</span>
+        <span class="s0">return </span><span class="s1">_NOFILES_DEFAULT_BATCH_SIZE</span>
+    <span class="s0">if </span><span class="s1">resource </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">_DEFAULT_BATCH_SIZE</span>
+
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">soft_limit</span><span class="s0">, </span><span class="s1">_ = resource.getrlimit(resource.RLIMIT_NOFILE)</span>
+    <span class="s0">except </span><span class="s1">(ImportError</span><span class="s0">, </span><span class="s1">ValueError</span><span class="s0">, </span><span class="s1">ResourceError):</span>
+        <span class="s0">return </span><span class="s1">_DEFAULT_BATCH_SIZE</span>
+
+    <span class="s0">if </span><span class="s1">soft_limit == resource.RLIM_INFINITY:</span>
+        <span class="s0">return </span><span class="s1">-</span><span class="s5">1</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">soft_limit // </span><span class="s5">8</span>
+
+
+<span class="s0">def </span><span class="s1">running_async() -&gt; bool:</span>
+    <span class="s4">&quot;&quot;&quot;Being executed by an event loop?&quot;&quot;&quot;</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">asyncio.get_running_loop()</span>
+        <span class="s0">return True</span>
+    <span class="s0">except </span><span class="s1">RuntimeError:</span>
+        <span class="s0">return False</span>
+
+
+<span class="s0">async def </span><span class="s1">_run_coros_in_chunks(</span>
+    <span class="s1">coros</span><span class="s0">,</span>
+    <span class="s1">batch_size=</span><span class="s0">None,</span>
+    <span class="s1">callback=_DEFAULT_CALLBACK</span><span class="s0">,</span>
+    <span class="s1">timeout=</span><span class="s0">None,</span>
+    <span class="s1">return_exceptions=</span><span class="s0">False,</span>
+    <span class="s1">nofiles=</span><span class="s0">False,</span>
+<span class="s1">):</span>
+    <span class="s4">&quot;&quot;&quot;Run the given coroutines in  chunks. 
+ 
+    Parameters 
+    ---------- 
+    coros: list of coroutines to run 
+    batch_size: int or None 
+        Number of coroutines to submit/wait on simultaneously. 
+        If -1, then it will not be any throttling. If 
+        None, it will be inferred from _get_batch_size() 
+    callback: fsspec.callbacks.Callback instance 
+        Gets a relative_update when each coroutine completes 
+    timeout: number or None 
+        If given, each coroutine times out after this time. Note that, since 
+        there are multiple batches, the total run time of this function will in 
+        general be longer 
+    return_exceptions: bool 
+        Same meaning as in asyncio.gather 
+    nofiles: bool 
+        If inferring the batch_size, does this operation involve local files? 
+        If yes, you normally expect smaller batches. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">if </span><span class="s1">batch_size </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">batch_size = _get_batch_size(nofiles=nofiles)</span>
+
+    <span class="s0">if </span><span class="s1">batch_size == -</span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s1">batch_size = len(coros)</span>
+
+    <span class="s0">assert </span><span class="s1">batch_size &gt; </span><span class="s5">0</span>
+    <span class="s1">results = []</span>
+    <span class="s0">for </span><span class="s1">start </span><span class="s0">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s0">, </span><span class="s1">len(coros)</span><span class="s0">, </span><span class="s1">batch_size):</span>
+        <span class="s1">chunk = [</span>
+            <span class="s1">asyncio.Task(asyncio.wait_for(c</span><span class="s0">, </span><span class="s1">timeout=timeout))</span>
+            <span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">coros[start : start + batch_size]</span>
+        <span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">callback </span><span class="s0">is not </span><span class="s1">_DEFAULT_CALLBACK:</span>
+            <span class="s1">[</span>
+                <span class="s1">t.add_done_callback(</span><span class="s0">lambda </span><span class="s1">*_</span><span class="s0">, </span><span class="s1">**__: callback.relative_update(</span><span class="s5">1</span><span class="s1">))</span>
+                <span class="s0">for </span><span class="s1">t </span><span class="s0">in </span><span class="s1">chunk</span>
+            <span class="s1">]</span>
+        <span class="s1">results.extend(</span>
+            <span class="s0">await </span><span class="s1">asyncio.gather(*chunk</span><span class="s0">, </span><span class="s1">return_exceptions=return_exceptions)</span><span class="s0">,</span>
+        <span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">results</span>
+
+
+<span class="s3"># these methods should be implemented as async by any async-able backend</span>
+<span class="s1">async_methods = [</span>
+    <span class="s2">&quot;_ls&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_cat_file&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_get_file&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_put_file&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_rm_file&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_cp_file&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_pipe_file&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_expand_path&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_info&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_isfile&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_isdir&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_exists&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_walk&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_glob&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_find&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_du&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_size&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_mkdir&quot;</span><span class="s0">,</span>
+    <span class="s2">&quot;_makedirs&quot;</span><span class="s0">,</span>
+<span class="s1">]</span>
+
+
+<span class="s0">class </span><span class="s1">AsyncFileSystem(AbstractFileSystem):</span>
+    <span class="s4">&quot;&quot;&quot;Async file operations, default implementations 
+ 
+    Passes bulk operations to asyncio.gather for concurrent operation. 
+ 
+    Implementations that have concurrent batch operations and/or async methods 
+    should inherit from this class instead of AbstractFileSystem. Docstrings are 
+    copied from the un-underscored method in AbstractFileSystem, if not given. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3"># note that methods do not have docstring here; they will be copied</span>
+    <span class="s3"># for _* methods and inferred for overridden methods.</span>
+
+    <span class="s1">async_impl = </span><span class="s0">True</span>
+    <span class="s1">mirror_sync_methods = </span><span class="s0">True</span>
+    <span class="s1">disable_throttling = </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">asynchronous=</span><span class="s0">False, </span><span class="s1">loop=</span><span class="s0">None, </span><span class="s1">batch_size=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self.asynchronous = asynchronous</span>
+        <span class="s1">self._pid = os.getpid()</span>
+        <span class="s0">if not </span><span class="s1">asynchronous:</span>
+            <span class="s1">self._loop = loop </span><span class="s0">or </span><span class="s1">get_loop()</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self._loop = </span><span class="s0">None</span>
+        <span class="s1">self.batch_size = batch_size</span>
+        <span class="s1">super().__init__(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">loop(self):</span>
+        <span class="s0">if </span><span class="s1">self._pid != os.getpid():</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError(</span><span class="s2">&quot;This class is not fork-safe&quot;</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">self._loop</span>
+
+    <span class="s0">async def </span><span class="s1">_rm_file(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">async def </span><span class="s1">_rm(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">batch_size=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># TODO: implement on_error</span>
+        <span class="s1">batch_size = batch_size </span><span class="s0">or </span><span class="s1">self.batch_size</span>
+        <span class="s1">path = </span><span class="s0">await </span><span class="s1">self._expand_path(path</span><span class="s0">, </span><span class="s1">recursive=recursive)</span>
+        <span class="s0">return await </span><span class="s1">_run_coros_in_chunks(</span>
+            <span class="s1">[self._rm_file(p</span><span class="s0">, </span><span class="s1">**kwargs) </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">reversed(path)]</span><span class="s0">,</span>
+            <span class="s1">batch_size=batch_size</span><span class="s0">,</span>
+            <span class="s1">nofiles=</span><span class="s0">True,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">async def </span><span class="s1">_cp_file(self</span><span class="s0">, </span><span class="s1">path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">async def </span><span class="s1">_copy(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">path1</span><span class="s0">,</span>
+        <span class="s1">path2</span><span class="s0">,</span>
+        <span class="s1">recursive=</span><span class="s0">False,</span>
+        <span class="s1">on_error=</span><span class="s0">None,</span>
+        <span class="s1">maxdepth=</span><span class="s0">None,</span>
+        <span class="s1">batch_size=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">on_error </span><span class="s0">is None and </span><span class="s1">recursive:</span>
+            <span class="s1">on_error = </span><span class="s2">&quot;ignore&quot;</span>
+        <span class="s0">elif </span><span class="s1">on_error </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">on_error = </span><span class="s2">&quot;raise&quot;</span>
+
+        <span class="s0">if </span><span class="s1">isinstance(path1</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">and </span><span class="s1">isinstance(path2</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s3"># No need to expand paths when both source and destination</span>
+            <span class="s3"># are provided as lists</span>
+            <span class="s1">paths1 = path1</span>
+            <span class="s1">paths2 = path2</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">source_is_str = isinstance(path1</span><span class="s0">, </span><span class="s1">str)</span>
+            <span class="s1">paths1 = </span><span class="s0">await </span><span class="s1">self._expand_path(</span>
+                <span class="s1">path1</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth</span><span class="s0">, </span><span class="s1">recursive=recursive</span>
+            <span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">source_is_str </span><span class="s0">and </span><span class="s1">(</span><span class="s0">not </span><span class="s1">recursive </span><span class="s0">or </span><span class="s1">maxdepth </span><span class="s0">is not None</span><span class="s1">):</span>
+                <span class="s3"># Non-recursive glob does not copy directories</span>
+                <span class="s1">paths1 = [</span>
+                    <span class="s1">p </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">paths1 </span><span class="s0">if not </span><span class="s1">(trailing_sep(p) </span><span class="s0">or await </span><span class="s1">self._isdir(p))</span>
+                <span class="s1">]</span>
+                <span class="s0">if not </span><span class="s1">paths1:</span>
+                    <span class="s0">return</span>
+
+            <span class="s1">source_is_file = len(paths1) == </span><span class="s5">1</span>
+            <span class="s1">dest_is_dir = isinstance(path2</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">trailing_sep(path2) </span><span class="s0">or await </span><span class="s1">self._isdir(path2)</span>
+            <span class="s1">)</span>
+
+            <span class="s1">exists = source_is_str </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">(has_magic(path1) </span><span class="s0">and </span><span class="s1">source_is_file)</span>
+                <span class="s0">or </span><span class="s1">(</span><span class="s0">not </span><span class="s1">has_magic(path1) </span><span class="s0">and </span><span class="s1">dest_is_dir </span><span class="s0">and not </span><span class="s1">trailing_sep(path1))</span>
+            <span class="s1">)</span>
+            <span class="s1">paths2 = other_paths(</span>
+                <span class="s1">paths1</span><span class="s0">,</span>
+                <span class="s1">path2</span><span class="s0">,</span>
+                <span class="s1">exists=exists</span><span class="s0">,</span>
+                <span class="s1">flatten=</span><span class="s0">not </span><span class="s1">source_is_str</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s1">batch_size = batch_size </span><span class="s0">or </span><span class="s1">self.batch_size</span>
+        <span class="s1">coros = [self._cp_file(p1</span><span class="s0">, </span><span class="s1">p2</span><span class="s0">, </span><span class="s1">**kwargs) </span><span class="s0">for </span><span class="s1">p1</span><span class="s0">, </span><span class="s1">p2 </span><span class="s0">in </span><span class="s1">zip(paths1</span><span class="s0">, </span><span class="s1">paths2)]</span>
+        <span class="s1">result = </span><span class="s0">await </span><span class="s1">_run_coros_in_chunks(</span>
+            <span class="s1">coros</span><span class="s0">, </span><span class="s1">batch_size=batch_size</span><span class="s0">, </span><span class="s1">return_exceptions=</span><span class="s0">True, </span><span class="s1">nofiles=</span><span class="s0">True</span>
+        <span class="s1">)</span>
+
+        <span class="s0">for </span><span class="s1">ex </span><span class="s0">in </span><span class="s1">filter(is_exception</span><span class="s0">, </span><span class="s1">result):</span>
+            <span class="s0">if </span><span class="s1">on_error == </span><span class="s2">&quot;ignore&quot; </span><span class="s0">and </span><span class="s1">isinstance(ex</span><span class="s0">, </span><span class="s1">FileNotFoundError):</span>
+                <span class="s0">continue</span>
+            <span class="s0">raise </span><span class="s1">ex</span>
+
+    <span class="s0">async def </span><span class="s1">_pipe_file(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">async def </span><span class="s1">_pipe(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">value=</span><span class="s0">None, </span><span class="s1">batch_size=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">if </span><span class="s1">isinstance(path</span><span class="s0">, </span><span class="s1">str):</span>
+            <span class="s1">path = {path: value}</span>
+        <span class="s1">batch_size = batch_size </span><span class="s0">or </span><span class="s1">self.batch_size</span>
+        <span class="s0">return await </span><span class="s1">_run_coros_in_chunks(</span>
+            <span class="s1">[self._pipe_file(k</span><span class="s0">, </span><span class="s1">v</span><span class="s0">, </span><span class="s1">**kwargs) </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">path.items()]</span><span class="s0">,</span>
+            <span class="s1">batch_size=batch_size</span><span class="s0">,</span>
+            <span class="s1">nofiles=</span><span class="s0">True,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">async def </span><span class="s1">_process_limits(self</span><span class="s0">, </span><span class="s1">url</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">end):</span>
+        <span class="s4">&quot;&quot;&quot;Helper for &quot;Range&quot;-based _cat_file&quot;&quot;&quot;</span>
+        <span class="s1">size = </span><span class="s0">None</span>
+        <span class="s1">suff = </span><span class="s0">False</span>
+        <span class="s0">if </span><span class="s1">start </span><span class="s0">is not None and </span><span class="s1">start &lt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s3"># if start is negative and end None, end is the &quot;suffix length&quot;</span>
+            <span class="s0">if </span><span class="s1">end </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s1">end = -start</span>
+                <span class="s1">start = </span><span class="s2">&quot;&quot;</span>
+                <span class="s1">suff = </span><span class="s0">True</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">size = size </span><span class="s0">or </span><span class="s1">(</span><span class="s0">await </span><span class="s1">self._info(url))[</span><span class="s2">&quot;size&quot;</span><span class="s1">]</span>
+                <span class="s1">start = size + start</span>
+        <span class="s0">elif </span><span class="s1">start </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">start = </span><span class="s5">0</span>
+        <span class="s0">if not </span><span class="s1">suff:</span>
+            <span class="s0">if </span><span class="s1">end </span><span class="s0">is not None and </span><span class="s1">end &lt; </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s0">if </span><span class="s1">start </span><span class="s0">is not None</span><span class="s1">:</span>
+                    <span class="s1">size = size </span><span class="s0">or </span><span class="s1">(</span><span class="s0">await </span><span class="s1">self._info(url))[</span><span class="s2">&quot;size&quot;</span><span class="s1">]</span>
+                    <span class="s1">end = size + end</span>
+            <span class="s0">elif </span><span class="s1">end </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s1">end = </span><span class="s2">&quot;&quot;</span>
+            <span class="s0">if </span><span class="s1">isinstance(end</span><span class="s0">, </span><span class="s1">numbers.Integral):</span>
+                <span class="s1">end -= </span><span class="s5">1  </span><span class="s3"># bytes range is inclusive</span>
+        <span class="s0">return </span><span class="s2">f&quot;bytes=</span><span class="s0">{</span><span class="s1">start</span><span class="s0">}</span><span class="s2">-</span><span class="s0">{</span><span class="s1">end</span><span class="s0">}</span><span class="s2">&quot;</span>
+
+    <span class="s0">async def </span><span class="s1">_cat_file(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">start=</span><span class="s0">None, </span><span class="s1">end=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">async def </span><span class="s1">_cat(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">on_error=</span><span class="s2">&quot;raise&quot;</span><span class="s0">, </span><span class="s1">batch_size=</span><span class="s0">None, </span><span class="s1">**kwargs</span>
+    <span class="s1">):</span>
+        <span class="s1">paths = </span><span class="s0">await </span><span class="s1">self._expand_path(path</span><span class="s0">, </span><span class="s1">recursive=recursive)</span>
+        <span class="s1">coros = [self._cat_file(path</span><span class="s0">, </span><span class="s1">**kwargs) </span><span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">paths]</span>
+        <span class="s1">batch_size = batch_size </span><span class="s0">or </span><span class="s1">self.batch_size</span>
+        <span class="s1">out = </span><span class="s0">await </span><span class="s1">_run_coros_in_chunks(</span>
+            <span class="s1">coros</span><span class="s0">, </span><span class="s1">batch_size=batch_size</span><span class="s0">, </span><span class="s1">nofiles=</span><span class="s0">True, </span><span class="s1">return_exceptions=</span><span class="s0">True</span>
+        <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">on_error == </span><span class="s2">&quot;raise&quot;</span><span class="s1">:</span>
+            <span class="s1">ex = next(filter(is_exception</span><span class="s0">, </span><span class="s1">out)</span><span class="s0">, False</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">ex:</span>
+                <span class="s0">raise </span><span class="s1">ex</span>
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">len(paths) &gt; </span><span class="s5">1</span>
+            <span class="s0">or </span><span class="s1">isinstance(path</span><span class="s0">, </span><span class="s1">list)</span>
+            <span class="s0">or </span><span class="s1">paths[</span><span class="s5">0</span><span class="s1">] != self._strip_protocol(path)</span>
+        <span class="s1">):</span>
+            <span class="s0">return </span><span class="s1">{</span>
+                <span class="s1">k: v</span>
+                <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">zip(paths</span><span class="s0">, </span><span class="s1">out)</span>
+                <span class="s0">if </span><span class="s1">on_error != </span><span class="s2">&quot;omit&quot; </span><span class="s0">or not </span><span class="s1">is_exception(v)</span>
+            <span class="s1">}</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">out[</span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s0">async def </span><span class="s1">_cat_ranges(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">paths</span><span class="s0">,</span>
+        <span class="s1">starts</span><span class="s0">,</span>
+        <span class="s1">ends</span><span class="s0">,</span>
+        <span class="s1">max_gap=</span><span class="s0">None,</span>
+        <span class="s1">batch_size=</span><span class="s0">None,</span>
+        <span class="s1">on_error=</span><span class="s2">&quot;return&quot;</span><span class="s0">,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s3"># TODO: on_error</span>
+        <span class="s0">if </span><span class="s1">max_gap </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s3"># use utils.merge_offset_ranges</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+        <span class="s0">if not </span><span class="s1">isinstance(paths</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s0">raise </span><span class="s1">TypeError</span>
+        <span class="s0">if not </span><span class="s1">isinstance(starts</span><span class="s0">, </span><span class="s1">Iterable):</span>
+            <span class="s1">starts = [starts] * len(paths)</span>
+        <span class="s0">if not </span><span class="s1">isinstance(ends</span><span class="s0">, </span><span class="s1">Iterable):</span>
+            <span class="s1">ends = [starts] * len(paths)</span>
+        <span class="s0">if </span><span class="s1">len(starts) != len(paths) </span><span class="s0">or </span><span class="s1">len(ends) != len(paths):</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span>
+        <span class="s1">coros = [</span>
+            <span class="s1">self._cat_file(p</span><span class="s0">, </span><span class="s1">start=s</span><span class="s0">, </span><span class="s1">end=e</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+            <span class="s0">for </span><span class="s1">p</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">e </span><span class="s0">in </span><span class="s1">zip(paths</span><span class="s0">, </span><span class="s1">starts</span><span class="s0">, </span><span class="s1">ends)</span>
+        <span class="s1">]</span>
+        <span class="s1">batch_size = batch_size </span><span class="s0">or </span><span class="s1">self.batch_size</span>
+        <span class="s0">return await </span><span class="s1">_run_coros_in_chunks(</span>
+            <span class="s1">coros</span><span class="s0">, </span><span class="s1">batch_size=batch_size</span><span class="s0">, </span><span class="s1">nofiles=</span><span class="s0">True, </span><span class="s1">return_exceptions=</span><span class="s0">True</span>
+        <span class="s1">)</span>
+
+    <span class="s0">async def </span><span class="s1">_put_file(self</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">async def </span><span class="s1">_put(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">lpath</span><span class="s0">,</span>
+        <span class="s1">rpath</span><span class="s0">,</span>
+        <span class="s1">recursive=</span><span class="s0">False,</span>
+        <span class="s1">callback=_DEFAULT_CALLBACK</span><span class="s0">,</span>
+        <span class="s1">batch_size=</span><span class="s0">None,</span>
+        <span class="s1">maxdepth=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot;Copy file(s) from local. 
+ 
+        Copies a specific file or tree of files (if recursive=True). If rpath 
+        ends with a &quot;/&quot;, it will be assumed to be a directory, and target files 
+        will go within. 
+ 
+        The put_file method will be called concurrently on a batch of files. The 
+        batch_size option can configure the amount of futures that can be executed 
+        at the same time. If it is -1, then all the files will be uploaded concurrently. 
+        The default can be set for this instance by passing &quot;batch_size&quot; in the 
+        constructor, or for all instances by setting the &quot;gather_batch_size&quot; key 
+        in ``fsspec.config.conf``, falling back to 1/8th of the system limit . 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">isinstance(lpath</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">and </span><span class="s1">isinstance(rpath</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s3"># No need to expand paths when both source and destination</span>
+            <span class="s3"># are provided as lists</span>
+            <span class="s1">rpaths = rpath</span>
+            <span class="s1">lpaths = lpath</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">source_is_str = isinstance(lpath</span><span class="s0">, </span><span class="s1">str)</span>
+            <span class="s0">if </span><span class="s1">source_is_str:</span>
+                <span class="s1">lpath = make_path_posix(lpath)</span>
+            <span class="s1">fs = LocalFileSystem()</span>
+            <span class="s1">lpaths = fs.expand_path(lpath</span><span class="s0">, </span><span class="s1">recursive=recursive</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth)</span>
+            <span class="s0">if </span><span class="s1">source_is_str </span><span class="s0">and </span><span class="s1">(</span><span class="s0">not </span><span class="s1">recursive </span><span class="s0">or </span><span class="s1">maxdepth </span><span class="s0">is not None</span><span class="s1">):</span>
+                <span class="s3"># Non-recursive glob does not copy directories</span>
+                <span class="s1">lpaths = [p </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">lpaths </span><span class="s0">if not </span><span class="s1">(trailing_sep(p) </span><span class="s0">or </span><span class="s1">fs.isdir(p))]</span>
+                <span class="s0">if not </span><span class="s1">lpaths:</span>
+                    <span class="s0">return</span>
+
+            <span class="s1">source_is_file = len(lpaths) == </span><span class="s5">1</span>
+            <span class="s1">dest_is_dir = isinstance(rpath</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">trailing_sep(rpath) </span><span class="s0">or await </span><span class="s1">self._isdir(rpath)</span>
+            <span class="s1">)</span>
+
+            <span class="s1">rpath = self._strip_protocol(rpath)</span>
+            <span class="s1">exists = source_is_str </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">(has_magic(lpath) </span><span class="s0">and </span><span class="s1">source_is_file)</span>
+                <span class="s0">or </span><span class="s1">(</span><span class="s0">not </span><span class="s1">has_magic(lpath) </span><span class="s0">and </span><span class="s1">dest_is_dir </span><span class="s0">and not </span><span class="s1">trailing_sep(lpath))</span>
+            <span class="s1">)</span>
+            <span class="s1">rpaths = other_paths(</span>
+                <span class="s1">lpaths</span><span class="s0">,</span>
+                <span class="s1">rpath</span><span class="s0">,</span>
+                <span class="s1">exists=exists</span><span class="s0">,</span>
+                <span class="s1">flatten=</span><span class="s0">not </span><span class="s1">source_is_str</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s1">is_dir = {l: os.path.isdir(l) </span><span class="s0">for </span><span class="s1">l </span><span class="s0">in </span><span class="s1">lpaths}</span>
+        <span class="s1">rdirs = [r </span><span class="s0">for </span><span class="s1">l</span><span class="s0">, </span><span class="s1">r </span><span class="s0">in </span><span class="s1">zip(lpaths</span><span class="s0">, </span><span class="s1">rpaths) </span><span class="s0">if </span><span class="s1">is_dir[l]]</span>
+        <span class="s1">file_pairs = [(l</span><span class="s0">, </span><span class="s1">r) </span><span class="s0">for </span><span class="s1">l</span><span class="s0">, </span><span class="s1">r </span><span class="s0">in </span><span class="s1">zip(lpaths</span><span class="s0">, </span><span class="s1">rpaths) </span><span class="s0">if not </span><span class="s1">is_dir[l]]</span>
+
+        <span class="s0">await </span><span class="s1">asyncio.gather(*[self._makedirs(d</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">) </span><span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">rdirs])</span>
+        <span class="s1">batch_size = batch_size </span><span class="s0">or </span><span class="s1">self.batch_size</span>
+
+        <span class="s1">coros = []</span>
+        <span class="s1">callback.set_size(len(file_pairs))</span>
+        <span class="s0">for </span><span class="s1">lfile</span><span class="s0">, </span><span class="s1">rfile </span><span class="s0">in </span><span class="s1">file_pairs:</span>
+            <span class="s1">callback.branch(lfile</span><span class="s0">, </span><span class="s1">rfile</span><span class="s0">, </span><span class="s1">kwargs)</span>
+            <span class="s1">coros.append(self._put_file(lfile</span><span class="s0">, </span><span class="s1">rfile</span><span class="s0">, </span><span class="s1">**kwargs))</span>
+
+        <span class="s0">return await </span><span class="s1">_run_coros_in_chunks(</span>
+            <span class="s1">coros</span><span class="s0">, </span><span class="s1">batch_size=batch_size</span><span class="s0">, </span><span class="s1">callback=callback</span>
+        <span class="s1">)</span>
+
+    <span class="s0">async def </span><span class="s1">_get_file(self</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">async def </span><span class="s1">_get(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">rpath</span><span class="s0">,</span>
+        <span class="s1">lpath</span><span class="s0">,</span>
+        <span class="s1">recursive=</span><span class="s0">False,</span>
+        <span class="s1">callback=_DEFAULT_CALLBACK</span><span class="s0">,</span>
+        <span class="s1">maxdepth=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot;Copy file(s) to local. 
+ 
+        Copies a specific file or tree of files (if recursive=True). If lpath 
+        ends with a &quot;/&quot;, it will be assumed to be a directory, and target files 
+        will go within. Can submit a list of paths, which may be glob-patterns 
+        and will be expanded. 
+ 
+        The get_file method will be called concurrently on a batch of files. The 
+        batch_size option can configure the amount of futures that can be executed 
+        at the same time. If it is -1, then all the files will be uploaded concurrently. 
+        The default can be set for this instance by passing &quot;batch_size&quot; in the 
+        constructor, or for all instances by setting the &quot;gather_batch_size&quot; key 
+        in ``fsspec.config.conf``, falling back to 1/8th of the system limit . 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">isinstance(lpath</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">and </span><span class="s1">isinstance(rpath</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s3"># No need to expand paths when both source and destination</span>
+            <span class="s3"># are provided as lists</span>
+            <span class="s1">rpaths = rpath</span>
+            <span class="s1">lpaths = lpath</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">source_is_str = isinstance(rpath</span><span class="s0">, </span><span class="s1">str)</span>
+            <span class="s3"># First check for rpath trailing slash as _strip_protocol removes it.</span>
+            <span class="s1">source_not_trailing_sep = source_is_str </span><span class="s0">and not </span><span class="s1">trailing_sep(rpath)</span>
+            <span class="s1">rpath = self._strip_protocol(rpath)</span>
+            <span class="s1">rpaths = </span><span class="s0">await </span><span class="s1">self._expand_path(</span>
+                <span class="s1">rpath</span><span class="s0">, </span><span class="s1">recursive=recursive</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth</span>
+            <span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">source_is_str </span><span class="s0">and </span><span class="s1">(</span><span class="s0">not </span><span class="s1">recursive </span><span class="s0">or </span><span class="s1">maxdepth </span><span class="s0">is not None</span><span class="s1">):</span>
+                <span class="s3"># Non-recursive glob does not copy directories</span>
+                <span class="s1">rpaths = [</span>
+                    <span class="s1">p </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">rpaths </span><span class="s0">if not </span><span class="s1">(trailing_sep(p) </span><span class="s0">or await </span><span class="s1">self._isdir(p))</span>
+                <span class="s1">]</span>
+                <span class="s0">if not </span><span class="s1">rpaths:</span>
+                    <span class="s0">return</span>
+
+            <span class="s1">lpath = make_path_posix(lpath)</span>
+            <span class="s1">source_is_file = len(rpaths) == </span><span class="s5">1</span>
+            <span class="s1">dest_is_dir = isinstance(lpath</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">trailing_sep(lpath) </span><span class="s0">or </span><span class="s1">LocalFileSystem().isdir(lpath)</span>
+            <span class="s1">)</span>
+
+            <span class="s1">exists = source_is_str </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">(has_magic(rpath) </span><span class="s0">and </span><span class="s1">source_is_file)</span>
+                <span class="s0">or </span><span class="s1">(</span><span class="s0">not </span><span class="s1">has_magic(rpath) </span><span class="s0">and </span><span class="s1">dest_is_dir </span><span class="s0">and </span><span class="s1">source_not_trailing_sep)</span>
+            <span class="s1">)</span>
+            <span class="s1">lpaths = other_paths(</span>
+                <span class="s1">rpaths</span><span class="s0">,</span>
+                <span class="s1">lpath</span><span class="s0">,</span>
+                <span class="s1">exists=exists</span><span class="s0">,</span>
+                <span class="s1">flatten=</span><span class="s0">not </span><span class="s1">source_is_str</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s1">[os.makedirs(os.path.dirname(lp)</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">) </span><span class="s0">for </span><span class="s1">lp </span><span class="s0">in </span><span class="s1">lpaths]</span>
+        <span class="s1">batch_size = kwargs.pop(</span><span class="s2">&quot;batch_size&quot;</span><span class="s0">, </span><span class="s1">self.batch_size)</span>
+
+        <span class="s1">coros = []</span>
+        <span class="s1">callback.set_size(len(lpaths))</span>
+        <span class="s0">for </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">rpath </span><span class="s0">in </span><span class="s1">zip(lpaths</span><span class="s0">, </span><span class="s1">rpaths):</span>
+            <span class="s1">callback.branch(rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">kwargs)</span>
+            <span class="s1">coros.append(self._get_file(rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">**kwargs))</span>
+        <span class="s0">return await </span><span class="s1">_run_coros_in_chunks(</span>
+            <span class="s1">coros</span><span class="s0">, </span><span class="s1">batch_size=batch_size</span><span class="s0">, </span><span class="s1">callback=callback</span>
+        <span class="s1">)</span>
+
+    <span class="s0">async def </span><span class="s1">_isfile(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">(</span><span class="s0">await </span><span class="s1">self._info(path))[</span><span class="s2">&quot;type&quot;</span><span class="s1">] == </span><span class="s2">&quot;file&quot;</span>
+        <span class="s0">except</span><span class="s1">:  </span><span class="s3"># noqa: E722</span>
+            <span class="s0">return False</span>
+
+    <span class="s0">async def </span><span class="s1">_isdir(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">(</span><span class="s0">await </span><span class="s1">self._info(path))[</span><span class="s2">&quot;type&quot;</span><span class="s1">] == </span><span class="s2">&quot;directory&quot;</span>
+        <span class="s0">except </span><span class="s1">OSError:</span>
+            <span class="s0">return False</span>
+
+    <span class="s0">async def </span><span class="s1">_size(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s0">return </span><span class="s1">(</span><span class="s0">await </span><span class="s1">self._info(path)).get(</span><span class="s2">&quot;size&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+
+    <span class="s0">async def </span><span class="s1">_sizes(self</span><span class="s0">, </span><span class="s1">paths</span><span class="s0">, </span><span class="s1">batch_size=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">batch_size = batch_size </span><span class="s0">or </span><span class="s1">self.batch_size</span>
+        <span class="s0">return await </span><span class="s1">_run_coros_in_chunks(</span>
+            <span class="s1">[self._size(p) </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">paths]</span><span class="s0">, </span><span class="s1">batch_size=batch_size</span>
+        <span class="s1">)</span>
+
+    <span class="s0">async def </span><span class="s1">_exists(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">await </span><span class="s1">self._info(path)</span>
+            <span class="s0">return True</span>
+        <span class="s0">except </span><span class="s1">FileNotFoundError:</span>
+            <span class="s0">return False</span>
+
+    <span class="s0">async def </span><span class="s1">_info(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">async def </span><span class="s1">_ls(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">async def </span><span class="s1">_walk(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">on_error=</span><span class="s2">&quot;omit&quot;</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None and </span><span class="s1">maxdepth &lt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;maxdepth must be at least 1&quot;</span><span class="s1">)</span>
+
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">full_dirs = {}</span>
+        <span class="s1">dirs = {}</span>
+        <span class="s1">files = {}</span>
+
+        <span class="s1">detail = kwargs.pop(</span><span class="s2">&quot;detail&quot;</span><span class="s0">, False</span><span class="s1">)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">listing = </span><span class="s0">await </span><span class="s1">self._ls(path</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs)</span>
+        <span class="s0">except </span><span class="s1">(FileNotFoundError</span><span class="s0">, </span><span class="s1">OSError) </span><span class="s0">as </span><span class="s1">e:</span>
+            <span class="s0">if </span><span class="s1">on_error == </span><span class="s2">&quot;raise&quot;</span><span class="s1">:</span>
+                <span class="s0">raise</span>
+            <span class="s0">elif </span><span class="s1">callable(on_error):</span>
+                <span class="s1">on_error(e)</span>
+            <span class="s0">if </span><span class="s1">detail:</span>
+                <span class="s0">yield </span><span class="s1">path</span><span class="s0">, </span><span class="s1">{}</span><span class="s0">, </span><span class="s1">{}</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">yield </span><span class="s1">path</span><span class="s0">, </span><span class="s1">[]</span><span class="s0">, </span><span class="s1">[]</span>
+            <span class="s0">return</span>
+
+        <span class="s0">for </span><span class="s1">info </span><span class="s0">in </span><span class="s1">listing:</span>
+            <span class="s3"># each info name must be at least [path]/part , but here</span>
+            <span class="s3"># we check also for names like [path]/part/</span>
+            <span class="s1">pathname = info[</span><span class="s2">&quot;name&quot;</span><span class="s1">].rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+            <span class="s1">name = pathname.rsplit(</span><span class="s2">&quot;/&quot;</span><span class="s0">, </span><span class="s5">1</span><span class="s1">)[-</span><span class="s5">1</span><span class="s1">]</span>
+            <span class="s0">if </span><span class="s1">info[</span><span class="s2">&quot;type&quot;</span><span class="s1">] == </span><span class="s2">&quot;directory&quot; </span><span class="s0">and </span><span class="s1">pathname != path:</span>
+                <span class="s3"># do not include &quot;self&quot; path</span>
+                <span class="s1">full_dirs[name] = pathname</span>
+                <span class="s1">dirs[name] = info</span>
+            <span class="s0">elif </span><span class="s1">pathname == path:</span>
+                <span class="s3"># file-like with same name as give path</span>
+                <span class="s1">files[</span><span class="s2">&quot;&quot;</span><span class="s1">] = info</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">files[name] = info</span>
+
+        <span class="s0">if </span><span class="s1">detail:</span>
+            <span class="s0">yield </span><span class="s1">path</span><span class="s0">, </span><span class="s1">dirs</span><span class="s0">, </span><span class="s1">files</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">yield </span><span class="s1">path</span><span class="s0">, </span><span class="s1">list(dirs)</span><span class="s0">, </span><span class="s1">list(files)</span>
+
+        <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">maxdepth -= </span><span class="s5">1</span>
+            <span class="s0">if </span><span class="s1">maxdepth &lt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s0">return</span>
+
+        <span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">dirs:</span>
+            <span class="s0">async for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">self._walk(</span>
+                <span class="s1">full_dirs[d]</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth</span><span class="s0">, </span><span class="s1">detail=detail</span><span class="s0">, </span><span class="s1">**kwargs</span>
+            <span class="s1">):</span>
+                <span class="s0">yield </span><span class="s1">_</span>
+
+    <span class="s0">async def </span><span class="s1">_glob(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None and </span><span class="s1">maxdepth &lt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;maxdepth must be at least 1&quot;</span><span class="s1">)</span>
+
+        <span class="s0">import </span><span class="s1">re</span>
+
+        <span class="s1">ends = path.endswith(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">idx_star = path.find(</span><span class="s2">&quot;*&quot;</span><span class="s1">) </span><span class="s0">if </span><span class="s1">path.find(</span><span class="s2">&quot;*&quot;</span><span class="s1">) &gt;= </span><span class="s5">0 </span><span class="s0">else </span><span class="s1">len(path)</span>
+        <span class="s1">idx_qmark = path.find(</span><span class="s2">&quot;?&quot;</span><span class="s1">) </span><span class="s0">if </span><span class="s1">path.find(</span><span class="s2">&quot;?&quot;</span><span class="s1">) &gt;= </span><span class="s5">0 </span><span class="s0">else </span><span class="s1">len(path)</span>
+        <span class="s1">idx_brace = path.find(</span><span class="s2">&quot;[&quot;</span><span class="s1">) </span><span class="s0">if </span><span class="s1">path.find(</span><span class="s2">&quot;[&quot;</span><span class="s1">) &gt;= </span><span class="s5">0 </span><span class="s0">else </span><span class="s1">len(path)</span>
+
+        <span class="s1">min_idx = min(idx_star</span><span class="s0">, </span><span class="s1">idx_qmark</span><span class="s0">, </span><span class="s1">idx_brace)</span>
+
+        <span class="s1">detail = kwargs.pop(</span><span class="s2">&quot;detail&quot;</span><span class="s0">, False</span><span class="s1">)</span>
+
+        <span class="s0">if not </span><span class="s1">has_magic(path):</span>
+            <span class="s0">if await </span><span class="s1">self._exists(path):</span>
+                <span class="s0">if not </span><span class="s1">detail:</span>
+                    <span class="s0">return </span><span class="s1">[path]</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s0">return </span><span class="s1">{path: </span><span class="s0">await </span><span class="s1">self._info(path)}</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">if not </span><span class="s1">detail:</span>
+                    <span class="s0">return </span><span class="s1">[]  </span><span class="s3"># glob of non-existent returns empty</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s0">return </span><span class="s1">{}</span>
+        <span class="s0">elif </span><span class="s2">&quot;/&quot; </span><span class="s0">in </span><span class="s1">path[:min_idx]:</span>
+            <span class="s1">min_idx = path[:min_idx].rindex(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+            <span class="s1">root = path[: min_idx + </span><span class="s5">1</span><span class="s1">]</span>
+            <span class="s1">depth = path[min_idx + </span><span class="s5">1 </span><span class="s1">:].count(</span><span class="s2">&quot;/&quot;</span><span class="s1">) + </span><span class="s5">1</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">root = </span><span class="s2">&quot;&quot;</span>
+            <span class="s1">depth = path[min_idx + </span><span class="s5">1 </span><span class="s1">:].count(</span><span class="s2">&quot;/&quot;</span><span class="s1">) + </span><span class="s5">1</span>
+
+        <span class="s0">if </span><span class="s2">&quot;**&quot; </span><span class="s0">in </span><span class="s1">path:</span>
+            <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">idx_double_stars = path.find(</span><span class="s2">&quot;**&quot;</span><span class="s1">)</span>
+                <span class="s1">depth_double_stars = path[idx_double_stars:].count(</span><span class="s2">&quot;/&quot;</span><span class="s1">) + </span><span class="s5">1</span>
+                <span class="s1">depth = depth - depth_double_stars + maxdepth</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">depth = </span><span class="s0">None</span>
+
+        <span class="s1">allpaths = </span><span class="s0">await </span><span class="s1">self._find(</span>
+            <span class="s1">root</span><span class="s0">, </span><span class="s1">maxdepth=depth</span><span class="s0">, </span><span class="s1">withdirs=</span><span class="s0">True, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs</span>
+        <span class="s1">)</span>
+        <span class="s3"># Escape characters special to python regex, leaving our supported</span>
+        <span class="s3"># special characters in place.</span>
+        <span class="s3"># See https://www.gnu.org/software/bash/manual/html_node/Pattern-Matching.html</span>
+        <span class="s3"># for shell globbing details.</span>
+        <span class="s1">pattern = (</span>
+            <span class="s2">&quot;^&quot;</span>
+            <span class="s1">+ (</span>
+                <span class="s1">path.replace(</span><span class="s2">&quot;</span><span class="s0">\\</span><span class="s2">&quot;</span><span class="s0">, </span><span class="s2">r&quot;\\&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;.&quot;</span><span class="s0">, </span><span class="s2">r&quot;\.&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;+&quot;</span><span class="s0">, </span><span class="s2">r&quot;\+&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;//&quot;</span><span class="s0">, </span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;(&quot;</span><span class="s0">, </span><span class="s2">r&quot;\(&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;)&quot;</span><span class="s0">, </span><span class="s2">r&quot;\)&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;|&quot;</span><span class="s0">, </span><span class="s2">r&quot;\|&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;^&quot;</span><span class="s0">, </span><span class="s2">r&quot;\^&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;$&quot;</span><span class="s0">, </span><span class="s2">r&quot;\$&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;{&quot;</span><span class="s0">, </span><span class="s2">r&quot;\{&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;}&quot;</span><span class="s0">, </span><span class="s2">r&quot;\}&quot;</span><span class="s1">)</span>
+                <span class="s1">.rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;?&quot;</span><span class="s0">, </span><span class="s2">&quot;.&quot;</span><span class="s1">)</span>
+            <span class="s1">)</span>
+            <span class="s1">+ </span><span class="s2">&quot;$&quot;</span>
+        <span class="s1">)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s2">&quot;/[*]{2}&quot;</span><span class="s0">, </span><span class="s2">&quot;=SLASH_DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s2">&quot;[*]{2}/?&quot;</span><span class="s0">, </span><span class="s2">&quot;=DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s2">&quot;[*]&quot;</span><span class="s0">, </span><span class="s2">&quot;[^/]*&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s2">&quot;=SLASH_DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s2">&quot;(|/.*)&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s2">&quot;=DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s2">&quot;.*&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.compile(pattern)</span>
+        <span class="s1">out = {</span>
+            <span class="s1">p: allpaths[p]</span>
+            <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">sorted(allpaths)</span>
+            <span class="s0">if </span><span class="s1">pattern.match(p.replace(</span><span class="s2">&quot;//&quot;</span><span class="s0">, </span><span class="s2">&quot;/&quot;</span><span class="s1">).rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">))</span>
+        <span class="s1">}</span>
+
+        <span class="s3"># Return directories only when the glob end by a slash</span>
+        <span class="s3"># This is needed for posix glob compliance</span>
+        <span class="s0">if </span><span class="s1">ends:</span>
+            <span class="s1">out = {k: v </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">out.items() </span><span class="s0">if </span><span class="s1">v[</span><span class="s2">&quot;type&quot;</span><span class="s1">] == </span><span class="s2">&quot;directory&quot;</span><span class="s1">}</span>
+
+        <span class="s0">if </span><span class="s1">detail:</span>
+            <span class="s0">return </span><span class="s1">out</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">list(out)</span>
+
+    <span class="s0">async def </span><span class="s1">_du(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">total=</span><span class="s0">True, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">sizes = {}</span>
+        <span class="s3"># async for?</span>
+        <span class="s0">for </span><span class="s1">f </span><span class="s0">in await </span><span class="s1">self._find(path</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+            <span class="s1">info = </span><span class="s0">await </span><span class="s1">self._info(f)</span>
+            <span class="s1">sizes[info[</span><span class="s2">&quot;name&quot;</span><span class="s1">]] = info[</span><span class="s2">&quot;size&quot;</span><span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">total:</span>
+            <span class="s0">return </span><span class="s1">sum(sizes.values())</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">sizes</span>
+
+    <span class="s0">async def </span><span class="s1">_find(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">withdirs=</span><span class="s0">False, </span><span class="s1">**kwargs):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">out = {}</span>
+        <span class="s1">detail = kwargs.pop(</span><span class="s2">&quot;detail&quot;</span><span class="s0">, False</span><span class="s1">)</span>
+
+        <span class="s3"># Add the root directory if withdirs is requested</span>
+        <span class="s3"># This is needed for posix glob compliance</span>
+        <span class="s0">if </span><span class="s1">withdirs </span><span class="s0">and </span><span class="s1">path != </span><span class="s2">&quot;&quot; </span><span class="s0">and await </span><span class="s1">self._isdir(path):</span>
+            <span class="s1">out[path] = </span><span class="s0">await </span><span class="s1">self._info(path)</span>
+
+        <span class="s3"># async for?</span>
+        <span class="s0">async for </span><span class="s1">_</span><span class="s0">, </span><span class="s1">dirs</span><span class="s0">, </span><span class="s1">files </span><span class="s0">in </span><span class="s1">self._walk(path</span><span class="s0">, </span><span class="s1">maxdepth</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+            <span class="s0">if </span><span class="s1">withdirs:</span>
+                <span class="s1">files.update(dirs)</span>
+            <span class="s1">out.update({info[</span><span class="s2">&quot;name&quot;</span><span class="s1">]: info </span><span class="s0">for </span><span class="s1">name</span><span class="s0">, </span><span class="s1">info </span><span class="s0">in </span><span class="s1">files.items()})</span>
+        <span class="s0">if not </span><span class="s1">out </span><span class="s0">and </span><span class="s1">(</span><span class="s0">await </span><span class="s1">self._isfile(path)):</span>
+            <span class="s3"># walk works on directories, but find should also return [path]</span>
+            <span class="s3"># when path happens to be a file</span>
+            <span class="s1">out[path] = {}</span>
+        <span class="s1">names = sorted(out)</span>
+        <span class="s0">if not </span><span class="s1">detail:</span>
+            <span class="s0">return </span><span class="s1">names</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">{name: out[name] </span><span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">names}</span>
+
+    <span class="s0">async def </span><span class="s1">_expand_path(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">maxdepth=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None and </span><span class="s1">maxdepth &lt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;maxdepth must be at least 1&quot;</span><span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">isinstance(path</span><span class="s0">, </span><span class="s1">str):</span>
+            <span class="s1">out = </span><span class="s0">await </span><span class="s1">self._expand_path([path]</span><span class="s0">, </span><span class="s1">recursive</span><span class="s0">, </span><span class="s1">maxdepth)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">out = set()</span>
+            <span class="s1">path = [self._strip_protocol(p) </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">path]</span>
+            <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">path:  </span><span class="s3"># can gather here</span>
+                <span class="s0">if </span><span class="s1">has_magic(p):</span>
+                    <span class="s1">bit = set(</span><span class="s0">await </span><span class="s1">self._glob(p</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth))</span>
+                    <span class="s1">out |= bit</span>
+                    <span class="s0">if </span><span class="s1">recursive:</span>
+                        <span class="s3"># glob call above expanded one depth so if maxdepth is defined</span>
+                        <span class="s3"># then decrement it in expand_path call below. If it is zero</span>
+                        <span class="s3"># after decrementing then avoid expand_path call.</span>
+                        <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None and </span><span class="s1">maxdepth &lt;= </span><span class="s5">1</span><span class="s1">:</span>
+                            <span class="s0">continue</span>
+                        <span class="s1">out |= set(</span>
+                            <span class="s0">await </span><span class="s1">self._expand_path(</span>
+                                <span class="s1">list(bit)</span><span class="s0">,</span>
+                                <span class="s1">recursive=recursive</span><span class="s0">,</span>
+                                <span class="s1">maxdepth=maxdepth - </span><span class="s5">1 </span><span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None else None,</span>
+                            <span class="s1">)</span>
+                        <span class="s1">)</span>
+                    <span class="s0">continue</span>
+                <span class="s0">elif </span><span class="s1">recursive:</span>
+                    <span class="s1">rec = set(</span><span class="s0">await </span><span class="s1">self._find(p</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth</span><span class="s0">, </span><span class="s1">withdirs=</span><span class="s0">True</span><span class="s1">))</span>
+                    <span class="s1">out |= rec</span>
+                <span class="s0">if </span><span class="s1">p </span><span class="s0">not in </span><span class="s1">out </span><span class="s0">and </span><span class="s1">(recursive </span><span class="s0">is False or </span><span class="s1">(</span><span class="s0">await </span><span class="s1">self._exists(p))):</span>
+                    <span class="s3"># should only check once, for the root</span>
+                    <span class="s1">out.add(p)</span>
+        <span class="s0">if not </span><span class="s1">out:</span>
+            <span class="s0">raise </span><span class="s1">FileNotFoundError(path)</span>
+        <span class="s0">return </span><span class="s1">sorted(out)</span>
+
+    <span class="s0">async def </span><span class="s1">_mkdir(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">create_parents=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+        <span class="s0">pass  </span><span class="s3"># not necessary to implement, may not have directories</span>
+
+    <span class="s0">async def </span><span class="s1">_makedirs(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s0">pass  </span><span class="s3"># not necessary to implement, may not have directories</span>
+
+    <span class="s0">async def </span><span class="s1">open_async(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">if </span><span class="s2">&quot;b&quot; </span><span class="s0">not in </span><span class="s1">mode </span><span class="s0">or </span><span class="s1">kwargs.get(</span><span class="s2">&quot;compression&quot;</span><span class="s1">):</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+
+<span class="s0">def </span><span class="s1">mirror_sync_methods(obj):</span>
+    <span class="s4">&quot;&quot;&quot;Populate sync and async methods for obj 
+ 
+    For each method will create a sync version if the name refers to an async method 
+    (coroutine) and there is no override in the child class; will create an async 
+    method for the corresponding sync method if there is no implementation. 
+ 
+    Uses the methods specified in 
+    - async_methods: the set that an implementation is expected to provide 
+    - default_async_methods: that can be derived from their sync version in 
+      AbstractFileSystem 
+    - AsyncFileSystem: async-specific default coroutines 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">fsspec </span><span class="s0">import </span><span class="s1">AbstractFileSystem</span>
+
+    <span class="s0">for </span><span class="s1">method </span><span class="s0">in </span><span class="s1">async_methods + dir(AsyncFileSystem):</span>
+        <span class="s0">if not </span><span class="s1">method.startswith(</span><span class="s2">&quot;_&quot;</span><span class="s1">):</span>
+            <span class="s0">continue</span>
+        <span class="s1">smethod = method[</span><span class="s5">1</span><span class="s1">:]</span>
+        <span class="s0">if </span><span class="s1">private.match(method):</span>
+            <span class="s1">isco = inspect.iscoroutinefunction(getattr(obj</span><span class="s0">, </span><span class="s1">method</span><span class="s0">, None</span><span class="s1">))</span>
+            <span class="s1">unsync = getattr(getattr(obj</span><span class="s0">, </span><span class="s1">smethod</span><span class="s0">, False</span><span class="s1">)</span><span class="s0">, </span><span class="s2">&quot;__func__&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+            <span class="s1">is_default = unsync </span><span class="s0">is </span><span class="s1">getattr(AbstractFileSystem</span><span class="s0">, </span><span class="s1">smethod</span><span class="s0">, </span><span class="s2">&quot;&quot;</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">isco </span><span class="s0">and </span><span class="s1">is_default:</span>
+                <span class="s1">mth = sync_wrapper(getattr(obj</span><span class="s0">, </span><span class="s1">method)</span><span class="s0">, </span><span class="s1">obj=obj)</span>
+                <span class="s1">setattr(obj</span><span class="s0">, </span><span class="s1">smethod</span><span class="s0">, </span><span class="s1">mth)</span>
+                <span class="s0">if not </span><span class="s1">mth.__doc__:</span>
+                    <span class="s1">mth.__doc__ = getattr(</span>
+                        <span class="s1">getattr(AbstractFileSystem</span><span class="s0">, </span><span class="s1">smethod</span><span class="s0">, None</span><span class="s1">)</span><span class="s0">, </span><span class="s2">&quot;__doc__&quot;</span><span class="s0">, </span><span class="s2">&quot;&quot;</span>
+                    <span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">FSSpecCoroutineCancel(Exception):</span>
+    <span class="s0">pass</span>
+
+
+<span class="s0">def </span><span class="s1">_dump_running_tasks(</span>
+    <span class="s1">printout=</span><span class="s0">True, </span><span class="s1">cancel=</span><span class="s0">True, </span><span class="s1">exc=FSSpecCoroutineCancel</span><span class="s0">, </span><span class="s1">with_task=</span><span class="s0">False</span>
+<span class="s1">):</span>
+    <span class="s0">import </span><span class="s1">traceback</span>
+
+    <span class="s1">tasks = [t </span><span class="s0">for </span><span class="s1">t </span><span class="s0">in </span><span class="s1">asyncio.tasks.all_tasks(loop[</span><span class="s5">0</span><span class="s1">]) </span><span class="s0">if not </span><span class="s1">t.done()]</span>
+    <span class="s0">if </span><span class="s1">printout:</span>
+        <span class="s1">[task.print_stack() </span><span class="s0">for </span><span class="s1">task </span><span class="s0">in </span><span class="s1">tasks]</span>
+    <span class="s1">out = [</span>
+        <span class="s1">{</span>
+            <span class="s2">&quot;locals&quot;</span><span class="s1">: task._coro.cr_frame.f_locals</span><span class="s0">,</span>
+            <span class="s2">&quot;file&quot;</span><span class="s1">: task._coro.cr_frame.f_code.co_filename</span><span class="s0">,</span>
+            <span class="s2">&quot;firstline&quot;</span><span class="s1">: task._coro.cr_frame.f_code.co_firstlineno</span><span class="s0">,</span>
+            <span class="s2">&quot;linelo&quot;</span><span class="s1">: task._coro.cr_frame.f_lineno</span><span class="s0">,</span>
+            <span class="s2">&quot;stack&quot;</span><span class="s1">: traceback.format_stack(task._coro.cr_frame)</span><span class="s0">,</span>
+            <span class="s2">&quot;task&quot;</span><span class="s1">: task </span><span class="s0">if </span><span class="s1">with_task </span><span class="s0">else None,</span>
+        <span class="s1">}</span>
+        <span class="s0">for </span><span class="s1">task </span><span class="s0">in </span><span class="s1">tasks</span>
+    <span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">cancel:</span>
+        <span class="s0">for </span><span class="s1">t </span><span class="s0">in </span><span class="s1">tasks:</span>
+            <span class="s1">cbs = t._callbacks</span>
+            <span class="s1">t.cancel()</span>
+            <span class="s1">asyncio.futures.Future.set_exception(t</span><span class="s0">, </span><span class="s1">exc)</span>
+            <span class="s1">asyncio.futures.Future.cancel(t)</span>
+            <span class="s1">[cb[</span><span class="s5">0</span><span class="s1">](t) </span><span class="s0">for </span><span class="s1">cb </span><span class="s0">in </span><span class="s1">cbs]  </span><span class="s3"># cancels any dependent concurrent.futures</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">t._coro.throw(exc)  </span><span class="s3"># exits coro, unless explicitly handled</span>
+            <span class="s0">except </span><span class="s1">exc:</span>
+                <span class="s0">pass</span>
+    <span class="s0">return </span><span class="s1">out</span>
+
+
+<span class="s0">class </span><span class="s1">AbstractAsyncStreamedFile(AbstractBufferedFile):</span>
+    <span class="s3"># no read buffering, and always auto-commit</span>
+    <span class="s3"># TODO: readahead might still be useful here, but needs async version</span>
+
+    <span class="s0">async def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">length=-</span><span class="s5">1</span><span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Return data from cache, or fetch pieces as necessary 
+ 
+        Parameters 
+        ---------- 
+        length: int (-1) 
+            Number of bytes to read; if &lt;0, all remaining bytes. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">length = -</span><span class="s5">1 </span><span class="s0">if </span><span class="s1">length </span><span class="s0">is None else </span><span class="s1">int(length)</span>
+        <span class="s0">if </span><span class="s1">self.mode != </span><span class="s2">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;File not in read mode&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">length &lt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">length = self.size - self.loc</span>
+        <span class="s0">if </span><span class="s1">self.closed:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;I/O operation on closed file.&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">length == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s3"># don't even bother calling fetch</span>
+            <span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+        <span class="s1">out = </span><span class="s0">await </span><span class="s1">self._fetch_range(self.loc</span><span class="s0">, </span><span class="s1">self.loc + length)</span>
+        <span class="s1">self.loc += len(out)</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">async def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">data):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Write data to buffer. 
+ 
+        Buffer only sent on flush() or if buffer is greater than 
+        or equal to blocksize. 
+ 
+        Parameters 
+        ---------- 
+        data: bytes 
+            Set of bytes to be written. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self.mode </span><span class="s0">not in </span><span class="s1">{</span><span class="s2">&quot;wb&quot;</span><span class="s0">, </span><span class="s2">&quot;ab&quot;</span><span class="s1">}:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;File not in write mode&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.closed:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;I/O operation on closed file.&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.forced:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;This file has been force-flushed, can only close&quot;</span><span class="s1">)</span>
+        <span class="s1">out = self.buffer.write(data)</span>
+        <span class="s1">self.loc += out</span>
+        <span class="s0">if </span><span class="s1">self.buffer.tell() &gt;= self.blocksize:</span>
+            <span class="s0">await </span><span class="s1">self.flush()</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">async def </span><span class="s1">close(self):</span>
+        <span class="s4">&quot;&quot;&quot;Close file 
+ 
+        Finalizes writes, discards cache 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">getattr(self</span><span class="s0">, </span><span class="s2">&quot;_unclosable&quot;</span><span class="s0">, False</span><span class="s1">):</span>
+            <span class="s0">return</span>
+        <span class="s0">if </span><span class="s1">self.closed:</span>
+            <span class="s0">return</span>
+        <span class="s0">if </span><span class="s1">self.mode == </span><span class="s2">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s1">self.cache = </span><span class="s0">None</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">if not </span><span class="s1">self.forced:</span>
+                <span class="s0">await </span><span class="s1">self.flush(force=</span><span class="s0">True</span><span class="s1">)</span>
+
+            <span class="s0">if </span><span class="s1">self.fs </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">self.fs.invalidate_cache(self.path)</span>
+                <span class="s1">self.fs.invalidate_cache(self.fs._parent(self.path))</span>
+
+        <span class="s1">self.closed = </span><span class="s0">True</span>
+
+    <span class="s0">async def </span><span class="s1">flush(self</span><span class="s0">, </span><span class="s1">force=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">self.closed:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Flush on closed file&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">force </span><span class="s0">and </span><span class="s1">self.forced:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Force flush cannot be called more than once&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">force:</span>
+            <span class="s1">self.forced = </span><span class="s0">True</span>
+
+        <span class="s0">if </span><span class="s1">self.mode </span><span class="s0">not in </span><span class="s1">{</span><span class="s2">&quot;wb&quot;</span><span class="s0">, </span><span class="s2">&quot;ab&quot;</span><span class="s1">}:</span>
+            <span class="s3"># no-op to flush on read-mode</span>
+            <span class="s0">return</span>
+
+        <span class="s0">if not </span><span class="s1">force </span><span class="s0">and </span><span class="s1">self.buffer.tell() &lt; self.blocksize:</span>
+            <span class="s3"># Defer write on small block</span>
+            <span class="s0">return</span>
+
+        <span class="s0">if </span><span class="s1">self.offset </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s3"># Initialize a multipart upload</span>
+            <span class="s1">self.offset = </span><span class="s5">0</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s0">await </span><span class="s1">self._initiate_upload()</span>
+            <span class="s0">except</span><span class="s1">:  </span><span class="s3"># noqa: E722</span>
+                <span class="s1">self.closed = </span><span class="s0">True</span>
+                <span class="s0">raise</span>
+
+        <span class="s0">if await </span><span class="s1">self._upload_chunk(final=force) </span><span class="s0">is not False</span><span class="s1">:</span>
+            <span class="s1">self.offset += self.buffer.seek(</span><span class="s5">0</span><span class="s0">, </span><span class="s5">2</span><span class="s1">)</span>
+            <span class="s1">self.buffer = io.BytesIO()</span>
+
+    <span class="s0">async def </span><span class="s1">__aenter__(self):</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">async def </span><span class="s1">__aexit__(self</span><span class="s0">, </span><span class="s1">exc_type</span><span class="s0">, </span><span class="s1">exc_val</span><span class="s0">, </span><span class="s1">exc_tb):</span>
+        <span class="s0">await </span><span class="s1">self.close()</span>
+
+    <span class="s0">async def </span><span class="s1">_fetch_range(self</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">end):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">async def </span><span class="s1">_initiate_upload(self):</span>
+        <span class="s0">pass</span>
+
+    <span class="s0">async def </span><span class="s1">_upload_chunk(self</span><span class="s0">, </span><span class="s1">final=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,1166 @@
+<html>
+<head>
+<title>shuffle.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6897bb;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #808080;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+shuffle.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">contextlib</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">math</span>
+<span class="s0">import </span><span class="s1">shutil</span>
+<span class="s0">import </span><span class="s1">tempfile</span>
+<span class="s0">import </span><span class="s1">uuid</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+<span class="s0">from </span><span class="s1">collections.abc </span><span class="s0">import </span><span class="s1">Callable</span><span class="s0">, </span><span class="s1">Mapping</span><span class="s0">, </span><span class="s1">Sequence</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">Any</span><span class="s0">, </span><span class="s1">Literal</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">pandas </span><span class="s0">as </span><span class="s1">pd</span>
+<span class="s0">import </span><span class="s1">tlz </span><span class="s0">as </span><span class="s1">toolz</span>
+<span class="s0">from </span><span class="s1">pandas.api.types </span><span class="s0">import </span><span class="s1">is_numeric_dtype</span>
+
+<span class="s0">from </span><span class="s1">dask </span><span class="s0">import </span><span class="s1">config</span>
+<span class="s0">from </span><span class="s1">dask.base </span><span class="s0">import </span><span class="s1">compute</span><span class="s0">, </span><span class="s1">compute_as_if_collection</span><span class="s0">, </span><span class="s1">is_dask_collection</span><span class="s0">, </span><span class="s1">tokenize</span>
+<span class="s0">from </span><span class="s1">dask.dataframe </span><span class="s0">import </span><span class="s1">methods</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.core </span><span class="s0">import </span><span class="s1">DataFrame</span><span class="s0">, </span><span class="s1">Series</span><span class="s0">, </span><span class="s1">_Frame</span><span class="s0">, </span><span class="s1">map_partitions</span><span class="s0">, </span><span class="s1">new_dd_object</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.dispatch </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">group_split_dispatch</span><span class="s0">,</span>
+    <span class="s1">hash_object_dispatch</span><span class="s0">,</span>
+    <span class="s1">partd_encode_dispatch</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.utils </span><span class="s0">import </span><span class="s1">UNKNOWN_CATEGORIES</span>
+<span class="s0">from </span><span class="s1">dask.highlevelgraph </span><span class="s0">import </span><span class="s1">HighLevelGraph</span>
+<span class="s0">from </span><span class="s1">dask.layers </span><span class="s0">import </span><span class="s1">ShuffleLayer</span><span class="s0">, </span><span class="s1">SimpleShuffleLayer</span>
+<span class="s0">from </span><span class="s1">dask.sizeof </span><span class="s0">import </span><span class="s1">sizeof</span>
+<span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">M</span><span class="s0">, </span><span class="s1">digit</span><span class="s0">, </span><span class="s1">get_default_shuffle_method</span>
+
+<span class="s1">logger = logging.getLogger(__name__)</span>
+
+
+<span class="s0">def </span><span class="s1">_calculate_divisions(</span>
+    <span class="s1">df: DataFrame</span><span class="s0">,</span>
+    <span class="s1">partition_col: Series</span><span class="s0">,</span>
+    <span class="s1">repartition: bool</span><span class="s0">,</span>
+    <span class="s1">npartitions: int</span><span class="s0">,</span>
+    <span class="s1">upsample: float = </span><span class="s2">1.0</span><span class="s0">,</span>
+    <span class="s1">partition_size: float = </span><span class="s2">128e6</span><span class="s0">,</span>
+    <span class="s1">ascending: bool = </span><span class="s0">True,</span>
+<span class="s1">) -&gt; tuple[list</span><span class="s0">, </span><span class="s1">list</span><span class="s0">, </span><span class="s1">list</span><span class="s0">, </span><span class="s1">bool]:</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Utility function to calculate divisions for calls to `map_partitions` 
+    &quot;&quot;&quot;</span>
+    <span class="s1">sizes = df.map_partitions(sizeof) </span><span class="s0">if </span><span class="s1">repartition </span><span class="s0">else </span><span class="s1">[]</span>
+    <span class="s1">divisions = partition_col._repartition_quantiles(npartitions</span><span class="s0">, </span><span class="s1">upsample=upsample)</span>
+    <span class="s1">mins = partition_col.map_partitions(M.min)</span>
+    <span class="s1">maxes = partition_col.map_partitions(M.max)</span>
+
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">divisions</span><span class="s0">, </span><span class="s1">sizes</span><span class="s0">, </span><span class="s1">mins</span><span class="s0">, </span><span class="s1">maxes = compute(divisions</span><span class="s0">, </span><span class="s1">sizes</span><span class="s0">, </span><span class="s1">mins</span><span class="s0">, </span><span class="s1">maxes)</span>
+    <span class="s0">except </span><span class="s1">TypeError </span><span class="s0">as </span><span class="s1">e:</span>
+        <span class="s4"># When there are nulls and a column is non-numeric, a TypeError is sometimes raised as a result of</span>
+        <span class="s4"># 1) computing mins/maxes above, 2) every null being switched to NaN, and 3) NaN being a float.</span>
+        <span class="s4"># Also, Pandas ExtensionDtypes may cause TypeErrors when dealing with special nulls such as pd.NaT or pd.NA.</span>
+        <span class="s4"># If this happens, we hint the user about eliminating nulls beforehand.</span>
+        <span class="s0">if not </span><span class="s1">is_numeric_dtype(partition_col.dtype):</span>
+            <span class="s1">obj</span><span class="s0">, </span><span class="s1">suggested_method = (</span>
+                <span class="s1">(</span><span class="s5">&quot;column&quot;</span><span class="s0">, </span><span class="s5">f&quot;`.dropna(subset=['</span><span class="s0">{</span><span class="s1">partition_col.name</span><span class="s0">}</span><span class="s5">'])`&quot;</span><span class="s1">)</span>
+                <span class="s0">if </span><span class="s1">any(partition_col._name == df[c]._name </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">df)</span>
+                <span class="s0">else </span><span class="s1">(</span><span class="s5">&quot;series&quot;</span><span class="s0">, </span><span class="s5">&quot;`.loc[series[~series.isna()]]`&quot;</span><span class="s1">)</span>
+            <span class="s1">)</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError(</span>
+                <span class="s5">f&quot;Divisions calculation failed for non-numeric </span><span class="s0">{</span><span class="s1">obj</span><span class="s0">} </span><span class="s5">'</span><span class="s0">{</span><span class="s1">partition_col.name</span><span class="s0">}</span><span class="s5">'.</span><span class="s0">\n</span><span class="s5">&quot;</span>
+                <span class="s5">f&quot;This is probably due to the presence of nulls, which Dask does not entirely support in the index.</span><span class="s0">\n</span><span class="s5">&quot;</span>
+                <span class="s5">f&quot;We suggest you try with </span><span class="s0">{</span><span class="s1">suggested_method</span><span class="s0">}</span><span class="s5">.&quot;</span>
+            <span class="s1">) </span><span class="s0">from </span><span class="s1">e</span>
+        <span class="s4"># For numeric types there shouldn't be problems with nulls, so we raise as-it-is this particular TypeError</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">e</span>
+
+    <span class="s1">empty_dataframe_detected = pd.isna(divisions).all()</span>
+    <span class="s0">if </span><span class="s1">repartition </span><span class="s0">or </span><span class="s1">empty_dataframe_detected:</span>
+        <span class="s1">total = sum(sizes)</span>
+        <span class="s1">npartitions = max(math.ceil(total / partition_size)</span><span class="s0">, </span><span class="s2">1</span><span class="s1">)</span>
+        <span class="s1">npartitions = min(npartitions</span><span class="s0">, </span><span class="s1">df.npartitions)</span>
+        <span class="s1">n = divisions.size</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">divisions = np.interp(</span>
+                <span class="s1">x=np.linspace(</span><span class="s2">0</span><span class="s0">, </span><span class="s1">n - </span><span class="s2">1</span><span class="s0">, </span><span class="s1">npartitions + </span><span class="s2">1</span><span class="s1">)</span><span class="s0">,</span>
+                <span class="s1">xp=np.linspace(</span><span class="s2">0</span><span class="s0">, </span><span class="s1">n - </span><span class="s2">1</span><span class="s0">, </span><span class="s1">n)</span><span class="s0">,</span>
+                <span class="s1">fp=divisions.tolist()</span><span class="s0">,</span>
+            <span class="s1">).tolist()</span>
+        <span class="s0">except </span><span class="s1">(TypeError</span><span class="s0">, </span><span class="s1">ValueError):  </span><span class="s4"># str type</span>
+            <span class="s1">indexes = np.linspace(</span><span class="s2">0</span><span class="s0">, </span><span class="s1">n - </span><span class="s2">1</span><span class="s0">, </span><span class="s1">npartitions + </span><span class="s2">1</span><span class="s1">).astype(int)</span>
+            <span class="s1">divisions = divisions.iloc[indexes].tolist()</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s4"># Drop duplicate divisions returned by partition quantiles</span>
+        <span class="s1">n = divisions.size</span>
+        <span class="s1">divisions = (</span>
+            <span class="s1">list(divisions.iloc[: n - </span><span class="s2">1</span><span class="s1">].unique()) + divisions.iloc[n - </span><span class="s2">1 </span><span class="s1">:].tolist()</span>
+        <span class="s1">)</span>
+
+    <span class="s1">mins = mins.bfill()</span>
+    <span class="s1">maxes = maxes.bfill()</span>
+    <span class="s0">if </span><span class="s1">isinstance(partition_col.dtype</span><span class="s0">, </span><span class="s1">pd.CategoricalDtype):</span>
+        <span class="s1">dtype = partition_col.dtype</span>
+        <span class="s1">mins = mins.astype(dtype)</span>
+        <span class="s1">maxes = maxes.astype(dtype)</span>
+
+    <span class="s0">if </span><span class="s1">mins.isna().any() </span><span class="s0">or </span><span class="s1">maxes.isna().any():</span>
+        <span class="s1">presorted = </span><span class="s0">False</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">n = mins.size</span>
+        <span class="s1">maxes2 = (maxes.iloc[: n - </span><span class="s2">1</span><span class="s1">] </span><span class="s0">if </span><span class="s1">ascending </span><span class="s0">else </span><span class="s1">maxes.iloc[</span><span class="s2">1</span><span class="s1">:]).reset_index(</span>
+            <span class="s1">drop=</span><span class="s0">True</span>
+        <span class="s1">)</span>
+        <span class="s1">mins2 = (mins.iloc[</span><span class="s2">1</span><span class="s1">:] </span><span class="s0">if </span><span class="s1">ascending </span><span class="s0">else </span><span class="s1">mins.iloc[: n - </span><span class="s2">1</span><span class="s1">]).reset_index(</span>
+            <span class="s1">drop=</span><span class="s0">True</span>
+        <span class="s1">)</span>
+        <span class="s1">presorted = (</span>
+            <span class="s1">mins.tolist() == mins.sort_values(ascending=ascending).tolist()</span>
+            <span class="s0">and </span><span class="s1">maxes.tolist() == maxes.sort_values(ascending=ascending).tolist()</span>
+            <span class="s0">and </span><span class="s1">(maxes2 &lt; mins2).all()</span>
+        <span class="s1">)</span>
+
+    <span class="s0">return </span><span class="s1">divisions</span><span class="s0">, </span><span class="s1">mins.tolist()</span><span class="s0">, </span><span class="s1">maxes.tolist()</span><span class="s0">, </span><span class="s1">presorted</span>
+
+
+<span class="s0">def </span><span class="s1">sort_values(</span>
+    <span class="s1">df: DataFrame</span><span class="s0">,</span>
+    <span class="s1">by: str | list[str]</span><span class="s0">,</span>
+    <span class="s1">npartitions: int | Literal[</span><span class="s5">&quot;auto&quot;</span><span class="s1">] | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">shuffle: str | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">ascending: bool | list[bool] = </span><span class="s0">True,</span>
+    <span class="s1">na_position: Literal[</span><span class="s5">&quot;first&quot;</span><span class="s1">] | Literal[</span><span class="s5">&quot;last&quot;</span><span class="s1">] = </span><span class="s5">&quot;last&quot;</span><span class="s0">,</span>
+    <span class="s1">upsample: float = </span><span class="s2">1.0</span><span class="s0">,</span>
+    <span class="s1">partition_size: float = </span><span class="s2">128e6</span><span class="s0">,</span>
+    <span class="s1">sort_function: Callable[[pd.DataFrame]</span><span class="s0">, </span><span class="s1">pd.DataFrame] | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">sort_function_kwargs: Mapping[str</span><span class="s0">, </span><span class="s1">Any] | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+<span class="s1">) -&gt; DataFrame:</span>
+    <span class="s3">&quot;&quot;&quot;See DataFrame.sort_values for docstring&quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">na_position </span><span class="s0">not in </span><span class="s1">(</span><span class="s5">&quot;first&quot;</span><span class="s0">, </span><span class="s5">&quot;last&quot;</span><span class="s1">):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;na_position must be either 'first' or 'last'&quot;</span><span class="s1">)</span>
+    <span class="s0">if not </span><span class="s1">isinstance(by</span><span class="s0">, </span><span class="s1">list):</span>
+        <span class="s1">by = [by]</span>
+    <span class="s0">if </span><span class="s1">any(</span><span class="s0">not </span><span class="s1">isinstance(b</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">for </span><span class="s1">b </span><span class="s0">in </span><span class="s1">by):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError(</span>
+            <span class="s5">&quot;Dataframes only support sorting by named columns which must be passed as a &quot;</span>
+            <span class="s5">&quot;string or a list of strings.</span><span class="s0">\n</span><span class="s5">&quot;</span>
+            <span class="s5">&quot;You passed %s&quot; </span><span class="s1">% str(by)</span>
+        <span class="s1">)</span>
+
+    <span class="s1">sort_kwargs = {</span>
+        <span class="s5">&quot;by&quot;</span><span class="s1">: by</span><span class="s0">,</span>
+        <span class="s5">&quot;ascending&quot;</span><span class="s1">: ascending</span><span class="s0">,</span>
+        <span class="s5">&quot;na_position&quot;</span><span class="s1">: na_position</span><span class="s0">,</span>
+    <span class="s1">}</span>
+    <span class="s0">if </span><span class="s1">sort_function </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">sort_function = M.sort_values</span>
+    <span class="s0">if </span><span class="s1">sort_function_kwargs </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s1">sort_kwargs.update(sort_function_kwargs)</span>
+
+    <span class="s0">if </span><span class="s1">df.npartitions == </span><span class="s2">1</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">df.map_partitions(sort_function</span><span class="s0">, </span><span class="s1">**sort_kwargs)</span>
+
+    <span class="s0">if </span><span class="s1">npartitions == </span><span class="s5">&quot;auto&quot;</span><span class="s1">:</span>
+        <span class="s1">repartition = </span><span class="s0">True</span>
+        <span class="s1">npartitions = max(</span><span class="s2">100</span><span class="s0">, </span><span class="s1">df.npartitions)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">npartitions </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">npartitions = df.npartitions</span>
+        <span class="s1">repartition = </span><span class="s0">False</span>
+
+    <span class="s1">sort_by_col = df[by[</span><span class="s2">0</span><span class="s1">]]</span>
+
+    <span class="s0">if not </span><span class="s1">isinstance(ascending</span><span class="s0">, </span><span class="s1">bool):</span>
+        <span class="s4"># support [True] as input</span>
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">isinstance(ascending</span><span class="s0">, </span><span class="s1">list)</span>
+            <span class="s0">and </span><span class="s1">len(ascending) == </span><span class="s2">1</span>
+            <span class="s0">and </span><span class="s1">isinstance(ascending[</span><span class="s2">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">bool)</span>
+        <span class="s1">):</span>
+            <span class="s1">ascending = ascending[</span><span class="s2">0</span><span class="s1">]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError(</span>
+                <span class="s5">f&quot;Dask currently only supports a single boolean for ascending. You passed </span><span class="s0">{</span><span class="s1">str(ascending)</span><span class="s0">}</span><span class="s5">&quot;</span>
+            <span class="s1">)</span>
+
+    <span class="s1">divisions</span><span class="s0">, </span><span class="s1">_</span><span class="s0">, </span><span class="s1">_</span><span class="s0">, </span><span class="s1">presorted = _calculate_divisions(</span>
+        <span class="s1">df</span><span class="s0">, </span><span class="s1">sort_by_col</span><span class="s0">, </span><span class="s1">repartition</span><span class="s0">, </span><span class="s1">npartitions</span><span class="s0">, </span><span class="s1">upsample</span><span class="s0">, </span><span class="s1">partition_size</span><span class="s0">, </span><span class="s1">ascending</span>
+    <span class="s1">)</span>
+
+    <span class="s0">if </span><span class="s1">len(divisions) == </span><span class="s2">2</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">df.repartition(npartitions=</span><span class="s2">1</span><span class="s1">).map_partitions(</span>
+            <span class="s1">sort_function</span><span class="s0">, </span><span class="s1">**sort_kwargs</span>
+        <span class="s1">)</span>
+
+    <span class="s0">if </span><span class="s1">presorted </span><span class="s0">and </span><span class="s1">npartitions == df.npartitions:</span>
+        <span class="s4"># divisions are in the right place</span>
+        <span class="s0">return </span><span class="s1">df.map_partitions(sort_function</span><span class="s0">, </span><span class="s1">**sort_kwargs)</span>
+
+    <span class="s1">df = rearrange_by_divisions(</span>
+        <span class="s1">df</span><span class="s0">,</span>
+        <span class="s1">by[</span><span class="s2">0</span><span class="s1">]</span><span class="s0">,</span>
+        <span class="s1">divisions</span><span class="s0">,</span>
+        <span class="s1">shuffle=shuffle</span><span class="s0">,</span>
+        <span class="s1">ascending=ascending</span><span class="s0">,</span>
+        <span class="s1">na_position=na_position</span><span class="s0">,</span>
+        <span class="s1">duplicates=</span><span class="s0">False,</span>
+    <span class="s1">)</span>
+    <span class="s1">df = df.map_partitions(sort_function</span><span class="s0">, </span><span class="s1">**sort_kwargs)</span>
+    <span class="s0">return </span><span class="s1">df</span>
+
+
+<span class="s0">def </span><span class="s1">set_index(</span>
+    <span class="s1">df: DataFrame</span><span class="s0">,</span>
+    <span class="s1">index: str | Series</span><span class="s0">,</span>
+    <span class="s1">npartitions: int | Literal[</span><span class="s5">&quot;auto&quot;</span><span class="s1">] | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">shuffle: str | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">compute: bool = </span><span class="s0">False,</span>
+    <span class="s1">drop: bool = </span><span class="s0">True,</span>
+    <span class="s1">upsample: float = </span><span class="s2">1.0</span><span class="s0">,</span>
+    <span class="s1">divisions: Sequence | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">partition_size: float = </span><span class="s2">128e6</span><span class="s0">,</span>
+    <span class="s1">sort: bool = </span><span class="s0">True,</span>
+    <span class="s1">**kwargs</span><span class="s0">,</span>
+<span class="s1">) -&gt; DataFrame:</span>
+    <span class="s3">&quot;&quot;&quot;See _Frame.set_index for docstring&quot;&quot;&quot;</span>
+    <span class="s0">if not </span><span class="s1">sort:</span>
+        <span class="s0">return </span><span class="s1">df.map_partitions(</span>
+            <span class="s1">M.set_index</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">align_dataframes=</span><span class="s0">False, </span><span class="s1">drop=drop</span><span class="s0">, </span><span class="s1">**kwargs</span>
+        <span class="s1">).clear_divisions()</span>
+
+    <span class="s0">if </span><span class="s1">npartitions == </span><span class="s5">&quot;auto&quot;</span><span class="s1">:</span>
+        <span class="s1">repartition = </span><span class="s0">True</span>
+        <span class="s1">npartitions = max(</span><span class="s2">100</span><span class="s0">, </span><span class="s1">df.npartitions)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">npartitions </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">npartitions = df.npartitions</span>
+        <span class="s1">repartition = </span><span class="s0">False</span>
+
+    <span class="s0">if not </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">Series):</span>
+        <span class="s1">index2 = df[index]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">index2 = index</span>
+
+    <span class="s0">if </span><span class="s1">divisions </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">divisions</span><span class="s0">, </span><span class="s1">mins</span><span class="s0">, </span><span class="s1">maxes</span><span class="s0">, </span><span class="s1">presorted = _calculate_divisions(</span>
+            <span class="s1">df</span><span class="s0">, </span><span class="s1">index2</span><span class="s0">, </span><span class="s1">repartition</span><span class="s0">, </span><span class="s1">npartitions</span><span class="s0">, </span><span class="s1">upsample</span><span class="s0">, </span><span class="s1">partition_size</span>
+        <span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">presorted </span><span class="s0">and </span><span class="s1">npartitions == df.npartitions:</span>
+            <span class="s1">divisions = mins + [maxes[-</span><span class="s2">1</span><span class="s1">]]</span>
+            <span class="s1">result = set_sorted_index(df</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">drop=drop</span><span class="s0">, </span><span class="s1">divisions=divisions)</span>
+            <span class="s0">return </span><span class="s1">result.map_partitions(M.sort_index)</span>
+
+    <span class="s0">return </span><span class="s1">set_partition(</span>
+        <span class="s1">df</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">divisions</span><span class="s0">, </span><span class="s1">shuffle=shuffle</span><span class="s0">, </span><span class="s1">drop=drop</span><span class="s0">, </span><span class="s1">compute=compute</span><span class="s0">, </span><span class="s1">**kwargs</span>
+    <span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">set_partition(</span>
+    <span class="s1">df: DataFrame</span><span class="s0">,</span>
+    <span class="s1">index: str | Series</span><span class="s0">,</span>
+    <span class="s1">divisions: Sequence</span><span class="s0">,</span>
+    <span class="s1">max_branch: int = </span><span class="s2">32</span><span class="s0">,</span>
+    <span class="s1">drop: bool = </span><span class="s0">True,</span>
+    <span class="s1">shuffle: str | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">compute: bool | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+<span class="s1">) -&gt; DataFrame:</span>
+    <span class="s3">&quot;&quot;&quot;Group DataFrame by index 
+ 
+    Sets a new index and partitions data along that index according to 
+    divisions.  Divisions are often found by computing approximate quantiles. 
+    The function ``set_index`` will do both of these steps. 
+ 
+    Parameters 
+    ---------- 
+    df: DataFrame/Series 
+        Data that we want to re-partition 
+    index: string or Series 
+        Column to become the new index 
+    divisions: list 
+        Values to form new divisions between partitions 
+    drop: bool, default True 
+        Whether to delete columns to be used as the new index 
+    shuffle: str (optional) 
+        Either 'disk' for an on-disk shuffle or 'tasks' to use the task 
+        scheduling framework.  Use 'disk' if you are on a single machine 
+        and 'tasks' if you are on a distributed cluster. 
+    max_branch: int (optional) 
+        If using the task-based shuffle, the amount of splitting each 
+        partition undergoes.  Increase this for fewer copies but more 
+        scheduler overhead. 
+ 
+    See Also 
+    -------- 
+    set_index 
+    shuffle 
+    partd 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">isinstance(divisions</span><span class="s0">, </span><span class="s1">tuple):</span>
+        <span class="s4"># pd.isna considers tuples to be scalars. Convert to a list.</span>
+        <span class="s1">divisions = list(divisions)</span>
+
+    <span class="s0">if not </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">Series):</span>
+        <span class="s1">dtype = df[index].dtype</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">dtype = index.dtype</span>
+
+    <span class="s0">if </span><span class="s1">pd.isna(divisions).any() </span><span class="s0">and </span><span class="s1">pd.api.types.is_integer_dtype(dtype):</span>
+        <span class="s4"># Can't construct a Series[int64] when any / all of the divisions are NaN.</span>
+        <span class="s1">divisions = df._meta._constructor_sliced(divisions)</span>
+    <span class="s0">elif </span><span class="s1">(</span>
+        <span class="s1">isinstance(dtype</span><span class="s0">, </span><span class="s1">pd.CategoricalDtype)</span>
+        <span class="s0">and </span><span class="s1">UNKNOWN_CATEGORIES </span><span class="s0">in </span><span class="s1">dtype.categories</span>
+    <span class="s1">):</span>
+        <span class="s4"># If categories are unknown, leave as a string dtype instead.</span>
+        <span class="s1">divisions = df._meta._constructor_sliced(divisions)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">divisions = df._meta._constructor_sliced(divisions</span><span class="s0">, </span><span class="s1">dtype=dtype)</span>
+
+    <span class="s1">meta = df._meta._constructor_sliced([</span><span class="s2">0</span><span class="s1">])</span>
+    <span class="s4"># Ensure that we have the same index as before to avoid alignment</span>
+    <span class="s4"># when calculating meta dtypes later on</span>
+    <span class="s1">meta.index = df._meta_nonempty.index[:</span><span class="s2">1</span><span class="s1">]</span>
+
+    <span class="s0">if not </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">Series):</span>
+        <span class="s1">partitions = df[index].map_partitions(</span>
+            <span class="s1">set_partitions_pre</span><span class="s0">, </span><span class="s1">divisions=divisions</span><span class="s0">, </span><span class="s1">meta=meta</span>
+        <span class="s1">)</span>
+        <span class="s1">df2 = df.assign(_partitions=partitions)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">partitions = index.map_partitions(</span>
+            <span class="s1">set_partitions_pre</span><span class="s0">, </span><span class="s1">divisions=divisions</span><span class="s0">, </span><span class="s1">meta=meta</span>
+        <span class="s1">)</span>
+        <span class="s1">df2 = df.assign(_partitions=partitions</span><span class="s0">, </span><span class="s1">_index=index)</span>
+
+    <span class="s1">df3 = rearrange_by_column(</span>
+        <span class="s1">df2</span><span class="s0">,</span>
+        <span class="s5">&quot;_partitions&quot;</span><span class="s0">,</span>
+        <span class="s1">max_branch=max_branch</span><span class="s0">,</span>
+        <span class="s1">npartitions=len(divisions) - </span><span class="s2">1</span><span class="s0">,</span>
+        <span class="s1">shuffle=shuffle</span><span class="s0">,</span>
+        <span class="s1">compute=compute</span><span class="s0">,</span>
+        <span class="s1">ignore_index=</span><span class="s0">True,</span>
+    <span class="s1">)</span>
+
+    <span class="s0">if not </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">Series):</span>
+        <span class="s1">df4 = df3.map_partitions(</span>
+            <span class="s1">set_index_post_scalar</span><span class="s0">,</span>
+            <span class="s1">index_name=index</span><span class="s0">,</span>
+            <span class="s1">drop=drop</span><span class="s0">,</span>
+            <span class="s1">column_dtype=df.columns.dtype</span><span class="s0">,</span>
+        <span class="s1">)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">df4 = df3.map_partitions(</span>
+            <span class="s1">set_index_post_series</span><span class="s0">,</span>
+            <span class="s1">index_name=index.name</span><span class="s0">,</span>
+            <span class="s1">drop=drop</span><span class="s0">,</span>
+            <span class="s1">column_dtype=df.columns.dtype</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s1">divisions = methods.tolist(divisions)</span>
+    <span class="s4"># None and pd.NA values are not sortable</span>
+    <span class="s1">df4.divisions = tuple(i </span><span class="s0">if not </span><span class="s1">pd.isna(i) </span><span class="s0">else </span><span class="s1">np.nan </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">divisions)</span>
+
+    <span class="s0">return </span><span class="s1">df4.map_partitions(M.sort_index)</span>
+
+
+<span class="s0">def </span><span class="s1">shuffle(</span>
+    <span class="s1">df</span><span class="s0">,</span>
+    <span class="s1">index</span><span class="s0">,</span>
+    <span class="s1">shuffle=</span><span class="s0">None,</span>
+    <span class="s1">npartitions=</span><span class="s0">None,</span>
+    <span class="s1">max_branch=</span><span class="s2">32</span><span class="s0">,</span>
+    <span class="s1">ignore_index=</span><span class="s0">False,</span>
+    <span class="s1">compute=</span><span class="s0">None,</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Group DataFrame by index 
+ 
+    Hash grouping of elements. After this operation all elements that have 
+    the same index will be in the same partition. Note that this requires 
+    full dataset read, serialization and shuffle. This is expensive. If 
+    possible you should avoid shuffles. 
+ 
+    This does not preserve a meaningful index/partitioning scheme. This is not 
+    deterministic if done in parallel. 
+ 
+    See Also 
+    -------- 
+    set_index 
+    set_partition 
+    shuffle_disk 
+    &quot;&quot;&quot;</span>
+    <span class="s1">list_like = pd.api.types.is_list_like(index) </span><span class="s0">and not </span><span class="s1">is_dask_collection(index)</span>
+    <span class="s1">shuffle = shuffle </span><span class="s0">or </span><span class="s1">get_default_shuffle_method()</span>
+    <span class="s0">if </span><span class="s1">shuffle == </span><span class="s5">&quot;tasks&quot; </span><span class="s0">and </span><span class="s1">(isinstance(index</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">or </span><span class="s1">list_like):</span>
+        <span class="s4"># Avoid creating the &quot;_partitions&quot; column if possible.</span>
+        <span class="s4"># We currently do this if the user is passing in</span>
+        <span class="s4"># specific column names (and shuffle == &quot;tasks&quot;).</span>
+        <span class="s0">if </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">str):</span>
+            <span class="s1">index = [index]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">index = list(index)</span>
+        <span class="s1">nset = set(index)</span>
+        <span class="s0">if </span><span class="s1">nset &amp; set(df.columns) == nset:</span>
+            <span class="s0">return </span><span class="s1">rearrange_by_column(</span>
+                <span class="s1">df</span><span class="s0">,</span>
+                <span class="s1">index</span><span class="s0">,</span>
+                <span class="s1">npartitions=npartitions</span><span class="s0">,</span>
+                <span class="s1">max_branch=max_branch</span><span class="s0">,</span>
+                <span class="s1">shuffle=shuffle</span><span class="s0">,</span>
+                <span class="s1">ignore_index=ignore_index</span><span class="s0">,</span>
+                <span class="s1">compute=compute</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+    <span class="s0">if not </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">_Frame):</span>
+        <span class="s0">if </span><span class="s1">list_like:</span>
+            <span class="s4"># Make sure we don't try to select with pd.Series/pd.Index</span>
+            <span class="s1">index = list(index)</span>
+        <span class="s1">index = df._select_columns_or_index(index)</span>
+    <span class="s0">elif </span><span class="s1">hasattr(index</span><span class="s0">, </span><span class="s5">&quot;to_frame&quot;</span><span class="s1">):</span>
+        <span class="s4"># If this is an index, we should still convert to a</span>
+        <span class="s4"># DataFrame. Otherwise, the hashed values of a column</span>
+        <span class="s4"># selection will not match (important when merging).</span>
+        <span class="s1">index = index.to_frame()</span>
+
+    <span class="s1">meta = df._meta._constructor_sliced([</span><span class="s2">0</span><span class="s1">])</span>
+    <span class="s4"># Ensure that we have the same index as before to avoid alignment</span>
+    <span class="s4"># when calculating meta dtypes later on</span>
+    <span class="s1">meta.index = df._meta_nonempty.index[:</span><span class="s2">1</span><span class="s1">]</span>
+    <span class="s1">partitions = index.map_partitions(</span>
+        <span class="s1">partitioning_index</span><span class="s0">,</span>
+        <span class="s1">npartitions=npartitions </span><span class="s0">or </span><span class="s1">df.npartitions</span><span class="s0">,</span>
+        <span class="s1">meta=meta</span><span class="s0">,</span>
+        <span class="s1">transform_divisions=</span><span class="s0">False,</span>
+    <span class="s1">)</span>
+    <span class="s1">df2 = df.assign(_partitions=partitions)</span>
+    <span class="s1">df2._meta.index.name = df._meta.index.name</span>
+    <span class="s1">df3 = rearrange_by_column(</span>
+        <span class="s1">df2</span><span class="s0">,</span>
+        <span class="s5">&quot;_partitions&quot;</span><span class="s0">,</span>
+        <span class="s1">npartitions=npartitions</span><span class="s0">,</span>
+        <span class="s1">max_branch=max_branch</span><span class="s0">,</span>
+        <span class="s1">shuffle=shuffle</span><span class="s0">,</span>
+        <span class="s1">compute=compute</span><span class="s0">,</span>
+        <span class="s1">ignore_index=ignore_index</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s0">del </span><span class="s1">df3[</span><span class="s5">&quot;_partitions&quot;</span><span class="s1">]</span>
+    <span class="s0">return </span><span class="s1">df3</span>
+
+
+<span class="s0">def </span><span class="s1">rearrange_by_divisions(</span>
+    <span class="s1">df</span><span class="s0">,</span>
+    <span class="s1">column</span><span class="s0">,</span>
+    <span class="s1">divisions</span><span class="s0">,</span>
+    <span class="s1">max_branch=</span><span class="s0">None,</span>
+    <span class="s1">shuffle=</span><span class="s0">None,</span>
+    <span class="s1">ascending=</span><span class="s0">True,</span>
+    <span class="s1">na_position=</span><span class="s5">&quot;last&quot;</span><span class="s0">,</span>
+    <span class="s1">duplicates=</span><span class="s0">True,</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Shuffle dataframe so that column separates along divisions&quot;&quot;&quot;</span>
+    <span class="s1">divisions = df._meta._constructor_sliced(divisions)</span>
+    <span class="s4"># duplicates need to be removed sometimes to properly sort null dataframes</span>
+    <span class="s0">if not </span><span class="s1">duplicates:</span>
+        <span class="s1">divisions = divisions.drop_duplicates()</span>
+    <span class="s1">meta = df._meta._constructor_sliced([</span><span class="s2">0</span><span class="s1">])</span>
+    <span class="s4"># Ensure that we have the same index as before to avoid alignment</span>
+    <span class="s4"># when calculating meta dtypes later on</span>
+    <span class="s1">meta.index = df._meta_nonempty.index[:</span><span class="s2">1</span><span class="s1">]</span>
+    <span class="s4"># Assign target output partitions to every row</span>
+    <span class="s1">partitions = df[column].map_partitions(</span>
+        <span class="s1">set_partitions_pre</span><span class="s0">,</span>
+        <span class="s1">divisions=divisions</span><span class="s0">,</span>
+        <span class="s1">ascending=ascending</span><span class="s0">,</span>
+        <span class="s1">na_position=na_position</span><span class="s0">,</span>
+        <span class="s1">meta=meta</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">df2 = df.assign(_partitions=partitions)</span>
+
+    <span class="s4"># Perform shuffle</span>
+    <span class="s1">df3 = rearrange_by_column(</span>
+        <span class="s1">df2</span><span class="s0">,</span>
+        <span class="s5">&quot;_partitions&quot;</span><span class="s0">,</span>
+        <span class="s1">max_branch=max_branch</span><span class="s0">,</span>
+        <span class="s1">npartitions=len(divisions) - </span><span class="s2">1</span><span class="s0">,</span>
+        <span class="s1">shuffle=shuffle</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s0">del </span><span class="s1">df3[</span><span class="s5">&quot;_partitions&quot;</span><span class="s1">]</span>
+    <span class="s0">return </span><span class="s1">df3</span>
+
+
+<span class="s0">def </span><span class="s1">rearrange_by_column(</span>
+    <span class="s1">df</span><span class="s0">,</span>
+    <span class="s1">col</span><span class="s0">,</span>
+    <span class="s1">npartitions=</span><span class="s0">None,</span>
+    <span class="s1">max_branch=</span><span class="s0">None,</span>
+    <span class="s1">shuffle=</span><span class="s0">None,</span>
+    <span class="s1">compute=</span><span class="s0">None,</span>
+    <span class="s1">ignore_index=</span><span class="s0">False,</span>
+<span class="s1">):</span>
+    <span class="s1">shuffle = shuffle </span><span class="s0">or </span><span class="s1">get_default_shuffle_method()</span>
+
+    <span class="s4"># if the requested output partitions &lt; input partitions</span>
+    <span class="s4"># we repartition first as shuffling overhead is</span>
+    <span class="s4"># proportionate to the number of input partitions</span>
+
+    <span class="s0">if </span><span class="s1">shuffle != </span><span class="s5">&quot;p2p&quot; </span><span class="s0">and </span><span class="s1">npartitions </span><span class="s0">is not None and </span><span class="s1">npartitions &lt; df.npartitions:</span>
+        <span class="s1">df = df.repartition(npartitions=npartitions)</span>
+
+    <span class="s0">if </span><span class="s1">shuffle == </span><span class="s5">&quot;disk&quot;</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">rearrange_by_column_disk(df</span><span class="s0">, </span><span class="s1">col</span><span class="s0">, </span><span class="s1">npartitions</span><span class="s0">, </span><span class="s1">compute=compute)</span>
+    <span class="s0">elif </span><span class="s1">shuffle == </span><span class="s5">&quot;tasks&quot;</span><span class="s1">:</span>
+        <span class="s1">df2 = rearrange_by_column_tasks(</span>
+            <span class="s1">df</span><span class="s0">, </span><span class="s1">col</span><span class="s0">, </span><span class="s1">max_branch</span><span class="s0">, </span><span class="s1">npartitions</span><span class="s0">, </span><span class="s1">ignore_index=ignore_index</span>
+        <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">ignore_index:</span>
+            <span class="s1">df2._meta = df2._meta.reset_index(drop=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">df2</span>
+    <span class="s0">elif </span><span class="s1">shuffle == </span><span class="s5">&quot;p2p&quot;</span><span class="s1">:</span>
+        <span class="s0">from </span><span class="s1">distributed.shuffle </span><span class="s0">import </span><span class="s1">rearrange_by_column_p2p</span>
+
+        <span class="s0">return </span><span class="s1">rearrange_by_column_p2p(df</span><span class="s0">, </span><span class="s1">col</span><span class="s0">, </span><span class="s1">npartitions)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError(</span><span class="s5">&quot;Unknown shuffle method %s&quot; </span><span class="s1">% shuffle)</span>
+
+
+<span class="s0">class </span><span class="s1">maybe_buffered_partd:</span>
+    <span class="s3">&quot;&quot;&quot; 
+    If serialized, will return non-buffered partd. Otherwise returns a buffered partd 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">encode_cls=</span><span class="s0">None, </span><span class="s1">buffer=</span><span class="s0">True, </span><span class="s1">tempdir=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">self.tempdir = tempdir </span><span class="s0">or </span><span class="s1">config.get(</span><span class="s5">&quot;temporary_directory&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">self.buffer = buffer</span>
+        <span class="s1">self.compression = config.get(</span><span class="s5">&quot;dataframe.shuffle.compression&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">self.encode_cls = encode_cls</span>
+        <span class="s0">if </span><span class="s1">encode_cls </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">import </span><span class="s1">partd</span>
+
+            <span class="s1">self.encode_cls = partd.PandasBlocks</span>
+
+    <span class="s0">def </span><span class="s1">__reduce__(self):</span>
+        <span class="s0">if </span><span class="s1">self.tempdir:</span>
+            <span class="s0">return </span><span class="s1">(maybe_buffered_partd</span><span class="s0">, </span><span class="s1">(self.encode_cls</span><span class="s0">, False, </span><span class="s1">self.tempdir))</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">(maybe_buffered_partd</span><span class="s0">, </span><span class="s1">(self.encode_cls</span><span class="s0">, False</span><span class="s1">))</span>
+
+    <span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">import </span><span class="s1">partd</span>
+
+        <span class="s1">path = tempfile.mkdtemp(suffix=</span><span class="s5">&quot;.partd&quot;</span><span class="s0">, </span><span class="s1">dir=self.tempdir)</span>
+
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">partd_compression = (</span>
+                <span class="s1">getattr(partd.compressed</span><span class="s0">, </span><span class="s1">self.compression)</span>
+                <span class="s0">if </span><span class="s1">self.compression</span>
+                <span class="s0">else None</span>
+            <span class="s1">)</span>
+        <span class="s0">except </span><span class="s1">AttributeError </span><span class="s0">as </span><span class="s1">e:</span>
+            <span class="s0">raise </span><span class="s1">ImportError(</span>
+                <span class="s5">&quot;Not able to import and load {} as compression algorithm.&quot;</span>
+                <span class="s5">&quot;Please check if the library is installed and supported by Partd.&quot;</span><span class="s1">.format(</span>
+                    <span class="s1">self.compression</span>
+                <span class="s1">)</span>
+            <span class="s1">) </span><span class="s0">from </span><span class="s1">e</span>
+        <span class="s1">file = partd.File(path)</span>
+        <span class="s1">partd.file.cleanup_files.append(path)</span>
+        <span class="s4"># Envelope partd file with compression, if set and available</span>
+        <span class="s0">if </span><span class="s1">partd_compression:</span>
+            <span class="s1">file = partd_compression(file)</span>
+        <span class="s0">if </span><span class="s1">self.buffer:</span>
+            <span class="s0">return </span><span class="s1">self.encode_cls(partd.Buffer(partd.Dict()</span><span class="s0">, </span><span class="s1">file))</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self.encode_cls(file)</span>
+
+
+<span class="s0">def </span><span class="s1">rearrange_by_column_disk(df</span><span class="s0">, </span><span class="s1">column</span><span class="s0">, </span><span class="s1">npartitions=</span><span class="s0">None, </span><span class="s1">compute=</span><span class="s0">False</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Shuffle using local disk 
+ 
+    See Also 
+    -------- 
+    rearrange_by_column_tasks: 
+        Same function, but using tasks rather than partd 
+        Has a more informative docstring 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">npartitions </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">npartitions = df.npartitions</span>
+
+    <span class="s1">token = tokenize(df</span><span class="s0">, </span><span class="s1">column</span><span class="s0">, </span><span class="s1">npartitions)</span>
+    <span class="s1">always_new_token = uuid.uuid1().hex</span>
+
+    <span class="s1">p = (</span><span class="s5">&quot;zpartd-&quot; </span><span class="s1">+ always_new_token</span><span class="s0">,</span><span class="s1">)</span>
+    <span class="s1">encode_cls = partd_encode_dispatch(df._meta)</span>
+    <span class="s1">dsk1 = {p: (maybe_buffered_partd(encode_cls=encode_cls)</span><span class="s0">,</span><span class="s1">)}</span>
+
+    <span class="s4"># Partition data on disk</span>
+    <span class="s1">name = </span><span class="s5">&quot;shuffle-partition-&quot; </span><span class="s1">+ always_new_token</span>
+    <span class="s1">dsk2 = {</span>
+        <span class="s1">(name</span><span class="s0">, </span><span class="s1">i): (shuffle_group_3</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">column</span><span class="s0">, </span><span class="s1">npartitions</span><span class="s0">, </span><span class="s1">p)</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">key </span><span class="s0">in </span><span class="s1">enumerate(df.__dask_keys__())</span>
+    <span class="s1">}</span>
+
+    <span class="s1">dependencies = []</span>
+    <span class="s0">if </span><span class="s1">compute:</span>
+        <span class="s1">graph = HighLevelGraph.merge(df.dask</span><span class="s0">, </span><span class="s1">dsk1</span><span class="s0">, </span><span class="s1">dsk2)</span>
+        <span class="s1">graph = HighLevelGraph.from_collections(name</span><span class="s0">, </span><span class="s1">graph</span><span class="s0">, </span><span class="s1">dependencies=[df])</span>
+        <span class="s1">keys = [p</span><span class="s0">, </span><span class="s1">sorted(dsk2)]</span>
+        <span class="s1">pp</span><span class="s0">, </span><span class="s1">values = compute_as_if_collection(DataFrame</span><span class="s0">, </span><span class="s1">graph</span><span class="s0">, </span><span class="s1">keys)</span>
+        <span class="s1">dsk1 = {p: pp}</span>
+        <span class="s1">dsk2 = dict(zip(sorted(dsk2)</span><span class="s0">, </span><span class="s1">values))</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">dependencies.append(df)</span>
+
+    <span class="s4"># Barrier</span>
+    <span class="s1">barrier_token = </span><span class="s5">&quot;barrier-&quot; </span><span class="s1">+ always_new_token</span>
+    <span class="s1">dsk3 = {barrier_token: (barrier</span><span class="s0">, </span><span class="s1">list(dsk2))}</span>
+
+    <span class="s4"># Collect groups</span>
+    <span class="s1">name = </span><span class="s5">&quot;shuffle-collect-&quot; </span><span class="s1">+ token</span>
+    <span class="s1">dsk4 = {</span>
+        <span class="s1">(name</span><span class="s0">, </span><span class="s1">i): (collect</span><span class="s0">, </span><span class="s1">p</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s1">df._meta</span><span class="s0">, </span><span class="s1">barrier_token) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(npartitions)</span>
+    <span class="s1">}</span>
+
+    <span class="s1">divisions = (</span><span class="s0">None,</span><span class="s1">) * (npartitions + </span><span class="s2">1</span><span class="s1">)</span>
+
+    <span class="s1">layer = toolz.merge(dsk1</span><span class="s0">, </span><span class="s1">dsk2</span><span class="s0">, </span><span class="s1">dsk3</span><span class="s0">, </span><span class="s1">dsk4)</span>
+    <span class="s1">graph = HighLevelGraph.from_collections(name</span><span class="s0">, </span><span class="s1">layer</span><span class="s0">, </span><span class="s1">dependencies=dependencies)</span>
+    <span class="s0">return </span><span class="s1">new_dd_object(graph</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">df._meta</span><span class="s0">, </span><span class="s1">divisions)</span>
+
+
+<span class="s0">def </span><span class="s1">_noop(x</span><span class="s0">, </span><span class="s1">cleanup_token):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    A task that does nothing. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">return </span><span class="s1">x</span>
+
+
+<span class="s0">def </span><span class="s1">rearrange_by_column_tasks(</span>
+    <span class="s1">df</span><span class="s0">, </span><span class="s1">column</span><span class="s0">, </span><span class="s1">max_branch=</span><span class="s2">32</span><span class="s0">, </span><span class="s1">npartitions=</span><span class="s0">None, </span><span class="s1">ignore_index=</span><span class="s0">False</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Order divisions of DataFrame so that all values within column(s) align 
+ 
+    This enacts a task-based shuffle.  It contains most of the tricky logic 
+    around the complex network of tasks.  Typically before this function is 
+    called a new column, ``&quot;_partitions&quot;`` has been added to the dataframe, 
+    containing the output partition number of every row.  This function 
+    produces a new dataframe where every row is in the proper partition.  It 
+    accomplishes this by splitting each input partition into several pieces, 
+    and then concatenating pieces from different input partitions into output 
+    partitions.  If there are enough partitions then it does this work in 
+    stages to avoid scheduling overhead. 
+ 
+    Lets explain the motivation for this further.  Imagine that we have 1000 
+    input partitions and 1000 output partitions. In theory we could split each 
+    input into 1000 pieces, and then move the 1 000 000 resulting pieces 
+    around, and then concatenate them all into 1000 output groups.  This would 
+    be fine, but the central scheduling overhead of 1 000 000 tasks would 
+    become a bottleneck.  Instead we do this in stages so that we split each of 
+    the 1000 inputs into 30 pieces (we now have 30 000 pieces) move those 
+    around, concatenate back down to 1000, and then do the same process again. 
+    This has the same result as the full transfer, but now we've moved data 
+    twice (expensive) but done so with only 60 000 tasks (cheap). 
+ 
+    Note that the `column` input may correspond to a list of columns (rather 
+    than just a single column name).  In this case, the `shuffle_group` and 
+    `shuffle_group_2` functions will use hashing to map each row to an output 
+    partition. This approach may require the same rows to be hased multiple 
+    times, but avoids the need to assign a new &quot;_partitions&quot; column. 
+ 
+    Parameters 
+    ---------- 
+    df: dask.dataframe.DataFrame 
+    column: str or list 
+        A column name on which we want to split, commonly ``&quot;_partitions&quot;`` 
+        which is assigned by functions upstream.  This could also be a list of 
+        columns (in which case shuffle_group will create a hash array/column). 
+    max_branch: int 
+        The maximum number of splits per input partition.  Defaults to 32. 
+        If there are more partitions than this then the shuffling will occur in 
+        stages in order to avoid creating npartitions**2 tasks 
+        Increasing this number increases scheduling overhead but decreases the 
+        number of full-dataset transfers that we have to make. 
+    npartitions: Optional[int] 
+        The desired number of output partitions 
+ 
+    Returns 
+    ------- 
+    df3: dask.dataframe.DataFrame 
+ 
+    See also 
+    -------- 
+    rearrange_by_column_disk: same operation, but uses partd 
+    rearrange_by_column: parent function that calls this or rearrange_by_column_disk 
+    shuffle_group: does the actual splitting per-partition 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">max_branch = max_branch </span><span class="s0">or </span><span class="s2">32</span>
+
+    <span class="s0">if </span><span class="s1">(npartitions </span><span class="s0">or </span><span class="s1">df.npartitions) &lt;= max_branch:</span>
+        <span class="s4"># We are creating a small number of output partitions.</span>
+        <span class="s4"># No need for staged shuffling. Staged shuffling will</span>
+        <span class="s4"># sometimes require extra work/communication in this case.</span>
+        <span class="s1">token = tokenize(df</span><span class="s0">, </span><span class="s1">column</span><span class="s0">, </span><span class="s1">npartitions)</span>
+        <span class="s1">shuffle_name = </span><span class="s5">f&quot;simple-shuffle-</span><span class="s0">{</span><span class="s1">token</span><span class="s0">}</span><span class="s5">&quot;</span>
+        <span class="s1">npartitions = npartitions </span><span class="s0">or </span><span class="s1">df.npartitions</span>
+        <span class="s1">shuffle_layer = SimpleShuffleLayer(</span>
+            <span class="s1">shuffle_name</span><span class="s0">,</span>
+            <span class="s1">column</span><span class="s0">,</span>
+            <span class="s1">npartitions</span><span class="s0">,</span>
+            <span class="s1">df.npartitions</span><span class="s0">,</span>
+            <span class="s1">ignore_index</span><span class="s0">,</span>
+            <span class="s1">df._name</span><span class="s0">,</span>
+            <span class="s1">df._meta</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s1">graph = HighLevelGraph.from_collections(</span>
+            <span class="s1">shuffle_name</span><span class="s0">, </span><span class="s1">shuffle_layer</span><span class="s0">, </span><span class="s1">dependencies=[df]</span>
+        <span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">new_dd_object(graph</span><span class="s0">, </span><span class="s1">shuffle_name</span><span class="s0">, </span><span class="s1">df._meta</span><span class="s0">, </span><span class="s1">[</span><span class="s0">None</span><span class="s1">] * (npartitions + </span><span class="s2">1</span><span class="s1">))</span>
+
+    <span class="s1">n = df.npartitions</span>
+    <span class="s1">stages = int(math.ceil(math.log(n) / math.log(max_branch)))</span>
+    <span class="s0">if </span><span class="s1">stages &gt; </span><span class="s2">1</span><span class="s1">:</span>
+        <span class="s1">k = int(math.ceil(n ** (</span><span class="s2">1 </span><span class="s1">/ stages)))</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">k = n</span>
+
+    <span class="s1">inputs = [tuple(digit(i</span><span class="s0">, </span><span class="s1">j</span><span class="s0">, </span><span class="s1">k) </span><span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range(stages)) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(k**stages)]</span>
+
+    <span class="s1">npartitions_orig = df.npartitions</span>
+    <span class="s1">token = tokenize(df</span><span class="s0">, </span><span class="s1">stages</span><span class="s0">, </span><span class="s1">column</span><span class="s0">, </span><span class="s1">n</span><span class="s0">, </span><span class="s1">k)</span>
+    <span class="s0">for </span><span class="s1">stage </span><span class="s0">in </span><span class="s1">range(stages):</span>
+        <span class="s1">stage_name = </span><span class="s5">f&quot;shuffle-</span><span class="s0">{</span><span class="s1">stage</span><span class="s0">}</span><span class="s5">-</span><span class="s0">{</span><span class="s1">token</span><span class="s0">}</span><span class="s5">&quot;</span>
+        <span class="s1">stage_layer = ShuffleLayer(</span>
+            <span class="s1">stage_name</span><span class="s0">,</span>
+            <span class="s1">column</span><span class="s0">,</span>
+            <span class="s1">inputs</span><span class="s0">,</span>
+            <span class="s1">stage</span><span class="s0">,</span>
+            <span class="s1">npartitions</span><span class="s0">,</span>
+            <span class="s1">n</span><span class="s0">,</span>
+            <span class="s1">k</span><span class="s0">,</span>
+            <span class="s1">ignore_index</span><span class="s0">,</span>
+            <span class="s1">df._name</span><span class="s0">,</span>
+            <span class="s1">df._meta</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s1">graph = HighLevelGraph.from_collections(</span>
+            <span class="s1">stage_name</span><span class="s0">, </span><span class="s1">stage_layer</span><span class="s0">, </span><span class="s1">dependencies=[df]</span>
+        <span class="s1">)</span>
+        <span class="s1">df = new_dd_object(graph</span><span class="s0">, </span><span class="s1">stage_name</span><span class="s0">, </span><span class="s1">df._meta</span><span class="s0">, </span><span class="s1">df.divisions)</span>
+
+    <span class="s0">if </span><span class="s1">npartitions </span><span class="s0">is not None and </span><span class="s1">npartitions != npartitions_orig:</span>
+        <span class="s1">token = tokenize(df</span><span class="s0">, </span><span class="s1">npartitions)</span>
+        <span class="s1">repartition_group_token = </span><span class="s5">&quot;repartition-group-&quot; </span><span class="s1">+ token</span>
+
+        <span class="s1">dsk = {</span>
+            <span class="s1">(repartition_group_token</span><span class="s0">, </span><span class="s1">i): (</span>
+                <span class="s1">shuffle_group_2</span><span class="s0">,</span>
+                <span class="s1">k</span><span class="s0">,</span>
+                <span class="s1">column</span><span class="s0">,</span>
+                <span class="s1">ignore_index</span><span class="s0">,</span>
+                <span class="s1">npartitions</span><span class="s0">,</span>
+            <span class="s1">)</span>
+            <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">k </span><span class="s0">in </span><span class="s1">enumerate(df.__dask_keys__())</span>
+        <span class="s1">}</span>
+
+        <span class="s1">repartition_get_name = </span><span class="s5">&quot;repartition-get-&quot; </span><span class="s1">+ token</span>
+
+        <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">range(npartitions):</span>
+            <span class="s1">dsk[(repartition_get_name</span><span class="s0">, </span><span class="s1">p)] = (</span>
+                <span class="s1">shuffle_group_get</span><span class="s0">,</span>
+                <span class="s1">(repartition_group_token</span><span class="s0">, </span><span class="s1">p % npartitions_orig)</span><span class="s0">,</span>
+                <span class="s1">p</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s1">graph2 = HighLevelGraph.from_collections(</span>
+            <span class="s1">repartition_get_name</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">dependencies=[df]</span>
+        <span class="s1">)</span>
+        <span class="s1">df2 = new_dd_object(</span>
+            <span class="s1">graph2</span><span class="s0">, </span><span class="s1">repartition_get_name</span><span class="s0">, </span><span class="s1">df._meta</span><span class="s0">, </span><span class="s1">[</span><span class="s0">None</span><span class="s1">] * (npartitions + </span><span class="s2">1</span><span class="s1">)</span>
+        <span class="s1">)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">df2 = df</span>
+        <span class="s1">df2.divisions = (</span><span class="s0">None,</span><span class="s1">) * (npartitions_orig + </span><span class="s2">1</span><span class="s1">)</span>
+
+    <span class="s0">return </span><span class="s1">df2</span>
+
+
+<span class="s4">########################################################</span>
+<span class="s4"># Various convenience functions to be run by the above #</span>
+<span class="s4">########################################################</span>
+
+
+<span class="s0">def </span><span class="s1">partitioning_index(df</span><span class="s0">, </span><span class="s1">npartitions):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Computes a deterministic index mapping each record to a partition. 
+ 
+    Identical rows are mapped to the same partition. 
+ 
+    Parameters 
+    ---------- 
+    df : DataFrame/Series/Index 
+    npartitions : int 
+        The number of partitions to group into. 
+ 
+    Returns 
+    ------- 
+    partitions : ndarray 
+        An array of int64 values mapping each record to a partition. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">return </span><span class="s1">hash_object_dispatch(df</span><span class="s0">, </span><span class="s1">index=</span><span class="s0">False</span><span class="s1">) % int(npartitions)</span>
+
+
+<span class="s0">def </span><span class="s1">barrier(args):</span>
+    <span class="s1">list(args)</span>
+    <span class="s0">return </span><span class="s2">0</span>
+
+
+<span class="s0">def </span><span class="s1">cleanup_partd_files(p</span><span class="s0">, </span><span class="s1">keys):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Cleanup the files in a partd.File dataset. 
+ 
+    Parameters 
+    ---------- 
+    p : partd.Interface 
+        File or Encode wrapping a file should be OK. 
+    keys: List 
+        Just for scheduling purposes, not actually used. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">import </span><span class="s1">partd</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(p</span><span class="s0">, </span><span class="s1">partd.Encode):</span>
+        <span class="s1">maybe_file = p.partd</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">maybe_file = </span><span class="s0">None</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(maybe_file</span><span class="s0">, </span><span class="s1">partd.File):</span>
+        <span class="s1">path = maybe_file.path</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">path = </span><span class="s0">None</span>
+
+    <span class="s0">if </span><span class="s1">path:</span>
+        <span class="s1">shutil.rmtree(path</span><span class="s0">, </span><span class="s1">ignore_errors=</span><span class="s0">True</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">collect(p</span><span class="s0">, </span><span class="s1">part</span><span class="s0">, </span><span class="s1">meta</span><span class="s0">, </span><span class="s1">barrier_token):</span>
+    <span class="s3">&quot;&quot;&quot;Collect partitions from partd, yield dataframes&quot;&quot;&quot;</span>
+    <span class="s0">with </span><span class="s1">ensure_cleanup_on_exception(p):</span>
+        <span class="s1">res = p.get(part)</span>
+        <span class="s0">return </span><span class="s1">res </span><span class="s0">if </span><span class="s1">len(res) &gt; </span><span class="s2">0 </span><span class="s0">else </span><span class="s1">meta</span>
+
+
+<span class="s0">def </span><span class="s1">set_partitions_pre(s</span><span class="s0">, </span><span class="s1">divisions</span><span class="s0">, </span><span class="s1">ascending=</span><span class="s0">True, </span><span class="s1">na_position=</span><span class="s5">&quot;last&quot;</span><span class="s1">):</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">ascending:</span>
+            <span class="s1">partitions = divisions.searchsorted(s</span><span class="s0">, </span><span class="s1">side=</span><span class="s5">&quot;right&quot;</span><span class="s1">) - </span><span class="s2">1</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">partitions = len(divisions) - divisions.searchsorted(s</span><span class="s0">, </span><span class="s1">side=</span><span class="s5">&quot;right&quot;</span><span class="s1">) - </span><span class="s2">1</span>
+    <span class="s0">except </span><span class="s1">(TypeError</span><span class="s0">, </span><span class="s1">ValueError):</span>
+        <span class="s4"># `searchsorted` fails if either `divisions` or `s` contains nulls and strings</span>
+        <span class="s1">partitions = np.empty(len(s)</span><span class="s0">, </span><span class="s1">dtype=</span><span class="s5">&quot;int32&quot;</span><span class="s1">)</span>
+        <span class="s1">not_null = s.notna()</span>
+        <span class="s1">divisions_notna = divisions[divisions.notna()]</span>
+        <span class="s0">if </span><span class="s1">ascending:</span>
+            <span class="s1">partitions[not_null] = (</span>
+                <span class="s1">divisions_notna.searchsorted(s[not_null]</span><span class="s0">, </span><span class="s1">side=</span><span class="s5">&quot;right&quot;</span><span class="s1">) - </span><span class="s2">1</span>
+            <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">partitions[not_null] = (</span>
+                <span class="s1">len(divisions)</span>
+                <span class="s1">- divisions_notna.searchsorted(s[not_null]</span><span class="s0">, </span><span class="s1">side=</span><span class="s5">&quot;right&quot;</span><span class="s1">)</span>
+                <span class="s1">- </span><span class="s2">1</span>
+            <span class="s1">)</span>
+    <span class="s1">partitions[(partitions &lt; </span><span class="s2">0</span><span class="s1">) | (partitions &gt;= len(divisions) - </span><span class="s2">1</span><span class="s1">)] = (</span>
+        <span class="s1">len(divisions) - </span><span class="s2">2 </span><span class="s0">if </span><span class="s1">ascending </span><span class="s0">else </span><span class="s2">0</span>
+    <span class="s1">)</span>
+    <span class="s1">partitions[s.isna().values] = len(divisions) - </span><span class="s2">2 </span><span class="s0">if </span><span class="s1">na_position == </span><span class="s5">&quot;last&quot; </span><span class="s0">else </span><span class="s2">0</span>
+    <span class="s0">return </span><span class="s1">partitions</span>
+
+
+<span class="s0">def </span><span class="s1">shuffle_group_2(df</span><span class="s0">, </span><span class="s1">cols</span><span class="s0">, </span><span class="s1">ignore_index</span><span class="s0">, </span><span class="s1">nparts):</span>
+    <span class="s0">if not </span><span class="s1">len(df):</span>
+        <span class="s0">return </span><span class="s1">{}</span><span class="s0">, </span><span class="s1">df</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(cols</span><span class="s0">, </span><span class="s1">str):</span>
+        <span class="s1">cols = [cols]</span>
+
+    <span class="s0">if </span><span class="s1">cols </span><span class="s0">and </span><span class="s1">cols[</span><span class="s2">0</span><span class="s1">] == </span><span class="s5">&quot;_partitions&quot;</span><span class="s1">:</span>
+        <span class="s1">ind = df[cols[</span><span class="s2">0</span><span class="s1">]].astype(np.int32)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">ind = (</span>
+            <span class="s1">hash_object_dispatch(df[cols] </span><span class="s0">if </span><span class="s1">cols </span><span class="s0">else </span><span class="s1">df</span><span class="s0">, </span><span class="s1">index=</span><span class="s0">False</span><span class="s1">) % int(nparts)</span>
+        <span class="s1">).astype(np.int32)</span>
+
+    <span class="s1">n = ind.max() + </span><span class="s2">1</span>
+    <span class="s1">result2 = group_split_dispatch(df</span><span class="s0">, </span><span class="s1">ind</span><span class="s0">, </span><span class="s1">n</span><span class="s0">, </span><span class="s1">ignore_index=ignore_index)</span>
+    <span class="s0">return </span><span class="s1">result2</span><span class="s0">, </span><span class="s1">df.iloc[:</span><span class="s2">0</span><span class="s1">]</span>
+
+
+<span class="s0">def </span><span class="s1">shuffle_group_get(g_head</span><span class="s0">, </span><span class="s1">i):</span>
+    <span class="s1">g</span><span class="s0">, </span><span class="s1">head = g_head</span>
+    <span class="s0">if </span><span class="s1">i </span><span class="s0">in </span><span class="s1">g:</span>
+        <span class="s0">return </span><span class="s1">g[i]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">head</span>
+
+
+<span class="s0">def </span><span class="s1">shuffle_group(df</span><span class="s0">, </span><span class="s1">cols</span><span class="s0">, </span><span class="s1">stage</span><span class="s0">, </span><span class="s1">k</span><span class="s0">, </span><span class="s1">npartitions</span><span class="s0">, </span><span class="s1">ignore_index</span><span class="s0">, </span><span class="s1">nfinal):</span>
+    <span class="s3">&quot;&quot;&quot;Splits dataframe into groups 
+ 
+    The group is determined by their final partition, and which stage we are in 
+    in the shuffle 
+ 
+    Parameters 
+    ---------- 
+    df: DataFrame 
+    cols: str or list 
+        Column name(s) on which to split the dataframe. If ``cols`` is not 
+        &quot;_partitions&quot;, hashing will be used to determine target partition 
+    stage: int 
+        We shuffle dataframes with many partitions we in a few stages to avoid 
+        a quadratic number of tasks.  This number corresponds to which stage 
+        we're in, starting from zero up to some small integer 
+    k: int 
+        Desired number of splits from this dataframe 
+    npartition: int 
+        Total number of output partitions for the full dataframe 
+    nfinal: int 
+        Total number of output partitions after repartitioning 
+ 
+    Returns 
+    ------- 
+    out: Dict[int, DataFrame] 
+        A dictionary mapping integers in {0..k} to dataframes such that the 
+        hash values of ``df[col]`` are well partitioned. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">isinstance(cols</span><span class="s0">, </span><span class="s1">str):</span>
+        <span class="s1">cols = [cols]</span>
+
+    <span class="s0">if </span><span class="s1">cols </span><span class="s0">and </span><span class="s1">cols[</span><span class="s2">0</span><span class="s1">] == </span><span class="s5">&quot;_partitions&quot;</span><span class="s1">:</span>
+        <span class="s1">ind = df[cols[</span><span class="s2">0</span><span class="s1">]]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">ind = hash_object_dispatch(df[cols] </span><span class="s0">if </span><span class="s1">cols </span><span class="s0">else </span><span class="s1">df</span><span class="s0">, </span><span class="s1">index=</span><span class="s0">False</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">nfinal </span><span class="s0">and </span><span class="s1">nfinal != npartitions:</span>
+            <span class="s1">ind = ind % int(nfinal)</span>
+
+    <span class="s1">typ = np.min_scalar_type(npartitions * </span><span class="s2">2</span><span class="s1">)</span>
+    <span class="s4"># Here we convert the final output index `ind` into the output index</span>
+    <span class="s4"># for the current stage.</span>
+    <span class="s1">ind = (ind % npartitions).astype(typ</span><span class="s0">, </span><span class="s1">copy=</span><span class="s0">False</span><span class="s1">) // k**stage % k</span>
+    <span class="s0">return </span><span class="s1">group_split_dispatch(df</span><span class="s0">, </span><span class="s1">ind</span><span class="s0">, </span><span class="s1">k</span><span class="s0">, </span><span class="s1">ignore_index=ignore_index)</span>
+
+
+<span class="s1">@contextlib.contextmanager</span>
+<span class="s0">def </span><span class="s1">ensure_cleanup_on_exception(p):</span>
+    <span class="s3">&quot;&quot;&quot;Ensure a partd.File is cleaned up. 
+ 
+    We have several tasks referring to a `partd.File` instance. We want to 
+    ensure that the file is cleaned up if and only if there's an exception 
+    in the tasks using the `partd.File`. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">yield</span>
+    <span class="s0">except </span><span class="s1">Exception:</span>
+        <span class="s4"># the function (e.g. shuffle_group_3) had an internal exception.</span>
+        <span class="s4"># We'll cleanup our temporary files and re-raise.</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">p.drop()</span>
+        <span class="s0">except </span><span class="s1">Exception:</span>
+            <span class="s1">logger.exception(</span><span class="s5">&quot;ignoring exception in ensure_cleanup_on_exception&quot;</span><span class="s1">)</span>
+        <span class="s0">raise</span>
+
+
+<span class="s0">def </span><span class="s1">shuffle_group_3(df</span><span class="s0">, </span><span class="s1">col</span><span class="s0">, </span><span class="s1">npartitions</span><span class="s0">, </span><span class="s1">p):</span>
+    <span class="s0">with </span><span class="s1">ensure_cleanup_on_exception(p):</span>
+        <span class="s1">g = df.groupby(col)</span>
+        <span class="s1">d = {i: g.get_group(i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">g.groups}</span>
+        <span class="s1">p.append(d</span><span class="s0">, </span><span class="s1">fsync=</span><span class="s0">True</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">set_index_post_scalar(df</span><span class="s0">, </span><span class="s1">index_name</span><span class="s0">, </span><span class="s1">drop</span><span class="s0">, </span><span class="s1">column_dtype):</span>
+    <span class="s1">df2 = df.drop(</span><span class="s5">&quot;_partitions&quot;</span><span class="s0">, </span><span class="s1">axis=</span><span class="s2">1</span><span class="s1">).set_index(index_name</span><span class="s0">, </span><span class="s1">drop=drop)</span>
+    <span class="s1">df2.columns = df2.columns.astype(column_dtype)</span>
+    <span class="s0">return </span><span class="s1">df2</span>
+
+
+<span class="s0">def </span><span class="s1">set_index_post_series(df</span><span class="s0">, </span><span class="s1">index_name</span><span class="s0">, </span><span class="s1">drop</span><span class="s0">, </span><span class="s1">column_dtype):</span>
+    <span class="s1">df2 = df.drop(</span><span class="s5">&quot;_partitions&quot;</span><span class="s0">, </span><span class="s1">axis=</span><span class="s2">1</span><span class="s1">).set_index(</span><span class="s5">&quot;_index&quot;</span><span class="s0">, </span><span class="s1">drop=</span><span class="s0">True</span><span class="s1">)</span>
+    <span class="s1">df2.index.name = index_name</span>
+    <span class="s1">df2.columns = df2.columns.astype(column_dtype)</span>
+    <span class="s0">return </span><span class="s1">df2</span>
+
+
+<span class="s0">def </span><span class="s1">drop_overlap(df</span><span class="s0">, </span><span class="s1">index):</span>
+    <span class="s0">return </span><span class="s1">df.drop(index) </span><span class="s0">if </span><span class="s1">index </span><span class="s0">in </span><span class="s1">df.index </span><span class="s0">else </span><span class="s1">df</span>
+
+
+<span class="s0">def </span><span class="s1">get_overlap(df</span><span class="s0">, </span><span class="s1">index):</span>
+    <span class="s0">return </span><span class="s1">df.loc[[index]] </span><span class="s0">if </span><span class="s1">index </span><span class="s0">in </span><span class="s1">df.index </span><span class="s0">else </span><span class="s1">df._constructor()</span>
+
+
+<span class="s0">def </span><span class="s1">fix_overlap(ddf</span><span class="s0">, </span><span class="s1">mins</span><span class="s0">, </span><span class="s1">maxes</span><span class="s0">, </span><span class="s1">lens):</span>
+    <span class="s3">&quot;&quot;&quot;Ensures that the upper bound on each partition of ddf (except the last) is exclusive 
+ 
+    This is accomplished by first removing empty partitions, then altering existing 
+    partitions as needed to include all the values for a particular index value in 
+    one partition. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">name = </span><span class="s5">&quot;fix-overlap-&quot; </span><span class="s1">+ tokenize(ddf</span><span class="s0">, </span><span class="s1">mins</span><span class="s0">, </span><span class="s1">maxes</span><span class="s0">, </span><span class="s1">lens)</span>
+
+    <span class="s1">non_empties = [i </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">length </span><span class="s0">in </span><span class="s1">enumerate(lens) </span><span class="s0">if </span><span class="s1">length != </span><span class="s2">0</span><span class="s1">]</span>
+    <span class="s4"># If all empty, collapse into one partition</span>
+    <span class="s0">if </span><span class="s1">len(non_empties) == </span><span class="s2">0</span><span class="s1">:</span>
+        <span class="s1">divisions = (</span><span class="s0">None, None</span><span class="s1">)</span>
+        <span class="s1">dsk = {(name</span><span class="s0">, </span><span class="s2">0</span><span class="s1">): (ddf._name</span><span class="s0">, </span><span class="s2">0</span><span class="s1">)}</span>
+        <span class="s1">graph = HighLevelGraph.from_collections(name</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">dependencies=[ddf])</span>
+        <span class="s0">return </span><span class="s1">new_dd_object(graph</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">ddf._meta</span><span class="s0">, </span><span class="s1">divisions)</span>
+
+    <span class="s4"># drop empty partitions by mapping each partition in a new graph to a particular</span>
+    <span class="s4"># partition on the old graph.</span>
+    <span class="s1">dsk = {(name</span><span class="s0">, </span><span class="s1">i): (ddf._name</span><span class="s0">, </span><span class="s1">div) </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">div </span><span class="s0">in </span><span class="s1">enumerate(non_empties)}</span>
+    <span class="s1">ddf_keys = list(dsk.values())</span>
+    <span class="s1">divisions = tuple(mins) + (maxes[-</span><span class="s2">1</span><span class="s1">]</span><span class="s0">,</span><span class="s1">)</span>
+
+    <span class="s1">overlap = [i </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">1</span><span class="s0">, </span><span class="s1">len(mins)) </span><span class="s0">if </span><span class="s1">mins[i] &gt;= maxes[i - </span><span class="s2">1</span><span class="s1">]]</span>
+
+    <span class="s1">frames = []</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">overlap:</span>
+        <span class="s4"># `frames` is a list of data from previous partitions that we may want to</span>
+        <span class="s4"># move to partition i.  Here, we add &quot;overlap&quot; from the previous partition</span>
+        <span class="s4"># (i-1) to this list.</span>
+        <span class="s1">frames.append((get_overlap</span><span class="s0">, </span><span class="s1">ddf_keys[i - </span><span class="s2">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">divisions[i]))</span>
+
+        <span class="s4"># Make sure that any data added from partition i-1 to `frames` is removed</span>
+        <span class="s4"># from partition i-1.</span>
+        <span class="s1">dsk[(name</span><span class="s0">, </span><span class="s1">i - </span><span class="s2">1</span><span class="s1">)] = (drop_overlap</span><span class="s0">, </span><span class="s1">dsk[(name</span><span class="s0">, </span><span class="s1">i - </span><span class="s2">1</span><span class="s1">)]</span><span class="s0">, </span><span class="s1">divisions[i])</span>
+
+        <span class="s4"># We do not want to move &quot;overlap&quot; from the previous partition (i-1) into</span>
+        <span class="s4"># this partition (i) if the data from this partition will need to be moved</span>
+        <span class="s4"># to the next partition (i+1) anyway.  If we concatenate data too early,</span>
+        <span class="s4"># we may lose rows (https://github.com/dask/dask/issues/6972).</span>
+        <span class="s0">if </span><span class="s1">divisions[i] == divisions[i + </span><span class="s2">1</span><span class="s1">] </span><span class="s0">and </span><span class="s1">i + </span><span class="s2">1 </span><span class="s0">in </span><span class="s1">overlap:</span>
+            <span class="s0">continue</span>
+
+        <span class="s1">frames.append(ddf_keys[i])</span>
+        <span class="s1">dsk[(name</span><span class="s0">, </span><span class="s1">i)] = (methods.concat</span><span class="s0">, </span><span class="s1">frames)</span>
+        <span class="s1">frames = []</span>
+
+    <span class="s1">graph = HighLevelGraph.from_collections(name</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">dependencies=[ddf])</span>
+    <span class="s0">return </span><span class="s1">new_dd_object(graph</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">ddf._meta</span><span class="s0">, </span><span class="s1">divisions)</span>
+
+
+<span class="s0">def </span><span class="s1">_compute_partition_stats(</span>
+    <span class="s1">column: Series</span><span class="s0">, </span><span class="s1">allow_overlap: bool = </span><span class="s0">False, </span><span class="s1">**kwargs</span>
+<span class="s1">) -&gt; tuple[list</span><span class="s0">, </span><span class="s1">list</span><span class="s0">, </span><span class="s1">list[int]]:</span>
+    <span class="s3">&quot;&quot;&quot;For a given column, compute the min, max, and len of each partition. 
+ 
+    And make sure that the partitions are sorted relative to each other. 
+    NOTE: this does not guarantee that every partition is internally sorted. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">mins = column.map_partitions(M.min</span><span class="s0">, </span><span class="s1">meta=column)</span>
+    <span class="s1">maxes = column.map_partitions(M.max</span><span class="s0">, </span><span class="s1">meta=column)</span>
+    <span class="s1">lens = column.map_partitions(len</span><span class="s0">, </span><span class="s1">meta=column)</span>
+    <span class="s1">mins</span><span class="s0">, </span><span class="s1">maxes</span><span class="s0">, </span><span class="s1">lens = compute(mins</span><span class="s0">, </span><span class="s1">maxes</span><span class="s0">, </span><span class="s1">lens</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s1">mins = mins.bfill().tolist()</span>
+    <span class="s1">maxes = maxes.bfill().tolist()</span>
+    <span class="s1">non_empty_mins = [m </span><span class="s0">for </span><span class="s1">m</span><span class="s0">, </span><span class="s1">length </span><span class="s0">in </span><span class="s1">zip(mins</span><span class="s0">, </span><span class="s1">lens) </span><span class="s0">if </span><span class="s1">length != </span><span class="s2">0</span><span class="s1">]</span>
+    <span class="s1">non_empty_maxes = [m </span><span class="s0">for </span><span class="s1">m</span><span class="s0">, </span><span class="s1">length </span><span class="s0">in </span><span class="s1">zip(maxes</span><span class="s0">, </span><span class="s1">lens) </span><span class="s0">if </span><span class="s1">length != </span><span class="s2">0</span><span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">(</span>
+        <span class="s1">sorted(non_empty_mins) != non_empty_mins</span>
+        <span class="s0">or </span><span class="s1">sorted(non_empty_maxes) != non_empty_maxes</span>
+    <span class="s1">):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s5">f&quot;Partitions are not sorted ascending by </span><span class="s0">{</span><span class="s1">column.name </span><span class="s0">or </span><span class="s5">'the index'</span><span class="s0">}</span><span class="s5">&quot;</span><span class="s0">,</span>
+            <span class="s5">f&quot;In your dataset the (min, max, len) values of </span><span class="s0">{</span><span class="s1">column.name </span><span class="s0">or </span><span class="s5">'the index'</span><span class="s0">} </span><span class="s5">&quot;</span>
+            <span class="s5">f&quot;for each partition are : </span><span class="s0">{</span><span class="s1">list(zip(mins</span><span class="s0">, </span><span class="s1">maxes</span><span class="s0">, </span><span class="s1">lens))</span><span class="s0">}</span><span class="s5">&quot;</span><span class="s0">,</span>
+        <span class="s1">)</span>
+    <span class="s0">if not </span><span class="s1">allow_overlap </span><span class="s0">and </span><span class="s1">any(</span>
+        <span class="s1">a &lt;= b </span><span class="s0">for </span><span class="s1">a</span><span class="s0">, </span><span class="s1">b </span><span class="s0">in </span><span class="s1">zip(non_empty_mins[</span><span class="s2">1</span><span class="s1">:]</span><span class="s0">, </span><span class="s1">non_empty_maxes[:-</span><span class="s2">1</span><span class="s1">])</span>
+    <span class="s1">):</span>
+        <span class="s1">warnings.warn(</span>
+            <span class="s5">&quot;Partitions have overlapping values, so divisions are non-unique.&quot;</span>
+            <span class="s5">&quot;Use `set_index(sorted=True)` with no `divisions` to allow dask to fix the overlap. &quot;</span>
+            <span class="s5">f&quot;In your dataset the (min, max, len) values of </span><span class="s0">{</span><span class="s1">column.name </span><span class="s0">or </span><span class="s5">'the index'</span><span class="s0">} </span><span class="s5">&quot;</span>
+            <span class="s5">f&quot;for each partition are : </span><span class="s0">{</span><span class="s1">list(zip(mins</span><span class="s0">, </span><span class="s1">maxes</span><span class="s0">, </span><span class="s1">lens))</span><span class="s0">}</span><span class="s5">&quot;</span><span class="s0">,</span>
+            <span class="s1">UserWarning</span><span class="s0">,</span>
+        <span class="s1">)</span>
+    <span class="s1">lens = methods.tolist(lens)</span>
+    <span class="s0">if not </span><span class="s1">allow_overlap:</span>
+        <span class="s0">return </span><span class="s1">(mins</span><span class="s0">, </span><span class="s1">maxes</span><span class="s0">, </span><span class="s1">lens)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">(non_empty_mins</span><span class="s0">, </span><span class="s1">non_empty_maxes</span><span class="s0">, </span><span class="s1">lens)</span>
+
+
+<span class="s0">def </span><span class="s1">compute_divisions(df: DataFrame</span><span class="s0">, </span><span class="s1">col: Any | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None, </span><span class="s1">**kwargs) -&gt; tuple:</span>
+    <span class="s1">column = df.index </span><span class="s0">if </span><span class="s1">col </span><span class="s0">is None else </span><span class="s1">df[col]</span>
+    <span class="s1">mins</span><span class="s0">, </span><span class="s1">maxes</span><span class="s0">, </span><span class="s1">_ = _compute_partition_stats(column</span><span class="s0">, </span><span class="s1">allow_overlap=</span><span class="s0">False, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">return </span><span class="s1">tuple(mins) + (maxes[-</span><span class="s2">1</span><span class="s1">]</span><span class="s0">,</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">compute_and_set_divisions(df: DataFrame</span><span class="s0">, </span><span class="s1">**kwargs) -&gt; DataFrame:</span>
+    <span class="s1">mins</span><span class="s0">, </span><span class="s1">maxes</span><span class="s0">, </span><span class="s1">lens = _compute_partition_stats(df.index</span><span class="s0">, </span><span class="s1">allow_overlap=</span><span class="s0">True, </span><span class="s1">**kwargs)</span>
+    <span class="s0">if </span><span class="s1">len(mins) == len(df.divisions) - </span><span class="s2">1</span><span class="s1">:</span>
+        <span class="s1">df._divisions = tuple(mins) + (maxes[-</span><span class="s2">1</span><span class="s1">]</span><span class="s0">,</span><span class="s1">)</span>
+        <span class="s0">if not </span><span class="s1">any(mins[i] &gt;= maxes[i - </span><span class="s2">1</span><span class="s1">] </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">1</span><span class="s0">, </span><span class="s1">len(mins))):</span>
+            <span class="s0">return </span><span class="s1">df</span>
+
+    <span class="s0">return </span><span class="s1">fix_overlap(df</span><span class="s0">, </span><span class="s1">mins</span><span class="s0">, </span><span class="s1">maxes</span><span class="s0">, </span><span class="s1">lens)</span>
+
+
+<span class="s0">def </span><span class="s1">set_sorted_index(</span>
+    <span class="s1">df: DataFrame</span><span class="s0">,</span>
+    <span class="s1">index: str | Series</span><span class="s0">,</span>
+    <span class="s1">drop: bool = </span><span class="s0">True,</span>
+    <span class="s1">divisions: Sequence | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">**kwargs</span><span class="s0">,</span>
+<span class="s1">) -&gt; DataFrame:</span>
+    <span class="s0">if </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">Series):</span>
+        <span class="s1">meta = df._meta.set_index(index._meta</span><span class="s0">, </span><span class="s1">drop=drop)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">meta = df._meta.set_index(index</span><span class="s0">, </span><span class="s1">drop=drop)</span>
+
+    <span class="s1">result = map_partitions(</span>
+        <span class="s1">M.set_index</span><span class="s0">,</span>
+        <span class="s1">df</span><span class="s0">,</span>
+        <span class="s1">index</span><span class="s0">,</span>
+        <span class="s1">drop=drop</span><span class="s0">,</span>
+        <span class="s1">meta=meta</span><span class="s0">,</span>
+        <span class="s1">align_dataframes=</span><span class="s0">False,</span>
+        <span class="s1">transform_divisions=</span><span class="s0">False,</span>
+    <span class="s1">)</span>
+
+    <span class="s0">if not </span><span class="s1">divisions:</span>
+        <span class="s0">return </span><span class="s1">compute_and_set_divisions(result</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s0">elif </span><span class="s1">len(divisions) != len(df.divisions):</span>
+        <span class="s1">msg = (</span>
+            <span class="s5">&quot;When doing `df.set_index(col, sorted=True, divisions=...)`, &quot;</span>
+            <span class="s5">&quot;divisions indicates known splits in the index column. In this &quot;</span>
+            <span class="s5">&quot;case divisions must be the same length as the existing &quot;</span>
+            <span class="s5">&quot;divisions in `df`</span><span class="s0">\n\n</span><span class="s5">&quot;</span>
+            <span class="s5">&quot;If the intent is to repartition into new divisions after &quot;</span>
+            <span class="s5">&quot;setting the index, you probably want:</span><span class="s0">\n\n</span><span class="s5">&quot;</span>
+            <span class="s5">&quot;`df.set_index(col, sorted=True).repartition(divisions=divisions)`&quot;</span>
+        <span class="s1">)</span>
+        <span class="s0">raise </span><span class="s1">ValueError(msg)</span>
+
+    <span class="s1">result.divisions = tuple(divisions)</span>
+    <span class="s0">return </span><span class="s1">result</span>
+</pre>
+</body>
+</html>

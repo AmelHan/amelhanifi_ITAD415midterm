@@ -1,0 +1,889 @@
+<html>
+<head>
+<title>recursive_ls.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+recursive_ls.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Recursive least squares model 
+ 
+Author: Chad Fulton 
+License: Simplified-BSD 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">pandas </span><span class="s2">as </span><span class="s1">pd</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s2">import </span><span class="s1">Appender</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.tools.data </span><span class="s2">import </span><span class="s1">_is_using_pandas</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.mlemodel </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">MLEModel</span><span class="s2">, </span><span class="s1">MLEResults</span><span class="s2">, </span><span class="s1">MLEResultsWrapper</span><span class="s2">, </span><span class="s1">PredictionResults</span><span class="s2">,</span>
+    <span class="s1">PredictionResultsWrapper)</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.tools </span><span class="s2">import </span><span class="s1">concat</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.tools </span><span class="s2">import </span><span class="s1">Bunch</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.decorators </span><span class="s2">import </span><span class="s1">cache_readonly</span>
+<span class="s2">import </span><span class="s1">statsmodels.base.wrapper </span><span class="s2">as </span><span class="s1">wrap</span>
+
+<span class="s3"># Columns are alpha = 0.1, 0.05, 0.025, 0.01, 0.005</span>
+<span class="s1">_cusum_squares_scalars = np.array([</span>
+    <span class="s1">[</span><span class="s4">1.0729830</span><span class="s2">,   </span><span class="s4">1.2238734</span><span class="s2">,  </span><span class="s4">1.3581015</span><span class="s2">,  </span><span class="s4">1.5174271</span><span class="s2">,  </span><span class="s4">1.6276236</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s1">[-</span><span class="s4">0.6698868</span><span class="s2">, </span><span class="s1">-</span><span class="s4">0.6700069</span><span class="s2">, </span><span class="s1">-</span><span class="s4">0.6701218</span><span class="s2">, </span><span class="s1">-</span><span class="s4">0.6702672</span><span class="s2">, </span><span class="s1">-</span><span class="s4">0.6703724</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s1">[-</span><span class="s4">0.5816458</span><span class="s2">, </span><span class="s1">-</span><span class="s4">0.7351697</span><span class="s2">, </span><span class="s1">-</span><span class="s4">0.8858694</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1.0847745</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1.2365861</span><span class="s1">]</span>
+<span class="s1">])</span>
+
+
+<span class="s2">class </span><span class="s1">RecursiveLS(MLEModel):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Recursive least squares 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        The observed time-series process :math:`y` 
+    exog : array_like 
+        Array of exogenous regressors, shaped nobs x k. 
+    constraints : array_like, str, or tuple 
+            - array : An r x k array where r is the number of restrictions to 
+              test and k is the number of regressors. It is assumed that the 
+              linear combination is equal to zero. 
+            - str : The full hypotheses to test can be given as a string. 
+              See the examples. 
+            - tuple : A tuple of arrays in the form (R, q), ``q`` can be 
+              either a scalar or a length p row vector. 
+ 
+    Notes 
+    ----- 
+    Recursive least squares (RLS) corresponds to expanding window ordinary 
+    least squares (OLS). 
+ 
+    This model applies the Kalman filter to compute recursive estimates of the 
+    coefficients and recursive residuals. 
+ 
+    References 
+    ---------- 
+    .. [*] Durbin, James, and Siem Jan Koopman. 2012. 
+       Time Series Analysis by State Space Methods: Second Edition. 
+       Oxford University Press. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">constraints=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># Standardize data</span>
+        <span class="s1">endog_using_pandas = _is_using_pandas(endog</span><span class="s2">, None</span><span class="s1">)</span>
+        <span class="s2">if not </span><span class="s1">endog_using_pandas:</span>
+            <span class="s1">endog = np.asanyarray(endog)</span>
+
+        <span class="s1">exog_is_using_pandas = _is_using_pandas(exog</span><span class="s2">, None</span><span class="s1">)</span>
+        <span class="s2">if not </span><span class="s1">exog_is_using_pandas:</span>
+            <span class="s1">exog = np.asarray(exog)</span>
+
+        <span class="s3"># Make sure we have 2-dimensional array</span>
+        <span class="s2">if </span><span class="s1">exog.ndim == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s2">if not </span><span class="s1">exog_is_using_pandas:</span>
+                <span class="s1">exog = exog[:</span><span class="s2">, None</span><span class="s1">]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">exog = pd.DataFrame(exog)</span>
+
+        <span class="s1">self.k_exog = exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s3"># Handle constraints</span>
+        <span class="s1">self.k_constraints = </span><span class="s4">0</span>
+        <span class="s1">self._r_matrix = self._q_matrix = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">constraints </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">from </span><span class="s1">patsy </span><span class="s2">import </span><span class="s1">DesignInfo</span>
+            <span class="s2">from </span><span class="s1">statsmodels.base.data </span><span class="s2">import </span><span class="s1">handle_data</span>
+            <span class="s1">data = handle_data(endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+            <span class="s1">names = data.param_names</span>
+            <span class="s1">LC = DesignInfo(names).linear_constraint(constraints)</span>
+            <span class="s1">self._r_matrix</span><span class="s2">, </span><span class="s1">self._q_matrix = LC.coefs</span><span class="s2">, </span><span class="s1">LC.constants</span>
+            <span class="s1">self.k_constraints = self._r_matrix.shape[</span><span class="s4">0</span><span class="s1">]</span>
+
+            <span class="s1">nobs = len(endog)</span>
+            <span class="s1">constraint_endog = np.zeros((nobs</span><span class="s2">, </span><span class="s1">len(self._r_matrix)))</span>
+            <span class="s2">if </span><span class="s1">endog_using_pandas:</span>
+                <span class="s1">constraint_endog = pd.DataFrame(constraint_endog</span><span class="s2">,</span>
+                                                <span class="s1">index=endog.index)</span>
+                <span class="s1">endog = concat([endog</span><span class="s2">, </span><span class="s1">constraint_endog]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s4">1</span><span class="s1">)</span>
+                <span class="s3"># Complexity needed to handle multiple version of pandas</span>
+                <span class="s3"># Pandas &gt;= 2 can use endog.iloc[:, 1:] = self._q_matrix.T</span>
+                <span class="s1">endog.iloc[:</span><span class="s2">, </span><span class="s4">1</span><span class="s1">:] = np.tile(self._q_matrix.T</span><span class="s2">, </span><span class="s1">(nobs</span><span class="s2">, </span><span class="s4">1</span><span class="s1">))</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">endog[:</span><span class="s2">, </span><span class="s4">1</span><span class="s1">:] = self._q_matrix[:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span>
+
+        <span class="s3"># Handle coefficient initialization</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'initialization'</span><span class="s2">, </span><span class="s5">'diffuse'</span><span class="s1">)</span>
+
+        <span class="s3"># Remove some formula-specific kwargs</span>
+        <span class="s1">formula_kwargs = [</span><span class="s5">'missing'</span><span class="s2">, </span><span class="s5">'missing_idx'</span><span class="s2">, </span><span class="s5">'formula'</span><span class="s2">, </span><span class="s5">'design_info'</span><span class="s1">]</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">formula_kwargs:</span>
+            <span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">kwargs:</span>
+                <span class="s2">del </span><span class="s1">kwargs[name]</span>
+
+        <span class="s3"># Initialize the state space representation</span>
+        <span class="s1">super(RecursiveLS</span><span class="s2">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">endog</span><span class="s2">, </span><span class="s1">k_states=self.k_exog</span><span class="s2">, </span><span class="s1">exog=exog</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s3"># Use univariate filtering by default</span>
+        <span class="s1">self.ssm.filter_univariate = </span><span class="s2">True</span>
+
+        <span class="s3"># Concentrate the scale out of the likelihood function</span>
+        <span class="s1">self.ssm.filter_concentrated = </span><span class="s2">True</span>
+
+        <span class="s3"># Setup the state space representation</span>
+        <span class="s1">self[</span><span class="s5">'design'</span><span class="s1">] = np.zeros((self.k_endog</span><span class="s2">, </span><span class="s1">self.k_states</span><span class="s2">, </span><span class="s1">self.nobs))</span>
+        <span class="s1">self[</span><span class="s5">'design'</span><span class="s2">, </span><span class="s4">0</span><span class="s1">] = self.exog[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, None</span><span class="s1">].T</span>
+        <span class="s2">if </span><span class="s1">self._r_matrix </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self[</span><span class="s5">'design'</span><span class="s2">, </span><span class="s4">1</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:] = self._r_matrix[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, None</span><span class="s1">]</span>
+        <span class="s1">self[</span><span class="s5">'transition'</span><span class="s1">] = np.eye(self.k_states)</span>
+
+        <span class="s3"># Notice that the filter output does not depend on the measurement</span>
+        <span class="s3"># variance, so we set it here to 1</span>
+        <span class="s1">self[</span><span class="s5">'obs_cov'</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">] = </span><span class="s4">1.</span>
+        <span class="s1">self[</span><span class="s5">'transition'</span><span class="s1">] = np.eye(self.k_states)</span>
+
+        <span class="s3"># Linear constraints are technically imposed by adding &quot;fake&quot; endog</span>
+        <span class="s3"># variables that are used during filtering, but for all model- and</span>
+        <span class="s3"># results-based purposes we want k_endog = 1.</span>
+        <span class="s2">if </span><span class="s1">self._r_matrix </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.k_endog = </span><span class="s4">1</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">from_formula(cls</span><span class="s2">, </span><span class="s1">formula</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">subset=</span><span class="s2">None, </span><span class="s1">constraints=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">return </span><span class="s1">super(MLEModel</span><span class="s2">, </span><span class="s1">cls).from_formula(formula</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">subset</span><span class="s2">,</span>
+                                                 <span class="s1">constraints=constraints)</span>
+
+    <span class="s2">def </span><span class="s1">_validate_can_fix_params(self</span><span class="s2">, </span><span class="s1">param_names):</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'Linear constraints on coefficients should be given'</span>
+                         <span class="s5">' using the `constraints` argument in constructing.'</span>
+                         <span class="s5">' the model. Other parameter constraints are not'</span>
+                         <span class="s5">' available in the resursive least squares model.'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">fit(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Fits the model by application of the Kalman filter 
+ 
+        Returns 
+        ------- 
+        RecursiveLSResults 
+        &quot;&quot;&quot;</span>
+        <span class="s1">smoother_results = self.smooth(return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s2">with </span><span class="s1">self.ssm.fixed_scale(smoother_results.scale):</span>
+            <span class="s1">res = self.smooth()</span>
+
+        <span class="s2">return </span><span class="s1">res</span>
+
+    <span class="s2">def </span><span class="s1">filter(self</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">False, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># Get the state space output</span>
+        <span class="s1">result = super(RecursiveLS</span><span class="s2">, </span><span class="s1">self).filter([]</span><span class="s2">, </span><span class="s1">transformed=</span><span class="s2">True,</span>
+                                                 <span class="s1">cov_type=</span><span class="s5">'none'</span><span class="s2">,</span>
+                                                 <span class="s1">return_ssm=</span><span class="s2">True, </span><span class="s1">**kwargs)</span>
+
+        <span class="s3"># Wrap in a results object</span>
+        <span class="s2">if not </span><span class="s1">return_ssm:</span>
+            <span class="s1">params = result.filtered_state[:</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">cov_kwds = {</span>
+                <span class="s5">'custom_cov_type'</span><span class="s1">: </span><span class="s5">'nonrobust'</span><span class="s2">,</span>
+                <span class="s5">'custom_cov_params'</span><span class="s1">: result.filtered_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s5">'custom_description'</span><span class="s1">: (</span><span class="s5">'Parameters and covariance matrix'</span>
+                                       <span class="s5">' estimates are RLS estimates'</span>
+                                       <span class="s5">' conditional on the entire sample.'</span><span class="s1">)</span>
+            <span class="s1">}</span>
+            <span class="s1">result = RecursiveLSResultsWrapper(</span>
+                <span class="s1">RecursiveLSResults(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">result</span><span class="s2">, </span><span class="s1">cov_type=</span><span class="s5">'custom'</span><span class="s2">,</span>
+                                   <span class="s1">cov_kwds=cov_kwds)</span>
+            <span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">result</span>
+
+    <span class="s2">def </span><span class="s1">smooth(self</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">False, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># Get the state space output</span>
+        <span class="s1">result = super(RecursiveLS</span><span class="s2">, </span><span class="s1">self).smooth([]</span><span class="s2">, </span><span class="s1">transformed=</span><span class="s2">True,</span>
+                                                 <span class="s1">cov_type=</span><span class="s5">'none'</span><span class="s2">,</span>
+                                                 <span class="s1">return_ssm=</span><span class="s2">True, </span><span class="s1">**kwargs)</span>
+
+        <span class="s3"># Wrap in a results object</span>
+        <span class="s2">if not </span><span class="s1">return_ssm:</span>
+            <span class="s1">params = result.filtered_state[:</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">cov_kwds = {</span>
+                <span class="s5">'custom_cov_type'</span><span class="s1">: </span><span class="s5">'nonrobust'</span><span class="s2">,</span>
+                <span class="s5">'custom_cov_params'</span><span class="s1">: result.filtered_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s5">'custom_description'</span><span class="s1">: (</span><span class="s5">'Parameters and covariance matrix'</span>
+                                       <span class="s5">' estimates are RLS estimates'</span>
+                                       <span class="s5">' conditional on the entire sample.'</span><span class="s1">)</span>
+            <span class="s1">}</span>
+            <span class="s1">result = RecursiveLSResultsWrapper(</span>
+                <span class="s1">RecursiveLSResults(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">result</span><span class="s2">, </span><span class="s1">cov_type=</span><span class="s5">'custom'</span><span class="s2">,</span>
+                                   <span class="s1">cov_kwds=cov_kwds)</span>
+            <span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">result</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">endog_names(self):</span>
+        <span class="s1">endog_names = super(RecursiveLS</span><span class="s2">, </span><span class="s1">self).endog_names</span>
+        <span class="s2">return </span><span class="s1">endog_names[</span><span class="s4">0</span><span class="s1">] </span><span class="s2">if </span><span class="s1">isinstance(endog_names</span><span class="s2">, </span><span class="s1">list) </span><span class="s2">else </span><span class="s1">endog_names</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">param_names(self):</span>
+        <span class="s2">return </span><span class="s1">self.exog_names</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">start_params(self):</span>
+        <span class="s3"># Only parameter is the measurement disturbance standard deviation</span>
+        <span class="s2">return </span><span class="s1">np.zeros(</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">update(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Update the parameters of the model 
+ 
+        Updates the representation matrices to fill in the new parameter 
+        values. 
+ 
+        Parameters 
+        ---------- 
+        params : array_like 
+            Array of new parameters. 
+        transformed : bool, optional 
+            Whether or not `params` is already transformed. If set to False, 
+            `transform_params` is called. Default is True.. 
+ 
+        Returns 
+        ------- 
+        params : array_like 
+            Array of parameters. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">RecursiveLSResults(MLEResults):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Class to hold results from fitting a recursive least squares model. 
+ 
+    Parameters 
+    ---------- 
+    model : RecursiveLS instance 
+        The fitted model instance 
+ 
+    Attributes 
+    ---------- 
+    specification : dictionary 
+        Dictionary including all attributes from the recursive least squares 
+        model instance. 
+ 
+    See Also 
+    -------- 
+    statsmodels.tsa.statespace.kalman_filter.FilterResults 
+    statsmodels.tsa.statespace.mlemodel.MLEResults 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">model</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">filter_results</span><span class="s2">, </span><span class="s1">cov_type=</span><span class="s5">'opg'</span><span class="s2">,</span>
+                 <span class="s1">**kwargs):</span>
+        <span class="s1">super(RecursiveLSResults</span><span class="s2">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">model</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">filter_results</span><span class="s2">, </span><span class="s1">cov_type</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s3"># Since we are overriding params with things that are not MLE params,</span>
+        <span class="s3"># need to adjust df's</span>
+        <span class="s1">q = max(self.loglikelihood_burn</span><span class="s2">, </span><span class="s1">self.k_diffuse_states)</span>
+        <span class="s1">self.df_model = q - self.model.k_constraints</span>
+        <span class="s1">self.df_resid = self.nobs_effective - self.df_model</span>
+
+        <span class="s3"># Save _init_kwds</span>
+        <span class="s1">self._init_kwds = self.model._get_init_kwds()</span>
+
+        <span class="s3"># Save the model specification</span>
+        <span class="s1">self.specification = Bunch(**{</span>
+            <span class="s5">'k_exog'</span><span class="s1">: self.model.k_exog</span><span class="s2">,</span>
+            <span class="s5">'k_constraints'</span><span class="s1">: self.model.k_constraints})</span>
+
+        <span class="s3"># Adjust results to remove &quot;faux&quot; endog from the constraints</span>
+        <span class="s2">if </span><span class="s1">self.model._r_matrix </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">[</span><span class="s5">'forecasts'</span><span class="s2">, </span><span class="s5">'forecasts_error'</span><span class="s2">,</span>
+                         <span class="s5">'forecasts_error_cov'</span><span class="s2">, </span><span class="s5">'standardized_forecasts_error'</span><span class="s2">,</span>
+                         <span class="s5">'forecasts_error_diffuse_cov'</span><span class="s1">]:</span>
+                <span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">getattr(self</span><span class="s2">, </span><span class="s1">name)[</span><span class="s4">0</span><span class="s1">:</span><span class="s4">1</span><span class="s1">])</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">recursive_coefficients(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimates of regression coefficients, recursively estimated 
+ 
+        Returns 
+        ------- 
+        out: Bunch 
+            Has the following attributes: 
+ 
+            - `filtered`: a time series array with the filtered estimate of 
+                          the component 
+            - `filtered_cov`: a time series array with the filtered estimate of 
+                          the variance/covariance of the component 
+            - `smoothed`: a time series array with the smoothed estimate of 
+                          the component 
+            - `smoothed_cov`: a time series array with the smoothed estimate of 
+                          the variance/covariance of the component 
+            - `offset`: an integer giving the offset in the state vector where 
+                        this component begins 
+        &quot;&quot;&quot;</span>
+        <span class="s1">out = </span><span class="s2">None</span>
+        <span class="s1">spec = self.specification</span>
+        <span class="s1">start = offset = </span><span class="s4">0</span>
+        <span class="s1">end = offset + spec.k_exog</span>
+        <span class="s1">out = Bunch(</span>
+            <span class="s1">filtered=self.filtered_state[start:end]</span><span class="s2">,</span>
+            <span class="s1">filtered_cov=self.filtered_state_cov[start:end</span><span class="s2">, </span><span class="s1">start:end]</span><span class="s2">,</span>
+            <span class="s1">smoothed=</span><span class="s2">None, </span><span class="s1">smoothed_cov=</span><span class="s2">None,</span>
+            <span class="s1">offset=offset</span>
+        <span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">self.smoothed_state </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">out.smoothed = self.smoothed_state[start:end]</span>
+        <span class="s2">if </span><span class="s1">self.smoothed_state_cov </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">out.smoothed_cov = (</span>
+                <span class="s1">self.smoothed_state_cov[start:end</span><span class="s2">, </span><span class="s1">start:end])</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">resid_recursive(self):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Recursive residuals 
+ 
+        Returns 
+        ------- 
+        resid_recursive : array_like 
+            An array of length `nobs` holding the recursive 
+            residuals. 
+ 
+        Notes 
+        ----- 
+        These quantities are defined in, for example, Harvey (1989) 
+        section 5.4. In fact, there he defines the standardized innovations in 
+        equation 5.4.1, but in his version they have non-unit variance, whereas 
+        the standardized forecast errors computed by the Kalman filter here 
+        assume unit variance. To convert to Harvey's definition, we need to 
+        multiply by the standard deviation. 
+ 
+        Harvey notes that in smaller samples, &quot;although the second moment 
+        of the :math:`\tilde \sigma_*^{-1} \tilde v_t`'s is unity, the 
+        variance is not necessarily equal to unity as the mean need not be 
+        equal to zero&quot;, and he defines an alternative version (which are 
+        not provided here). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">(self.filter_results.standardized_forecasts_error[</span><span class="s4">0</span><span class="s1">] *</span>
+                <span class="s1">self.scale**</span><span class="s4">0.5</span><span class="s1">)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">cusum(self):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Cumulative sum of standardized recursive residuals statistics 
+ 
+        Returns 
+        ------- 
+        cusum : array_like 
+            An array of length `nobs - k_exog` holding the 
+            CUSUM statistics. 
+ 
+        Notes 
+        ----- 
+        The CUSUM statistic takes the form: 
+ 
+        .. math:: 
+ 
+            W_t = \frac{1}{\hat \sigma} \sum_{j=k+1}^t w_j 
+ 
+        where :math:`w_j` is the recursive residual at time :math:`j` and 
+        :math:`\hat \sigma` is the estimate of the standard deviation 
+        from the full sample. 
+ 
+        Excludes the first `k_exog` datapoints. 
+ 
+        Due to differences in the way :math:`\hat \sigma` is calculated, the 
+        output of this function differs slightly from the output in the 
+        R package strucchange and the Stata contributed .ado file cusum6. The 
+        calculation in this package is consistent with the description of 
+        Brown et al. (1975) 
+ 
+        References 
+        ---------- 
+        .. [*] Brown, R. L., J. Durbin, and J. M. Evans. 1975. 
+           &quot;Techniques for Testing the Constancy of 
+           Regression Relationships over Time.&quot; 
+           Journal of the Royal Statistical Society. 
+           Series B (Methodological) 37 (2): 149-92. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">d = max(self.nobs_diffuse</span><span class="s2">, </span><span class="s1">self.loglikelihood_burn)</span>
+        <span class="s2">return </span><span class="s1">(np.cumsum(self.resid_recursive[d:]) /</span>
+                <span class="s1">np.std(self.resid_recursive[d:]</span><span class="s2">, </span><span class="s1">ddof=</span><span class="s4">1</span><span class="s1">))</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">cusum_squares(self):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Cumulative sum of squares of standardized recursive residuals 
+        statistics 
+ 
+        Returns 
+        ------- 
+        cusum_squares : array_like 
+            An array of length `nobs - k_exog` holding the 
+            CUSUM of squares statistics. 
+ 
+        Notes 
+        ----- 
+        The CUSUM of squares statistic takes the form: 
+ 
+        .. math:: 
+ 
+            s_t = \left ( \sum_{j=k+1}^t w_j^2 \right ) \Bigg / 
+                  \left ( \sum_{j=k+1}^T w_j^2 \right ) 
+ 
+        where :math:`w_j` is the recursive residual at time :math:`j`. 
+ 
+        Excludes the first `k_exog` datapoints. 
+ 
+        References 
+        ---------- 
+        .. [*] Brown, R. L., J. Durbin, and J. M. Evans. 1975. 
+           &quot;Techniques for Testing the Constancy of 
+           Regression Relationships over Time.&quot; 
+           Journal of the Royal Statistical Society. 
+           Series B (Methodological) 37 (2): 149-92. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">d = max(self.nobs_diffuse</span><span class="s2">, </span><span class="s1">self.loglikelihood_burn)</span>
+        <span class="s1">numer = np.cumsum(self.resid_recursive[d:]**</span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s1">denom = numer[-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">numer / denom</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">llf_recursive_obs(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        (float) Loglikelihood at observation, computed from recursive residuals 
+        &quot;&quot;&quot;</span>
+        <span class="s2">from </span><span class="s1">scipy.stats </span><span class="s2">import </span><span class="s1">norm</span>
+        <span class="s2">return </span><span class="s1">np.log(norm.pdf(self.resid_recursive</span><span class="s2">, </span><span class="s1">loc=</span><span class="s4">0</span><span class="s2">,</span>
+                               <span class="s1">scale=self.scale**</span><span class="s4">0.5</span><span class="s1">))</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">llf_recursive(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        (float) Loglikelihood defined by recursive residuals, equivalent to OLS 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">np.sum(self.llf_recursive_obs)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">ssr(self):</span>
+        <span class="s0">&quot;&quot;&quot;ssr&quot;&quot;&quot;</span>
+        <span class="s1">d = max(self.nobs_diffuse</span><span class="s2">, </span><span class="s1">self.loglikelihood_burn)</span>
+        <span class="s2">return </span><span class="s1">(self.nobs - d) * self.filter_results.obs_cov[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">centered_tss(self):</span>
+        <span class="s0">&quot;&quot;&quot;Centered tss&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">np.sum((self.filter_results.endog[</span><span class="s4">0</span><span class="s1">] -</span>
+                       <span class="s1">np.mean(self.filter_results.endog))**</span><span class="s4">2</span><span class="s1">)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">uncentered_tss(self):</span>
+        <span class="s0">&quot;&quot;&quot;uncentered tss&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">np.sum((self.filter_results.endog[</span><span class="s4">0</span><span class="s1">])**</span><span class="s4">2</span><span class="s1">)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">ess(self):</span>
+        <span class="s0">&quot;&quot;&quot;ess&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self.k_constant:</span>
+            <span class="s2">return </span><span class="s1">self.centered_tss - self.ssr</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.uncentered_tss - self.ssr</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">rsquared(self):</span>
+        <span class="s0">&quot;&quot;&quot;rsquared&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self.k_constant:</span>
+            <span class="s2">return </span><span class="s4">1 </span><span class="s1">- self.ssr / self.centered_tss</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s4">1 </span><span class="s1">- self.ssr / self.uncentered_tss</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">mse_model(self):</span>
+        <span class="s0">&quot;&quot;&quot;mse_model&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.ess / self.df_model</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">mse_resid(self):</span>
+        <span class="s0">&quot;&quot;&quot;mse_resid&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.ssr / self.df_resid</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">mse_total(self):</span>
+        <span class="s0">&quot;&quot;&quot;mse_total&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self.k_constant:</span>
+            <span class="s2">return </span><span class="s1">self.centered_tss / (self.df_resid + self.df_model)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.uncentered_tss / (self.df_resid + self.df_model)</span>
+
+    <span class="s1">@Appender(MLEResults.get_prediction.__doc__)</span>
+    <span class="s2">def </span><span class="s1">get_prediction(self</span><span class="s2">, </span><span class="s1">start=</span><span class="s2">None, </span><span class="s1">end=</span><span class="s2">None, </span><span class="s1">dynamic=</span><span class="s2">False,</span>
+                       <span class="s1">information_set=</span><span class="s5">'predicted'</span><span class="s2">, </span><span class="s1">signal_only=</span><span class="s2">False,</span>
+                       <span class="s1">index=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># Note: need to override this, because we currently do not support</span>
+        <span class="s3"># dynamic prediction or forecasts when there are constraints.</span>
+        <span class="s2">if </span><span class="s1">start </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">start = self.model._index[</span><span class="s4">0</span><span class="s1">]</span>
+
+        <span class="s3"># Handle start, end, dynamic</span>
+        <span class="s1">start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, </span><span class="s1">out_of_sample</span><span class="s2">, </span><span class="s1">prediction_index = (</span>
+            <span class="s1">self.model._get_prediction_index(start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, </span><span class="s1">index))</span>
+
+        <span class="s3"># Handle `dynamic`</span>
+        <span class="s2">if </span><span class="s1">isinstance(dynamic</span><span class="s2">, </span><span class="s1">(bytes</span><span class="s2">, </span><span class="s1">str)):</span>
+            <span class="s1">dynamic</span><span class="s2">, </span><span class="s1">_</span><span class="s2">, </span><span class="s1">_ = self.model._get_index_loc(dynamic)</span>
+
+        <span class="s2">if </span><span class="s1">self.model._r_matrix </span><span class="s2">is not None and </span><span class="s1">(out_of_sample </span><span class="s2">or </span><span class="s1">dynamic):</span>
+            <span class="s2">raise </span><span class="s1">NotImplementedError(</span><span class="s5">'Cannot yet perform out-of-sample or'</span>
+                                      <span class="s5">' dynamic prediction in models with'</span>
+                                      <span class="s5">' constraints.'</span><span class="s1">)</span>
+
+        <span class="s3"># Perform the prediction</span>
+        <span class="s3"># This is a (k_endog x npredictions) array; do not want to squeeze in</span>
+        <span class="s3"># case of npredictions = 1</span>
+        <span class="s1">prediction_results = self.filter_results.predict(</span>
+            <span class="s1">start</span><span class="s2">, </span><span class="s1">end + out_of_sample + </span><span class="s4">1</span><span class="s2">, </span><span class="s1">dynamic</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s3"># Return a new mlemodel.PredictionResults object</span>
+        <span class="s1">res_obj = PredictionResults(self</span><span class="s2">, </span><span class="s1">prediction_results</span><span class="s2">,</span>
+                                    <span class="s1">information_set=information_set</span><span class="s2">,</span>
+                                    <span class="s1">signal_only=signal_only</span><span class="s2">,</span>
+                                    <span class="s1">row_labels=prediction_index)</span>
+        <span class="s2">return </span><span class="s1">PredictionResultsWrapper(res_obj)</span>
+
+    <span class="s2">def </span><span class="s1">plot_recursive_coefficient(self</span><span class="s2">, </span><span class="s1">variables=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">,</span>
+                                   <span class="s1">legend_loc=</span><span class="s5">'upper left'</span><span class="s2">, </span><span class="s1">fig=</span><span class="s2">None,</span>
+                                   <span class="s1">figsize=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Plot the recursively estimated coefficients on a given variable 
+ 
+        Parameters 
+        ---------- 
+        variables : {int, str, list[int], list[str]}, optional 
+            Integer index or string name of the variable whose coefficient will 
+            be plotted. Can also be an iterable of integers or strings. Default 
+            is the first variable. 
+        alpha : float, optional 
+            The confidence intervals for the coefficient are (1 - alpha) % 
+        legend_loc : str, optional 
+            The location of the legend in the plot. Default is upper left. 
+        fig : Figure, optional 
+            If given, subplots are created in this figure instead of in a new 
+            figure. Note that the grid will be created in the provided 
+            figure using `fig.add_subplot()`. 
+        figsize : tuple, optional 
+            If a figure is created, this argument allows specifying a size. 
+            The tuple is (width, height). 
+ 
+        Notes 
+        ----- 
+        All plots contain (1 - `alpha`) %  confidence intervals. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Get variables</span>
+        <span class="s2">if </span><span class="s1">isinstance(variables</span><span class="s2">, </span><span class="s1">(int</span><span class="s2">, </span><span class="s1">str)):</span>
+            <span class="s1">variables = [variables]</span>
+        <span class="s1">k_variables = len(variables)</span>
+
+        <span class="s3"># If a string was given for `variable`, try to get it from exog names</span>
+        <span class="s1">exog_names = self.model.exog_names</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(k_variables):</span>
+            <span class="s1">variable = variables[i]</span>
+            <span class="s2">if </span><span class="s1">isinstance(variable</span><span class="s2">, </span><span class="s1">str):</span>
+                <span class="s1">variables[i] = exog_names.index(variable)</span>
+
+        <span class="s3"># Create the plot</span>
+        <span class="s2">from </span><span class="s1">scipy.stats </span><span class="s2">import </span><span class="s1">norm</span>
+        <span class="s2">from </span><span class="s1">statsmodels.graphics.utils </span><span class="s2">import </span><span class="s1">_import_mpl</span><span class="s2">, </span><span class="s1">create_mpl_fig</span>
+        <span class="s1">plt = _import_mpl()</span>
+        <span class="s1">fig = create_mpl_fig(fig</span><span class="s2">, </span><span class="s1">figsize)</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(k_variables):</span>
+            <span class="s1">variable = variables[i]</span>
+            <span class="s1">ax = fig.add_subplot(k_variables</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">i + </span><span class="s4">1</span><span class="s1">)</span>
+
+            <span class="s3"># Get dates, if applicable</span>
+            <span class="s2">if </span><span class="s1">hasattr(self.data</span><span class="s2">, </span><span class="s5">'dates'</span><span class="s1">) </span><span class="s2">and </span><span class="s1">self.data.dates </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">dates = self.data.dates._mpl_repr()</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">dates = np.arange(self.nobs)</span>
+            <span class="s1">d = max(self.nobs_diffuse</span><span class="s2">, </span><span class="s1">self.loglikelihood_burn)</span>
+
+            <span class="s3"># Plot the coefficient</span>
+            <span class="s1">coef = self.recursive_coefficients</span>
+            <span class="s1">ax.plot(dates[d:]</span><span class="s2">, </span><span class="s1">coef.filtered[variable</span><span class="s2">, </span><span class="s1">d:]</span><span class="s2">,</span>
+                    <span class="s1">label=</span><span class="s5">'Recursive estimates: %s' </span><span class="s1">% exog_names[variable])</span>
+
+            <span class="s3"># Legend</span>
+            <span class="s1">handles</span><span class="s2">, </span><span class="s1">labels = ax.get_legend_handles_labels()</span>
+
+            <span class="s3"># Get the critical value for confidence intervals</span>
+            <span class="s2">if </span><span class="s1">alpha </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">critical_value = norm.ppf(</span><span class="s4">1 </span><span class="s1">- alpha / </span><span class="s4">2.</span><span class="s1">)</span>
+
+                <span class="s3"># Plot confidence intervals</span>
+                <span class="s1">std_errors = np.sqrt(coef.filtered_cov[variable</span><span class="s2">, </span><span class="s1">variable</span><span class="s2">, </span><span class="s1">:])</span>
+                <span class="s1">ci_lower = (</span>
+                    <span class="s1">coef.filtered[variable] - critical_value * std_errors)</span>
+                <span class="s1">ci_upper = (</span>
+                    <span class="s1">coef.filtered[variable] + critical_value * std_errors)</span>
+                <span class="s1">ci_poly = ax.fill_between(</span>
+                    <span class="s1">dates[d:]</span><span class="s2">, </span><span class="s1">ci_lower[d:]</span><span class="s2">, </span><span class="s1">ci_upper[d:]</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.2</span>
+                <span class="s1">)</span>
+                <span class="s1">ci_label = (</span><span class="s5">'$%.3g </span><span class="s2">\\</span><span class="s5">%%$ confidence interval'</span>
+                            <span class="s1">% ((</span><span class="s4">1 </span><span class="s1">- alpha)*</span><span class="s4">100</span><span class="s1">))</span>
+
+                <span class="s3"># Only add CI to legend for the first plot</span>
+                <span class="s2">if </span><span class="s1">i == </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s3"># Proxy artist for fill_between legend entry</span>
+                    <span class="s3"># See https://matplotlib.org/1.3.1/users/legend_guide.html</span>
+                    <span class="s1">p = plt.Rectangle((</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">,</span>
+                                      <span class="s1">fc=ci_poly.get_facecolor()[</span><span class="s4">0</span><span class="s1">])</span>
+
+                    <span class="s1">handles.append(p)</span>
+                    <span class="s1">labels.append(ci_label)</span>
+
+            <span class="s1">ax.legend(handles</span><span class="s2">, </span><span class="s1">labels</span><span class="s2">, </span><span class="s1">loc=legend_loc)</span>
+
+            <span class="s3"># Remove xticks for all but the last plot</span>
+            <span class="s2">if </span><span class="s1">i &lt; k_variables - </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">ax.xaxis.set_ticklabels([])</span>
+
+        <span class="s1">fig.tight_layout()</span>
+
+        <span class="s2">return </span><span class="s1">fig</span>
+
+    <span class="s2">def </span><span class="s1">_cusum_significance_bounds(self</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">ddof=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">points=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        alpha : float, optional 
+            The significance bound is alpha %. 
+        ddof : int, optional 
+            The number of periods additional to `k_exog` to exclude in 
+            constructing the bounds. Default is zero. This is usually used 
+            only for testing purposes. 
+        points : iterable, optional 
+            The points at which to evaluate the significance bounds. Default is 
+            two points, beginning and end of the sample. 
+ 
+        Notes 
+        ----- 
+        Comparing against the cusum6 package for Stata, this does not produce 
+        exactly the same confidence bands (which are produced in cusum6 by 
+        lw, uw) because they burn the first k_exog + 1 periods instead of the 
+        first k_exog. If this change is performed 
+        (so that `tmp = (self.nobs - d - 1)**0.5`), then the output here 
+        matches cusum6. 
+ 
+        The cusum6 behavior does not seem to be consistent with 
+        Brown et al. (1975); it is likely they did that because they needed 
+        three initial observations to get the initial OLS estimates, whereas 
+        we do not need to do that. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Get the constant associated with the significance level</span>
+        <span class="s2">if </span><span class="s1">alpha == </span><span class="s4">0.01</span><span class="s1">:</span>
+            <span class="s1">scalar = </span><span class="s4">1.143</span>
+        <span class="s2">elif </span><span class="s1">alpha == </span><span class="s4">0.05</span><span class="s1">:</span>
+            <span class="s1">scalar = </span><span class="s4">0.948</span>
+        <span class="s2">elif </span><span class="s1">alpha == </span><span class="s4">0.10</span><span class="s1">:</span>
+            <span class="s1">scalar = </span><span class="s4">0.950</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'Invalid significance level.'</span><span class="s1">)</span>
+
+        <span class="s3"># Get the points for the significance bound lines</span>
+        <span class="s1">d = max(self.nobs_diffuse</span><span class="s2">, </span><span class="s1">self.loglikelihood_burn)</span>
+        <span class="s1">tmp = (self.nobs - d - ddof)**</span><span class="s4">0.5</span>
+
+        <span class="s2">def </span><span class="s1">upper_line(x):</span>
+            <span class="s2">return </span><span class="s1">scalar * tmp + </span><span class="s4">2 </span><span class="s1">* scalar * (x - d) / tmp</span>
+
+        <span class="s2">if </span><span class="s1">points </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">points = np.array([d</span><span class="s2">, </span><span class="s1">self.nobs])</span>
+        <span class="s2">return </span><span class="s1">-upper_line(points)</span><span class="s2">, </span><span class="s1">upper_line(points)</span>
+
+    <span class="s2">def </span><span class="s1">plot_cusum(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">legend_loc=</span><span class="s5">'upper left'</span><span class="s2">,</span>
+                   <span class="s1">fig=</span><span class="s2">None, </span><span class="s1">figsize=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Plot the CUSUM statistic and significance bounds. 
+ 
+        Parameters 
+        ---------- 
+        alpha : float, optional 
+            The plotted significance bounds are alpha %. 
+        legend_loc : str, optional 
+            The location of the legend in the plot. Default is upper left. 
+        fig : Figure, optional 
+            If given, subplots are created in this figure instead of in a new 
+            figure. Note that the grid will be created in the provided 
+            figure using `fig.add_subplot()`. 
+        figsize : tuple, optional 
+            If a figure is created, this argument allows specifying a size. 
+            The tuple is (width, height). 
+ 
+        Notes 
+        ----- 
+        Evidence of parameter instability may be found if the CUSUM statistic 
+        moves out of the significance bounds. 
+ 
+        References 
+        ---------- 
+        .. [*] Brown, R. L., J. Durbin, and J. M. Evans. 1975. 
+           &quot;Techniques for Testing the Constancy of 
+           Regression Relationships over Time.&quot; 
+           Journal of the Royal Statistical Society. 
+           Series B (Methodological) 37 (2): 149-92. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Create the plot</span>
+        <span class="s2">from </span><span class="s1">statsmodels.graphics.utils </span><span class="s2">import </span><span class="s1">_import_mpl</span><span class="s2">, </span><span class="s1">create_mpl_fig</span>
+        <span class="s1">_import_mpl()</span>
+        <span class="s1">fig = create_mpl_fig(fig</span><span class="s2">, </span><span class="s1">figsize)</span>
+        <span class="s1">ax = fig.add_subplot(</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s3"># Get dates, if applicable</span>
+        <span class="s2">if </span><span class="s1">hasattr(self.data</span><span class="s2">, </span><span class="s5">'dates'</span><span class="s1">) </span><span class="s2">and </span><span class="s1">self.data.dates </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">dates = self.data.dates._mpl_repr()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">dates = np.arange(self.nobs)</span>
+        <span class="s1">d = max(self.nobs_diffuse</span><span class="s2">, </span><span class="s1">self.loglikelihood_burn)</span>
+
+        <span class="s3"># Plot cusum series and reference line</span>
+        <span class="s1">ax.plot(dates[d:]</span><span class="s2">, </span><span class="s1">self.cusum</span><span class="s2">, </span><span class="s1">label=</span><span class="s5">'CUSUM'</span><span class="s1">)</span>
+        <span class="s1">ax.hlines(</span><span class="s4">0</span><span class="s2">, </span><span class="s1">dates[d]</span><span class="s2">, </span><span class="s1">dates[-</span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">color=</span><span class="s5">'k'</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.3</span><span class="s1">)</span>
+
+        <span class="s3"># Plot significance bounds</span>
+        <span class="s1">lower_line</span><span class="s2">, </span><span class="s1">upper_line = self._cusum_significance_bounds(alpha)</span>
+        <span class="s1">ax.plot([dates[d]</span><span class="s2">, </span><span class="s1">dates[-</span><span class="s4">1</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">upper_line</span><span class="s2">, </span><span class="s5">'k--'</span><span class="s2">,</span>
+                <span class="s1">label=</span><span class="s5">'%d%% significance' </span><span class="s1">% (alpha * </span><span class="s4">100</span><span class="s1">))</span>
+        <span class="s1">ax.plot([dates[d]</span><span class="s2">, </span><span class="s1">dates[-</span><span class="s4">1</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">lower_line</span><span class="s2">, </span><span class="s5">'k--'</span><span class="s1">)</span>
+
+        <span class="s1">ax.legend(loc=legend_loc)</span>
+
+        <span class="s2">return </span><span class="s1">fig</span>
+
+    <span class="s2">def </span><span class="s1">_cusum_squares_significance_bounds(self</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">points=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Notes 
+        ----- 
+        Comparing against the cusum6 package for Stata, this does not produce 
+        exactly the same confidence bands (which are produced in cusum6 by 
+        lww, uww) because they use a different method for computing the 
+        critical value; in particular, they use tabled values from 
+        Table C, pp. 364-365 of &quot;The Econometric Analysis of Time Series&quot; 
+        Harvey, (1990), and use the value given to 99 observations for any 
+        larger number of observations. In contrast, we use the approximating 
+        critical values suggested in Edgerton and Wells (1994) which allows 
+        computing relatively good approximations for any number of 
+        observations. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Get the approximate critical value associated with the significance</span>
+        <span class="s3"># level</span>
+        <span class="s1">d = max(self.nobs_diffuse</span><span class="s2">, </span><span class="s1">self.loglikelihood_burn)</span>
+        <span class="s1">n = </span><span class="s4">0.5 </span><span class="s1">* (self.nobs - d) - </span><span class="s4">1</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">ix = [</span><span class="s4">0.1</span><span class="s2">, </span><span class="s4">0.05</span><span class="s2">, </span><span class="s4">0.025</span><span class="s2">, </span><span class="s4">0.01</span><span class="s2">, </span><span class="s4">0.005</span><span class="s1">].index(alpha / </span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s2">except </span><span class="s1">ValueError:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'Invalid significance level.'</span><span class="s1">)</span>
+        <span class="s1">scalars = _cusum_squares_scalars[:</span><span class="s2">, </span><span class="s1">ix]</span>
+        <span class="s1">crit = scalars[</span><span class="s4">0</span><span class="s1">] / n**</span><span class="s4">0.5 </span><span class="s1">+ scalars[</span><span class="s4">1</span><span class="s1">] / n + scalars[</span><span class="s4">2</span><span class="s1">] / n**</span><span class="s4">1.5</span>
+
+        <span class="s3"># Get the points for the significance bound lines</span>
+        <span class="s2">if </span><span class="s1">points </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">points = np.array([d</span><span class="s2">, </span><span class="s1">self.nobs])</span>
+        <span class="s1">line = (points - d) / (self.nobs - d)</span>
+
+        <span class="s2">return </span><span class="s1">line - crit</span><span class="s2">, </span><span class="s1">line + crit</span>
+
+    <span class="s2">def </span><span class="s1">plot_cusum_squares(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">legend_loc=</span><span class="s5">'upper left'</span><span class="s2">,</span>
+                           <span class="s1">fig=</span><span class="s2">None, </span><span class="s1">figsize=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Plot the CUSUM of squares statistic and significance bounds. 
+ 
+        Parameters 
+        ---------- 
+        alpha : float, optional 
+            The plotted significance bounds are alpha %. 
+        legend_loc : str, optional 
+            The location of the legend in the plot. Default is upper left. 
+        fig : Figure, optional 
+            If given, subplots are created in this figure instead of in a new 
+            figure. Note that the grid will be created in the provided 
+            figure using `fig.add_subplot()`. 
+        figsize : tuple, optional 
+            If a figure is created, this argument allows specifying a size. 
+            The tuple is (width, height). 
+ 
+        Notes 
+        ----- 
+        Evidence of parameter instability may be found if the CUSUM of squares 
+        statistic moves out of the significance bounds. 
+ 
+        Critical values used in creating the significance bounds are computed 
+        using the approximate formula of [1]_. 
+ 
+        References 
+        ---------- 
+        .. [*] Brown, R. L., J. Durbin, and J. M. Evans. 1975. 
+           &quot;Techniques for Testing the Constancy of 
+           Regression Relationships over Time.&quot; 
+           Journal of the Royal Statistical Society. 
+           Series B (Methodological) 37 (2): 149-92. 
+        .. [1] Edgerton, David, and Curt Wells. 1994. 
+           &quot;Critical Values for the Cusumsq Statistic 
+           in Medium and Large Sized Samples.&quot; 
+           Oxford Bulletin of Economics and Statistics 56 (3): 355-65. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Create the plot</span>
+        <span class="s2">from </span><span class="s1">statsmodels.graphics.utils </span><span class="s2">import </span><span class="s1">_import_mpl</span><span class="s2">, </span><span class="s1">create_mpl_fig</span>
+        <span class="s1">_import_mpl()</span>
+        <span class="s1">fig = create_mpl_fig(fig</span><span class="s2">, </span><span class="s1">figsize)</span>
+        <span class="s1">ax = fig.add_subplot(</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s3"># Get dates, if applicable</span>
+        <span class="s2">if </span><span class="s1">hasattr(self.data</span><span class="s2">, </span><span class="s5">'dates'</span><span class="s1">) </span><span class="s2">and </span><span class="s1">self.data.dates </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">dates = self.data.dates._mpl_repr()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">dates = np.arange(self.nobs)</span>
+        <span class="s1">d = max(self.nobs_diffuse</span><span class="s2">, </span><span class="s1">self.loglikelihood_burn)</span>
+
+        <span class="s3"># Plot cusum series and reference line</span>
+        <span class="s1">ax.plot(dates[d:]</span><span class="s2">, </span><span class="s1">self.cusum_squares</span><span class="s2">, </span><span class="s1">label=</span><span class="s5">'CUSUM of squares'</span><span class="s1">)</span>
+        <span class="s1">ref_line = (np.arange(d</span><span class="s2">, </span><span class="s1">self.nobs) - d) / (self.nobs - d)</span>
+        <span class="s1">ax.plot(dates[d:]</span><span class="s2">, </span><span class="s1">ref_line</span><span class="s2">, </span><span class="s5">'k'</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.3</span><span class="s1">)</span>
+
+        <span class="s3"># Plot significance bounds</span>
+        <span class="s1">lower_line</span><span class="s2">, </span><span class="s1">upper_line = self._cusum_squares_significance_bounds(alpha)</span>
+        <span class="s1">ax.plot([dates[d]</span><span class="s2">, </span><span class="s1">dates[-</span><span class="s4">1</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">upper_line</span><span class="s2">, </span><span class="s5">'k--'</span><span class="s2">,</span>
+                <span class="s1">label=</span><span class="s5">'%d%% significance' </span><span class="s1">% (alpha * </span><span class="s4">100</span><span class="s1">))</span>
+        <span class="s1">ax.plot([dates[d]</span><span class="s2">, </span><span class="s1">dates[-</span><span class="s4">1</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">lower_line</span><span class="s2">, </span><span class="s5">'k--'</span><span class="s1">)</span>
+
+        <span class="s1">ax.legend(loc=legend_loc)</span>
+
+        <span class="s2">return </span><span class="s1">fig</span>
+
+
+<span class="s2">class </span><span class="s1">RecursiveLSResultsWrapper(MLEResultsWrapper):</span>
+    <span class="s1">_attrs = {}</span>
+    <span class="s1">_wrap_attrs = wrap.union_dicts(MLEResultsWrapper._wrap_attrs</span><span class="s2">,</span>
+                                   <span class="s1">_attrs)</span>
+    <span class="s1">_methods = {}</span>
+    <span class="s1">_wrap_methods = wrap.union_dicts(MLEResultsWrapper._wrap_methods</span><span class="s2">,</span>
+                                     <span class="s1">_methods)</span>
+<span class="s1">wrap.populate_wrapper(RecursiveLSResultsWrapper</span><span class="s2">,  </span><span class="s3"># noqa:E305</span>
+                      <span class="s1">RecursiveLSResults)</span>
+</pre>
+</body>
+</html>

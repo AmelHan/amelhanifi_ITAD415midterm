@@ -1,0 +1,1032 @@
+<html>
+<head>
+<title>arima_process.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+arima_process.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;ARMA process and estimation with scipy.signal.lfilter 
+ 
+Notes 
+----- 
+* written without textbook, works but not sure about everything 
+  briefly checked and it looks to be standard least squares, see below 
+ 
+* theoretical autocorrelation function of general ARMA 
+  Done, relatively easy to guess solution, time consuming to get 
+  theoretical test cases, example file contains explicit formulas for 
+  acovf of MA(1), MA(2) and ARMA(1,1) 
+ 
+Properties: 
+Judge, ... (1985): The Theory and Practise of Econometrics 
+ 
+Author: josefpktd 
+License: BSD 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s2">import </span><span class="s1">Appender</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">linalg</span><span class="s2">, </span><span class="s1">optimize</span><span class="s2">, </span><span class="s1">signal</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.tools.docstring </span><span class="s2">import </span><span class="s1">Docstring</span><span class="s2">, </span><span class="s1">remove_parameters</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.validation </span><span class="s2">import </span><span class="s1">array_like</span>
+
+<span class="s1">__all__ = [</span>
+    <span class="s3">&quot;arma_acf&quot;</span><span class="s2">,</span>
+    <span class="s3">&quot;arma_acovf&quot;</span><span class="s2">,</span>
+    <span class="s3">&quot;arma_generate_sample&quot;</span><span class="s2">,</span>
+    <span class="s3">&quot;arma_impulse_response&quot;</span><span class="s2">,</span>
+    <span class="s3">&quot;arma2ar&quot;</span><span class="s2">,</span>
+    <span class="s3">&quot;arma2ma&quot;</span><span class="s2">,</span>
+    <span class="s3">&quot;deconvolve&quot;</span><span class="s2">,</span>
+    <span class="s3">&quot;lpol2index&quot;</span><span class="s2">,</span>
+    <span class="s3">&quot;index2lpol&quot;</span><span class="s2">,</span>
+<span class="s1">]</span>
+
+
+<span class="s1">NONSTATIONARY_ERROR = </span><span class="s3">&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">The model's autoregressive parameters (ar) indicate that the process 
+ is non-stationary. arma_acovf can only be used with stationary processes. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s2">def </span><span class="s1">arma_generate_sample(</span>
+    <span class="s1">ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">nsample</span><span class="s2">, </span><span class="s1">scale=</span><span class="s4">1</span><span class="s2">, </span><span class="s1">distrvs=</span><span class="s2">None, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">burnin=</span><span class="s4">0</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Simulate data from an ARMA. 
+ 
+    Parameters 
+    ---------- 
+    ar : array_like 
+        The coefficient for autoregressive lag polynomial, including zero lag. 
+    ma : array_like 
+        The coefficient for moving-average lag polynomial, including zero lag. 
+    nsample : int or tuple of ints 
+        If nsample is an integer, then this creates a 1d timeseries of 
+        length size. If nsample is a tuple, creates a len(nsample) 
+        dimensional time series where time is indexed along the input 
+        variable ``axis``. All series are unless ``distrvs`` generates 
+        dependent data. 
+    scale : float 
+        The standard deviation of noise. 
+    distrvs : function, random number generator 
+        A function that generates the random numbers, and takes ``size`` 
+        as argument. The default is np.random.standard_normal. 
+    axis : int 
+        See nsample for details. 
+    burnin : int 
+        Number of observation at the beginning of the sample to drop. 
+        Used to reduce dependence on initial values. 
+ 
+    Returns 
+    ------- 
+    ndarray 
+        Random sample(s) from an ARMA process. 
+ 
+    Notes 
+    ----- 
+    As mentioned above, both the AR and MA components should include the 
+    coefficient on the zero-lag. This is typically 1. Further, due to the 
+    conventions used in signal processing used in signal.lfilter vs. 
+    conventions in statistics for ARMA processes, the AR parameters should 
+    have the opposite sign of what you might expect. See the examples below. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; np.random.seed(12345) 
+    &gt;&gt;&gt; arparams = np.array([.75, -.25]) 
+    &gt;&gt;&gt; maparams = np.array([.65, .35]) 
+    &gt;&gt;&gt; ar = np.r_[1, -arparams] # add zero-lag and negate 
+    &gt;&gt;&gt; ma = np.r_[1, maparams] # add zero-lag 
+    &gt;&gt;&gt; y = sm.tsa.arma_generate_sample(ar, ma, 250) 
+    &gt;&gt;&gt; model = sm.tsa.ARIMA(y, (2, 0, 2), trend='n').fit(disp=0) 
+    &gt;&gt;&gt; model.params 
+    array([ 0.79044189, -0.23140636,  0.70072904,  0.40608028]) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">distrvs = np.random.standard_normal </span><span class="s2">if </span><span class="s1">distrvs </span><span class="s2">is None else </span><span class="s1">distrvs</span>
+    <span class="s2">if </span><span class="s1">np.ndim(nsample) == </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">nsample = [nsample]</span>
+    <span class="s2">if </span><span class="s1">burnin:</span>
+        <span class="s5"># handle burin time for nd arrays</span>
+        <span class="s5"># maybe there is a better trick in scipy.fft code</span>
+        <span class="s1">newsize = list(nsample)</span>
+        <span class="s1">newsize[axis] += burnin</span>
+        <span class="s1">newsize = tuple(newsize)</span>
+        <span class="s1">fslice = [slice(</span><span class="s2">None</span><span class="s1">)] * len(newsize)</span>
+        <span class="s1">fslice[axis] = slice(burnin</span><span class="s2">, None, None</span><span class="s1">)</span>
+        <span class="s1">fslice = tuple(fslice)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">newsize = tuple(nsample)</span>
+        <span class="s1">fslice = tuple([slice(</span><span class="s2">None</span><span class="s1">)] * np.ndim(newsize))</span>
+    <span class="s1">eta = scale * distrvs(size=newsize)</span>
+    <span class="s2">return </span><span class="s1">signal.lfilter(ma</span><span class="s2">, </span><span class="s1">ar</span><span class="s2">, </span><span class="s1">eta</span><span class="s2">, </span><span class="s1">axis=axis)[fslice]</span>
+
+
+<span class="s2">def </span><span class="s1">arma_acovf(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">nobs=</span><span class="s4">10</span><span class="s2">, </span><span class="s1">sigma2=</span><span class="s4">1</span><span class="s2">, </span><span class="s1">dtype=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Theoretical autocovariances of stationary ARMA processes 
+ 
+    Parameters 
+    ---------- 
+    ar : array_like, 1d 
+        The coefficients for autoregressive lag polynomial, including zero lag. 
+    ma : array_like, 1d 
+        The coefficients for moving-average lag polynomial, including zero lag. 
+    nobs : int 
+        The number of terms (lags plus zero lag) to include in returned acovf. 
+    sigma2 : float 
+        Variance of the innovation term. 
+ 
+    Returns 
+    ------- 
+    ndarray 
+        The autocovariance of ARMA process given by ar, ma. 
+ 
+    See Also 
+    -------- 
+    arma_acf : Autocorrelation function for ARMA processes. 
+    acovf : Sample autocovariance estimation. 
+ 
+    References 
+    ---------- 
+    .. [*] Brockwell, Peter J., and Richard A. Davis. 2009. Time Series: 
+        Theory and Methods. 2nd ed. 1991. New York, NY: Springer. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">dtype </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">dtype = np.common_type(np.array(ar)</span><span class="s2">, </span><span class="s1">np.array(ma)</span><span class="s2">, </span><span class="s1">np.array(sigma2))</span>
+
+    <span class="s1">p = len(ar) - </span><span class="s4">1</span>
+    <span class="s1">q = len(ma) - </span><span class="s4">1</span>
+    <span class="s1">m = max(p</span><span class="s2">, </span><span class="s1">q) + </span><span class="s4">1</span>
+
+    <span class="s2">if </span><span class="s1">sigma2.real &lt; </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Must have positive innovation variance.&quot;</span><span class="s1">)</span>
+
+    <span class="s5"># Short-circuit for trivial corner-case</span>
+    <span class="s2">if </span><span class="s1">p == q == </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">out = np.zeros(nobs</span><span class="s2">, </span><span class="s1">dtype=dtype)</span>
+        <span class="s1">out[</span><span class="s4">0</span><span class="s1">] = sigma2</span>
+        <span class="s2">return </span><span class="s1">out</span>
+    <span class="s2">elif </span><span class="s1">p &gt; </span><span class="s4">0 </span><span class="s2">and </span><span class="s1">np.max(np.abs(np.roots(ar))) &gt;= </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(NONSTATIONARY_ERROR)</span>
+
+    <span class="s5"># Get the moving average representation coefficients that we need</span>
+    <span class="s1">ma_coeffs = arma2ma(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">lags=m)</span>
+
+    <span class="s5"># Solve for the first m autocovariances via the linear system</span>
+    <span class="s5"># described by (BD, eq. 3.3.8)</span>
+    <span class="s1">A = np.zeros((m</span><span class="s2">, </span><span class="s1">m)</span><span class="s2">, </span><span class="s1">dtype=dtype)</span>
+    <span class="s1">b = np.zeros((m</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">dtype=dtype)</span>
+    <span class="s5"># We need a zero-right-padded version of ar params</span>
+    <span class="s1">tmp_ar = np.zeros(m</span><span class="s2">, </span><span class="s1">dtype=dtype)</span>
+    <span class="s1">tmp_ar[: p + </span><span class="s4">1</span><span class="s1">] = ar</span>
+    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range(m):</span>
+        <span class="s1">A[k</span><span class="s2">, </span><span class="s1">: (k + </span><span class="s4">1</span><span class="s1">)] = tmp_ar[: (k + </span><span class="s4">1</span><span class="s1">)][::-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">A[k</span><span class="s2">, </span><span class="s4">1 </span><span class="s1">: m - k] += tmp_ar[(k + </span><span class="s4">1</span><span class="s1">) : m]</span>
+        <span class="s1">b[k] = sigma2 * np.dot(ma[k : q + </span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ma_coeffs[: max((q + </span><span class="s4">1 </span><span class="s1">- k)</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)])</span>
+    <span class="s1">acovf = np.zeros(max(nobs</span><span class="s2">, </span><span class="s1">m)</span><span class="s2">, </span><span class="s1">dtype=dtype)</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">acovf[:m] = np.linalg.solve(A</span><span class="s2">, </span><span class="s1">b)[:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s2">except </span><span class="s1">np.linalg.LinAlgError:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(NONSTATIONARY_ERROR)</span>
+
+    <span class="s5"># Iteratively apply (BD, eq. 3.3.9) to solve for remaining autocovariances</span>
+    <span class="s2">if </span><span class="s1">nobs &gt; m:</span>
+        <span class="s1">zi = signal.lfiltic([</span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ar</span><span class="s2">, </span><span class="s1">acovf[:m:][::-</span><span class="s4">1</span><span class="s1">])</span>
+        <span class="s1">acovf[m:] = signal.lfilter(</span>
+            <span class="s1">[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ar</span><span class="s2">, </span><span class="s1">np.zeros(nobs - m</span><span class="s2">, </span><span class="s1">dtype=dtype)</span><span class="s2">, </span><span class="s1">zi=zi</span>
+        <span class="s1">)[</span><span class="s4">0</span><span class="s1">]</span>
+
+    <span class="s2">return </span><span class="s1">acovf[:nobs]</span>
+
+
+<span class="s2">def </span><span class="s1">arma_acf(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">lags=</span><span class="s4">10</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Theoretical autocorrelation function of an ARMA process. 
+ 
+    Parameters 
+    ---------- 
+    ar : array_like 
+        Coefficients for autoregressive lag polynomial, including zero lag. 
+    ma : array_like 
+        Coefficients for moving-average lag polynomial, including zero lag. 
+    lags : int 
+        The number of terms (lags plus zero lag) to include in returned acf. 
+ 
+    Returns 
+    ------- 
+    ndarray 
+        The autocorrelations of ARMA process given by ar and ma. 
+ 
+    See Also 
+    -------- 
+    arma_acovf : Autocovariances from ARMA processes. 
+    acf : Sample autocorrelation function estimation. 
+    acovf : Sample autocovariance function estimation. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">acovf = arma_acovf(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">lags)</span>
+    <span class="s2">return </span><span class="s1">acovf / acovf[</span><span class="s4">0</span><span class="s1">]</span>
+
+
+<span class="s2">def </span><span class="s1">arma_pacf(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">lags=</span><span class="s4">10</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Theoretical partial autocorrelation function of an ARMA process. 
+ 
+    Parameters 
+    ---------- 
+    ar : array_like, 1d 
+        The coefficients for autoregressive lag polynomial, including zero lag. 
+    ma : array_like, 1d 
+        The coefficients for moving-average lag polynomial, including zero lag. 
+    lags : int 
+        The number of terms (lags plus zero lag) to include in returned pacf. 
+ 
+    Returns 
+    ------- 
+    ndarrray 
+        The partial autocorrelation of ARMA process given by ar and ma. 
+ 
+    Notes 
+    ----- 
+    Solves yule-walker equation for each lag order up to nobs lags. 
+ 
+    not tested/checked yet 
+    &quot;&quot;&quot;</span>
+    <span class="s5"># TODO: Should use rank 1 inverse update</span>
+    <span class="s1">apacf = np.zeros(lags)</span>
+    <span class="s1">acov = arma_acf(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">lags=lags + </span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s1">apacf[</span><span class="s4">0</span><span class="s1">] = </span><span class="s4">1.0</span>
+    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range(</span><span class="s4">2</span><span class="s2">, </span><span class="s1">lags + </span><span class="s4">1</span><span class="s1">):</span>
+        <span class="s1">r = acov[:k]</span>
+        <span class="s1">apacf[k - </span><span class="s4">1</span><span class="s1">] = linalg.solve(linalg.toeplitz(r[:-</span><span class="s4">1</span><span class="s1">])</span><span class="s2">, </span><span class="s1">r[</span><span class="s4">1</span><span class="s1">:])[-</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s2">return </span><span class="s1">apacf</span>
+
+
+<span class="s2">def </span><span class="s1">arma_periodogram(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">worN=</span><span class="s2">None, </span><span class="s1">whole=</span><span class="s4">0</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Periodogram for ARMA process given by lag-polynomials ar and ma. 
+ 
+    Parameters 
+    ---------- 
+    ar : array_like 
+        The autoregressive lag-polynomial with leading 1 and lhs sign. 
+    ma : array_like 
+        The moving average lag-polynomial with leading 1. 
+    worN : {None, int}, optional 
+        An option for scipy.signal.freqz (read &quot;w or N&quot;). 
+        If None, then compute at 512 frequencies around the unit circle. 
+        If a single integer, the compute at that many frequencies. 
+        Otherwise, compute the response at frequencies given in worN. 
+    whole : {0,1}, optional 
+        An options for scipy.signal.freqz/ 
+        Normally, frequencies are computed from 0 to pi (upper-half of 
+        unit-circle.  If whole is non-zero compute frequencies from 0 to 2*pi. 
+ 
+    Returns 
+    ------- 
+    w : ndarray 
+        The frequencies. 
+    sd : ndarray 
+        The periodogram, also known as the spectral density. 
+ 
+    Notes 
+    ----- 
+    Normalization ? 
+ 
+    This uses signal.freqz, which does not use fft. There is a fft version 
+    somewhere. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">w</span><span class="s2">, </span><span class="s1">h = signal.freqz(ma</span><span class="s2">, </span><span class="s1">ar</span><span class="s2">, </span><span class="s1">worN=worN</span><span class="s2">, </span><span class="s1">whole=whole)</span>
+    <span class="s1">sd = np.abs(h) ** </span><span class="s4">2 </span><span class="s1">/ np.sqrt(</span><span class="s4">2 </span><span class="s1">* np.pi)</span>
+    <span class="s2">if </span><span class="s1">np.any(np.isnan(h)):</span>
+        <span class="s5"># this happens with unit root or seasonal unit root'</span>
+        <span class="s2">import </span><span class="s1">warnings</span>
+
+        <span class="s1">warnings.warn(</span>
+            <span class="s3">&quot;Warning: nan in frequency response h, maybe a unit &quot; &quot;root&quot;</span><span class="s2">,</span>
+            <span class="s1">RuntimeWarning</span><span class="s2">,</span>
+            <span class="s1">stacklevel=</span><span class="s4">2</span><span class="s2">,</span>
+        <span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">w</span><span class="s2">, </span><span class="s1">sd</span>
+
+
+<span class="s2">def </span><span class="s1">arma_impulse_response(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">leads=</span><span class="s4">100</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Compute the impulse response function (MA representation) for ARMA process. 
+ 
+    Parameters 
+    ---------- 
+    ar : array_like, 1d 
+        The auto regressive lag polynomial. 
+    ma : array_like, 1d 
+        The moving average lag polynomial. 
+    leads : int 
+        The number of observations to calculate. 
+ 
+    Returns 
+    ------- 
+    ndarray 
+        The impulse response function with nobs elements. 
+ 
+    Notes 
+    ----- 
+    This is the same as finding the MA representation of an ARMA(p,q). 
+    By reversing the role of ar and ma in the function arguments, the 
+    returned result is the AR representation of an ARMA(p,q), i.e 
+ 
+    ma_representation = arma_impulse_response(ar, ma, leads=100) 
+    ar_representation = arma_impulse_response(ma, ar, leads=100) 
+ 
+    Fully tested against matlab 
+ 
+    Examples 
+    -------- 
+    AR(1) 
+ 
+    &gt;&gt;&gt; arma_impulse_response([1.0, -0.8], [1.], leads=10) 
+    array([ 1.        ,  0.8       ,  0.64      ,  0.512     ,  0.4096    , 
+            0.32768   ,  0.262144  ,  0.2097152 ,  0.16777216,  0.13421773]) 
+ 
+    this is the same as 
+ 
+    &gt;&gt;&gt; 0.8**np.arange(10) 
+    array([ 1.        ,  0.8       ,  0.64      ,  0.512     ,  0.4096    , 
+            0.32768   ,  0.262144  ,  0.2097152 ,  0.16777216,  0.13421773]) 
+ 
+    MA(2) 
+ 
+    &gt;&gt;&gt; arma_impulse_response([1.0], [1., 0.5, 0.2], leads=10) 
+    array([ 1. ,  0.5,  0.2,  0. ,  0. ,  0. ,  0. ,  0. ,  0. ,  0. ]) 
+ 
+    ARMA(1,2) 
+ 
+    &gt;&gt;&gt; arma_impulse_response([1.0, -0.8], [1., 0.5, 0.2], leads=10) 
+    array([ 1.        ,  1.3       ,  1.24      ,  0.992     ,  0.7936    , 
+            0.63488   ,  0.507904  ,  0.4063232 ,  0.32505856,  0.26004685]) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">impulse = np.zeros(leads)</span>
+    <span class="s1">impulse[</span><span class="s4">0</span><span class="s1">] = </span><span class="s4">1.0</span>
+    <span class="s2">return </span><span class="s1">signal.lfilter(ma</span><span class="s2">, </span><span class="s1">ar</span><span class="s2">, </span><span class="s1">impulse)</span>
+
+
+<span class="s2">def </span><span class="s1">arma2ma(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">lags=</span><span class="s4">100</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A finite-lag approximate MA representation of an ARMA process. 
+ 
+    Parameters 
+    ---------- 
+    ar : ndarray 
+        The auto regressive lag polynomial. 
+    ma : ndarray 
+        The moving average lag polynomial. 
+    lags : int 
+        The number of coefficients to calculate. 
+ 
+    Returns 
+    ------- 
+    ndarray 
+        The coefficients of AR lag polynomial with nobs elements. 
+ 
+    Notes 
+    ----- 
+    Equivalent to ``arma_impulse_response(ma, ar, leads=100)`` 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">arma_impulse_response(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">leads=lags)</span>
+
+
+<span class="s2">def </span><span class="s1">arma2ar(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">lags=</span><span class="s4">100</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A finite-lag AR approximation of an ARMA process. 
+ 
+    Parameters 
+    ---------- 
+    ar : array_like 
+        The auto regressive lag polynomial. 
+    ma : array_like 
+        The moving average lag polynomial. 
+    lags : int 
+        The number of coefficients to calculate. 
+ 
+    Returns 
+    ------- 
+    ndarray 
+        The coefficients of AR lag polynomial with nobs elements. 
+ 
+    Notes 
+    ----- 
+    Equivalent to ``arma_impulse_response(ma, ar, leads=100)`` 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">arma_impulse_response(ma</span><span class="s2">, </span><span class="s1">ar</span><span class="s2">, </span><span class="s1">leads=lags)</span>
+
+
+<span class="s5"># moved from sandbox.tsa.try_fi</span>
+<span class="s2">def </span><span class="s1">ar2arma(ar_des</span><span class="s2">, </span><span class="s1">p</span><span class="s2">, </span><span class="s1">q</span><span class="s2">, </span><span class="s1">n=</span><span class="s4">20</span><span class="s2">, </span><span class="s1">mse=</span><span class="s3">&quot;ar&quot;</span><span class="s2">, </span><span class="s1">start=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Find arma approximation to ar process. 
+ 
+    This finds the ARMA(p,q) coefficients that minimize the integrated 
+    squared difference between the impulse_response functions (MA 
+    representation) of the AR and the ARMA process. This does not  check 
+    whether the MA lag polynomial of the ARMA process is invertible, neither 
+    does it check the roots of the AR lag polynomial. 
+ 
+    Parameters 
+    ---------- 
+    ar_des : array_like 
+        The coefficients of original AR lag polynomial, including lag zero. 
+    p : int 
+        The length of desired AR lag polynomials. 
+    q : int 
+        The length of desired MA lag polynomials. 
+    n : int 
+        The number of terms of the impulse_response function to include in the 
+        objective function for the approximation. 
+    mse : str, 'ar' 
+        Not used. 
+    start : ndarray 
+        Initial values to use when finding the approximation. 
+ 
+    Returns 
+    ------- 
+    ar_app : ndarray 
+        The coefficients of the AR lag polynomials of the approximation. 
+    ma_app : ndarray 
+        The coefficients of the MA lag polynomials of the approximation. 
+    res : tuple 
+        The result of optimize.leastsq. 
+ 
+    Notes 
+    ----- 
+    Extension is possible if we want to match autocovariance instead 
+    of impulse response function. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s5"># TODO: convert MA lag polynomial, ma_app, to be invertible, by mirroring</span>
+    <span class="s5"># TODO: roots outside the unit interval to ones that are inside. How to do</span>
+    <span class="s5"># TODO: this?</span>
+
+    <span class="s5"># p,q = pq</span>
+    <span class="s2">def </span><span class="s1">msear_err(arma</span><span class="s2">, </span><span class="s1">ar_des):</span>
+        <span class="s1">ar</span><span class="s2">, </span><span class="s1">ma = np.r_[</span><span class="s4">1</span><span class="s2">, </span><span class="s1">arma[: p - </span><span class="s4">1</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">np.r_[</span><span class="s4">1</span><span class="s2">, </span><span class="s1">arma[p - </span><span class="s4">1 </span><span class="s1">:]]</span>
+        <span class="s1">ar_approx = arma_impulse_response(ma</span><span class="s2">, </span><span class="s1">ar</span><span class="s2">, </span><span class="s1">n)</span>
+        <span class="s2">return </span><span class="s1">ar_des - ar_approx  </span><span class="s5"># ((ar - ar_approx)**2).sum()</span>
+
+    <span class="s2">if </span><span class="s1">start </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">arma0 = np.r_[-</span><span class="s4">0.9 </span><span class="s1">* np.ones(p - </span><span class="s4">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">np.zeros(q - </span><span class="s4">1</span><span class="s1">)]</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">arma0 = start</span>
+    <span class="s1">res = optimize.leastsq(msear_err</span><span class="s2">, </span><span class="s1">arma0</span><span class="s2">, </span><span class="s1">ar_des</span><span class="s2">, </span><span class="s1">maxfev=</span><span class="s4">5000</span><span class="s1">)</span>
+    <span class="s1">arma_app = np.atleast_1d(res[</span><span class="s4">0</span><span class="s1">])</span>
+    <span class="s1">ar_app = (np.r_[</span><span class="s4">1</span><span class="s2">, </span><span class="s1">arma_app[: p - </span><span class="s4">1</span><span class="s1">]]</span><span class="s2">,</span><span class="s1">)</span>
+    <span class="s1">ma_app = np.r_[</span><span class="s4">1</span><span class="s2">, </span><span class="s1">arma_app[p - </span><span class="s4">1 </span><span class="s1">:]]</span>
+    <span class="s2">return </span><span class="s1">ar_app</span><span class="s2">, </span><span class="s1">ma_app</span><span class="s2">, </span><span class="s1">res</span>
+
+
+<span class="s1">_arma_docs = {</span><span class="s3">&quot;ar&quot;</span><span class="s1">: arma2ar.__doc__</span><span class="s2">, </span><span class="s3">&quot;ma&quot;</span><span class="s1">: arma2ma.__doc__}</span>
+
+
+<span class="s2">def </span><span class="s1">lpol2index(ar):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Remove zeros from lag polynomial 
+ 
+    Parameters 
+    ---------- 
+    ar : array_like 
+        coefficients of lag polynomial 
+ 
+    Returns 
+    ------- 
+    coeffs : ndarray 
+        non-zero coefficients of lag polynomial 
+    index : ndarray 
+        index (lags) of lag polynomial with non-zero elements 
+    &quot;&quot;&quot;</span>
+    <span class="s2">with </span><span class="s1">warnings.catch_warnings():</span>
+        <span class="s1">warnings.simplefilter(</span><span class="s3">&quot;ignore&quot;</span><span class="s2">, </span><span class="s1">np.ComplexWarning)</span>
+        <span class="s1">ar = array_like(ar</span><span class="s2">, </span><span class="s3">&quot;ar&quot;</span><span class="s1">)</span>
+    <span class="s1">index = np.nonzero(ar)[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">coeffs = ar[index]</span>
+    <span class="s2">return </span><span class="s1">coeffs</span><span class="s2">, </span><span class="s1">index</span>
+
+
+<span class="s2">def </span><span class="s1">index2lpol(coeffs</span><span class="s2">, </span><span class="s1">index):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Expand coefficients to lag poly 
+ 
+    Parameters 
+    ---------- 
+    coeffs : ndarray 
+        non-zero coefficients of lag polynomial 
+    index : ndarray 
+        index (lags) of lag polynomial with non-zero elements 
+ 
+    Returns 
+    ------- 
+    ar : array_like 
+        coefficients of lag polynomial 
+    &quot;&quot;&quot;</span>
+    <span class="s1">n = max(index)</span>
+    <span class="s1">ar = np.zeros(n + </span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">ar[index] = coeffs</span>
+    <span class="s2">return </span><span class="s1">ar</span>
+
+
+<span class="s2">def </span><span class="s1">lpol_fima(d</span><span class="s2">, </span><span class="s1">n=</span><span class="s4">20</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;MA representation of fractional integration 
+ 
+    .. math:: (1-L)^{-d} for |d|&lt;0.5  or |d|&lt;1 (?) 
+ 
+    Parameters 
+    ---------- 
+    d : float 
+        fractional power 
+    n : int 
+        number of terms to calculate, including lag zero 
+ 
+    Returns 
+    ------- 
+    ma : ndarray 
+        coefficients of lag polynomial 
+    &quot;&quot;&quot;</span>
+    <span class="s5"># hide import inside function until we use this heavily</span>
+    <span class="s2">from </span><span class="s1">scipy.special </span><span class="s2">import </span><span class="s1">gammaln</span>
+
+    <span class="s1">j = np.arange(n)</span>
+    <span class="s2">return </span><span class="s1">np.exp(gammaln(d + j) - gammaln(j + </span><span class="s4">1</span><span class="s1">) - gammaln(d))</span>
+
+
+<span class="s5"># moved from sandbox.tsa.try_fi</span>
+<span class="s2">def </span><span class="s1">lpol_fiar(d</span><span class="s2">, </span><span class="s1">n=</span><span class="s4">20</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;AR representation of fractional integration 
+ 
+    .. math:: (1-L)^{d} for |d|&lt;0.5  or |d|&lt;1 (?) 
+ 
+    Parameters 
+    ---------- 
+    d : float 
+        fractional power 
+    n : int 
+        number of terms to calculate, including lag zero 
+ 
+    Returns 
+    ------- 
+    ar : ndarray 
+        coefficients of lag polynomial 
+ 
+    Notes: 
+    first coefficient is 1, negative signs except for first term, 
+    ar(L)*x_t 
+    &quot;&quot;&quot;</span>
+    <span class="s5"># hide import inside function until we use this heavily</span>
+    <span class="s2">from </span><span class="s1">scipy.special </span><span class="s2">import </span><span class="s1">gammaln</span>
+
+    <span class="s1">j = np.arange(n)</span>
+    <span class="s1">ar = -np.exp(gammaln(-d + j) - gammaln(j + </span><span class="s4">1</span><span class="s1">) - gammaln(-d))</span>
+    <span class="s1">ar[</span><span class="s4">0</span><span class="s1">] = </span><span class="s4">1</span>
+    <span class="s2">return </span><span class="s1">ar</span>
+
+
+<span class="s5"># moved from sandbox.tsa.try_fi</span>
+<span class="s2">def </span><span class="s1">lpol_sdiff(s):</span>
+    <span class="s0">&quot;&quot;&quot;return coefficients for seasonal difference (1-L^s) 
+ 
+    just a trivial convenience function 
+ 
+    Parameters 
+    ---------- 
+    s : int 
+        number of periods in season 
+ 
+    Returns 
+    ------- 
+    sdiff : list, length s+1 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">[</span><span class="s4">1</span><span class="s1">] + [</span><span class="s4">0</span><span class="s1">] * (s - </span><span class="s4">1</span><span class="s1">) + [-</span><span class="s4">1</span><span class="s1">]</span>
+
+
+<span class="s2">def </span><span class="s1">deconvolve(num</span><span class="s2">, </span><span class="s1">den</span><span class="s2">, </span><span class="s1">n=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Deconvolves divisor out of signal, division of polynomials for n terms 
+ 
+    calculates den^{-1} * num 
+ 
+    Parameters 
+    ---------- 
+    num : array_like 
+        signal or lag polynomial 
+    denom : array_like 
+        coefficients of lag polynomial (linear filter) 
+    n : None or int 
+        number of terms of quotient 
+ 
+    Returns 
+    ------- 
+    quot : ndarray 
+        quotient or filtered series 
+    rem : ndarray 
+        remainder 
+ 
+    Notes 
+    ----- 
+    If num is a time series, then this applies the linear filter den^{-1}. 
+    If both num and den are both lag polynomials, then this calculates the 
+    quotient polynomial for n terms and also returns the remainder. 
+ 
+    This is copied from scipy.signal.signaltools and added n as optional 
+    parameter. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">num = np.atleast_1d(num)</span>
+    <span class="s1">den = np.atleast_1d(den)</span>
+    <span class="s1">N = len(num)</span>
+    <span class="s1">D = len(den)</span>
+    <span class="s2">if </span><span class="s1">D &gt; N </span><span class="s2">and </span><span class="s1">n </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">quot = []</span>
+        <span class="s1">rem = num</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">if </span><span class="s1">n </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">n = N - D + </span><span class="s4">1</span>
+        <span class="s1">input = np.zeros(n</span><span class="s2">, </span><span class="s1">float)</span>
+        <span class="s1">input[</span><span class="s4">0</span><span class="s1">] = </span><span class="s4">1</span>
+        <span class="s1">quot = signal.lfilter(num</span><span class="s2">, </span><span class="s1">den</span><span class="s2">, </span><span class="s1">input)</span>
+        <span class="s1">num_approx = signal.convolve(den</span><span class="s2">, </span><span class="s1">quot</span><span class="s2">, </span><span class="s1">mode=</span><span class="s3">&quot;full&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">len(num) &lt; len(num_approx):  </span><span class="s5"># 1d only ?</span>
+            <span class="s1">num = np.concatenate((num</span><span class="s2">, </span><span class="s1">np.zeros(len(num_approx) - len(num))))</span>
+        <span class="s1">rem = num - num_approx</span>
+    <span class="s2">return </span><span class="s1">quot</span><span class="s2">, </span><span class="s1">rem</span>
+
+
+<span class="s1">_generate_sample_doc = Docstring(arma_generate_sample.__doc__)</span>
+<span class="s1">_generate_sample_doc.remove_parameters([</span><span class="s3">&quot;ar&quot;</span><span class="s2">, </span><span class="s3">&quot;ma&quot;</span><span class="s1">])</span>
+<span class="s1">_generate_sample_doc.replace_block(</span><span class="s3">&quot;Notes&quot;</span><span class="s2">, </span><span class="s1">[])</span>
+<span class="s1">_generate_sample_doc.replace_block(</span><span class="s3">&quot;Examples&quot;</span><span class="s2">, </span><span class="s1">[])</span>
+
+
+<span class="s2">class </span><span class="s1">ArmaProcess:</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Theoretical properties of an ARMA process for specified lag-polynomials. 
+ 
+    Parameters 
+    ---------- 
+    ar : array_like 
+        Coefficient for autoregressive lag polynomial, including zero lag. 
+        Must be entered using the signs from the lag polynomial representation. 
+        See the notes for more information about the sign. 
+    ma : array_like 
+        Coefficient for moving-average lag polynomial, including zero lag. 
+    nobs : int, optional 
+        Length of simulated time series. Used, for example, if a sample is 
+        generated. See example. 
+ 
+    Notes 
+    ----- 
+    Both the AR and MA components must include the coefficient on the 
+    zero-lag. In almost all cases these values should be 1. Further, due to 
+    using the lag-polynomial representation, the AR parameters should 
+    have the opposite sign of what one would write in the ARMA representation. 
+    See the examples below. 
+ 
+    The ARMA(p,q) process is described by 
+ 
+    .. math:: 
+ 
+        y_{t}=\phi_{1}y_{t-1}+\ldots+\phi_{p}y_{t-p}+\theta_{1}\epsilon_{t-1} 
+               +\ldots+\theta_{q}\epsilon_{t-q}+\epsilon_{t} 
+ 
+    and the parameterization used in this function uses the lag-polynomial 
+    representation, 
+ 
+    .. math:: 
+ 
+        \left(1-\phi_{1}L-\ldots-\phi_{p}L^{p}\right)y_{t} = 
+            \left(1+\theta_{1}L+\ldots+\theta_{q}L^{q}\right)\epsilon_{t} 
+ 
+    Examples 
+    -------- 
+    ARMA(2,2) with AR coefficients 0.75 and -0.25, and MA coefficients 0.65 and 0.35 
+ 
+    &gt;&gt;&gt; import statsmodels.api as sm 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; np.random.seed(12345) 
+    &gt;&gt;&gt; arparams = np.array([.75, -.25]) 
+    &gt;&gt;&gt; maparams = np.array([.65, .35]) 
+    &gt;&gt;&gt; ar = np.r_[1, -arparams] # add zero-lag and negate 
+    &gt;&gt;&gt; ma = np.r_[1, maparams] # add zero-lag 
+    &gt;&gt;&gt; arma_process = sm.tsa.ArmaProcess(ar, ma) 
+    &gt;&gt;&gt; arma_process.isstationary 
+    True 
+    &gt;&gt;&gt; arma_process.isinvertible 
+    True 
+    &gt;&gt;&gt; arma_process.arroots 
+    array([1.5-1.32287566j, 1.5+1.32287566j]) 
+    &gt;&gt;&gt; y = arma_process.generate_sample(250) 
+    &gt;&gt;&gt; model = sm.tsa.ARIMA(y, (2, 0, 2), trend='n').fit(disp=0) 
+    &gt;&gt;&gt; model.params 
+    array([ 0.79044189, -0.23140636,  0.70072904,  0.40608028]) 
+ 
+    The same ARMA(2,2) Using the from_coeffs class method 
+ 
+    &gt;&gt;&gt; arma_process = sm.tsa.ArmaProcess.from_coeffs(arparams, maparams) 
+    &gt;&gt;&gt; arma_process.arroots 
+    array([1.5-1.32287566j, 1.5+1.32287566j]) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s5"># TODO: Check unit root behavior</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">ar=</span><span class="s2">None, </span><span class="s1">ma=</span><span class="s2">None, </span><span class="s1">nobs=</span><span class="s4">100</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">ar </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">ar = np.array([</span><span class="s4">1.0</span><span class="s1">])</span>
+        <span class="s2">if </span><span class="s1">ma </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">ma = np.array([</span><span class="s4">1.0</span><span class="s1">])</span>
+        <span class="s2">with </span><span class="s1">warnings.catch_warnings():</span>
+            <span class="s1">warnings.simplefilter(</span><span class="s3">&quot;ignore&quot;</span><span class="s2">, </span><span class="s1">np.ComplexWarning)</span>
+            <span class="s1">self.ar = array_like(ar</span><span class="s2">, </span><span class="s3">&quot;ar&quot;</span><span class="s1">)</span>
+            <span class="s1">self.ma = array_like(ma</span><span class="s2">, </span><span class="s3">&quot;ma&quot;</span><span class="s1">)</span>
+        <span class="s1">self.arcoefs = -self.ar[</span><span class="s4">1</span><span class="s1">:]</span>
+        <span class="s1">self.macoefs = self.ma[</span><span class="s4">1</span><span class="s1">:]</span>
+        <span class="s1">self.arpoly = np.polynomial.Polynomial(self.ar)</span>
+        <span class="s1">self.mapoly = np.polynomial.Polynomial(self.ma)</span>
+        <span class="s1">self.nobs = nobs</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">from_roots(cls</span><span class="s2">, </span><span class="s1">maroots=</span><span class="s2">None, </span><span class="s1">arroots=</span><span class="s2">None, </span><span class="s1">nobs=</span><span class="s4">100</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create ArmaProcess from AR and MA polynomial roots. 
+ 
+        Parameters 
+        ---------- 
+        maroots : array_like, optional 
+            Roots for the MA polynomial 
+            1 + theta_1*z + theta_2*z^2 + ..... + theta_n*z^n 
+        arroots : array_like, optional 
+            Roots for the AR polynomial 
+            1 - phi_1*z - phi_2*z^2 - ..... - phi_n*z^n 
+        nobs : int, optional 
+            Length of simulated time series. Used, for example, if a sample 
+            is generated. 
+ 
+        Returns 
+        ------- 
+        ArmaProcess 
+            Class instance initialized with arcoefs and macoefs. 
+ 
+        Examples 
+        -------- 
+        &gt;&gt;&gt; arroots = [.75, -.25] 
+        &gt;&gt;&gt; maroots = [.65, .35] 
+        &gt;&gt;&gt; arma_process = sm.tsa.ArmaProcess.from_roots(arroots, maroots) 
+        &gt;&gt;&gt; arma_process.isstationary 
+        True 
+        &gt;&gt;&gt; arma_process.isinvertible 
+        True 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">arroots </span><span class="s2">is not None and </span><span class="s1">len(arroots):</span>
+            <span class="s1">arpoly = np.polynomial.polynomial.Polynomial.fromroots(arroots)</span>
+            <span class="s1">arcoefs = arpoly.coef[</span><span class="s4">1</span><span class="s1">:] / arpoly.coef[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">arcoefs = []</span>
+
+        <span class="s2">if </span><span class="s1">maroots </span><span class="s2">is not None and </span><span class="s1">len(maroots):</span>
+            <span class="s1">mapoly = np.polynomial.polynomial.Polynomial.fromroots(maroots)</span>
+            <span class="s1">macoefs = mapoly.coef[</span><span class="s4">1</span><span class="s1">:] / mapoly.coef[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">macoefs = []</span>
+
+        <span class="s5"># As from_coeffs will create a polynomial with constant 1/-1,(MA/AR)</span>
+        <span class="s5"># we need to scale the polynomial coefficients accordingly</span>
+        <span class="s2">return </span><span class="s1">cls(np.r_[</span><span class="s4">1</span><span class="s2">, </span><span class="s1">arcoefs]</span><span class="s2">, </span><span class="s1">np.r_[</span><span class="s4">1</span><span class="s2">, </span><span class="s1">macoefs]</span><span class="s2">, </span><span class="s1">nobs=nobs)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">from_coeffs(cls</span><span class="s2">, </span><span class="s1">arcoefs=</span><span class="s2">None, </span><span class="s1">macoefs=</span><span class="s2">None, </span><span class="s1">nobs=</span><span class="s4">100</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create ArmaProcess from an ARMA representation. 
+ 
+        Parameters 
+        ---------- 
+        arcoefs : array_like 
+            Coefficient for autoregressive lag polynomial, not including zero 
+            lag. The sign is inverted to conform to the usual time series 
+            representation of an ARMA process in statistics. See the class 
+            docstring for more information. 
+        macoefs : array_like 
+            Coefficient for moving-average lag polynomial, excluding zero lag. 
+        nobs : int, optional 
+            Length of simulated time series. Used, for example, if a sample 
+            is generated. 
+ 
+        Returns 
+        ------- 
+        ArmaProcess 
+            Class instance initialized with arcoefs and macoefs. 
+ 
+        Examples 
+        -------- 
+        &gt;&gt;&gt; arparams = [.75, -.25] 
+        &gt;&gt;&gt; maparams = [.65, .35] 
+        &gt;&gt;&gt; arma_process = sm.tsa.ArmaProcess.from_coeffs(ar, ma) 
+        &gt;&gt;&gt; arma_process.isstationary 
+        True 
+        &gt;&gt;&gt; arma_process.isinvertible 
+        True 
+        &quot;&quot;&quot;</span>
+        <span class="s1">arcoefs = [] </span><span class="s2">if </span><span class="s1">arcoefs </span><span class="s2">is None else </span><span class="s1">arcoefs</span>
+        <span class="s1">macoefs = [] </span><span class="s2">if </span><span class="s1">macoefs </span><span class="s2">is None else </span><span class="s1">macoefs</span>
+        <span class="s2">return </span><span class="s1">cls(</span>
+            <span class="s1">np.r_[</span><span class="s4">1</span><span class="s2">, </span><span class="s1">-np.asarray(arcoefs)]</span><span class="s2">,</span>
+            <span class="s1">np.r_[</span><span class="s4">1</span><span class="s2">, </span><span class="s1">np.asarray(macoefs)]</span><span class="s2">,</span>
+            <span class="s1">nobs=nobs</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">from_estimation(cls</span><span class="s2">, </span><span class="s1">model_results</span><span class="s2">, </span><span class="s1">nobs=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create an ArmaProcess from the results of an ARIMA estimation. 
+ 
+        Parameters 
+        ---------- 
+        model_results : ARIMAResults instance 
+            A fitted model. 
+        nobs : int, optional 
+            If None, nobs is taken from the results. 
+ 
+        Returns 
+        ------- 
+        ArmaProcess 
+            Class instance initialized from model_results. 
+ 
+        See Also 
+        -------- 
+        statsmodels.tsa.arima.model.ARIMA 
+            The models class used to create the ArmaProcess 
+        &quot;&quot;&quot;</span>
+        <span class="s1">nobs = nobs </span><span class="s2">or </span><span class="s1">model_results.nobs</span>
+        <span class="s2">return </span><span class="s1">cls(</span>
+            <span class="s1">model_results.polynomial_reduced_ar</span><span class="s2">,</span>
+            <span class="s1">model_results.polynomial_reduced_ma</span><span class="s2">,</span>
+            <span class="s1">nobs=nobs</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__mul__(self</span><span class="s2">, </span><span class="s1">oth):</span>
+        <span class="s2">if </span><span class="s1">isinstance(oth</span><span class="s2">, </span><span class="s1">self.__class__):</span>
+            <span class="s1">ar = (self.arpoly * oth.arpoly).coef</span>
+            <span class="s1">ma = (self.mapoly * oth.mapoly).coef</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">aroth</span><span class="s2">, </span><span class="s1">maoth = oth</span>
+                <span class="s1">arpolyoth = np.polynomial.Polynomial(aroth)</span>
+                <span class="s1">mapolyoth = np.polynomial.Polynomial(maoth)</span>
+                <span class="s1">ar = (self.arpoly * arpolyoth).coef</span>
+                <span class="s1">ma = (self.mapoly * mapolyoth).coef</span>
+            <span class="s2">except</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">TypeError(</span><span class="s3">&quot;Other type is not a valid type&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">self.__class__(ar</span><span class="s2">, </span><span class="s1">ma</span><span class="s2">, </span><span class="s1">nobs=self.nobs)</span>
+
+    <span class="s2">def </span><span class="s1">__repr__(self):</span>
+        <span class="s1">msg = </span><span class="s3">&quot;ArmaProcess({0}, {1}, nobs={2}) at {3}&quot;</span>
+        <span class="s2">return </span><span class="s1">msg.format(</span>
+            <span class="s1">self.ar.tolist()</span><span class="s2">, </span><span class="s1">self.ma.tolist()</span><span class="s2">, </span><span class="s1">self.nobs</span><span class="s2">, </span><span class="s1">hex(id(self))</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__str__(self):</span>
+        <span class="s2">return </span><span class="s3">&quot;ArmaProcess</span><span class="s2">\n</span><span class="s3">AR: {0}</span><span class="s2">\n</span><span class="s3">MA: {1}&quot;</span><span class="s1">.format(</span>
+            <span class="s1">self.ar.tolist()</span><span class="s2">, </span><span class="s1">self.ma.tolist()</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@Appender(remove_parameters(arma_acovf.__doc__</span><span class="s2">, </span><span class="s1">[</span><span class="s3">&quot;ar&quot;</span><span class="s2">, </span><span class="s3">&quot;ma&quot;</span><span class="s2">, </span><span class="s3">&quot;sigma2&quot;</span><span class="s1">]))</span>
+    <span class="s2">def </span><span class="s1">acovf(self</span><span class="s2">, </span><span class="s1">nobs=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">nobs = nobs </span><span class="s2">or </span><span class="s1">self.nobs</span>
+        <span class="s2">return </span><span class="s1">arma_acovf(self.ar</span><span class="s2">, </span><span class="s1">self.ma</span><span class="s2">, </span><span class="s1">nobs=nobs)</span>
+
+    <span class="s1">@Appender(remove_parameters(arma_acf.__doc__</span><span class="s2">, </span><span class="s1">[</span><span class="s3">&quot;ar&quot;</span><span class="s2">, </span><span class="s3">&quot;ma&quot;</span><span class="s1">]))</span>
+    <span class="s2">def </span><span class="s1">acf(self</span><span class="s2">, </span><span class="s1">lags=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">lags = lags </span><span class="s2">or </span><span class="s1">self.nobs</span>
+        <span class="s2">return </span><span class="s1">arma_acf(self.ar</span><span class="s2">, </span><span class="s1">self.ma</span><span class="s2">, </span><span class="s1">lags=lags)</span>
+
+    <span class="s1">@Appender(remove_parameters(arma_pacf.__doc__</span><span class="s2">, </span><span class="s1">[</span><span class="s3">&quot;ar&quot;</span><span class="s2">, </span><span class="s3">&quot;ma&quot;</span><span class="s1">]))</span>
+    <span class="s2">def </span><span class="s1">pacf(self</span><span class="s2">, </span><span class="s1">lags=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">lags = lags </span><span class="s2">or </span><span class="s1">self.nobs</span>
+        <span class="s2">return </span><span class="s1">arma_pacf(self.ar</span><span class="s2">, </span><span class="s1">self.ma</span><span class="s2">, </span><span class="s1">lags=lags)</span>
+
+    <span class="s1">@Appender(</span>
+        <span class="s1">remove_parameters(</span>
+            <span class="s1">arma_periodogram.__doc__</span><span class="s2">, </span><span class="s1">[</span><span class="s3">&quot;ar&quot;</span><span class="s2">, </span><span class="s3">&quot;ma&quot;</span><span class="s2">, </span><span class="s3">&quot;worN&quot;</span><span class="s2">, </span><span class="s3">&quot;whole&quot;</span><span class="s1">]</span>
+        <span class="s1">)</span>
+    <span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">periodogram(self</span><span class="s2">, </span><span class="s1">nobs=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">nobs = nobs </span><span class="s2">or </span><span class="s1">self.nobs</span>
+        <span class="s2">return </span><span class="s1">arma_periodogram(self.ar</span><span class="s2">, </span><span class="s1">self.ma</span><span class="s2">, </span><span class="s1">worN=nobs)</span>
+
+    <span class="s1">@Appender(remove_parameters(arma_impulse_response.__doc__</span><span class="s2">, </span><span class="s1">[</span><span class="s3">&quot;ar&quot;</span><span class="s2">, </span><span class="s3">&quot;ma&quot;</span><span class="s1">]))</span>
+    <span class="s2">def </span><span class="s1">impulse_response(self</span><span class="s2">, </span><span class="s1">leads=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">leads = leads </span><span class="s2">or </span><span class="s1">self.nobs</span>
+        <span class="s2">return </span><span class="s1">arma_impulse_response(self.ar</span><span class="s2">, </span><span class="s1">self.ma</span><span class="s2">, </span><span class="s1">leads=leads)</span>
+
+    <span class="s1">@Appender(remove_parameters(arma2ma.__doc__</span><span class="s2">, </span><span class="s1">[</span><span class="s3">&quot;ar&quot;</span><span class="s2">, </span><span class="s3">&quot;ma&quot;</span><span class="s1">]))</span>
+    <span class="s2">def </span><span class="s1">arma2ma(self</span><span class="s2">, </span><span class="s1">lags=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">lags = lags </span><span class="s2">or </span><span class="s1">self.lags</span>
+        <span class="s2">return </span><span class="s1">arma2ma(self.ar</span><span class="s2">, </span><span class="s1">self.ma</span><span class="s2">, </span><span class="s1">lags=lags)</span>
+
+    <span class="s1">@Appender(remove_parameters(arma2ar.__doc__</span><span class="s2">, </span><span class="s1">[</span><span class="s3">&quot;ar&quot;</span><span class="s2">, </span><span class="s3">&quot;ma&quot;</span><span class="s1">]))</span>
+    <span class="s2">def </span><span class="s1">arma2ar(self</span><span class="s2">, </span><span class="s1">lags=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">lags = lags </span><span class="s2">or </span><span class="s1">self.lags</span>
+        <span class="s2">return </span><span class="s1">arma2ar(self.ar</span><span class="s2">, </span><span class="s1">self.ma</span><span class="s2">, </span><span class="s1">lags=lags)</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">arroots(self):</span>
+        <span class="s0">&quot;&quot;&quot;Roots of autoregressive lag-polynomial&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.arpoly.roots()</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">maroots(self):</span>
+        <span class="s0">&quot;&quot;&quot;Roots of moving average lag-polynomial&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.mapoly.roots()</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">isstationary(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Arma process is stationary if AR roots are outside unit circle. 
+ 
+        Returns 
+        ------- 
+        bool 
+             True if autoregressive roots are outside unit circle. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">np.all(np.abs(self.arroots) &gt; </span><span class="s4">1.0</span><span class="s1">):</span>
+            <span class="s2">return True</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return False</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">isinvertible(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Arma process is invertible if MA roots are outside unit circle. 
+ 
+        Returns 
+        ------- 
+        bool 
+             True if moving average roots are outside unit circle. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">np.all(np.abs(self.maroots) &gt; </span><span class="s4">1</span><span class="s1">):</span>
+            <span class="s2">return True</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">invertroots(self</span><span class="s2">, </span><span class="s1">retnew=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Make MA polynomial invertible by inverting roots inside unit circle. 
+ 
+        Parameters 
+        ---------- 
+        retnew : bool 
+            If False (default), then return the lag-polynomial as array. 
+            If True, then return a new instance with invertible MA-polynomial. 
+ 
+        Returns 
+        ------- 
+        manew : ndarray 
+           A new invertible MA lag-polynomial, returned if retnew is false. 
+        wasinvertible : bool 
+           True if the MA lag-polynomial was already invertible, returned if 
+           retnew is false. 
+        armaprocess : new instance of class 
+           If retnew is true, then return a new instance with invertible 
+           MA-polynomial. 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># TODO: variable returns like this?</span>
+        <span class="s1">pr = self.maroots</span>
+        <span class="s1">mainv = self.ma</span>
+        <span class="s1">invertible = self.isinvertible</span>
+        <span class="s2">if not </span><span class="s1">invertible:</span>
+            <span class="s1">pr[np.abs(pr) &lt; </span><span class="s4">1</span><span class="s1">] = </span><span class="s4">1.0 </span><span class="s1">/ pr[np.abs(pr) &lt; </span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">pnew = np.polynomial.Polynomial.fromroots(pr)</span>
+            <span class="s1">mainv = pnew.coef / pnew.coef[</span><span class="s4">0</span><span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">retnew:</span>
+            <span class="s2">return </span><span class="s1">self.__class__(self.ar</span><span class="s2">, </span><span class="s1">mainv</span><span class="s2">, </span><span class="s1">nobs=self.nobs)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">mainv</span><span class="s2">, </span><span class="s1">invertible</span>
+
+    <span class="s1">@Appender(str(_generate_sample_doc))</span>
+    <span class="s2">def </span><span class="s1">generate_sample(</span>
+        <span class="s1">self</span><span class="s2">, </span><span class="s1">nsample=</span><span class="s4">100</span><span class="s2">, </span><span class="s1">scale=</span><span class="s4">1.0</span><span class="s2">, </span><span class="s1">distrvs=</span><span class="s2">None, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">burnin=</span><span class="s4">0</span>
+    <span class="s1">):</span>
+        <span class="s2">return </span><span class="s1">arma_generate_sample(</span>
+            <span class="s1">self.ar</span><span class="s2">, </span><span class="s1">self.ma</span><span class="s2">, </span><span class="s1">nsample</span><span class="s2">, </span><span class="s1">scale</span><span class="s2">, </span><span class="s1">distrvs</span><span class="s2">, </span><span class="s1">axis=axis</span><span class="s2">, </span><span class="s1">burnin=burnin</span>
+        <span class="s1">)</span>
+</pre>
+</body>
+</html>

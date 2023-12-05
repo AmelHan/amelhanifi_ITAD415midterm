@@ -1,0 +1,435 @@
+<html>
+<head>
+<title>gui.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+gui.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">ast</span>
+<span class="s0">import </span><span class="s1">contextlib</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">ClassVar</span><span class="s0">, </span><span class="s1">Sequence</span>
+
+<span class="s0">import </span><span class="s1">panel </span><span class="s0">as </span><span class="s1">pn</span>
+
+<span class="s0">from </span><span class="s1">.core </span><span class="s0">import </span><span class="s1">OpenFile</span><span class="s0">, </span><span class="s1">get_filesystem_class</span><span class="s0">, </span><span class="s1">split_protocol</span>
+<span class="s0">from </span><span class="s1">.registry </span><span class="s0">import </span><span class="s1">known_implementations</span>
+
+<span class="s1">pn.extension()</span>
+<span class="s1">logger = logging.getLogger(</span><span class="s2">&quot;fsspec.gui&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">SigSlot:</span>
+    <span class="s3">&quot;&quot;&quot;Signal-slot mixin, for Panel event passing 
+ 
+    Include this class in a widget manager's superclasses to be able to 
+    register events and callbacks on Panel widgets managed by that class. 
+ 
+    The method ``_register`` should be called as widgets are added, and external 
+    code should call ``connect`` to associate callbacks. 
+ 
+    By default, all signals emit a DEBUG logging statement. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># names of signals that this class may emit each of which must be</span>
+    <span class="s4"># set by _register for any new instance</span>
+    <span class="s1">signals: ClassVar[Sequence[str]] = []</span>
+    <span class="s4"># names of actions that this class may respond to</span>
+    <span class="s1">slots: ClassVar[Sequence[str]] = []</span>
+
+    <span class="s4"># each of which must be a method name</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">self._ignoring_events = </span><span class="s0">False</span>
+        <span class="s1">self._sigs = {}</span>
+        <span class="s1">self._map = {}</span>
+        <span class="s1">self._setup()</span>
+
+    <span class="s0">def </span><span class="s1">_setup(self):</span>
+        <span class="s3">&quot;&quot;&quot;Create GUI elements and register signals&quot;&quot;&quot;</span>
+        <span class="s1">self.panel = pn.pane.PaneBase()</span>
+        <span class="s4"># no signals to set up in the base class</span>
+
+    <span class="s0">def </span><span class="s1">_register(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">widget</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">thing=</span><span class="s2">&quot;value&quot;</span><span class="s0">, </span><span class="s1">log_level=logging.DEBUG</span><span class="s0">, </span><span class="s1">auto=</span><span class="s0">False</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Watch the given attribute of a widget and assign it a named event 
+ 
+        This is normally called at the time a widget is instantiated, in the 
+        class which owns it. 
+ 
+        Parameters 
+        ---------- 
+        widget : pn.layout.Panel or None 
+            Widget to watch. If None, an anonymous signal not associated with 
+            any widget. 
+        name : str 
+            Name of this event 
+        thing : str 
+            Attribute of the given widget to watch 
+        log_level : int 
+            When the signal is triggered, a logging event of the given level 
+            will be fired in the dfviz logger. 
+        auto : bool 
+            If True, automatically connects with a method in this class of the 
+            same name. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">name </span><span class="s0">not in </span><span class="s1">self.signals:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">f&quot;Attempt to assign an undeclared signal: </span><span class="s0">{</span><span class="s1">name</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+        <span class="s1">self._sigs[name] = {</span>
+            <span class="s2">&quot;widget&quot;</span><span class="s1">: widget</span><span class="s0">,</span>
+            <span class="s2">&quot;callbacks&quot;</span><span class="s1">: []</span><span class="s0">,</span>
+            <span class="s2">&quot;thing&quot;</span><span class="s1">: thing</span><span class="s0">,</span>
+            <span class="s2">&quot;log&quot;</span><span class="s1">: log_level</span><span class="s0">,</span>
+        <span class="s1">}</span>
+        <span class="s1">wn = </span><span class="s2">&quot;-&quot;</span><span class="s1">.join(</span>
+            <span class="s1">[</span>
+                <span class="s1">getattr(widget</span><span class="s0">, </span><span class="s2">&quot;name&quot;</span><span class="s0">, </span><span class="s1">str(widget)) </span><span class="s0">if </span><span class="s1">widget </span><span class="s0">is not None else </span><span class="s2">&quot;none&quot;</span><span class="s0">,</span>
+                <span class="s1">thing</span><span class="s0">,</span>
+            <span class="s1">]</span>
+        <span class="s1">)</span>
+        <span class="s1">self._map[wn] = name</span>
+        <span class="s0">if </span><span class="s1">widget </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">widget.param.watch(self._signal</span><span class="s0">, </span><span class="s1">thing</span><span class="s0">, </span><span class="s1">onlychanged=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">auto </span><span class="s0">and </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s1">name):</span>
+            <span class="s1">self.connect(name</span><span class="s0">, </span><span class="s1">getattr(self</span><span class="s0">, </span><span class="s1">name))</span>
+
+    <span class="s0">def </span><span class="s1">_repr_mimebundle_(self</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Display in a notebook or a server&quot;&quot;&quot;</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self.panel._repr_mimebundle_(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s0">except </span><span class="s1">(ValueError</span><span class="s0">, </span><span class="s1">AttributeError):</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError(</span><span class="s2">&quot;Panel does not seem to be set &quot; &quot;up properly&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">connect(self</span><span class="s0">, </span><span class="s1">signal</span><span class="s0">, </span><span class="s1">slot):</span>
+        <span class="s3">&quot;&quot;&quot;Associate call back with given event 
+ 
+        The callback must be a function which takes the &quot;new&quot; value of the 
+        watched attribute as the only parameter. If the callback return False, 
+        this cancels any further processing of the given event. 
+ 
+        Alternatively, the callback can be a string, in which case it means 
+        emitting the correspondingly-named event (i.e., connect to self) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._sigs[signal][</span><span class="s2">&quot;callbacks&quot;</span><span class="s1">].append(slot)</span>
+
+    <span class="s0">def </span><span class="s1">_signal(self</span><span class="s0">, </span><span class="s1">event):</span>
+        <span class="s3">&quot;&quot;&quot;This is called by a an action on a widget 
+ 
+        Within an self.ignore_events context, nothing happens. 
+ 
+        Tests can execute this method by directly changing the values of 
+        widget components. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if not </span><span class="s1">self._ignoring_events:</span>
+            <span class="s1">wn = </span><span class="s2">&quot;-&quot;</span><span class="s1">.join([event.obj.name</span><span class="s0">, </span><span class="s1">event.name])</span>
+            <span class="s0">if </span><span class="s1">wn </span><span class="s0">in </span><span class="s1">self._map </span><span class="s0">and </span><span class="s1">self._map[wn] </span><span class="s0">in </span><span class="s1">self._sigs:</span>
+                <span class="s1">self._emit(self._map[wn]</span><span class="s0">, </span><span class="s1">event.new)</span>
+
+    <span class="s1">@contextlib.contextmanager</span>
+    <span class="s0">def </span><span class="s1">ignore_events(self):</span>
+        <span class="s3">&quot;&quot;&quot;Temporarily turn off events processing in this instance 
+ 
+        (does not propagate to children) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._ignoring_events = </span><span class="s0">True</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">yield</span>
+        <span class="s0">finally</span><span class="s1">:</span>
+            <span class="s1">self._ignoring_events = </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">_emit(self</span><span class="s0">, </span><span class="s1">sig</span><span class="s0">, </span><span class="s1">value=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;An event happened, call its callbacks 
+ 
+        This method can be used in tests to simulate message passing without 
+        directly changing visual elements. 
+ 
+        Calling of callbacks will halt whenever one returns False. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">logger.log(self._sigs[sig][</span><span class="s2">&quot;log&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s2">f&quot;</span><span class="s0">{</span><span class="s1">sig</span><span class="s0">}</span><span class="s2">: </span><span class="s0">{</span><span class="s1">value</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+        <span class="s0">for </span><span class="s1">callback </span><span class="s0">in </span><span class="s1">self._sigs[sig][</span><span class="s2">&quot;callbacks&quot;</span><span class="s1">]:</span>
+            <span class="s0">if </span><span class="s1">isinstance(callback</span><span class="s0">, </span><span class="s1">str):</span>
+                <span class="s1">self._emit(callback)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">try</span><span class="s1">:</span>
+                    <span class="s4"># running callbacks should not break the interface</span>
+                    <span class="s1">ret = callback(value)</span>
+                    <span class="s0">if </span><span class="s1">ret </span><span class="s0">is False</span><span class="s1">:</span>
+                        <span class="s0">break</span>
+                <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e:</span>
+                    <span class="s1">logger.exception(</span>
+                        <span class="s2">&quot;Exception (%s) while executing callback for signal: %s&quot;</span>
+                        <span class="s2">&quot;&quot; </span><span class="s1">% (e</span><span class="s0">, </span><span class="s1">sig)</span>
+                    <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">show(self</span><span class="s0">, </span><span class="s1">threads=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Open a new browser tab and display this instance's interface&quot;&quot;&quot;</span>
+        <span class="s1">self.panel.show(threads=threads</span><span class="s0">, </span><span class="s1">verbose=</span><span class="s0">False</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+
+<span class="s0">class </span><span class="s1">SingleSelect(SigSlot):</span>
+    <span class="s3">&quot;&quot;&quot;A multiselect which only allows you to select one item for an event&quot;&quot;&quot;</span>
+
+    <span class="s1">signals = [</span><span class="s2">&quot;_selected&quot;</span><span class="s0">, </span><span class="s2">&quot;selected&quot;</span><span class="s1">]  </span><span class="s4"># the first is internal</span>
+    <span class="s1">slots = [</span><span class="s2">&quot;set_options&quot;</span><span class="s0">, </span><span class="s2">&quot;set_selection&quot;</span><span class="s0">, </span><span class="s2">&quot;add&quot;</span><span class="s0">, </span><span class="s2">&quot;clear&quot;</span><span class="s0">, </span><span class="s2">&quot;select&quot;</span><span class="s1">]</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self.kwargs = kwargs</span>
+        <span class="s1">super().__init__()</span>
+
+    <span class="s0">def </span><span class="s1">_setup(self):</span>
+        <span class="s1">self.panel = pn.widgets.MultiSelect(**self.kwargs)</span>
+        <span class="s1">self._register(self.panel</span><span class="s0">, </span><span class="s2">&quot;_selected&quot;</span><span class="s0">, </span><span class="s2">&quot;value&quot;</span><span class="s1">)</span>
+        <span class="s1">self._register(</span><span class="s0">None, </span><span class="s2">&quot;selected&quot;</span><span class="s1">)</span>
+        <span class="s1">self.connect(</span><span class="s2">&quot;_selected&quot;</span><span class="s0">, </span><span class="s1">self.select_one)</span>
+
+    <span class="s0">def </span><span class="s1">_signal(self</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super()._signal(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">select_one(self</span><span class="s0">, </span><span class="s1">*_):</span>
+        <span class="s0">with </span><span class="s1">self.ignore_events():</span>
+            <span class="s1">val = [self.panel.value[-</span><span class="s5">1</span><span class="s1">]] </span><span class="s0">if </span><span class="s1">self.panel.value </span><span class="s0">else </span><span class="s1">[]</span>
+            <span class="s1">self.panel.value = val</span>
+        <span class="s1">self._emit(</span><span class="s2">&quot;selected&quot;</span><span class="s0">, </span><span class="s1">self.panel.value)</span>
+
+    <span class="s0">def </span><span class="s1">set_options(self</span><span class="s0">, </span><span class="s1">options):</span>
+        <span class="s1">self.panel.options = options</span>
+
+    <span class="s0">def </span><span class="s1">clear(self):</span>
+        <span class="s1">self.panel.options = []</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">value(self):</span>
+        <span class="s0">return </span><span class="s1">self.panel.value</span>
+
+    <span class="s0">def </span><span class="s1">set_selection(self</span><span class="s0">, </span><span class="s1">selection):</span>
+        <span class="s1">self.panel.value = [selection]</span>
+
+
+<span class="s0">class </span><span class="s1">FileSelector(SigSlot):</span>
+    <span class="s3">&quot;&quot;&quot;Panel-based graphical file selector widget 
+ 
+    Instances of this widget are interactive and can be displayed in jupyter by having 
+    them as the output of a cell,  or in a separate browser tab using ``.show()``. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">signals = [</span>
+        <span class="s2">&quot;protocol_changed&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;selection_changed&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;directory_entered&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;home_clicked&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;up_clicked&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;go_clicked&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;filters_changed&quot;</span><span class="s0">,</span>
+    <span class="s1">]</span>
+    <span class="s1">slots = [</span><span class="s2">&quot;set_filters&quot;</span><span class="s0">, </span><span class="s2">&quot;go_home&quot;</span><span class="s1">]</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">url=</span><span class="s0">None, </span><span class="s1">filters=</span><span class="s0">None, </span><span class="s1">ignore=</span><span class="s0">None, </span><span class="s1">kwargs=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+ 
+        Parameters 
+        ---------- 
+        url : str (optional) 
+            Initial value of the URL to populate the dialog; should include protocol 
+        filters : list(str) (optional) 
+            File endings to include in the listings. If not included, all files are 
+            allowed. Does not affect directories. 
+            If given, the endings will appear as checkboxes in the interface 
+        ignore : list(str) (optional) 
+            Regex(s) of file basename patterns to ignore, e.g., &quot;\\.&quot; for typical 
+            hidden files on posix 
+        kwargs : dict (optional) 
+            To pass to file system instance 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">url:</span>
+            <span class="s1">self.init_protocol</span><span class="s0">, </span><span class="s1">url = split_protocol(url)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.init_protocol</span><span class="s0">, </span><span class="s1">url = </span><span class="s2">&quot;file&quot;</span><span class="s0">, </span><span class="s1">os.getcwd()</span>
+        <span class="s1">self.init_url = url</span>
+        <span class="s1">self.init_kwargs = kwargs </span><span class="s0">or </span><span class="s2">&quot;{}&quot;</span>
+        <span class="s1">self.filters = filters</span>
+        <span class="s1">self.ignore = [re.compile(i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">ignore </span><span class="s0">or </span><span class="s1">[]]</span>
+        <span class="s1">self._fs = </span><span class="s0">None</span>
+        <span class="s1">super().__init__()</span>
+
+    <span class="s0">def </span><span class="s1">_setup(self):</span>
+        <span class="s1">self.url = pn.widgets.TextInput(</span>
+            <span class="s1">name=</span><span class="s2">&quot;url&quot;</span><span class="s0">,</span>
+            <span class="s1">value=self.init_url</span><span class="s0">,</span>
+            <span class="s1">align=</span><span class="s2">&quot;end&quot;</span><span class="s0">,</span>
+            <span class="s1">sizing_mode=</span><span class="s2">&quot;stretch_width&quot;</span><span class="s0">,</span>
+            <span class="s1">width_policy=</span><span class="s2">&quot;max&quot;</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s1">self.protocol = pn.widgets.Select(</span>
+            <span class="s1">options=sorted(known_implementations)</span><span class="s0">,</span>
+            <span class="s1">value=self.init_protocol</span><span class="s0">,</span>
+            <span class="s1">name=</span><span class="s2">&quot;protocol&quot;</span><span class="s0">,</span>
+            <span class="s1">align=</span><span class="s2">&quot;center&quot;</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s1">self.kwargs = pn.widgets.TextInput(</span>
+            <span class="s1">name=</span><span class="s2">&quot;kwargs&quot;</span><span class="s0">, </span><span class="s1">value=self.init_kwargs</span><span class="s0">, </span><span class="s1">align=</span><span class="s2">&quot;center&quot;</span>
+        <span class="s1">)</span>
+        <span class="s1">self.go = pn.widgets.Button(name=</span><span class="s2">&quot;⇨&quot;</span><span class="s0">, </span><span class="s1">align=</span><span class="s2">&quot;end&quot;</span><span class="s0">, </span><span class="s1">width=</span><span class="s5">45</span><span class="s1">)</span>
+        <span class="s1">self.main = SingleSelect(size=</span><span class="s5">10</span><span class="s1">)</span>
+        <span class="s1">self.home = pn.widgets.Button(name=</span><span class="s2">&quot;🏠&quot;</span><span class="s0">, </span><span class="s1">width=</span><span class="s5">40</span><span class="s0">, </span><span class="s1">height=</span><span class="s5">30</span><span class="s0">, </span><span class="s1">align=</span><span class="s2">&quot;end&quot;</span><span class="s1">)</span>
+        <span class="s1">self.up = pn.widgets.Button(name=</span><span class="s2">&quot;‹&quot;</span><span class="s0">, </span><span class="s1">width=</span><span class="s5">30</span><span class="s0">, </span><span class="s1">height=</span><span class="s5">30</span><span class="s0">, </span><span class="s1">align=</span><span class="s2">&quot;end&quot;</span><span class="s1">)</span>
+
+        <span class="s1">self._register(self.protocol</span><span class="s0">, </span><span class="s2">&quot;protocol_changed&quot;</span><span class="s0">, </span><span class="s1">auto=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s1">self._register(self.go</span><span class="s0">, </span><span class="s2">&quot;go_clicked&quot;</span><span class="s0">, </span><span class="s2">&quot;clicks&quot;</span><span class="s0">, </span><span class="s1">auto=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s1">self._register(self.up</span><span class="s0">, </span><span class="s2">&quot;up_clicked&quot;</span><span class="s0">, </span><span class="s2">&quot;clicks&quot;</span><span class="s0">, </span><span class="s1">auto=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s1">self._register(self.home</span><span class="s0">, </span><span class="s2">&quot;home_clicked&quot;</span><span class="s0">, </span><span class="s2">&quot;clicks&quot;</span><span class="s0">, </span><span class="s1">auto=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s1">self._register(</span><span class="s0">None, </span><span class="s2">&quot;selection_changed&quot;</span><span class="s1">)</span>
+        <span class="s1">self.main.connect(</span><span class="s2">&quot;selected&quot;</span><span class="s0">, </span><span class="s1">self.selection_changed)</span>
+        <span class="s1">self._register(</span><span class="s0">None, </span><span class="s2">&quot;directory_entered&quot;</span><span class="s1">)</span>
+        <span class="s1">self.prev_protocol = self.protocol.value</span>
+        <span class="s1">self.prev_kwargs = self.storage_options</span>
+
+        <span class="s1">self.filter_sel = pn.widgets.CheckBoxGroup(</span>
+            <span class="s1">value=[]</span><span class="s0">, </span><span class="s1">options=[]</span><span class="s0">, </span><span class="s1">inline=</span><span class="s0">False, </span><span class="s1">align=</span><span class="s2">&quot;end&quot;</span><span class="s0">, </span><span class="s1">width_policy=</span><span class="s2">&quot;min&quot;</span>
+        <span class="s1">)</span>
+        <span class="s1">self._register(self.filter_sel</span><span class="s0">, </span><span class="s2">&quot;filters_changed&quot;</span><span class="s0">, </span><span class="s1">auto=</span><span class="s0">True</span><span class="s1">)</span>
+
+        <span class="s1">self.panel = pn.Column(</span>
+            <span class="s1">pn.Row(self.protocol</span><span class="s0">, </span><span class="s1">self.kwargs)</span><span class="s0">,</span>
+            <span class="s1">pn.Row(self.home</span><span class="s0">, </span><span class="s1">self.up</span><span class="s0">, </span><span class="s1">self.url</span><span class="s0">, </span><span class="s1">self.go</span><span class="s0">, </span><span class="s1">self.filter_sel)</span><span class="s0">,</span>
+            <span class="s1">self.main.panel</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s1">self.set_filters(self.filters)</span>
+        <span class="s1">self.go_clicked()</span>
+
+    <span class="s0">def </span><span class="s1">set_filters(self</span><span class="s0">, </span><span class="s1">filters=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">self.filters = filters</span>
+        <span class="s0">if </span><span class="s1">filters:</span>
+            <span class="s1">self.filter_sel.options = filters</span>
+            <span class="s1">self.filter_sel.value = filters</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.filter_sel.options = []</span>
+            <span class="s1">self.filter_sel.value = []</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">storage_options(self):</span>
+        <span class="s3">&quot;&quot;&quot;Value of the kwargs box as a dictionary&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">ast.literal_eval(self.kwargs.value) </span><span class="s0">or </span><span class="s1">{}</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">fs(self):</span>
+        <span class="s3">&quot;&quot;&quot;Current filesystem instance&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self._fs </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">cls = get_filesystem_class(self.protocol.value)</span>
+            <span class="s1">self._fs = cls(**self.storage_options)</span>
+        <span class="s0">return </span><span class="s1">self._fs</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">urlpath(self):</span>
+        <span class="s3">&quot;&quot;&quot;URL of currently selected item&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">(</span>
+            <span class="s1">(</span><span class="s2">f&quot;</span><span class="s0">{</span><span class="s1">self.protocol.value</span><span class="s0">}</span><span class="s2">://</span><span class="s0">{</span><span class="s1">self.main.value[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">self.main.value</span>
+            <span class="s0">else None</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">open_file(self</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">compression=</span><span class="s0">None, </span><span class="s1">encoding=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Create OpenFile instance for the currently selected item 
+ 
+        For example, in a notebook you might do something like 
+ 
+        .. code-block:: 
+ 
+            [ ]: sel = FileSelector(); sel 
+ 
+            # user selects their file 
+ 
+            [ ]: with sel.open_file('rb') as f: 
+            ...      out = f.read() 
+ 
+        Parameters 
+        ---------- 
+        mode: str (optional) 
+            Open mode for the file. 
+        compression: str (optional) 
+            The interact with the file as compressed. Set to 'infer' to guess 
+            compression from the file ending 
+        encoding: str (optional) 
+            If using text mode, use this encoding; defaults to UTF8. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self.urlpath </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;No file selected&quot;</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">OpenFile(self.fs</span><span class="s0">, </span><span class="s1">self.urlpath</span><span class="s0">, </span><span class="s1">mode</span><span class="s0">, </span><span class="s1">compression</span><span class="s0">, </span><span class="s1">encoding)</span>
+
+    <span class="s0">def </span><span class="s1">filters_changed(self</span><span class="s0">, </span><span class="s1">values):</span>
+        <span class="s1">self.filters = values</span>
+        <span class="s1">self.go_clicked()</span>
+
+    <span class="s0">def </span><span class="s1">selection_changed(self</span><span class="s0">, </span><span class="s1">*_):</span>
+        <span class="s0">if </span><span class="s1">self.urlpath </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">return</span>
+        <span class="s0">if </span><span class="s1">self.fs.isdir(self.urlpath):</span>
+            <span class="s1">self.url.value = self.fs._strip_protocol(self.urlpath)</span>
+        <span class="s1">self.go_clicked()</span>
+
+    <span class="s0">def </span><span class="s1">go_clicked(self</span><span class="s0">, </span><span class="s1">*_):</span>
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">self.prev_protocol != self.protocol.value</span>
+            <span class="s0">or </span><span class="s1">self.prev_kwargs != self.storage_options</span>
+        <span class="s1">):</span>
+            <span class="s1">self._fs = </span><span class="s0">None  </span><span class="s4"># causes fs to be recreated</span>
+            <span class="s1">self.prev_protocol = self.protocol.value</span>
+            <span class="s1">self.prev_kwargs = self.storage_options</span>
+        <span class="s1">listing = sorted(</span>
+            <span class="s1">self.fs.ls(self.url.value</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True</span><span class="s1">)</span><span class="s0">, </span><span class="s1">key=</span><span class="s0">lambda </span><span class="s1">x: x[</span><span class="s2">&quot;name&quot;</span><span class="s1">]</span>
+        <span class="s1">)</span>
+        <span class="s1">listing = [</span>
+            <span class="s1">l</span>
+            <span class="s0">for </span><span class="s1">l </span><span class="s0">in </span><span class="s1">listing</span>
+            <span class="s0">if not </span><span class="s1">any(i.match(l[</span><span class="s2">&quot;name&quot;</span><span class="s1">].rsplit(</span><span class="s2">&quot;/&quot;</span><span class="s0">, </span><span class="s5">1</span><span class="s1">)[-</span><span class="s5">1</span><span class="s1">]) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">self.ignore)</span>
+        <span class="s1">]</span>
+        <span class="s1">folders = {</span>
+            <span class="s2">&quot;📁 &quot; </span><span class="s1">+ o[</span><span class="s2">&quot;name&quot;</span><span class="s1">].rsplit(</span><span class="s2">&quot;/&quot;</span><span class="s0">, </span><span class="s5">1</span><span class="s1">)[-</span><span class="s5">1</span><span class="s1">]: o[</span><span class="s2">&quot;name&quot;</span><span class="s1">]</span>
+            <span class="s0">for </span><span class="s1">o </span><span class="s0">in </span><span class="s1">listing</span>
+            <span class="s0">if </span><span class="s1">o[</span><span class="s2">&quot;type&quot;</span><span class="s1">] == </span><span class="s2">&quot;directory&quot;</span>
+        <span class="s1">}</span>
+        <span class="s1">files = {</span>
+            <span class="s2">&quot;📄 &quot; </span><span class="s1">+ o[</span><span class="s2">&quot;name&quot;</span><span class="s1">].rsplit(</span><span class="s2">&quot;/&quot;</span><span class="s0">, </span><span class="s5">1</span><span class="s1">)[-</span><span class="s5">1</span><span class="s1">]: o[</span><span class="s2">&quot;name&quot;</span><span class="s1">]</span>
+            <span class="s0">for </span><span class="s1">o </span><span class="s0">in </span><span class="s1">listing</span>
+            <span class="s0">if </span><span class="s1">o[</span><span class="s2">&quot;type&quot;</span><span class="s1">] == </span><span class="s2">&quot;file&quot;</span>
+        <span class="s1">}</span>
+        <span class="s0">if </span><span class="s1">self.filters:</span>
+            <span class="s1">files = {</span>
+                <span class="s1">k: v</span>
+                <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">files.items()</span>
+                <span class="s0">if </span><span class="s1">any(v.endswith(ext) </span><span class="s0">for </span><span class="s1">ext </span><span class="s0">in </span><span class="s1">self.filters)</span>
+            <span class="s1">}</span>
+        <span class="s1">self.main.set_options(dict(**folders</span><span class="s0">, </span><span class="s1">**files))</span>
+
+    <span class="s0">def </span><span class="s1">protocol_changed(self</span><span class="s0">, </span><span class="s1">*_):</span>
+        <span class="s1">self._fs = </span><span class="s0">None</span>
+        <span class="s1">self.main.options = []</span>
+        <span class="s1">self.url.value = </span><span class="s2">&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">home_clicked(self</span><span class="s0">, </span><span class="s1">*_):</span>
+        <span class="s1">self.protocol.value = self.init_protocol</span>
+        <span class="s1">self.kwargs.value = self.init_kwargs</span>
+        <span class="s1">self.url.value = self.init_url</span>
+        <span class="s1">self.go_clicked()</span>
+
+    <span class="s0">def </span><span class="s1">up_clicked(self</span><span class="s0">, </span><span class="s1">*_):</span>
+        <span class="s1">self.url.value = self.fs._parent(self.url.value)</span>
+        <span class="s1">self.go_clicked()</span>
+</pre>
+</body>
+</html>

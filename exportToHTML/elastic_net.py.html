@@ -1,0 +1,410 @@
+<html>
+<head>
+<title>elastic_net.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+elastic_net.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">from </span><span class="s1">statsmodels.base.model </span><span class="s0">import </span><span class="s1">Results</span>
+<span class="s0">import </span><span class="s1">statsmodels.base.wrapper </span><span class="s0">as </span><span class="s1">wrap</span>
+<span class="s0">from </span><span class="s1">statsmodels.tools.decorators </span><span class="s0">import </span><span class="s1">cache_readonly</span>
+
+<span class="s2">&quot;&quot;&quot; 
+Elastic net regularization. 
+ 
+Routines for fitting regression models using elastic net 
+regularization.  The elastic net minimizes the objective function 
+ 
+-llf / nobs + alpha((1 - L1_wt) * sum(params**2) / 2 + 
+    L1_wt * sum(abs(params))) 
+ 
+The algorithm implemented here closely follows the implementation in 
+the R glmnet package, documented here: 
+ 
+http://cran.r-project.org/web/packages/glmnet/index.html 
+ 
+and here: 
+ 
+http://www.jstatsoft.org/v33/i01/paper 
+ 
+This routine should work for any regression model that implements 
+loglike, score, and hess. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s0">def </span><span class="s1">_gen_npfuncs(k</span><span class="s0">, </span><span class="s1">L1_wt</span><span class="s0">, </span><span class="s1">alpha</span><span class="s0">, </span><span class="s1">loglike_kwds</span><span class="s0">, </span><span class="s1">score_kwds</span><span class="s0">, </span><span class="s1">hess_kwds):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Negative penalized log-likelihood functions. 
+ 
+    Returns the negative penalized log-likelihood, its derivative, and 
+    its Hessian.  The penalty only includes the smooth (L2) term. 
+ 
+    All three functions have argument signature (x, model), where 
+    ``x`` is a point in the parameter space and ``model`` is an 
+    arbitrary statsmodels regression model. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">nploglike(params</span><span class="s0">, </span><span class="s1">model):</span>
+        <span class="s1">nobs = model.nobs</span>
+        <span class="s1">pen_llf = alpha[k] * (</span><span class="s4">1 </span><span class="s1">- L1_wt) * np.sum(params**</span><span class="s4">2</span><span class="s1">) / </span><span class="s4">2</span>
+        <span class="s1">llf = model.loglike(np.r_[params]</span><span class="s0">, </span><span class="s1">**loglike_kwds)</span>
+        <span class="s0">return </span><span class="s1">- llf / nobs + pen_llf</span>
+
+    <span class="s0">def </span><span class="s1">npscore(params</span><span class="s0">, </span><span class="s1">model):</span>
+        <span class="s1">nobs = model.nobs</span>
+        <span class="s1">pen_grad = alpha[k] * (</span><span class="s4">1 </span><span class="s1">- L1_wt) * params</span>
+        <span class="s1">gr = -model.score(np.r_[params]</span><span class="s0">, </span><span class="s1">**score_kwds)[</span><span class="s4">0</span><span class="s1">] / nobs</span>
+        <span class="s0">return </span><span class="s1">gr + pen_grad</span>
+
+    <span class="s0">def </span><span class="s1">nphess(params</span><span class="s0">, </span><span class="s1">model):</span>
+        <span class="s1">nobs = model.nobs</span>
+        <span class="s1">pen_hess = alpha[k] * (</span><span class="s4">1 </span><span class="s1">- L1_wt)</span>
+        <span class="s1">h = -model.hessian(np.r_[params]</span><span class="s0">, </span><span class="s1">**hess_kwds)[</span><span class="s4">0</span><span class="s0">, </span><span class="s4">0</span><span class="s1">] / nobs + pen_hess</span>
+        <span class="s0">return </span><span class="s1">h</span>
+
+    <span class="s0">return </span><span class="s1">nploglike</span><span class="s0">, </span><span class="s1">npscore</span><span class="s0">, </span><span class="s1">nphess</span>
+
+
+<span class="s0">def </span><span class="s1">fit_elasticnet(model</span><span class="s0">, </span><span class="s1">method=</span><span class="s2">&quot;coord_descent&quot;</span><span class="s0">, </span><span class="s1">maxiter=</span><span class="s4">100</span><span class="s0">,</span>
+                   <span class="s1">alpha=</span><span class="s4">0.</span><span class="s0">, </span><span class="s1">L1_wt=</span><span class="s4">1.</span><span class="s0">, </span><span class="s1">start_params=</span><span class="s0">None, </span><span class="s1">cnvrg_tol=</span><span class="s4">1e-7</span><span class="s0">,</span>
+                   <span class="s1">zero_tol=</span><span class="s4">1e-8</span><span class="s0">, </span><span class="s1">refit=</span><span class="s0">False, </span><span class="s1">check_step=</span><span class="s0">True,</span>
+                   <span class="s1">loglike_kwds=</span><span class="s0">None, </span><span class="s1">score_kwds=</span><span class="s0">None, </span><span class="s1">hess_kwds=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Return an elastic net regularized fit to a regression model. 
+ 
+    Parameters 
+    ---------- 
+    model : model object 
+        A statsmodels object implementing ``loglike``, ``score``, and 
+        ``hessian``. 
+    method : {'coord_descent'} 
+        Only the coordinate descent algorithm is implemented. 
+    maxiter : int 
+        The maximum number of iteration cycles (an iteration cycle 
+        involves running coordinate descent on all variables). 
+    alpha : scalar or array_like 
+        The penalty weight.  If a scalar, the same penalty weight 
+        applies to all variables in the model.  If a vector, it 
+        must have the same length as `params`, and contains a 
+        penalty weight for each coefficient. 
+    L1_wt : scalar 
+        The fraction of the penalty given to the L1 penalty term. 
+        Must be between 0 and 1 (inclusive).  If 0, the fit is 
+        a ridge fit, if 1 it is a lasso fit. 
+    start_params : array_like 
+        Starting values for `params`. 
+    cnvrg_tol : scalar 
+        If `params` changes by less than this amount (in sup-norm) 
+        in one iteration cycle, the algorithm terminates with 
+        convergence. 
+    zero_tol : scalar 
+        Any estimated coefficient smaller than this value is 
+        replaced with zero. 
+    refit : bool 
+        If True, the model is refit using only the variables that have 
+        non-zero coefficients in the regularized fit.  The refitted 
+        model is not regularized. 
+    check_step : bool 
+        If True, confirm that the first step is an improvement and search 
+        further if it is not. 
+    loglike_kwds : dict-like or None 
+        Keyword arguments for the log-likelihood function. 
+    score_kwds : dict-like or None 
+        Keyword arguments for the score function. 
+    hess_kwds : dict-like or None 
+        Keyword arguments for the Hessian function. 
+ 
+    Returns 
+    ------- 
+    Results 
+        A results object. 
+ 
+    Notes 
+    ----- 
+    The ``elastic net`` penalty is a combination of L1 and L2 
+    penalties. 
+ 
+    The function that is minimized is: 
+ 
+    -loglike/n + alpha*((1-L1_wt)*|params|_2^2/2 + L1_wt*|params|_1) 
+ 
+    where |*|_1 and |*|_2 are the L1 and L2 norms. 
+ 
+    The computational approach used here is to obtain a quadratic 
+    approximation to the smooth part of the target function: 
+ 
+    -loglike/n + alpha*(1-L1_wt)*|params|_2^2/2 
+ 
+    then repeatedly optimize the L1 penalized version of this function 
+    along coordinate axes. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">k_exog = model.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+
+    <span class="s1">loglike_kwds = {} </span><span class="s0">if </span><span class="s1">loglike_kwds </span><span class="s0">is None else </span><span class="s1">loglike_kwds</span>
+    <span class="s1">score_kwds = {} </span><span class="s0">if </span><span class="s1">score_kwds </span><span class="s0">is None else </span><span class="s1">score_kwds</span>
+    <span class="s1">hess_kwds = {} </span><span class="s0">if </span><span class="s1">hess_kwds </span><span class="s0">is None else </span><span class="s1">hess_kwds</span>
+
+    <span class="s0">if </span><span class="s1">np.isscalar(alpha):</span>
+        <span class="s1">alpha = alpha * np.ones(k_exog)</span>
+
+    <span class="s5"># Define starting params</span>
+    <span class="s0">if </span><span class="s1">start_params </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">params = np.zeros(k_exog)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">params = start_params.copy()</span>
+
+    <span class="s1">btol = </span><span class="s4">1e-4</span>
+    <span class="s1">params_zero = np.zeros(len(params)</span><span class="s0">, </span><span class="s1">dtype=bool)</span>
+
+    <span class="s1">init_args = model._get_init_kwds()</span>
+    <span class="s5"># we do not need a copy of init_args b/c get_init_kwds provides new dict</span>
+    <span class="s1">init_args[</span><span class="s2">'hasconst'</span><span class="s1">] = </span><span class="s0">False</span>
+    <span class="s1">model_offset = init_args.pop(</span><span class="s2">'offset'</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s2">'exposure' </span><span class="s0">in </span><span class="s1">init_args </span><span class="s0">and </span><span class="s1">init_args[</span><span class="s2">'exposure'</span><span class="s1">] </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">model_offset </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">model_offset = np.log(init_args.pop(</span><span class="s2">'exposure'</span><span class="s1">))</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">model_offset += np.log(init_args.pop(</span><span class="s2">'exposure'</span><span class="s1">))</span>
+
+    <span class="s1">fgh_list = [</span>
+        <span class="s1">_gen_npfuncs(k</span><span class="s0">, </span><span class="s1">L1_wt</span><span class="s0">, </span><span class="s1">alpha</span><span class="s0">, </span><span class="s1">loglike_kwds</span><span class="s0">, </span><span class="s1">score_kwds</span><span class="s0">, </span><span class="s1">hess_kwds)</span>
+        <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">range(k_exog)]</span>
+
+    <span class="s1">converged = </span><span class="s0">False</span>
+
+    <span class="s0">for </span><span class="s1">itr </span><span class="s0">in </span><span class="s1">range(maxiter):</span>
+
+        <span class="s5"># Sweep through the parameters</span>
+        <span class="s1">params_save = params.copy()</span>
+        <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">range(k_exog):</span>
+
+            <span class="s5"># Under the active set method, if a parameter becomes</span>
+            <span class="s5"># zero we do not try to change it again.</span>
+            <span class="s5"># TODO : give the user the option to switch this off</span>
+            <span class="s0">if </span><span class="s1">params_zero[k]:</span>
+                <span class="s0">continue</span>
+
+            <span class="s5"># Set the offset to account for the variables that are</span>
+            <span class="s5"># being held fixed in the current coordinate</span>
+            <span class="s5"># optimization.</span>
+            <span class="s1">params0 = params.copy()</span>
+            <span class="s1">params0[k] = </span><span class="s4">0</span>
+            <span class="s1">offset = np.dot(model.exog</span><span class="s0">, </span><span class="s1">params0)</span>
+            <span class="s0">if </span><span class="s1">model_offset </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">offset += model_offset</span>
+
+            <span class="s5"># Create a one-variable model for optimization.</span>
+            <span class="s1">model_1var = model.__class__(</span>
+                <span class="s1">model.endog</span><span class="s0">, </span><span class="s1">model.exog[:</span><span class="s0">, </span><span class="s1">k]</span><span class="s0">, </span><span class="s1">offset=offset</span><span class="s0">, </span><span class="s1">**init_args)</span>
+
+            <span class="s5"># Do the one-dimensional optimization.</span>
+            <span class="s1">func</span><span class="s0">, </span><span class="s1">grad</span><span class="s0">, </span><span class="s1">hess = fgh_list[k]</span>
+            <span class="s1">params[k] = _opt_1d(</span>
+                <span class="s1">func</span><span class="s0">, </span><span class="s1">grad</span><span class="s0">, </span><span class="s1">hess</span><span class="s0">, </span><span class="s1">model_1var</span><span class="s0">, </span><span class="s1">params[k]</span><span class="s0">, </span><span class="s1">alpha[k]*L1_wt</span><span class="s0">,</span>
+                <span class="s1">tol=btol</span><span class="s0">, </span><span class="s1">check_step=check_step)</span>
+
+            <span class="s5"># Update the active set</span>
+            <span class="s0">if </span><span class="s1">itr &gt; </span><span class="s4">0 </span><span class="s0">and </span><span class="s1">np.abs(params[k]) &lt; zero_tol:</span>
+                <span class="s1">params_zero[k] = </span><span class="s0">True</span>
+                <span class="s1">params[k] = </span><span class="s4">0.</span>
+
+        <span class="s5"># Check for convergence</span>
+        <span class="s1">pchange = np.max(np.abs(params - params_save))</span>
+        <span class="s0">if </span><span class="s1">pchange &lt; cnvrg_tol:</span>
+            <span class="s1">converged = </span><span class="s0">True</span>
+            <span class="s0">break</span>
+
+    <span class="s5"># Set approximate zero coefficients to be exactly zero</span>
+    <span class="s1">params[np.abs(params) &lt; zero_tol] = </span><span class="s4">0</span>
+
+    <span class="s0">if not </span><span class="s1">refit:</span>
+        <span class="s1">results = RegularizedResults(model</span><span class="s0">, </span><span class="s1">params)</span>
+        <span class="s1">results.converged = converged</span>
+        <span class="s0">return </span><span class="s1">RegularizedResultsWrapper(results)</span>
+
+    <span class="s5"># Fit the reduced model to get standard errors and other</span>
+    <span class="s5"># post-estimation results.</span>
+    <span class="s1">ii = np.flatnonzero(params)</span>
+    <span class="s1">cov = np.zeros((k_exog</span><span class="s0">, </span><span class="s1">k_exog))</span>
+    <span class="s1">init_args = dict([(k</span><span class="s0">, </span><span class="s1">getattr(model</span><span class="s0">, </span><span class="s1">k</span><span class="s0">, None</span><span class="s1">)) </span><span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">model._init_keys])</span>
+    <span class="s0">if </span><span class="s1">len(ii) &gt; </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">model1 = model.__class__(</span>
+            <span class="s1">model.endog</span><span class="s0">, </span><span class="s1">model.exog[:</span><span class="s0">, </span><span class="s1">ii]</span><span class="s0">, </span><span class="s1">**init_args)</span>
+        <span class="s1">rslt = model1.fit()</span>
+        <span class="s1">params[ii] = rslt.params</span>
+        <span class="s1">cov[np.ix_(ii</span><span class="s0">, </span><span class="s1">ii)] = rslt.normalized_cov_params</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s5"># Hack: no variables were selected but we need to run fit in</span>
+        <span class="s5"># order to get the correct results class.  So just fit a model</span>
+        <span class="s5"># with one variable.</span>
+        <span class="s1">model1 = model.__class__(model.endog</span><span class="s0">, </span><span class="s1">model.exog[:</span><span class="s0">, </span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">**init_args)</span>
+        <span class="s1">rslt = model1.fit(maxiter=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s5"># fit may return a results or a results wrapper</span>
+    <span class="s0">if </span><span class="s1">issubclass(rslt.__class__</span><span class="s0">, </span><span class="s1">wrap.ResultsWrapper):</span>
+        <span class="s1">klass = rslt._results.__class__</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">klass = rslt.__class__</span>
+
+    <span class="s5"># Not all models have a scale</span>
+    <span class="s0">if </span><span class="s1">hasattr(rslt</span><span class="s0">, </span><span class="s2">'scale'</span><span class="s1">):</span>
+        <span class="s1">scale = rslt.scale</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">scale = </span><span class="s4">1.</span>
+
+    <span class="s5"># The degrees of freedom should reflect the number of parameters</span>
+    <span class="s5"># in the refit model, not including the zeros that are displayed</span>
+    <span class="s5"># to indicate which variables were dropped.  See issue #1723 for</span>
+    <span class="s5"># discussion about setting df parameters in model and results</span>
+    <span class="s5"># classes.</span>
+    <span class="s1">p</span><span class="s0">, </span><span class="s1">q = model.df_model</span><span class="s0">, </span><span class="s1">model.df_resid</span>
+    <span class="s1">model.df_model = len(ii)</span>
+    <span class="s1">model.df_resid = model.nobs - model.df_model</span>
+
+    <span class="s5"># Assuming a standard signature for creating results classes.</span>
+    <span class="s1">refit = klass(model</span><span class="s0">, </span><span class="s1">params</span><span class="s0">, </span><span class="s1">cov</span><span class="s0">, </span><span class="s1">scale=scale)</span>
+    <span class="s1">refit.regularized = </span><span class="s0">True</span>
+    <span class="s1">refit.converged = converged</span>
+    <span class="s1">refit.method = method</span>
+    <span class="s1">refit.fit_history = {</span><span class="s2">'iteration'</span><span class="s1">: itr + </span><span class="s4">1</span><span class="s1">}</span>
+
+    <span class="s5"># Restore df in model class, see issue #1723 for discussion.</span>
+    <span class="s1">model.df_model</span><span class="s0">, </span><span class="s1">model.df_resid = p</span><span class="s0">, </span><span class="s1">q</span>
+
+    <span class="s0">return </span><span class="s1">refit</span>
+
+
+<span class="s0">def </span><span class="s1">_opt_1d(func</span><span class="s0">, </span><span class="s1">grad</span><span class="s0">, </span><span class="s1">hess</span><span class="s0">, </span><span class="s1">model</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">L1_wt</span><span class="s0">, </span><span class="s1">tol</span><span class="s0">,</span>
+            <span class="s1">check_step=</span><span class="s0">True</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    One-dimensional helper for elastic net. 
+ 
+    Parameters 
+    ---------- 
+    func : function 
+        A smooth function of a single variable to be optimized 
+        with L1 penaty. 
+    grad : function 
+        The gradient of `func`. 
+    hess : function 
+        The Hessian of `func`. 
+    model : statsmodels model 
+        The model being fit. 
+    start : real 
+        A starting value for the function argument 
+    L1_wt : non-negative real 
+        The weight for the L1 penalty function. 
+    tol : non-negative real 
+        A convergence threshold. 
+    check_step : bool 
+        If True, check that the first step is an improvement and 
+        use bisection if it is not.  If False, return after the 
+        first step regardless. 
+ 
+    Notes 
+    ----- 
+    ``func``, ``grad``, and ``hess`` have argument signature (x, 
+    model), where ``x`` is a point in the parameter space and 
+    ``model`` is the model being fit. 
+ 
+    If the log-likelihood for the model is exactly quadratic, the 
+    global minimum is returned in one step.  Otherwise numerical 
+    bisection is used. 
+ 
+    Returns 
+    ------- 
+    The argmin of the objective function. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s5"># Overview:</span>
+    <span class="s5"># We want to minimize L(x) + L1_wt*abs(x), where L() is a smooth</span>
+    <span class="s5"># loss function that includes the log-likelihood and L2 penalty.</span>
+    <span class="s5"># This is a 1-dimensional optimization.  If L(x) is exactly</span>
+    <span class="s5"># quadratic we can solve for the argmin exactly.  Otherwise we</span>
+    <span class="s5"># approximate L(x) with a quadratic function Q(x) and try to use</span>
+    <span class="s5"># the minimizer of Q(x) + L1_wt*abs(x).  But if this yields an</span>
+    <span class="s5"># uphill step for the actual target function L(x) + L1_wt*abs(x),</span>
+    <span class="s5"># then we fall back to a expensive line search.  The line search</span>
+    <span class="s5"># is never needed for OLS.</span>
+
+    <span class="s1">x = start</span>
+    <span class="s1">f = func(x</span><span class="s0">, </span><span class="s1">model)</span>
+    <span class="s1">b = grad(x</span><span class="s0">, </span><span class="s1">model)</span>
+    <span class="s1">c = hess(x</span><span class="s0">, </span><span class="s1">model)</span>
+    <span class="s1">d = b - c*x</span>
+
+    <span class="s5"># The optimum is achieved by hard thresholding to zero</span>
+    <span class="s0">if </span><span class="s1">L1_wt &gt; np.abs(d):</span>
+        <span class="s0">return </span><span class="s4">0.</span>
+
+    <span class="s5"># x + h is the minimizer of the Q(x) + L1_wt*abs(x)</span>
+    <span class="s0">if </span><span class="s1">d &gt;= </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">h = (L1_wt - b) / c</span>
+    <span class="s0">elif </span><span class="s1">d &lt; </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">h = -(L1_wt + b) / c</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">np.nan</span>
+
+    <span class="s5"># If the new point is not uphill for the target function, take it</span>
+    <span class="s5"># and return.  This check is a bit expensive and un-necessary for</span>
+    <span class="s5"># OLS</span>
+    <span class="s0">if not </span><span class="s1">check_step:</span>
+        <span class="s0">return </span><span class="s1">x + h</span>
+    <span class="s1">f1 = func(x + h</span><span class="s0">, </span><span class="s1">model) + L1_wt*np.abs(x + h)</span>
+    <span class="s0">if </span><span class="s1">f1 &lt;= f + L1_wt*np.abs(x) + </span><span class="s4">1e-10</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">x + h</span>
+
+    <span class="s5"># Fallback for models where the loss is not quadratic</span>
+    <span class="s0">from </span><span class="s1">scipy.optimize </span><span class="s0">import </span><span class="s1">brent</span>
+    <span class="s1">x_opt = brent(func</span><span class="s0">, </span><span class="s1">args=(model</span><span class="s0">,</span><span class="s1">)</span><span class="s0">, </span><span class="s1">brack=(x-</span><span class="s4">1</span><span class="s0">, </span><span class="s1">x+</span><span class="s4">1</span><span class="s1">)</span><span class="s0">, </span><span class="s1">tol=tol)</span>
+    <span class="s0">return </span><span class="s1">x_opt</span>
+
+
+<span class="s0">class </span><span class="s1">RegularizedResults(Results):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Results for models estimated using regularization 
+ 
+    Parameters 
+    ---------- 
+    model : Model 
+        The model instance used to estimate the parameters. 
+    params : ndarray 
+        The estimated (regularized) parameters. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">model</span><span class="s0">, </span><span class="s1">params):</span>
+        <span class="s1">super(RegularizedResults</span><span class="s0">, </span><span class="s1">self).__init__(model</span><span class="s0">, </span><span class="s1">params)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s0">def </span><span class="s1">fittedvalues(self):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        The predicted values from the model at the estimated parameters. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.model.predict(self.params)</span>
+
+
+<span class="s0">class </span><span class="s1">RegularizedResultsWrapper(wrap.ResultsWrapper):</span>
+    <span class="s1">_attrs = {</span>
+        <span class="s2">'params'</span><span class="s1">: </span><span class="s2">'columns'</span><span class="s0">,</span>
+        <span class="s2">'resid'</span><span class="s1">: </span><span class="s2">'rows'</span><span class="s0">,</span>
+        <span class="s2">'fittedvalues'</span><span class="s1">: </span><span class="s2">'rows'</span><span class="s0">,</span>
+    <span class="s1">}</span>
+    <span class="s1">_wrap_attrs = _attrs</span>
+<span class="s1">wrap.populate_wrapper(RegularizedResultsWrapper</span><span class="s0">,  </span><span class="s5"># noqa:E305</span>
+                      <span class="s1">RegularizedResults)</span>
+</pre>
+</body>
+</html>

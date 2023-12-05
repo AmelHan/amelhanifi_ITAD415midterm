@@ -1,0 +1,438 @@
+<html>
+<head>
+<title>quantile_regression.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+quantile_regression.py</font>
+</center></td></tr></table>
+<pre><span class="s0">#!/usr/bin/env python</span>
+
+<span class="s2">''' 
+Quantile regression model 
+ 
+Model parameters are estimated using iterated reweighted least squares. The 
+asymptotic covariance matrix estimated using kernel density estimation. 
+ 
+Author: Vincent Arel-Bundock 
+License: BSD-3 
+Created: 2013-03-19 
+ 
+The original IRLS function was written for Matlab by Shapour Mohammadi, 
+University of Tehran, 2008 (shmohammadi@gmail.com), with some lines based on 
+code written by James P. Lesage in Applied Econometrics Using MATLAB(1999).PP. 
+73-4.  Translated to python with permission from original author by Christian 
+Prinoth (christian at prinoth dot name). 
+'''</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">import </span><span class="s1">scipy.stats </span><span class="s3">as </span><span class="s1">stats</span>
+<span class="s3">from </span><span class="s1">numpy.linalg </span><span class="s3">import </span><span class="s1">pinv</span>
+<span class="s3">from </span><span class="s1">scipy.stats </span><span class="s3">import </span><span class="s1">norm</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.decorators </span><span class="s3">import </span><span class="s1">cache_readonly</span>
+<span class="s3">from </span><span class="s1">statsmodels.regression.linear_model </span><span class="s3">import </span><span class="s1">(RegressionModel</span><span class="s3">,</span>
+                                                 <span class="s1">RegressionResults</span><span class="s3">,</span>
+                                                 <span class="s1">RegressionResultsWrapper)</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.sm_exceptions </span><span class="s3">import </span><span class="s1">(ConvergenceWarning</span><span class="s3">,</span>
+                                             <span class="s1">IterationLimitWarning)</span>
+
+<span class="s3">class </span><span class="s1">QuantReg(RegressionModel):</span>
+    <span class="s2">'''Quantile Regression 
+ 
+    Estimate a quantile regression model using iterative reweighted least 
+    squares. 
+ 
+    Parameters 
+    ---------- 
+    endog : array or dataframe 
+        endogenous/response variable 
+    exog : array or dataframe 
+        exogenous/explanatory variable(s) 
+ 
+    Notes 
+    ----- 
+    The Least Absolute Deviation (LAD) estimator is a special case where 
+    quantile is set to 0.5 (q argument of the fit method). 
+ 
+    The asymptotic covariance matrix is estimated following the procedure in 
+    Greene (2008, p.407-408), using either the logistic or gaussian kernels 
+    (kernel argument of the fit method). 
+ 
+    References 
+    ---------- 
+    General: 
+ 
+    * Birkes, D. and Y. Dodge(1993). Alternative Methods of Regression, John Wiley and Sons. 
+    * Green,W. H. (2008). Econometric Analysis. Sixth Edition. International Student Edition. 
+    * Koenker, R. (2005). Quantile Regression. New York: Cambridge University Press. 
+    * LeSage, J. P.(1999). Applied Econometrics Using MATLAB, 
+ 
+    Kernels (used by the fit method): 
+ 
+    * Green (2008) Table 14.2 
+ 
+    Bandwidth selection (used by the fit method): 
+ 
+    * Bofinger, E. (1975). Estimation of a density function using order statistics. Australian Journal of Statistics 17: 1-17. 
+    * Chamberlain, G. (1994). Quantile regression, censoring, and the structure of wages. In Advances in Econometrics, Vol. 1: Sixth World Congress, ed. C. A. Sims, 171-209. Cambridge: Cambridge University Press. 
+    * Hall, P., and S. Sheather. (1988). On the distribution of the Studentized quantile. Journal of the Royal Statistical Society, Series B 50: 381-391. 
+ 
+    Keywords: Least Absolute Deviation(LAD) Regression, Quantile Regression, 
+    Regression, Robust Estimation. 
+    '''</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._check_kwargs(kwargs)</span>
+        <span class="s1">super(QuantReg</span><span class="s3">, </span><span class="s1">self).__init__(endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s3">def </span><span class="s1">whiten(self</span><span class="s3">, </span><span class="s1">data):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        QuantReg model whitener does nothing: returns data. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">data</span>
+
+    <span class="s3">def </span><span class="s1">fit(self</span><span class="s3">, </span><span class="s1">q=</span><span class="s4">.5</span><span class="s3">, </span><span class="s1">vcov=</span><span class="s5">'robust'</span><span class="s3">, </span><span class="s1">kernel=</span><span class="s5">'epa'</span><span class="s3">, </span><span class="s1">bandwidth=</span><span class="s5">'hsheather'</span><span class="s3">,</span>
+            <span class="s1">max_iter=</span><span class="s4">1000</span><span class="s3">, </span><span class="s1">p_tol=</span><span class="s4">1e-6</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Solve by Iterative Weighted Least Squares 
+ 
+        Parameters 
+        ---------- 
+        q : float 
+            Quantile must be strictly between 0 and 1 
+        vcov : str, method used to calculate the variance-covariance matrix 
+            of the parameters. Default is ``robust``: 
+ 
+            - robust : heteroskedasticity robust standard errors (as suggested 
+              in Greene 6th edition) 
+            - iid : iid errors (as in Stata 12) 
+ 
+        kernel : str, kernel to use in the kernel density estimation for the 
+            asymptotic covariance matrix: 
+ 
+            - epa: Epanechnikov 
+            - cos: Cosine 
+            - gau: Gaussian 
+            - par: Parzene 
+ 
+        bandwidth : str, Bandwidth selection method in kernel density 
+            estimation for asymptotic covariance estimate (full 
+            references in QuantReg docstring): 
+ 
+            - hsheather: Hall-Sheather (1988) 
+            - bofinger: Bofinger (1975) 
+            - chamberlain: Chamberlain (1994) 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">if </span><span class="s1">q &lt;= </span><span class="s4">0 </span><span class="s3">or </span><span class="s1">q &gt;= </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">Exception(</span><span class="s5">'q must be strictly between 0 and 1'</span><span class="s1">)</span>
+
+        <span class="s1">kern_names = [</span><span class="s5">'biw'</span><span class="s3">, </span><span class="s5">'cos'</span><span class="s3">, </span><span class="s5">'epa'</span><span class="s3">, </span><span class="s5">'gau'</span><span class="s3">, </span><span class="s5">'par'</span><span class="s1">]</span>
+        <span class="s3">if </span><span class="s1">kernel </span><span class="s3">not in </span><span class="s1">kern_names:</span>
+            <span class="s3">raise </span><span class="s1">Exception(</span><span class="s5">&quot;kernel must be one of &quot; </span><span class="s1">+ </span><span class="s5">', '</span><span class="s1">.join(kern_names))</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">kernel = kernels[kernel]</span>
+
+        <span class="s3">if </span><span class="s1">bandwidth == </span><span class="s5">'hsheather'</span><span class="s1">:</span>
+            <span class="s1">bandwidth = hall_sheather</span>
+        <span class="s3">elif </span><span class="s1">bandwidth == </span><span class="s5">'bofinger'</span><span class="s1">:</span>
+            <span class="s1">bandwidth = bofinger</span>
+        <span class="s3">elif </span><span class="s1">bandwidth == </span><span class="s5">'chamberlain'</span><span class="s1">:</span>
+            <span class="s1">bandwidth = chamberlain</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">Exception(</span><span class="s5">&quot;bandwidth must be in 'hsheather', 'bofinger', 'chamberlain'&quot;</span><span class="s1">)</span>
+
+        <span class="s1">endog = self.endog</span>
+        <span class="s1">exog = self.exog</span>
+        <span class="s1">nobs = self.nobs</span>
+        <span class="s1">exog_rank = np.linalg.matrix_rank(self.exog)</span>
+        <span class="s1">self.rank = exog_rank</span>
+        <span class="s1">self.df_model = float(self.rank - self.k_constant)</span>
+        <span class="s1">self.df_resid = self.nobs - self.rank</span>
+        <span class="s1">n_iter = </span><span class="s4">0</span>
+        <span class="s1">xstar = exog</span>
+
+        <span class="s1">beta = np.ones(exog.shape[</span><span class="s4">1</span><span class="s1">])</span>
+        <span class="s0"># TODO: better start, initial beta is used only for convergence check</span>
+
+        <span class="s0"># Note the following does not work yet,</span>
+        <span class="s0"># the iteration loop always starts with OLS as initial beta</span>
+        <span class="s0"># if start_params is not None:</span>
+        <span class="s0">#    if len(start_params) != rank:</span>
+        <span class="s0">#       raise ValueError('start_params has wrong length')</span>
+        <span class="s0">#       beta = start_params</span>
+        <span class="s0">#    else:</span>
+        <span class="s0">#       # start with OLS</span>
+        <span class="s0">#       beta = np.dot(np.linalg.pinv(exog), endog)</span>
+
+        <span class="s1">diff = </span><span class="s4">10</span>
+        <span class="s1">cycle = </span><span class="s3">False</span>
+
+        <span class="s1">history = dict(params = []</span><span class="s3">, </span><span class="s1">mse=[])</span>
+        <span class="s3">while </span><span class="s1">n_iter &lt; max_iter </span><span class="s3">and </span><span class="s1">diff &gt; p_tol </span><span class="s3">and not </span><span class="s1">cycle:</span>
+            <span class="s1">n_iter += </span><span class="s4">1</span>
+            <span class="s1">beta0 = beta</span>
+            <span class="s1">xtx = np.dot(xstar.T</span><span class="s3">, </span><span class="s1">exog)</span>
+            <span class="s1">xty = np.dot(xstar.T</span><span class="s3">, </span><span class="s1">endog)</span>
+            <span class="s1">beta = np.dot(pinv(xtx)</span><span class="s3">, </span><span class="s1">xty)</span>
+            <span class="s1">resid = endog - np.dot(exog</span><span class="s3">, </span><span class="s1">beta)</span>
+
+            <span class="s1">mask = np.abs(resid) &lt; </span><span class="s4">.000001</span>
+            <span class="s1">resid[mask] = ((resid[mask] &gt;= </span><span class="s4">0</span><span class="s1">) * </span><span class="s4">2 </span><span class="s1">- </span><span class="s4">1</span><span class="s1">) * </span><span class="s4">.000001</span>
+            <span class="s1">resid = np.where(resid &lt; </span><span class="s4">0</span><span class="s3">, </span><span class="s1">q * resid</span><span class="s3">, </span><span class="s1">(</span><span class="s4">1</span><span class="s1">-q) * resid)</span>
+            <span class="s1">resid = np.abs(resid)</span>
+            <span class="s1">xstar = exog / resid[:</span><span class="s3">, </span><span class="s1">np.newaxis]</span>
+            <span class="s1">diff = np.max(np.abs(beta - beta0))</span>
+            <span class="s1">history[</span><span class="s5">'params'</span><span class="s1">].append(beta)</span>
+            <span class="s1">history[</span><span class="s5">'mse'</span><span class="s1">].append(np.mean(resid*resid))</span>
+
+            <span class="s3">if </span><span class="s1">(n_iter &gt;= </span><span class="s4">300</span><span class="s1">) </span><span class="s3">and </span><span class="s1">(n_iter % </span><span class="s4">100 </span><span class="s1">== </span><span class="s4">0</span><span class="s1">):</span>
+                <span class="s0"># check for convergence circle, should not happen</span>
+                <span class="s3">for </span><span class="s1">ii </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">2</span><span class="s3">, </span><span class="s4">10</span><span class="s1">):</span>
+                    <span class="s3">if </span><span class="s1">np.all(beta == history[</span><span class="s5">'params'</span><span class="s1">][-ii]):</span>
+                        <span class="s1">cycle = </span><span class="s3">True</span>
+                        <span class="s1">warnings.warn(</span><span class="s5">&quot;Convergence cycle detected&quot;</span><span class="s3">, </span><span class="s1">ConvergenceWarning)</span>
+                        <span class="s3">break</span>
+
+        <span class="s3">if </span><span class="s1">n_iter == max_iter:</span>
+            <span class="s1">warnings.warn(</span><span class="s5">&quot;Maximum number of iterations (&quot; </span><span class="s1">+ str(max_iter) +</span>
+                          <span class="s5">&quot;) reached.&quot;</span><span class="s3">, </span><span class="s1">IterationLimitWarning)</span>
+
+        <span class="s1">e = endog - np.dot(exog</span><span class="s3">, </span><span class="s1">beta)</span>
+        <span class="s0"># Greene (2008, p.407) writes that Stata 6 uses this bandwidth:</span>
+        <span class="s0"># h = 0.9 * np.std(e) / (nobs**0.2)</span>
+        <span class="s0"># Instead, we calculate bandwidth as in Stata 12</span>
+        <span class="s1">iqre = stats.scoreatpercentile(e</span><span class="s3">, </span><span class="s4">75</span><span class="s1">) - stats.scoreatpercentile(e</span><span class="s3">, </span><span class="s4">25</span><span class="s1">)</span>
+        <span class="s1">h = bandwidth(nobs</span><span class="s3">, </span><span class="s1">q)</span>
+        <span class="s1">h = min(np.std(endog)</span><span class="s3">,</span>
+                <span class="s1">iqre / </span><span class="s4">1.34</span><span class="s1">) * (norm.ppf(q + h) - norm.ppf(q - h))</span>
+
+        <span class="s1">fhat0 = </span><span class="s4">1. </span><span class="s1">/ (nobs * h) * np.sum(kernel(e / h))</span>
+
+        <span class="s3">if </span><span class="s1">vcov == </span><span class="s5">'robust'</span><span class="s1">:</span>
+            <span class="s1">d = np.where(e &gt; </span><span class="s4">0</span><span class="s3">, </span><span class="s1">(q/fhat0)**</span><span class="s4">2</span><span class="s3">, </span><span class="s1">((</span><span class="s4">1</span><span class="s1">-q)/fhat0)**</span><span class="s4">2</span><span class="s1">)</span>
+            <span class="s1">xtxi = pinv(np.dot(exog.T</span><span class="s3">, </span><span class="s1">exog))</span>
+            <span class="s1">xtdx = np.dot(exog.T * d[np.newaxis</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">, </span><span class="s1">exog)</span>
+            <span class="s1">vcov = xtxi @ xtdx @ xtxi</span>
+        <span class="s3">elif </span><span class="s1">vcov == </span><span class="s5">'iid'</span><span class="s1">:</span>
+            <span class="s1">vcov = (</span><span class="s4">1. </span><span class="s1">/ fhat0)**</span><span class="s4">2 </span><span class="s1">* q * (</span><span class="s4">1 </span><span class="s1">- q) * pinv(np.dot(exog.T</span><span class="s3">, </span><span class="s1">exog))</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">Exception(</span><span class="s5">&quot;vcov must be 'robust' or 'iid'&quot;</span><span class="s1">)</span>
+
+        <span class="s1">lfit = QuantRegResults(self</span><span class="s3">, </span><span class="s1">beta</span><span class="s3">, </span><span class="s1">normalized_cov_params=vcov)</span>
+
+        <span class="s1">lfit.q = q</span>
+        <span class="s1">lfit.iterations = n_iter</span>
+        <span class="s1">lfit.sparsity = </span><span class="s4">1. </span><span class="s1">/ fhat0</span>
+        <span class="s1">lfit.bandwidth = h</span>
+        <span class="s1">lfit.history = history</span>
+
+        <span class="s3">return </span><span class="s1">RegressionResultsWrapper(lfit)</span>
+
+
+<span class="s3">def </span><span class="s1">_parzen(u):</span>
+    <span class="s1">z = np.where(np.abs(u) &lt;= </span><span class="s4">.5</span><span class="s3">, </span><span class="s4">4.</span><span class="s1">/</span><span class="s4">3 </span><span class="s1">- </span><span class="s4">8. </span><span class="s1">* u**</span><span class="s4">2 </span><span class="s1">+ </span><span class="s4">8. </span><span class="s1">* np.abs(u)**</span><span class="s4">3</span><span class="s3">,</span>
+                 <span class="s4">8. </span><span class="s1">* (</span><span class="s4">1 </span><span class="s1">- np.abs(u))**</span><span class="s4">3 </span><span class="s1">/ </span><span class="s4">3.</span><span class="s1">)</span>
+    <span class="s1">z[np.abs(u) &gt; </span><span class="s4">1</span><span class="s1">] = </span><span class="s4">0</span>
+    <span class="s3">return </span><span class="s1">z</span>
+
+
+<span class="s1">kernels = {}</span>
+<span class="s1">kernels[</span><span class="s5">'biw'</span><span class="s1">] = </span><span class="s3">lambda </span><span class="s1">u: </span><span class="s4">15. </span><span class="s1">/ </span><span class="s4">16 </span><span class="s1">* (</span><span class="s4">1 </span><span class="s1">- u**</span><span class="s4">2</span><span class="s1">)**</span><span class="s4">2 </span><span class="s1">* np.where(np.abs(u) &lt;= </span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s4">0</span><span class="s1">)</span>
+<span class="s1">kernels[</span><span class="s5">'cos'</span><span class="s1">] = </span><span class="s3">lambda </span><span class="s1">u: np.where(np.abs(u) &lt;= </span><span class="s4">.5</span><span class="s3">, </span><span class="s4">1 </span><span class="s1">+ np.cos(</span><span class="s4">2 </span><span class="s1">* np.pi * u)</span><span class="s3">, </span><span class="s4">0</span><span class="s1">)</span>
+<span class="s1">kernels[</span><span class="s5">'epa'</span><span class="s1">] = </span><span class="s3">lambda </span><span class="s1">u: </span><span class="s4">3. </span><span class="s1">/ </span><span class="s4">4 </span><span class="s1">* (</span><span class="s4">1</span><span class="s1">-u**</span><span class="s4">2</span><span class="s1">) * np.where(np.abs(u) &lt;= </span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s4">0</span><span class="s1">)</span>
+<span class="s1">kernels[</span><span class="s5">'gau'</span><span class="s1">] = norm.pdf</span>
+<span class="s1">kernels[</span><span class="s5">'par'</span><span class="s1">] = _parzen</span>
+<span class="s0">#kernels['bet'] = lambda u: np.where(np.abs(u) &lt;= 1, .75 * (1 - u) * (1 + u), 0)</span>
+<span class="s0">#kernels['log'] = lambda u: logistic.pdf(u) * (1 - logistic.pdf(u))</span>
+<span class="s0">#kernels['tri'] = lambda u: np.where(np.abs(u) &lt;= 1, 1 - np.abs(u), 0)</span>
+<span class="s0">#kernels['trw'] = lambda u: 35. / 32 * (1 - u**2)**3 * np.where(np.abs(u) &lt;= 1, 1, 0)</span>
+<span class="s0">#kernels['uni'] = lambda u: 1. / 2 * np.where(np.abs(u) &lt;= 1, 1, 0)</span>
+
+
+<span class="s3">def </span><span class="s1">hall_sheather(n</span><span class="s3">, </span><span class="s1">q</span><span class="s3">, </span><span class="s1">alpha=</span><span class="s4">.05</span><span class="s1">):</span>
+    <span class="s1">z = norm.ppf(q)</span>
+    <span class="s1">num = </span><span class="s4">1.5 </span><span class="s1">* norm.pdf(z)**</span><span class="s4">2.</span>
+    <span class="s1">den = </span><span class="s4">2. </span><span class="s1">* z**</span><span class="s4">2. </span><span class="s1">+ </span><span class="s4">1.</span>
+    <span class="s1">h = n**(-</span><span class="s4">1. </span><span class="s1">/ </span><span class="s4">3</span><span class="s1">) * norm.ppf(</span><span class="s4">1. </span><span class="s1">- alpha / </span><span class="s4">2.</span><span class="s1">)**(</span><span class="s4">2.</span><span class="s1">/</span><span class="s4">3</span><span class="s1">) * (num / den)**(</span><span class="s4">1.</span><span class="s1">/</span><span class="s4">3</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">h</span>
+
+
+<span class="s3">def </span><span class="s1">bofinger(n</span><span class="s3">, </span><span class="s1">q):</span>
+    <span class="s1">num = </span><span class="s4">9. </span><span class="s1">/ </span><span class="s4">2 </span><span class="s1">* norm.pdf(</span><span class="s4">2 </span><span class="s1">* norm.ppf(q))**</span><span class="s4">4</span>
+    <span class="s1">den = (</span><span class="s4">2 </span><span class="s1">* norm.ppf(q)**</span><span class="s4">2 </span><span class="s1">+ </span><span class="s4">1</span><span class="s1">)**</span><span class="s4">2</span>
+    <span class="s1">h = n**(-</span><span class="s4">1. </span><span class="s1">/ </span><span class="s4">5</span><span class="s1">) * (num / den)**(</span><span class="s4">1. </span><span class="s1">/ </span><span class="s4">5</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">h</span>
+
+
+<span class="s3">def </span><span class="s1">chamberlain(n</span><span class="s3">, </span><span class="s1">q</span><span class="s3">, </span><span class="s1">alpha=</span><span class="s4">.05</span><span class="s1">):</span>
+    <span class="s3">return </span><span class="s1">norm.ppf(</span><span class="s4">1 </span><span class="s1">- alpha / </span><span class="s4">2</span><span class="s1">) * np.sqrt(q*(</span><span class="s4">1 </span><span class="s1">- q) / n)</span>
+
+
+<span class="s3">class </span><span class="s1">QuantRegResults(RegressionResults):</span>
+    <span class="s2">'''Results instance for the QuantReg model'''</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">prsquared(self):</span>
+        <span class="s1">q = self.q</span>
+        <span class="s1">endog = self.model.endog</span>
+        <span class="s1">e = self.resid</span>
+        <span class="s1">e = np.where(e &lt; </span><span class="s4">0</span><span class="s3">, </span><span class="s1">(</span><span class="s4">1 </span><span class="s1">- q) * e</span><span class="s3">, </span><span class="s1">q * e)</span>
+        <span class="s1">e = np.abs(e)</span>
+        <span class="s1">ered = endog - stats.scoreatpercentile(endog</span><span class="s3">, </span><span class="s1">q * </span><span class="s4">100</span><span class="s1">)</span>
+        <span class="s1">ered = np.where(ered &lt; </span><span class="s4">0</span><span class="s3">, </span><span class="s1">(</span><span class="s4">1 </span><span class="s1">- q) * ered</span><span class="s3">, </span><span class="s1">q * ered)</span>
+        <span class="s1">ered = np.abs(ered)</span>
+        <span class="s3">return </span><span class="s4">1 </span><span class="s1">- np.sum(e) / np.sum(ered)</span>
+
+    <span class="s0">#@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">scale(self):</span>
+        <span class="s3">return </span><span class="s4">1.</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">bic(self):</span>
+        <span class="s3">return </span><span class="s1">np.nan</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">aic(self):</span>
+        <span class="s3">return </span><span class="s1">np.nan</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">llf(self):</span>
+        <span class="s3">return </span><span class="s1">np.nan</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">rsquared(self):</span>
+        <span class="s3">return </span><span class="s1">np.nan</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">rsquared_adj(self):</span>
+        <span class="s3">return </span><span class="s1">np.nan</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">mse(self):</span>
+        <span class="s3">return </span><span class="s1">np.nan</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">mse_model(self):</span>
+        <span class="s3">return </span><span class="s1">np.nan</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">mse_total(self):</span>
+        <span class="s3">return </span><span class="s1">np.nan</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">centered_tss(self):</span>
+        <span class="s3">return </span><span class="s1">np.nan</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">uncentered_tss(self):</span>
+        <span class="s3">return </span><span class="s1">np.nan</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">HC0_se(self):</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">HC1_se(self):</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">HC2_se(self):</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">HC3_se(self):</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s3">def </span><span class="s1">summary(self</span><span class="s3">, </span><span class="s1">yname=</span><span class="s3">None, </span><span class="s1">xname=</span><span class="s3">None, </span><span class="s1">title=</span><span class="s3">None, </span><span class="s1">alpha=</span><span class="s4">.05</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Summarize the Regression Results 
+ 
+        Parameters 
+        ---------- 
+        yname : str, optional 
+            Default is `y` 
+        xname : list[str], optional 
+            Names for the exogenous variables. Default is `var_##` for ## in 
+            the number of regressors. Must match the number of parameters 
+            in the model 
+        title : str, optional 
+            Title for the top table. If not None, then this replaces the 
+            default title 
+        alpha : float 
+            significance level for the confidence intervals 
+ 
+        Returns 
+        ------- 
+        smry : Summary instance 
+            this holds the summary tables and text, which can be printed or 
+            converted to various output formats. 
+ 
+        See Also 
+        -------- 
+        statsmodels.iolib.summary.Summary : class to hold summary results 
+        &quot;&quot;&quot;</span>
+        <span class="s1">eigvals = self.eigenvals</span>
+        <span class="s1">condno = self.condition_number</span>
+
+        <span class="s1">top_left = [(</span><span class="s5">'Dep. Variable:'</span><span class="s3">, None</span><span class="s1">)</span><span class="s3">,</span>
+                    <span class="s1">(</span><span class="s5">'Model:'</span><span class="s3">, None</span><span class="s1">)</span><span class="s3">,</span>
+                    <span class="s1">(</span><span class="s5">'Method:'</span><span class="s3">, </span><span class="s1">[</span><span class="s5">'Least Squares'</span><span class="s1">])</span><span class="s3">,</span>
+                    <span class="s1">(</span><span class="s5">'Date:'</span><span class="s3">, None</span><span class="s1">)</span><span class="s3">,</span>
+                    <span class="s1">(</span><span class="s5">'Time:'</span><span class="s3">, None</span><span class="s1">)</span>
+                    <span class="s1">]</span>
+
+        <span class="s1">top_right = [(</span><span class="s5">'Pseudo R-squared:'</span><span class="s3">, </span><span class="s1">[</span><span class="s5">&quot;%#8.4g&quot; </span><span class="s1">% self.prsquared])</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s5">'Bandwidth:'</span><span class="s3">, </span><span class="s1">[</span><span class="s5">&quot;%#8.4g&quot; </span><span class="s1">% self.bandwidth])</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s5">'Sparsity:'</span><span class="s3">, </span><span class="s1">[</span><span class="s5">&quot;%#8.4g&quot; </span><span class="s1">% self.sparsity])</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s5">'No. Observations:'</span><span class="s3">, None</span><span class="s1">)</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s5">'Df Residuals:'</span><span class="s3">, None</span><span class="s1">)</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s5">'Df Model:'</span><span class="s3">, None</span><span class="s1">)</span>
+                     <span class="s1">]</span>
+
+        <span class="s3">if </span><span class="s1">title </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">title = self.model.__class__.__name__ + </span><span class="s5">' ' </span><span class="s1">+ </span><span class="s5">&quot;Regression Results&quot;</span>
+
+        <span class="s0"># create summary table instance</span>
+        <span class="s3">from </span><span class="s1">statsmodels.iolib.summary </span><span class="s3">import </span><span class="s1">Summary</span>
+        <span class="s1">smry = Summary()</span>
+        <span class="s1">smry.add_table_2cols(self</span><span class="s3">, </span><span class="s1">gleft=top_left</span><span class="s3">, </span><span class="s1">gright=top_right</span><span class="s3">,</span>
+                             <span class="s1">yname=yname</span><span class="s3">, </span><span class="s1">xname=xname</span><span class="s3">, </span><span class="s1">title=title)</span>
+        <span class="s1">smry.add_table_params(self</span><span class="s3">, </span><span class="s1">yname=yname</span><span class="s3">, </span><span class="s1">xname=xname</span><span class="s3">, </span><span class="s1">alpha=alpha</span><span class="s3">,</span>
+                              <span class="s1">use_t=self.use_t)</span>
+
+        <span class="s0"># add warnings/notes, added to text format only</span>
+        <span class="s1">etext = []</span>
+        <span class="s3">if </span><span class="s1">eigvals[-</span><span class="s4">1</span><span class="s1">] &lt; </span><span class="s4">1e-10</span><span class="s1">:</span>
+            <span class="s1">wstr = </span><span class="s5">&quot;The smallest eigenvalue is %6.3g. This might indicate &quot;</span>
+            <span class="s1">wstr += </span><span class="s5">&quot;that there are</span><span class="s3">\n</span><span class="s5">&quot;</span>
+            <span class="s1">wstr += </span><span class="s5">&quot;strong multicollinearity problems or that the design &quot;</span>
+            <span class="s1">wstr += </span><span class="s5">&quot;matrix is singular.&quot;</span>
+            <span class="s1">wstr = wstr % eigvals[-</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">etext.append(wstr)</span>
+        <span class="s3">elif </span><span class="s1">condno &gt; </span><span class="s4">1000</span><span class="s1">:  </span><span class="s0"># TODO: what is recommended</span>
+            <span class="s1">wstr = </span><span class="s5">&quot;The condition number is large, %6.3g. This might &quot;</span>
+            <span class="s1">wstr += </span><span class="s5">&quot;indicate that there are</span><span class="s3">\n</span><span class="s5">&quot;</span>
+            <span class="s1">wstr += </span><span class="s5">&quot;strong multicollinearity or other numerical &quot;</span>
+            <span class="s1">wstr += </span><span class="s5">&quot;problems.&quot;</span>
+            <span class="s1">wstr = wstr % condno</span>
+            <span class="s1">etext.append(wstr)</span>
+
+        <span class="s3">if </span><span class="s1">etext:</span>
+            <span class="s1">smry.add_extra_txt(etext)</span>
+
+        <span class="s3">return </span><span class="s1">smry</span>
+</pre>
+</body>
+</html>

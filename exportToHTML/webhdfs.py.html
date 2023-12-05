@@ -1,0 +1,468 @@
+<html>
+<head>
+<title>webhdfs.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+webhdfs.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># https://hadoop.apache.org/docs/r1.0.4/webhdfs.html</span>
+
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">secrets</span>
+<span class="s2">import </span><span class="s1">shutil</span>
+<span class="s2">import </span><span class="s1">tempfile</span>
+<span class="s2">import </span><span class="s1">uuid</span>
+<span class="s2">from </span><span class="s1">contextlib </span><span class="s2">import </span><span class="s1">suppress</span>
+<span class="s2">from </span><span class="s1">urllib.parse </span><span class="s2">import </span><span class="s1">quote</span>
+
+<span class="s2">import </span><span class="s1">requests</span>
+
+<span class="s2">from </span><span class="s1">..spec </span><span class="s2">import </span><span class="s1">AbstractBufferedFile</span><span class="s2">, </span><span class="s1">AbstractFileSystem</span>
+<span class="s2">from </span><span class="s1">..utils </span><span class="s2">import </span><span class="s1">infer_storage_options</span><span class="s2">, </span><span class="s1">tokenize</span>
+
+<span class="s1">logger = logging.getLogger(</span><span class="s3">&quot;webhdfs&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">WebHDFS(AbstractFileSystem):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Interface to HDFS over HTTP using the WebHDFS API. Supports also HttpFS gateways. 
+ 
+    Three auth mechanisms are supported: 
+ 
+    insecure: no auth is done, and the user is assumed to be whoever they 
+        say they are (parameter ``user``), or a predefined value such as 
+        &quot;dr.who&quot; if not given 
+    spnego: when kerberos authentication is enabled, auth is negotiated by 
+        requests_kerberos https://github.com/requests/requests-kerberos . 
+        This establishes a session based on existing kinit login and/or 
+        specified principal/password; parameters are passed with ``kerb_kwargs`` 
+    token: uses an existing Hadoop delegation token from another secured 
+        service. Indeed, this client can also generate such tokens when 
+        not insecure. Note that tokens expire, but can be renewed (by a 
+        previously specified user) and may allow for proxying. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">tempdir = str(tempfile.gettempdir())</span>
+    <span class="s1">protocol = </span><span class="s3">&quot;webhdfs&quot;</span><span class="s2">, </span><span class="s3">&quot;webHDFS&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">host</span><span class="s2">,</span>
+        <span class="s1">port=</span><span class="s5">50070</span><span class="s2">,</span>
+        <span class="s1">kerberos=</span><span class="s2">False,</span>
+        <span class="s1">token=</span><span class="s2">None,</span>
+        <span class="s1">user=</span><span class="s2">None,</span>
+        <span class="s1">proxy_to=</span><span class="s2">None,</span>
+        <span class="s1">kerb_kwargs=</span><span class="s2">None,</span>
+        <span class="s1">data_proxy=</span><span class="s2">None,</span>
+        <span class="s1">use_https=</span><span class="s2">False,</span>
+        <span class="s1">**kwargs</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        host: str 
+            Name-node address 
+        port: int 
+            Port for webHDFS 
+        kerberos: bool 
+            Whether to authenticate with kerberos for this connection 
+        token: str or None 
+            If given, use this token on every call to authenticate. A user 
+            and user-proxy may be encoded in the token and should not be also 
+            given 
+        user: str or None 
+            If given, assert the user name to connect with 
+        proxy_to: str or None 
+            If given, the user has the authority to proxy, and this value is 
+            the user in who's name actions are taken 
+        kerb_kwargs: dict 
+            Any extra arguments for HTTPKerberosAuth, see 
+            `&lt;https://github.com/requests/requests-kerberos/blob/master/requests_kerberos/kerberos_.py&gt;`_ 
+        data_proxy: dict, callable or None 
+            If given, map data-node addresses. This can be necessary if the 
+            HDFS cluster is behind a proxy, running on Docker or otherwise has 
+            a mismatch between the host-names given by the name-node and the 
+            address by which to refer to them from the client. If a dict, 
+            maps host names ``host-&gt;data_proxy[host]``; if a callable, full 
+            URLs are passed, and function must conform to 
+            ``url-&gt;data_proxy(url)``. 
+        use_https: bool 
+            Whether to connect to the Name-node using HTTPS instead of HTTP 
+        kwargs 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self._cached:</span>
+            <span class="s2">return</span>
+        <span class="s1">super().__init__(**kwargs)</span>
+        <span class="s1">self.url = </span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s3">'https' </span><span class="s2">if </span><span class="s1">use_https </span><span class="s2">else </span><span class="s3">'http'</span><span class="s2">}</span><span class="s3">://</span><span class="s2">{</span><span class="s1">host</span><span class="s2">}</span><span class="s3">:</span><span class="s2">{</span><span class="s1">port</span><span class="s2">}</span><span class="s3">/webhdfs/v1&quot;</span>
+        <span class="s1">self.kerb = kerberos</span>
+        <span class="s1">self.kerb_kwargs = kerb_kwargs </span><span class="s2">or </span><span class="s1">{}</span>
+        <span class="s1">self.pars = {}</span>
+        <span class="s1">self.proxy = data_proxy </span><span class="s2">or </span><span class="s1">{}</span>
+        <span class="s2">if </span><span class="s1">token </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">user </span><span class="s2">is not None or </span><span class="s1">proxy_to </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">&quot;If passing a delegation token, must not set &quot;</span>
+                    <span class="s3">&quot;user or proxy_to, as these are encoded in the&quot;</span>
+                    <span class="s3">&quot; token&quot;</span>
+                <span class="s1">)</span>
+            <span class="s1">self.pars[</span><span class="s3">&quot;delegation&quot;</span><span class="s1">] = token</span>
+        <span class="s2">if </span><span class="s1">user </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.pars[</span><span class="s3">&quot;user.name&quot;</span><span class="s1">] = user</span>
+        <span class="s2">if </span><span class="s1">proxy_to </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.pars[</span><span class="s3">&quot;doas&quot;</span><span class="s1">] = proxy_to</span>
+        <span class="s2">if </span><span class="s1">kerberos </span><span class="s2">and </span><span class="s1">user </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">&quot;If using Kerberos auth, do not specify the &quot;</span>
+                <span class="s3">&quot;user, this is handled by kinit.&quot;</span>
+            <span class="s1">)</span>
+        <span class="s1">self._connect()</span>
+
+        <span class="s1">self._fsid = </span><span class="s3">f&quot;webhdfs_</span><span class="s2">{</span><span class="s1">tokenize(host</span><span class="s2">, </span><span class="s1">port)</span><span class="s2">}</span><span class="s3">&quot;</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">fsid(self):</span>
+        <span class="s2">return </span><span class="s1">self._fsid</span>
+
+    <span class="s2">def </span><span class="s1">_connect(self):</span>
+        <span class="s1">self.session = requests.Session()</span>
+        <span class="s2">if </span><span class="s1">self.kerb:</span>
+            <span class="s2">from </span><span class="s1">requests_kerberos </span><span class="s2">import </span><span class="s1">HTTPKerberosAuth</span>
+
+            <span class="s1">self.session.auth = HTTPKerberosAuth(**self.kerb_kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">_call(self</span><span class="s2">, </span><span class="s1">op</span><span class="s2">, </span><span class="s1">method=</span><span class="s3">&quot;get&quot;</span><span class="s2">, </span><span class="s1">path=</span><span class="s2">None, </span><span class="s1">data=</span><span class="s2">None, </span><span class="s1">redirect=</span><span class="s2">True, </span><span class="s1">**kwargs):</span>
+        <span class="s1">url = self.url + quote(path </span><span class="s2">or </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s1">args = kwargs.copy()</span>
+        <span class="s1">args.update(self.pars)</span>
+        <span class="s1">args[</span><span class="s3">&quot;op&quot;</span><span class="s1">] = op.upper()</span>
+        <span class="s1">logger.debug(</span><span class="s3">&quot;sending %s with %s&quot;</span><span class="s2">, </span><span class="s1">url</span><span class="s2">, </span><span class="s1">method)</span>
+        <span class="s1">out = self.session.request(</span>
+            <span class="s1">method=method.upper()</span><span class="s2">,</span>
+            <span class="s1">url=url</span><span class="s2">,</span>
+            <span class="s1">params=args</span><span class="s2">,</span>
+            <span class="s1">data=data</span><span class="s2">,</span>
+            <span class="s1">allow_redirects=redirect</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">out.status_code </span><span class="s2">in </span><span class="s1">[</span><span class="s5">400</span><span class="s2">, </span><span class="s5">401</span><span class="s2">, </span><span class="s5">403</span><span class="s2">, </span><span class="s5">404</span><span class="s2">, </span><span class="s5">500</span><span class="s1">]:</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">err = out.json()</span>
+                <span class="s1">msg = err[</span><span class="s3">&quot;RemoteException&quot;</span><span class="s1">][</span><span class="s3">&quot;message&quot;</span><span class="s1">]</span>
+                <span class="s1">exp = err[</span><span class="s3">&quot;RemoteException&quot;</span><span class="s1">][</span><span class="s3">&quot;exception&quot;</span><span class="s1">]</span>
+            <span class="s2">except </span><span class="s1">(ValueError</span><span class="s2">, </span><span class="s1">KeyError):</span>
+                <span class="s2">pass</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">if </span><span class="s1">exp </span><span class="s2">in </span><span class="s1">[</span><span class="s3">&quot;IllegalArgumentException&quot;</span><span class="s2">, </span><span class="s3">&quot;UnsupportedOperationException&quot;</span><span class="s1">]:</span>
+                    <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+                <span class="s2">elif </span><span class="s1">exp </span><span class="s2">in </span><span class="s1">[</span><span class="s3">&quot;SecurityException&quot;</span><span class="s2">, </span><span class="s3">&quot;AccessControlException&quot;</span><span class="s1">]:</span>
+                    <span class="s2">raise </span><span class="s1">PermissionError(msg)</span>
+                <span class="s2">elif </span><span class="s1">exp </span><span class="s2">in </span><span class="s1">[</span><span class="s3">&quot;FileNotFoundException&quot;</span><span class="s1">]:</span>
+                    <span class="s2">raise </span><span class="s1">FileNotFoundError(msg)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">raise </span><span class="s1">RuntimeError(msg)</span>
+        <span class="s1">out.raise_for_status()</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s2">def </span><span class="s1">_open(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">path</span><span class="s2">,</span>
+        <span class="s1">mode=</span><span class="s3">&quot;rb&quot;</span><span class="s2">,</span>
+        <span class="s1">block_size=</span><span class="s2">None,</span>
+        <span class="s1">autocommit=</span><span class="s2">True,</span>
+        <span class="s1">replication=</span><span class="s2">None,</span>
+        <span class="s1">permissions=</span><span class="s2">None,</span>
+        <span class="s1">**kwargs</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+            File location 
+        mode: str 
+            'rb', 'wb', etc. 
+        block_size: int 
+            Client buffer size for read-ahead or write buffer 
+        autocommit: bool 
+            If False, writes to temporary file that only gets put in final 
+            location upon commit 
+        replication: int 
+            Number of copies of file on the cluster, write mode only 
+        permissions: str or int 
+            posix permissions, write mode only 
+        kwargs 
+ 
+        Returns 
+        ------- 
+        WebHDFile instance 
+        &quot;&quot;&quot;</span>
+        <span class="s1">block_size = block_size </span><span class="s2">or </span><span class="s1">self.blocksize</span>
+        <span class="s2">return </span><span class="s1">WebHDFile(</span>
+            <span class="s1">self</span><span class="s2">,</span>
+            <span class="s1">path</span><span class="s2">,</span>
+            <span class="s1">mode=mode</span><span class="s2">,</span>
+            <span class="s1">block_size=block_size</span><span class="s2">,</span>
+            <span class="s1">tempdir=self.tempdir</span><span class="s2">,</span>
+            <span class="s1">autocommit=autocommit</span><span class="s2">,</span>
+            <span class="s1">replication=replication</span><span class="s2">,</span>
+            <span class="s1">permissions=permissions</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_process_info(info):</span>
+        <span class="s1">info[</span><span class="s3">&quot;type&quot;</span><span class="s1">] = info[</span><span class="s3">&quot;type&quot;</span><span class="s1">].lower()</span>
+        <span class="s1">info[</span><span class="s3">&quot;size&quot;</span><span class="s1">] = info[</span><span class="s3">&quot;length&quot;</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">info</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">_strip_protocol(cls</span><span class="s2">, </span><span class="s1">path):</span>
+        <span class="s2">return </span><span class="s1">infer_storage_options(path)[</span><span class="s3">&quot;path&quot;</span><span class="s1">]</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_get_kwargs_from_urls(urlpath):</span>
+        <span class="s1">out = infer_storage_options(urlpath)</span>
+        <span class="s1">out.pop(</span><span class="s3">&quot;path&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+        <span class="s1">out.pop(</span><span class="s3">&quot;protocol&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s3">&quot;username&quot; </span><span class="s2">in </span><span class="s1">out:</span>
+            <span class="s1">out[</span><span class="s3">&quot;user&quot;</span><span class="s1">] = out.pop(</span><span class="s3">&quot;username&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s2">def </span><span class="s1">info(self</span><span class="s2">, </span><span class="s1">path):</span>
+        <span class="s1">out = self._call(</span><span class="s3">&quot;GETFILESTATUS&quot;</span><span class="s2">, </span><span class="s1">path=path)</span>
+        <span class="s1">info = out.json()[</span><span class="s3">&quot;FileStatus&quot;</span><span class="s1">]</span>
+        <span class="s1">info[</span><span class="s3">&quot;name&quot;</span><span class="s1">] = path</span>
+        <span class="s2">return </span><span class="s1">self._process_info(info)</span>
+
+    <span class="s2">def </span><span class="s1">ls(self</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">detail=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s1">out = self._call(</span><span class="s3">&quot;LISTSTATUS&quot;</span><span class="s2">, </span><span class="s1">path=path)</span>
+        <span class="s1">infos = out.json()[</span><span class="s3">&quot;FileStatuses&quot;</span><span class="s1">][</span><span class="s3">&quot;FileStatus&quot;</span><span class="s1">]</span>
+        <span class="s2">for </span><span class="s1">info </span><span class="s2">in </span><span class="s1">infos:</span>
+            <span class="s1">self._process_info(info)</span>
+            <span class="s1">info[</span><span class="s3">&quot;name&quot;</span><span class="s1">] = path.rstrip(</span><span class="s3">&quot;/&quot;</span><span class="s1">) + </span><span class="s3">&quot;/&quot; </span><span class="s1">+ info[</span><span class="s3">&quot;pathSuffix&quot;</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">detail:</span>
+            <span class="s2">return </span><span class="s1">sorted(infos</span><span class="s2">, </span><span class="s1">key=</span><span class="s2">lambda </span><span class="s1">i: i[</span><span class="s3">&quot;name&quot;</span><span class="s1">])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">sorted(info[</span><span class="s3">&quot;name&quot;</span><span class="s1">] </span><span class="s2">for </span><span class="s1">info </span><span class="s2">in </span><span class="s1">infos)</span>
+
+    <span class="s2">def </span><span class="s1">content_summary(self</span><span class="s2">, </span><span class="s1">path):</span>
+        <span class="s4">&quot;&quot;&quot;Total numbers of files, directories and bytes under path&quot;&quot;&quot;</span>
+        <span class="s1">out = self._call(</span><span class="s3">&quot;GETCONTENTSUMMARY&quot;</span><span class="s2">, </span><span class="s1">path=path)</span>
+        <span class="s2">return </span><span class="s1">out.json()[</span><span class="s3">&quot;ContentSummary&quot;</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">ukey(self</span><span class="s2">, </span><span class="s1">path):</span>
+        <span class="s4">&quot;&quot;&quot;Checksum info of file, giving method and result&quot;&quot;&quot;</span>
+        <span class="s1">out = self._call(</span><span class="s3">&quot;GETFILECHECKSUM&quot;</span><span class="s2">, </span><span class="s1">path=path</span><span class="s2">, </span><span class="s1">redirect=</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s3">&quot;Location&quot; </span><span class="s2">in </span><span class="s1">out.headers:</span>
+            <span class="s1">location = self._apply_proxy(out.headers[</span><span class="s3">&quot;Location&quot;</span><span class="s1">])</span>
+            <span class="s1">out2 = self.session.get(location)</span>
+            <span class="s1">out2.raise_for_status()</span>
+            <span class="s2">return </span><span class="s1">out2.json()[</span><span class="s3">&quot;FileChecksum&quot;</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">out.raise_for_status()</span>
+            <span class="s2">return </span><span class="s1">out.json()[</span><span class="s3">&quot;FileChecksum&quot;</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">home_directory(self):</span>
+        <span class="s4">&quot;&quot;&quot;Get user's home directory&quot;&quot;&quot;</span>
+        <span class="s1">out = self._call(</span><span class="s3">&quot;GETHOMEDIRECTORY&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">out.json()[</span><span class="s3">&quot;Path&quot;</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">get_delegation_token(self</span><span class="s2">, </span><span class="s1">renewer=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot;Retrieve token which can give the same authority to other uses 
+ 
+        Parameters 
+        ---------- 
+        renewer: str or None 
+            User who may use this token; if None, will be current user 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">renewer:</span>
+            <span class="s1">out = self._call(</span><span class="s3">&quot;GETDELEGATIONTOKEN&quot;</span><span class="s2">, </span><span class="s1">renewer=renewer)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">out = self._call(</span><span class="s3">&quot;GETDELEGATIONTOKEN&quot;</span><span class="s1">)</span>
+        <span class="s1">t = out.json()[</span><span class="s3">&quot;Token&quot;</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">t </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;No token available for this user/security context&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">t[</span><span class="s3">&quot;urlString&quot;</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">renew_delegation_token(self</span><span class="s2">, </span><span class="s1">token):</span>
+        <span class="s4">&quot;&quot;&quot;Make token live longer. Returns new expiry time&quot;&quot;&quot;</span>
+        <span class="s1">out = self._call(</span><span class="s3">&quot;RENEWDELEGATIONTOKEN&quot;</span><span class="s2">, </span><span class="s1">method=</span><span class="s3">&quot;put&quot;</span><span class="s2">, </span><span class="s1">token=token)</span>
+        <span class="s2">return </span><span class="s1">out.json()[</span><span class="s3">&quot;long&quot;</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">cancel_delegation_token(self</span><span class="s2">, </span><span class="s1">token):</span>
+        <span class="s4">&quot;&quot;&quot;Stop the token from being useful&quot;&quot;&quot;</span>
+        <span class="s1">self._call(</span><span class="s3">&quot;CANCELDELEGATIONTOKEN&quot;</span><span class="s2">, </span><span class="s1">method=</span><span class="s3">&quot;put&quot;</span><span class="s2">, </span><span class="s1">token=token)</span>
+
+    <span class="s2">def </span><span class="s1">chmod(self</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">mod):</span>
+        <span class="s4">&quot;&quot;&quot;Set the permission at path 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+            location to set (file or directory) 
+        mod: str or int 
+            posix epresentation or permission, give as oct string, e.g, '777' 
+            or 0o777 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._call(</span><span class="s3">&quot;SETPERMISSION&quot;</span><span class="s2">, </span><span class="s1">method=</span><span class="s3">&quot;put&quot;</span><span class="s2">, </span><span class="s1">path=path</span><span class="s2">, </span><span class="s1">permission=mod)</span>
+
+    <span class="s2">def </span><span class="s1">chown(self</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">owner=</span><span class="s2">None, </span><span class="s1">group=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot;Change owning user and/or group&quot;&quot;&quot;</span>
+        <span class="s1">kwargs = {}</span>
+        <span class="s2">if </span><span class="s1">owner </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">kwargs[</span><span class="s3">&quot;owner&quot;</span><span class="s1">] = owner</span>
+        <span class="s2">if </span><span class="s1">group </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">kwargs[</span><span class="s3">&quot;group&quot;</span><span class="s1">] = group</span>
+        <span class="s1">self._call(</span><span class="s3">&quot;SETOWNER&quot;</span><span class="s2">, </span><span class="s1">method=</span><span class="s3">&quot;put&quot;</span><span class="s2">, </span><span class="s1">path=path</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">set_replication(self</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">replication):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Set file replication factor 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+            File location (not for directories) 
+        replication: int 
+            Number of copies of file on the cluster. Should be smaller than 
+            number of data nodes; normally 3 on most systems. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._call(</span><span class="s3">&quot;SETREPLICATION&quot;</span><span class="s2">, </span><span class="s1">path=path</span><span class="s2">, </span><span class="s1">method=</span><span class="s3">&quot;put&quot;</span><span class="s2">, </span><span class="s1">replication=replication)</span>
+
+    <span class="s2">def </span><span class="s1">mkdir(self</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._call(</span><span class="s3">&quot;MKDIRS&quot;</span><span class="s2">, </span><span class="s1">method=</span><span class="s3">&quot;put&quot;</span><span class="s2">, </span><span class="s1">path=path)</span>
+
+    <span class="s2">def </span><span class="s1">makedirs(self</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">exist_ok=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">exist_ok </span><span class="s2">is False and </span><span class="s1">self.exists(path):</span>
+            <span class="s2">raise </span><span class="s1">FileExistsError(path)</span>
+        <span class="s1">self.mkdir(path)</span>
+
+    <span class="s2">def </span><span class="s1">mv(self</span><span class="s2">, </span><span class="s1">path1</span><span class="s2">, </span><span class="s1">path2</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._call(</span><span class="s3">&quot;RENAME&quot;</span><span class="s2">, </span><span class="s1">method=</span><span class="s3">&quot;put&quot;</span><span class="s2">, </span><span class="s1">path=path1</span><span class="s2">, </span><span class="s1">destination=path2)</span>
+
+    <span class="s2">def </span><span class="s1">rm(self</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">recursive=</span><span class="s2">False, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self._call(</span>
+            <span class="s3">&quot;DELETE&quot;</span><span class="s2">,</span>
+            <span class="s1">method=</span><span class="s3">&quot;delete&quot;</span><span class="s2">,</span>
+            <span class="s1">path=path</span><span class="s2">,</span>
+            <span class="s1">recursive=</span><span class="s3">&quot;true&quot; </span><span class="s2">if </span><span class="s1">recursive </span><span class="s2">else </span><span class="s3">&quot;false&quot;</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">rm_file(self</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self.rm(path)</span>
+
+    <span class="s2">def </span><span class="s1">cp_file(self</span><span class="s2">, </span><span class="s1">lpath</span><span class="s2">, </span><span class="s1">rpath</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">with </span><span class="s1">self.open(lpath) </span><span class="s2">as </span><span class="s1">lstream:</span>
+            <span class="s1">tmp_fname = </span><span class="s3">&quot;/&quot;</span><span class="s1">.join([self._parent(rpath)</span><span class="s2">, </span><span class="s3">f&quot;.tmp.</span><span class="s2">{</span><span class="s1">secrets.token_hex(</span><span class="s5">16</span><span class="s1">)</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s1">])</span>
+            <span class="s0"># Perform an atomic copy (stream to a temporary file and</span>
+            <span class="s0"># move it to the actual destination).</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s2">with </span><span class="s1">self.open(tmp_fname</span><span class="s2">, </span><span class="s3">&quot;wb&quot;</span><span class="s1">) </span><span class="s2">as </span><span class="s1">rstream:</span>
+                    <span class="s1">shutil.copyfileobj(lstream</span><span class="s2">, </span><span class="s1">rstream)</span>
+                <span class="s1">self.mv(tmp_fname</span><span class="s2">, </span><span class="s1">rpath)</span>
+            <span class="s2">except </span><span class="s1">BaseException:  </span><span class="s0"># noqa</span>
+                <span class="s2">with </span><span class="s1">suppress(FileNotFoundError):</span>
+                    <span class="s1">self.rm(tmp_fname)</span>
+                <span class="s2">raise</span>
+
+    <span class="s2">def </span><span class="s1">_apply_proxy(self</span><span class="s2">, </span><span class="s1">location):</span>
+        <span class="s2">if </span><span class="s1">self.proxy </span><span class="s2">and </span><span class="s1">callable(self.proxy):</span>
+            <span class="s1">location = self.proxy(location)</span>
+        <span class="s2">elif </span><span class="s1">self.proxy:</span>
+            <span class="s0"># as a dict</span>
+            <span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">self.proxy.items():</span>
+                <span class="s1">location = location.replace(k</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">location</span>
+
+
+<span class="s2">class </span><span class="s1">WebHDFile(AbstractBufferedFile):</span>
+    <span class="s4">&quot;&quot;&quot;A file living in HDFS over webHDFS&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">fs</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super().__init__(fs</span><span class="s2">, </span><span class="s1">path</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">kwargs = kwargs.copy()</span>
+        <span class="s2">if </span><span class="s1">kwargs.get(</span><span class="s3">&quot;permissions&quot;</span><span class="s2">, None</span><span class="s1">) </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">kwargs.pop(</span><span class="s3">&quot;permissions&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">kwargs.get(</span><span class="s3">&quot;replication&quot;</span><span class="s2">, None</span><span class="s1">) </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">kwargs.pop(</span><span class="s3">&quot;replication&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+        <span class="s1">self.permissions = kwargs.pop(</span><span class="s3">&quot;permissions&quot;</span><span class="s2">, </span><span class="s5">511</span><span class="s1">)</span>
+        <span class="s1">tempdir = kwargs.pop(</span><span class="s3">&quot;tempdir&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">kwargs.pop(</span><span class="s3">&quot;autocommit&quot;</span><span class="s2">, False</span><span class="s1">) </span><span class="s2">is False</span><span class="s1">:</span>
+            <span class="s1">self.target = self.path</span>
+            <span class="s1">self.path = os.path.join(tempdir</span><span class="s2">, </span><span class="s1">str(uuid.uuid4()))</span>
+
+    <span class="s2">def </span><span class="s1">_upload_chunk(self</span><span class="s2">, </span><span class="s1">final=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot;Write one part of a multi-block file upload 
+ 
+        Parameters 
+        ========== 
+        final: bool 
+            This is the last block, so should complete file, if 
+            self.autocommit is True. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">out = self.fs.session.post(</span>
+            <span class="s1">self.location</span><span class="s2">,</span>
+            <span class="s1">data=self.buffer.getvalue()</span><span class="s2">,</span>
+            <span class="s1">headers={</span><span class="s3">&quot;content-type&quot;</span><span class="s1">: </span><span class="s3">&quot;application/octet-stream&quot;</span><span class="s1">}</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s1">out.raise_for_status()</span>
+        <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">_initiate_upload(self):</span>
+        <span class="s4">&quot;&quot;&quot;Create remote file/upload&quot;&quot;&quot;</span>
+        <span class="s1">kwargs = self.kwargs.copy()</span>
+        <span class="s2">if </span><span class="s3">&quot;a&quot; </span><span class="s2">in </span><span class="s1">self.mode:</span>
+            <span class="s1">op</span><span class="s2">, </span><span class="s1">method = </span><span class="s3">&quot;APPEND&quot;</span><span class="s2">, </span><span class="s3">&quot;POST&quot;</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">op</span><span class="s2">, </span><span class="s1">method = </span><span class="s3">&quot;CREATE&quot;</span><span class="s2">, </span><span class="s3">&quot;PUT&quot;</span>
+            <span class="s1">kwargs[</span><span class="s3">&quot;overwrite&quot;</span><span class="s1">] = </span><span class="s3">&quot;true&quot;</span>
+        <span class="s1">out = self.fs._call(op</span><span class="s2">, </span><span class="s1">method</span><span class="s2">, </span><span class="s1">self.path</span><span class="s2">, </span><span class="s1">redirect=</span><span class="s2">False, </span><span class="s1">**kwargs)</span>
+        <span class="s1">location = self.fs._apply_proxy(out.headers[</span><span class="s3">&quot;Location&quot;</span><span class="s1">])</span>
+        <span class="s2">if </span><span class="s3">&quot;w&quot; </span><span class="s2">in </span><span class="s1">self.mode:</span>
+            <span class="s0"># create empty file to append to</span>
+            <span class="s1">out2 = self.fs.session.put(</span>
+                <span class="s1">location</span><span class="s2">, </span><span class="s1">headers={</span><span class="s3">&quot;content-type&quot;</span><span class="s1">: </span><span class="s3">&quot;application/octet-stream&quot;</span><span class="s1">}</span>
+            <span class="s1">)</span>
+            <span class="s1">out2.raise_for_status()</span>
+            <span class="s0"># after creating empty file, change location to append to</span>
+            <span class="s1">out2 = self.fs._call(</span><span class="s3">&quot;APPEND&quot;</span><span class="s2">, </span><span class="s3">&quot;POST&quot;</span><span class="s2">, </span><span class="s1">self.path</span><span class="s2">, </span><span class="s1">redirect=</span><span class="s2">False, </span><span class="s1">**kwargs)</span>
+            <span class="s1">self.location = self.fs._apply_proxy(out2.headers[</span><span class="s3">&quot;Location&quot;</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">_fetch_range(self</span><span class="s2">, </span><span class="s1">start</span><span class="s2">, </span><span class="s1">end):</span>
+        <span class="s1">start = max(start</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">end = min(self.size</span><span class="s2">, </span><span class="s1">end)</span>
+        <span class="s2">if </span><span class="s1">start &gt;= end </span><span class="s2">or </span><span class="s1">start &gt;= self.size:</span>
+            <span class="s2">return </span><span class="s6">b&quot;&quot;</span>
+        <span class="s1">out = self.fs._call(</span>
+            <span class="s3">&quot;OPEN&quot;</span><span class="s2">, </span><span class="s1">path=self.path</span><span class="s2">, </span><span class="s1">offset=start</span><span class="s2">, </span><span class="s1">length=end - start</span><span class="s2">, </span><span class="s1">redirect=</span><span class="s2">False</span>
+        <span class="s1">)</span>
+        <span class="s1">out.raise_for_status()</span>
+        <span class="s2">if </span><span class="s3">&quot;Location&quot; </span><span class="s2">in </span><span class="s1">out.headers:</span>
+            <span class="s1">location = out.headers[</span><span class="s3">&quot;Location&quot;</span><span class="s1">]</span>
+            <span class="s1">out2 = self.fs.session.get(self.fs._apply_proxy(location))</span>
+            <span class="s2">return </span><span class="s1">out2.content</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">out.content</span>
+
+    <span class="s2">def </span><span class="s1">commit(self):</span>
+        <span class="s1">self.fs.mv(self.path</span><span class="s2">, </span><span class="s1">self.target)</span>
+
+    <span class="s2">def </span><span class="s1">discard(self):</span>
+        <span class="s1">self.fs.rm(self.path)</span>
+</pre>
+</body>
+</html>

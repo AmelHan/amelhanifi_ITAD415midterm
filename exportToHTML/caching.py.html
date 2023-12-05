@@ -1,0 +1,898 @@
+<html>
+<head>
+<title>caching.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #808080;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+caching.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">collections</span>
+<span class="s0">import </span><span class="s1">functools</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">math</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">threading</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+<span class="s0">from </span><span class="s1">concurrent.futures </span><span class="s0">import </span><span class="s1">Future</span><span class="s0">, </span><span class="s1">ThreadPoolExecutor</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">TYPE_CHECKING</span><span class="s0">,</span>
+    <span class="s1">Any</span><span class="s0">,</span>
+    <span class="s1">Callable</span><span class="s0">,</span>
+    <span class="s1">ClassVar</span><span class="s0">,</span>
+    <span class="s1">Generic</span><span class="s0">,</span>
+    <span class="s1">NamedTuple</span><span class="s0">,</span>
+    <span class="s1">OrderedDict</span><span class="s0">,</span>
+    <span class="s1">TypeVar</span><span class="s0">,</span>
+<span class="s1">)</span>
+
+<span class="s0">if </span><span class="s1">TYPE_CHECKING:</span>
+    <span class="s0">import </span><span class="s1">mmap</span>
+
+    <span class="s0">from </span><span class="s1">typing_extensions </span><span class="s0">import </span><span class="s1">ParamSpec</span>
+
+    <span class="s1">P = ParamSpec(</span><span class="s2">&quot;P&quot;</span><span class="s1">)</span>
+<span class="s0">else</span><span class="s1">:</span>
+    <span class="s1">P = TypeVar(</span><span class="s2">&quot;P&quot;</span><span class="s1">)</span>
+
+<span class="s1">T = TypeVar(</span><span class="s2">&quot;T&quot;</span><span class="s1">)</span>
+
+
+<span class="s1">logger = logging.getLogger(</span><span class="s2">&quot;fsspec&quot;</span><span class="s1">)</span>
+
+<span class="s1">Fetcher = Callable[[int</span><span class="s0">, </span><span class="s1">int]</span><span class="s0">, </span><span class="s1">bytes]  </span><span class="s3"># Maps (start, end) to bytes</span>
+
+
+<span class="s0">class </span><span class="s1">BaseCache:</span>
+    <span class="s4">&quot;&quot;&quot;Pass-though cache: doesn't keep anything, calls every time 
+ 
+    Acts as base class for other cachers 
+ 
+    Parameters 
+    ---------- 
+    blocksize: int 
+        How far to read ahead in numbers of bytes 
+    fetcher: func 
+        Function of the form f(start, end) which gets bytes from remote as 
+        specified 
+    size: int 
+        How big this file is 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">name: ClassVar[str] = </span><span class="s2">&quot;none&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">blocksize: int</span><span class="s0">, </span><span class="s1">fetcher: Fetcher</span><span class="s0">, </span><span class="s1">size: int) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s1">self.blocksize = blocksize</span>
+        <span class="s1">self.fetcher = fetcher</span>
+        <span class="s1">self.size = size</span>
+
+    <span class="s0">def </span><span class="s1">_fetch(self</span><span class="s0">, </span><span class="s1">start: int | </span><span class="s0">None, </span><span class="s1">stop: int | </span><span class="s0">None</span><span class="s1">) -&gt; bytes:</span>
+        <span class="s0">if </span><span class="s1">start </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">start = </span><span class="s5">0</span>
+        <span class="s0">if </span><span class="s1">stop </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">stop = self.size</span>
+        <span class="s0">if </span><span class="s1">start &gt;= self.size </span><span class="s0">or </span><span class="s1">start &gt;= stop:</span>
+            <span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.fetcher(start</span><span class="s0">, </span><span class="s1">stop)</span>
+
+
+<span class="s0">class </span><span class="s1">MMapCache(BaseCache):</span>
+    <span class="s4">&quot;&quot;&quot;memory-mapped sparse file cache 
+ 
+    Opens temporary file, which is filled blocks-wise when data is requested. 
+    Ensure there is enough disc space in the temporary location. 
+ 
+    This cache method might only work on posix 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">name = </span><span class="s2">&quot;mmap&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">blocksize: int</span><span class="s0">,</span>
+        <span class="s1">fetcher: Fetcher</span><span class="s0">,</span>
+        <span class="s1">size: int</span><span class="s0">,</span>
+        <span class="s1">location: str | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+        <span class="s1">blocks: set[int] | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s1">super().__init__(blocksize</span><span class="s0">, </span><span class="s1">fetcher</span><span class="s0">, </span><span class="s1">size)</span>
+        <span class="s1">self.blocks = set() </span><span class="s0">if </span><span class="s1">blocks </span><span class="s0">is None else </span><span class="s1">blocks</span>
+        <span class="s1">self.location = location</span>
+        <span class="s1">self.cache = self._makefile()</span>
+
+    <span class="s0">def </span><span class="s1">_makefile(self) -&gt; mmap.mmap | bytearray:</span>
+        <span class="s0">import </span><span class="s1">mmap</span>
+        <span class="s0">import </span><span class="s1">tempfile</span>
+
+        <span class="s0">if </span><span class="s1">self.size == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">bytearray()</span>
+
+        <span class="s3"># posix version</span>
+        <span class="s0">if </span><span class="s1">self.location </span><span class="s0">is None or not </span><span class="s1">os.path.exists(self.location):</span>
+            <span class="s0">if </span><span class="s1">self.location </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s1">fd = tempfile.TemporaryFile()</span>
+                <span class="s1">self.blocks = set()</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">fd = open(self.location</span><span class="s0">, </span><span class="s2">&quot;wb+&quot;</span><span class="s1">)</span>
+            <span class="s1">fd.seek(self.size - </span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s1">fd.write(</span><span class="s6">b&quot;1&quot;</span><span class="s1">)</span>
+            <span class="s1">fd.flush()</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">fd = open(self.location</span><span class="s0">, </span><span class="s2">&quot;rb+&quot;</span><span class="s1">)</span>
+
+        <span class="s0">return </span><span class="s1">mmap.mmap(fd.fileno()</span><span class="s0">, </span><span class="s1">self.size)</span>
+
+    <span class="s0">def </span><span class="s1">_fetch(self</span><span class="s0">, </span><span class="s1">start: int | </span><span class="s0">None, </span><span class="s1">end: int | </span><span class="s0">None</span><span class="s1">) -&gt; bytes:</span>
+        <span class="s1">logger.debug(</span><span class="s2">f&quot;MMap cache fetching </span><span class="s0">{</span><span class="s1">start</span><span class="s0">}</span><span class="s2">-</span><span class="s0">{</span><span class="s1">end</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">start </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">start = </span><span class="s5">0</span>
+        <span class="s0">if </span><span class="s1">end </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">end = self.size</span>
+        <span class="s0">if </span><span class="s1">start &gt;= self.size </span><span class="s0">or </span><span class="s1">start &gt;= end:</span>
+            <span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+        <span class="s1">start_block = start // self.blocksize</span>
+        <span class="s1">end_block = end // self.blocksize</span>
+        <span class="s1">need = [i </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(start_block</span><span class="s0">, </span><span class="s1">end_block + </span><span class="s5">1</span><span class="s1">) </span><span class="s0">if </span><span class="s1">i </span><span class="s0">not in </span><span class="s1">self.blocks]</span>
+        <span class="s0">while </span><span class="s1">need:</span>
+            <span class="s3"># TODO: not a for loop so we can consolidate blocks later to</span>
+            <span class="s3"># make fewer fetch calls; this could be parallel</span>
+            <span class="s1">i = need.pop(</span><span class="s5">0</span><span class="s1">)</span>
+            <span class="s1">sstart = i * self.blocksize</span>
+            <span class="s1">send = min(sstart + self.blocksize</span><span class="s0">, </span><span class="s1">self.size)</span>
+            <span class="s1">logger.debug(</span><span class="s2">f&quot;MMap get block #</span><span class="s0">{</span><span class="s1">i</span><span class="s0">} </span><span class="s2">(</span><span class="s0">{</span><span class="s1">sstart</span><span class="s0">}</span><span class="s2">-</span><span class="s0">{</span><span class="s1">send</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+            <span class="s1">self.cache[sstart:send] = self.fetcher(sstart</span><span class="s0">, </span><span class="s1">send)</span>
+            <span class="s1">self.blocks.add(i)</span>
+
+        <span class="s0">return </span><span class="s1">self.cache[start:end]</span>
+
+    <span class="s0">def </span><span class="s1">__getstate__(self) -&gt; dict[str</span><span class="s0">, </span><span class="s1">Any]:</span>
+        <span class="s1">state = self.__dict__.copy()</span>
+        <span class="s3"># Remove the unpicklable entries.</span>
+        <span class="s0">del </span><span class="s1">state[</span><span class="s2">&quot;cache&quot;</span><span class="s1">]</span>
+        <span class="s0">return </span><span class="s1">state</span>
+
+    <span class="s0">def </span><span class="s1">__setstate__(self</span><span class="s0">, </span><span class="s1">state: dict[str</span><span class="s0">, </span><span class="s1">Any]) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s3"># Restore instance attributes</span>
+        <span class="s1">self.__dict__.update(state)</span>
+        <span class="s1">self.cache = self._makefile()</span>
+
+
+<span class="s0">class </span><span class="s1">ReadAheadCache(BaseCache):</span>
+    <span class="s4">&quot;&quot;&quot;Cache which reads only when we get beyond a block of data 
+ 
+    This is a much simpler version of BytesCache, and does not attempt to 
+    fill holes in the cache or keep fragments alive. It is best suited to 
+    many small reads in a sequential order (e.g., reading lines from a file). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">name = </span><span class="s2">&quot;readahead&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">blocksize: int</span><span class="s0">, </span><span class="s1">fetcher: Fetcher</span><span class="s0">, </span><span class="s1">size: int) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s1">super().__init__(blocksize</span><span class="s0">, </span><span class="s1">fetcher</span><span class="s0">, </span><span class="s1">size)</span>
+        <span class="s1">self.cache = </span><span class="s6">b&quot;&quot;</span>
+        <span class="s1">self.start = </span><span class="s5">0</span>
+        <span class="s1">self.end = </span><span class="s5">0</span>
+
+    <span class="s0">def </span><span class="s1">_fetch(self</span><span class="s0">, </span><span class="s1">start: int | </span><span class="s0">None, </span><span class="s1">end: int | </span><span class="s0">None</span><span class="s1">) -&gt; bytes:</span>
+        <span class="s0">if </span><span class="s1">start </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">start = </span><span class="s5">0</span>
+        <span class="s0">if </span><span class="s1">end </span><span class="s0">is None or </span><span class="s1">end &gt; self.size:</span>
+            <span class="s1">end = self.size</span>
+        <span class="s0">if </span><span class="s1">start &gt;= self.size </span><span class="s0">or </span><span class="s1">start &gt;= end:</span>
+            <span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+        <span class="s1">l = end - start</span>
+        <span class="s0">if </span><span class="s1">start &gt;= self.start </span><span class="s0">and </span><span class="s1">end &lt;= self.end:</span>
+            <span class="s3"># cache hit</span>
+            <span class="s0">return </span><span class="s1">self.cache[start - self.start : end - self.start]</span>
+        <span class="s0">elif </span><span class="s1">self.start &lt;= start &lt; self.end:</span>
+            <span class="s3"># partial hit</span>
+            <span class="s1">part = self.cache[start - self.start :]</span>
+            <span class="s1">l -= len(part)</span>
+            <span class="s1">start = self.end</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s3"># miss</span>
+            <span class="s1">part = </span><span class="s6">b&quot;&quot;</span>
+        <span class="s1">end = min(self.size</span><span class="s0">, </span><span class="s1">end + self.blocksize)</span>
+        <span class="s1">self.cache = self.fetcher(start</span><span class="s0">, </span><span class="s1">end)  </span><span class="s3"># new block replaces old</span>
+        <span class="s1">self.start = start</span>
+        <span class="s1">self.end = self.start + len(self.cache)</span>
+        <span class="s0">return </span><span class="s1">part + self.cache[:l]</span>
+
+
+<span class="s0">class </span><span class="s1">FirstChunkCache(BaseCache):</span>
+    <span class="s4">&quot;&quot;&quot;Caches the first block of a file only 
+ 
+    This may be useful for file types where the metadata is stored in the header, 
+    but is randomly accessed. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">name = </span><span class="s2">&quot;first&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">blocksize: int</span><span class="s0">, </span><span class="s1">fetcher: Fetcher</span><span class="s0">, </span><span class="s1">size: int) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s1">super().__init__(blocksize</span><span class="s0">, </span><span class="s1">fetcher</span><span class="s0">, </span><span class="s1">size)</span>
+        <span class="s1">self.cache: bytes | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">_fetch(self</span><span class="s0">, </span><span class="s1">start: int | </span><span class="s0">None, </span><span class="s1">end: int | </span><span class="s0">None</span><span class="s1">) -&gt; bytes:</span>
+        <span class="s1">start = start </span><span class="s0">or </span><span class="s5">0</span>
+        <span class="s1">end = end </span><span class="s0">or </span><span class="s1">self.size</span>
+        <span class="s0">if </span><span class="s1">start &lt; self.blocksize:</span>
+            <span class="s0">if </span><span class="s1">self.cache </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s0">if </span><span class="s1">end &gt; self.blocksize:</span>
+                    <span class="s1">data = self.fetcher(</span><span class="s5">0</span><span class="s0">, </span><span class="s1">end)</span>
+                    <span class="s1">self.cache = data[: self.blocksize]</span>
+                    <span class="s0">return </span><span class="s1">data[start:]</span>
+                <span class="s1">self.cache = self.fetcher(</span><span class="s5">0</span><span class="s0">, </span><span class="s1">self.blocksize)</span>
+            <span class="s1">part = self.cache[start:end]</span>
+            <span class="s0">if </span><span class="s1">end &gt; self.blocksize:</span>
+                <span class="s1">part += self.fetcher(self.blocksize</span><span class="s0">, </span><span class="s1">end)</span>
+            <span class="s0">return </span><span class="s1">part</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self.fetcher(start</span><span class="s0">, </span><span class="s1">end)</span>
+
+
+<span class="s0">class </span><span class="s1">BlockCache(BaseCache):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Cache holding memory as a set of blocks. 
+ 
+    Requests are only ever made ``blocksize`` at a time, and are 
+    stored in an LRU cache. The least recently accessed block is 
+    discarded when more than ``maxblocks`` are stored. 
+ 
+    Parameters 
+    ---------- 
+    blocksize : int 
+        The number of bytes to store in each block. 
+        Requests are only ever made for ``blocksize``, so this 
+        should balance the overhead of making a request against 
+        the granularity of the blocks. 
+    fetcher : Callable 
+    size : int 
+        The total size of the file being cached. 
+    maxblocks : int 
+        The maximum number of blocks to cache for. The maximum memory 
+        use for this cache is then ``blocksize * maxblocks``. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">name = </span><span class="s2">&quot;blockcache&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">blocksize: int</span><span class="s0">, </span><span class="s1">fetcher: Fetcher</span><span class="s0">, </span><span class="s1">size: int</span><span class="s0">, </span><span class="s1">maxblocks: int = </span><span class="s5">32</span>
+    <span class="s1">) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s1">super().__init__(blocksize</span><span class="s0">, </span><span class="s1">fetcher</span><span class="s0">, </span><span class="s1">size)</span>
+        <span class="s1">self.nblocks = math.ceil(size / blocksize)</span>
+        <span class="s1">self.maxblocks = maxblocks</span>
+        <span class="s1">self._fetch_block_cached = functools.lru_cache(maxblocks)(self._fetch_block)</span>
+
+    <span class="s0">def </span><span class="s1">__repr__(self) -&gt; str:</span>
+        <span class="s0">return </span><span class="s1">(</span>
+            <span class="s2">f&quot;&lt;BlockCache blocksize=</span><span class="s0">{</span><span class="s1">self.blocksize</span><span class="s0">}</span><span class="s2">, &quot;</span>
+            <span class="s2">f&quot;size=</span><span class="s0">{</span><span class="s1">self.size</span><span class="s0">}</span><span class="s2">, nblocks=</span><span class="s0">{</span><span class="s1">self.nblocks</span><span class="s0">}</span><span class="s2">&gt;&quot;</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">cache_info(self):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        The statistics on the block cache. 
+ 
+        Returns 
+        ------- 
+        NamedTuple 
+            Returned directly from the LRU Cache used internally. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self._fetch_block_cached.cache_info()</span>
+
+    <span class="s0">def </span><span class="s1">__getstate__(self) -&gt; dict[str</span><span class="s0">, </span><span class="s1">Any]:</span>
+        <span class="s1">state = self.__dict__</span>
+        <span class="s0">del </span><span class="s1">state[</span><span class="s2">&quot;_fetch_block_cached&quot;</span><span class="s1">]</span>
+        <span class="s0">return </span><span class="s1">state</span>
+
+    <span class="s0">def </span><span class="s1">__setstate__(self</span><span class="s0">, </span><span class="s1">state: dict[str</span><span class="s0">, </span><span class="s1">Any]) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s1">self.__dict__.update(state)</span>
+        <span class="s1">self._fetch_block_cached = functools.lru_cache(state[</span><span class="s2">&quot;maxblocks&quot;</span><span class="s1">])(</span>
+            <span class="s1">self._fetch_block</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_fetch(self</span><span class="s0">, </span><span class="s1">start: int | </span><span class="s0">None, </span><span class="s1">end: int | </span><span class="s0">None</span><span class="s1">) -&gt; bytes:</span>
+        <span class="s0">if </span><span class="s1">start </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">start = </span><span class="s5">0</span>
+        <span class="s0">if </span><span class="s1">end </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">end = self.size</span>
+        <span class="s0">if </span><span class="s1">start &gt;= self.size </span><span class="s0">or </span><span class="s1">start &gt;= end:</span>
+            <span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+
+        <span class="s3"># byte position -&gt; block numbers</span>
+        <span class="s1">start_block_number = start // self.blocksize</span>
+        <span class="s1">end_block_number = end // self.blocksize</span>
+
+        <span class="s3"># these are cached, so safe to do multiple calls for the same start and end.</span>
+        <span class="s0">for </span><span class="s1">block_number </span><span class="s0">in </span><span class="s1">range(start_block_number</span><span class="s0">, </span><span class="s1">end_block_number + </span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">self._fetch_block_cached(block_number)</span>
+
+        <span class="s0">return </span><span class="s1">self._read_cache(</span>
+            <span class="s1">start</span><span class="s0">,</span>
+            <span class="s1">end</span><span class="s0">,</span>
+            <span class="s1">start_block_number=start_block_number</span><span class="s0">,</span>
+            <span class="s1">end_block_number=end_block_number</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_fetch_block(self</span><span class="s0">, </span><span class="s1">block_number: int) -&gt; bytes:</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Fetch the block of data for `block_number`. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">block_number &gt; self.nblocks:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s2">f&quot;'block_number=</span><span class="s0">{</span><span class="s1">block_number</span><span class="s0">}</span><span class="s2">' is greater than &quot;</span>
+                <span class="s2">f&quot;the number of blocks (</span><span class="s0">{</span><span class="s1">self.nblocks</span><span class="s0">}</span><span class="s2">)&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">start = block_number * self.blocksize</span>
+        <span class="s1">end = start + self.blocksize</span>
+        <span class="s1">logger.info(</span><span class="s2">&quot;BlockCache fetching block %d&quot;</span><span class="s0">, </span><span class="s1">block_number)</span>
+        <span class="s1">block_contents = super()._fetch(start</span><span class="s0">, </span><span class="s1">end)</span>
+        <span class="s0">return </span><span class="s1">block_contents</span>
+
+    <span class="s0">def </span><span class="s1">_read_cache(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">start: int</span><span class="s0">, </span><span class="s1">end: int</span><span class="s0">, </span><span class="s1">start_block_number: int</span><span class="s0">, </span><span class="s1">end_block_number: int</span>
+    <span class="s1">) -&gt; bytes:</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Read from our block cache. 
+ 
+        Parameters 
+        ---------- 
+        start, end : int 
+            The start and end byte positions. 
+        start_block_number, end_block_number : int 
+            The start and end block numbers. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">start_pos = start % self.blocksize</span>
+        <span class="s1">end_pos = end % self.blocksize</span>
+
+        <span class="s0">if </span><span class="s1">start_block_number == end_block_number:</span>
+            <span class="s1">block: bytes = self._fetch_block_cached(start_block_number)</span>
+            <span class="s0">return </span><span class="s1">block[start_pos:end_pos]</span>
+
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s3"># read from the initial</span>
+            <span class="s1">out = []</span>
+            <span class="s1">out.append(self._fetch_block_cached(start_block_number)[start_pos:])</span>
+
+            <span class="s3"># intermediate blocks</span>
+            <span class="s3"># Note: it'd be nice to combine these into one big request. However</span>
+            <span class="s3"># that doesn't play nicely with our LRU cache.</span>
+            <span class="s0">for </span><span class="s1">block_number </span><span class="s0">in </span><span class="s1">range(start_block_number + </span><span class="s5">1</span><span class="s0">, </span><span class="s1">end_block_number):</span>
+                <span class="s1">out.append(self._fetch_block_cached(block_number))</span>
+
+            <span class="s3"># final block</span>
+            <span class="s1">out.append(self._fetch_block_cached(end_block_number)[:end_pos])</span>
+
+            <span class="s0">return </span><span class="s6">b&quot;&quot;</span><span class="s1">.join(out)</span>
+
+
+<span class="s0">class </span><span class="s1">BytesCache(BaseCache):</span>
+    <span class="s4">&quot;&quot;&quot;Cache which holds data in a in-memory bytes object 
+ 
+    Implements read-ahead by the block size, for semi-random reads progressing 
+    through the file. 
+ 
+    Parameters 
+    ---------- 
+    trim: bool 
+        As we read more data, whether to discard the start of the buffer when 
+        we are more than a blocksize ahead of it. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">name: ClassVar[str] = </span><span class="s2">&quot;bytes&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">blocksize: int</span><span class="s0">, </span><span class="s1">fetcher: Fetcher</span><span class="s0">, </span><span class="s1">size: int</span><span class="s0">, </span><span class="s1">trim: bool = </span><span class="s0">True</span>
+    <span class="s1">) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s1">super().__init__(blocksize</span><span class="s0">, </span><span class="s1">fetcher</span><span class="s0">, </span><span class="s1">size)</span>
+        <span class="s1">self.cache = </span><span class="s6">b&quot;&quot;</span>
+        <span class="s1">self.start: int | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None</span>
+        <span class="s1">self.end: int | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None</span>
+        <span class="s1">self.trim = trim</span>
+
+    <span class="s0">def </span><span class="s1">_fetch(self</span><span class="s0">, </span><span class="s1">start: int | </span><span class="s0">None, </span><span class="s1">end: int | </span><span class="s0">None</span><span class="s1">) -&gt; bytes:</span>
+        <span class="s3"># TODO: only set start/end after fetch, in case it fails?</span>
+        <span class="s3"># is this where retry logic might go?</span>
+        <span class="s0">if </span><span class="s1">start </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">start = </span><span class="s5">0</span>
+        <span class="s0">if </span><span class="s1">end </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">end = self.size</span>
+        <span class="s0">if </span><span class="s1">start &gt;= self.size </span><span class="s0">or </span><span class="s1">start &gt;= end:</span>
+            <span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">self.start </span><span class="s0">is not None</span>
+            <span class="s0">and </span><span class="s1">start &gt;= self.start</span>
+            <span class="s0">and </span><span class="s1">self.end </span><span class="s0">is not None</span>
+            <span class="s0">and </span><span class="s1">end &lt; self.end</span>
+        <span class="s1">):</span>
+            <span class="s3"># cache hit: we have all the required data</span>
+            <span class="s1">offset = start - self.start</span>
+            <span class="s0">return </span><span class="s1">self.cache[offset : offset + end - start]</span>
+
+        <span class="s0">if </span><span class="s1">self.blocksize:</span>
+            <span class="s1">bend = min(self.size</span><span class="s0">, </span><span class="s1">end + self.blocksize)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">bend = end</span>
+
+        <span class="s0">if </span><span class="s1">bend == start </span><span class="s0">or </span><span class="s1">start &gt; self.size:</span>
+            <span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+
+        <span class="s0">if </span><span class="s1">(self.start </span><span class="s0">is None or </span><span class="s1">start &lt; self.start) </span><span class="s0">and </span><span class="s1">(</span>
+            <span class="s1">self.end </span><span class="s0">is None or </span><span class="s1">end &gt; self.end</span>
+        <span class="s1">):</span>
+            <span class="s3"># First read, or extending both before and after</span>
+            <span class="s1">self.cache = self.fetcher(start</span><span class="s0">, </span><span class="s1">bend)</span>
+            <span class="s1">self.start = start</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">assert </span><span class="s1">self.start </span><span class="s0">is not None</span>
+            <span class="s0">assert </span><span class="s1">self.end </span><span class="s0">is not None</span>
+
+            <span class="s0">if </span><span class="s1">start &lt; self.start:</span>
+                <span class="s0">if </span><span class="s1">self.end </span><span class="s0">is None or </span><span class="s1">self.end - end &gt; self.blocksize:</span>
+                    <span class="s1">self.cache = self.fetcher(start</span><span class="s0">, </span><span class="s1">bend)</span>
+                    <span class="s1">self.start = start</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">new = self.fetcher(start</span><span class="s0">, </span><span class="s1">self.start)</span>
+                    <span class="s1">self.start = start</span>
+                    <span class="s1">self.cache = new + self.cache</span>
+            <span class="s0">elif </span><span class="s1">self.end </span><span class="s0">is not None and </span><span class="s1">bend &gt; self.end:</span>
+                <span class="s0">if </span><span class="s1">self.end &gt; self.size:</span>
+                    <span class="s0">pass</span>
+                <span class="s0">elif </span><span class="s1">end - self.end &gt; self.blocksize:</span>
+                    <span class="s1">self.cache = self.fetcher(start</span><span class="s0">, </span><span class="s1">bend)</span>
+                    <span class="s1">self.start = start</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">new = self.fetcher(self.end</span><span class="s0">, </span><span class="s1">bend)</span>
+                    <span class="s1">self.cache = self.cache + new</span>
+
+        <span class="s1">self.end = self.start + len(self.cache)</span>
+        <span class="s1">offset = start - self.start</span>
+        <span class="s1">out = self.cache[offset : offset + end - start]</span>
+        <span class="s0">if </span><span class="s1">self.trim:</span>
+            <span class="s1">num = (self.end - self.start) // (self.blocksize + </span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">num &gt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">self.start += self.blocksize * num</span>
+                <span class="s1">self.cache = self.cache[self.blocksize * num :]</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">__len__(self) -&gt; int:</span>
+        <span class="s0">return </span><span class="s1">len(self.cache)</span>
+
+
+<span class="s0">class </span><span class="s1">AllBytes(BaseCache):</span>
+    <span class="s4">&quot;&quot;&quot;Cache entire contents of the file&quot;&quot;&quot;</span>
+
+    <span class="s1">name: ClassVar[str] = </span><span class="s2">&quot;all&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">blocksize: int | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+        <span class="s1">fetcher: Fetcher | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+        <span class="s1">size: int | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+        <span class="s1">data: bytes | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s1">super().__init__(blocksize</span><span class="s0">, </span><span class="s1">fetcher</span><span class="s0">, </span><span class="s1">size)  </span><span class="s3"># type: ignore[arg-type]</span>
+        <span class="s0">if </span><span class="s1">data </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">data = self.fetcher(</span><span class="s5">0</span><span class="s0">, </span><span class="s1">self.size)</span>
+        <span class="s1">self.data = data</span>
+
+    <span class="s0">def </span><span class="s1">_fetch(self</span><span class="s0">, </span><span class="s1">start: int | </span><span class="s0">None, </span><span class="s1">stop: int | </span><span class="s0">None</span><span class="s1">) -&gt; bytes:</span>
+        <span class="s0">return </span><span class="s1">self.data[start:stop]</span>
+
+
+<span class="s0">class </span><span class="s1">KnownPartsOfAFile(BaseCache):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Cache holding known file parts. 
+ 
+    Parameters 
+    ---------- 
+    blocksize: int 
+        How far to read ahead in numbers of bytes 
+    fetcher: func 
+        Function of the form f(start, end) which gets bytes from remote as 
+        specified 
+    size: int 
+        How big this file is 
+    data: dict 
+        A dictionary mapping explicit `(start, stop)` file-offset tuples 
+        with known bytes. 
+    strict: bool, default True 
+        Whether to fetch reads that go beyond a known byte-range boundary. 
+        If `False`, any read that ends outside a known part will be zero 
+        padded. Note that zero padding will not be used for reads that 
+        begin outside a known byte-range. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">name: ClassVar[str] = </span><span class="s2">&quot;parts&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">blocksize: int</span><span class="s0">,</span>
+        <span class="s1">fetcher: Fetcher</span><span class="s0">,</span>
+        <span class="s1">size: int</span><span class="s0">,</span>
+        <span class="s1">data: dict[tuple[int</span><span class="s0">, </span><span class="s1">int]</span><span class="s0">, </span><span class="s1">bytes] = {}</span><span class="s0">,</span>
+        <span class="s1">strict: bool = </span><span class="s0">True,</span>
+        <span class="s1">**_: Any</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__(blocksize</span><span class="s0">, </span><span class="s1">fetcher</span><span class="s0">, </span><span class="s1">size)</span>
+        <span class="s1">self.strict = strict</span>
+
+        <span class="s3"># simple consolidation of contiguous blocks</span>
+        <span class="s0">if </span><span class="s1">data:</span>
+            <span class="s1">old_offsets = sorted(data.keys())</span>
+            <span class="s1">offsets = [old_offsets[</span><span class="s5">0</span><span class="s1">]]</span>
+            <span class="s1">blocks = [data.pop(old_offsets[</span><span class="s5">0</span><span class="s1">])]</span>
+            <span class="s0">for </span><span class="s1">start</span><span class="s0">, </span><span class="s1">stop </span><span class="s0">in </span><span class="s1">old_offsets[</span><span class="s5">1</span><span class="s1">:]:</span>
+                <span class="s1">start0</span><span class="s0">, </span><span class="s1">stop0 = offsets[-</span><span class="s5">1</span><span class="s1">]</span>
+                <span class="s0">if </span><span class="s1">start == stop0:</span>
+                    <span class="s1">offsets[-</span><span class="s5">1</span><span class="s1">] = (start0</span><span class="s0">, </span><span class="s1">stop)</span>
+                    <span class="s1">blocks[-</span><span class="s5">1</span><span class="s1">] += data.pop((start</span><span class="s0">, </span><span class="s1">stop))</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">offsets.append((start</span><span class="s0">, </span><span class="s1">stop))</span>
+                    <span class="s1">blocks.append(data.pop((start</span><span class="s0">, </span><span class="s1">stop)))</span>
+
+            <span class="s1">self.data = dict(zip(offsets</span><span class="s0">, </span><span class="s1">blocks))</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.data = data</span>
+
+    <span class="s0">def </span><span class="s1">_fetch(self</span><span class="s0">, </span><span class="s1">start: int | </span><span class="s0">None, </span><span class="s1">stop: int | </span><span class="s0">None</span><span class="s1">) -&gt; bytes:</span>
+        <span class="s0">if </span><span class="s1">start </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">start = </span><span class="s5">0</span>
+        <span class="s0">if </span><span class="s1">stop </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">stop = self.size</span>
+
+        <span class="s1">out = </span><span class="s6">b&quot;&quot;</span>
+        <span class="s0">for </span><span class="s1">(loc0</span><span class="s0">, </span><span class="s1">loc1)</span><span class="s0">, </span><span class="s1">data </span><span class="s0">in </span><span class="s1">self.data.items():</span>
+            <span class="s3"># If self.strict=False, use zero-padded data</span>
+            <span class="s3"># for reads beyond the end of a &quot;known&quot; buffer</span>
+            <span class="s0">if </span><span class="s1">loc0 &lt;= start &lt; loc1:</span>
+                <span class="s1">off = start - loc0</span>
+                <span class="s1">out = data[off : off + stop - start]</span>
+                <span class="s0">if not </span><span class="s1">self.strict </span><span class="s0">or </span><span class="s1">loc0 &lt;= stop &lt;= loc1:</span>
+                    <span class="s3"># The request is within a known range, or</span>
+                    <span class="s3"># it begins within a known range, and we</span>
+                    <span class="s3"># are allowed to pad reads beyond the</span>
+                    <span class="s3"># buffer with zero</span>
+                    <span class="s1">out += </span><span class="s6">b&quot;</span><span class="s0">\x00</span><span class="s6">&quot; </span><span class="s1">* (stop - start - len(out))</span>
+                    <span class="s0">return </span><span class="s1">out</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s3"># The request ends outside a known range,</span>
+                    <span class="s3"># and we are being &quot;strict&quot; about reads</span>
+                    <span class="s3"># beyond the buffer</span>
+                    <span class="s1">start = loc1</span>
+                    <span class="s0">break</span>
+
+        <span class="s3"># We only get here if there is a request outside the</span>
+        <span class="s3"># known parts of the file. In an ideal world, this</span>
+        <span class="s3"># should never happen</span>
+        <span class="s0">if </span><span class="s1">self.fetcher </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s3"># We cannot fetch the data, so raise an error</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">f&quot;Read is outside the known file parts: </span><span class="s0">{</span><span class="s1">(start</span><span class="s0">, </span><span class="s1">stop)</span><span class="s0">}</span><span class="s2">. &quot;</span><span class="s1">)</span>
+        <span class="s3"># We can fetch the data, but should warn the user</span>
+        <span class="s3"># that this may be slow</span>
+        <span class="s1">warnings.warn(</span>
+            <span class="s2">f&quot;Read is outside the known file parts: </span><span class="s0">{</span><span class="s1">(start</span><span class="s0">, </span><span class="s1">stop)</span><span class="s0">}</span><span class="s2">. &quot;</span>
+            <span class="s2">f&quot;IO/caching performance may be poor!&quot;</span>
+        <span class="s1">)</span>
+        <span class="s1">logger.debug(</span><span class="s2">f&quot;KnownPartsOfAFile cache fetching </span><span class="s0">{</span><span class="s1">start</span><span class="s0">}</span><span class="s2">-</span><span class="s0">{</span><span class="s1">stop</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">out + super()._fetch(start</span><span class="s0">, </span><span class="s1">stop)</span>
+
+
+<span class="s0">class </span><span class="s1">UpdatableLRU(Generic[P</span><span class="s0">, </span><span class="s1">T]):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Custom implementation of LRU cache that allows updating keys 
+ 
+    Used by BackgroudBlockCache 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">class </span><span class="s1">CacheInfo(NamedTuple):</span>
+        <span class="s1">hits: int</span>
+        <span class="s1">misses: int</span>
+        <span class="s1">maxsize: int</span>
+        <span class="s1">currsize: int</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">func: Callable[P</span><span class="s0">, </span><span class="s1">T]</span><span class="s0">, </span><span class="s1">max_size: int = </span><span class="s5">128</span><span class="s1">) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s1">self._cache: OrderedDict[Any</span><span class="s0">, </span><span class="s1">T] = collections.OrderedDict()</span>
+        <span class="s1">self._func = func</span>
+        <span class="s1">self._max_size = max_size</span>
+        <span class="s1">self._hits = </span><span class="s5">0</span>
+        <span class="s1">self._misses = </span><span class="s5">0</span>
+        <span class="s1">self._lock = threading.Lock()</span>
+
+    <span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">*args: P.args</span><span class="s0">, </span><span class="s1">**kwargs: P.kwargs) -&gt; T:</span>
+        <span class="s0">if </span><span class="s1">kwargs:</span>
+            <span class="s0">raise </span><span class="s1">TypeError(</span><span class="s2">f&quot;Got unexpected keyword argument </span><span class="s0">{</span><span class="s1">kwargs.keys()</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+        <span class="s0">with </span><span class="s1">self._lock:</span>
+            <span class="s0">if </span><span class="s1">args </span><span class="s0">in </span><span class="s1">self._cache:</span>
+                <span class="s1">self._cache.move_to_end(args)</span>
+                <span class="s1">self._hits += </span><span class="s5">1</span>
+                <span class="s0">return </span><span class="s1">self._cache[args]</span>
+
+        <span class="s1">result = self._func(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s0">with </span><span class="s1">self._lock:</span>
+            <span class="s1">self._cache[args] = result</span>
+            <span class="s1">self._misses += </span><span class="s5">1</span>
+            <span class="s0">if </span><span class="s1">len(self._cache) &gt; self._max_size:</span>
+                <span class="s1">self._cache.popitem(last=</span><span class="s0">False</span><span class="s1">)</span>
+
+        <span class="s0">return </span><span class="s1">result</span>
+
+    <span class="s0">def </span><span class="s1">is_key_cached(self</span><span class="s0">, </span><span class="s1">*args: Any) -&gt; bool:</span>
+        <span class="s0">with </span><span class="s1">self._lock:</span>
+            <span class="s0">return </span><span class="s1">args </span><span class="s0">in </span><span class="s1">self._cache</span>
+
+    <span class="s0">def </span><span class="s1">add_key(self</span><span class="s0">, </span><span class="s1">result: T</span><span class="s0">, </span><span class="s1">*args: Any) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s0">with </span><span class="s1">self._lock:</span>
+            <span class="s1">self._cache[args] = result</span>
+            <span class="s0">if </span><span class="s1">len(self._cache) &gt; self._max_size:</span>
+                <span class="s1">self._cache.popitem(last=</span><span class="s0">False</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">cache_info(self) -&gt; UpdatableLRU.CacheInfo:</span>
+        <span class="s0">with </span><span class="s1">self._lock:</span>
+            <span class="s0">return </span><span class="s1">self.CacheInfo(</span>
+                <span class="s1">maxsize=self._max_size</span><span class="s0">,</span>
+                <span class="s1">currsize=len(self._cache)</span><span class="s0">,</span>
+                <span class="s1">hits=self._hits</span><span class="s0">,</span>
+                <span class="s1">misses=self._misses</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">BackgroundBlockCache(BaseCache):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Cache holding memory as a set of blocks with pre-loading of 
+    the next block in the background. 
+ 
+    Requests are only ever made ``blocksize`` at a time, and are 
+    stored in an LRU cache. The least recently accessed block is 
+    discarded when more than ``maxblocks`` are stored. If the 
+    next block is not in cache, it is loaded in a separate thread 
+    in non-blocking way. 
+ 
+    Parameters 
+    ---------- 
+    blocksize : int 
+        The number of bytes to store in each block. 
+        Requests are only ever made for ``blocksize``, so this 
+        should balance the overhead of making a request against 
+        the granularity of the blocks. 
+    fetcher : Callable 
+    size : int 
+        The total size of the file being cached. 
+    maxblocks : int 
+        The maximum number of blocks to cache for. The maximum memory 
+        use for this cache is then ``blocksize * maxblocks``. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">name: ClassVar[str] = </span><span class="s2">&quot;background&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">blocksize: int</span><span class="s0">, </span><span class="s1">fetcher: Fetcher</span><span class="s0">, </span><span class="s1">size: int</span><span class="s0">, </span><span class="s1">maxblocks: int = </span><span class="s5">32</span>
+    <span class="s1">) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s1">super().__init__(blocksize</span><span class="s0">, </span><span class="s1">fetcher</span><span class="s0">, </span><span class="s1">size)</span>
+        <span class="s1">self.nblocks = math.ceil(size / blocksize)</span>
+        <span class="s1">self.maxblocks = maxblocks</span>
+        <span class="s1">self._fetch_block_cached = UpdatableLRU(self._fetch_block</span><span class="s0">, </span><span class="s1">maxblocks)</span>
+
+        <span class="s1">self._thread_executor = ThreadPoolExecutor(max_workers=</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">self._fetch_future_block_number: int | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None</span>
+        <span class="s1">self._fetch_future: Future[bytes] | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None</span>
+        <span class="s1">self._fetch_future_lock = threading.Lock()</span>
+
+    <span class="s0">def </span><span class="s1">__repr__(self) -&gt; str:</span>
+        <span class="s0">return </span><span class="s1">(</span>
+            <span class="s2">f&quot;&lt;BackgroundBlockCache blocksize=</span><span class="s0">{</span><span class="s1">self.blocksize</span><span class="s0">}</span><span class="s2">, &quot;</span>
+            <span class="s2">f&quot;size=</span><span class="s0">{</span><span class="s1">self.size</span><span class="s0">}</span><span class="s2">, nblocks=</span><span class="s0">{</span><span class="s1">self.nblocks</span><span class="s0">}</span><span class="s2">&gt;&quot;</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">cache_info(self) -&gt; UpdatableLRU.CacheInfo:</span>
+        <span class="s4">&quot;&quot;&quot; 
+        The statistics on the block cache. 
+ 
+        Returns 
+        ------- 
+        NamedTuple 
+            Returned directly from the LRU Cache used internally. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self._fetch_block_cached.cache_info()</span>
+
+    <span class="s0">def </span><span class="s1">__getstate__(self) -&gt; dict[str</span><span class="s0">, </span><span class="s1">Any]:</span>
+        <span class="s1">state = self.__dict__</span>
+        <span class="s0">del </span><span class="s1">state[</span><span class="s2">&quot;_fetch_block_cached&quot;</span><span class="s1">]</span>
+        <span class="s0">del </span><span class="s1">state[</span><span class="s2">&quot;_thread_executor&quot;</span><span class="s1">]</span>
+        <span class="s0">del </span><span class="s1">state[</span><span class="s2">&quot;_fetch_future_block_number&quot;</span><span class="s1">]</span>
+        <span class="s0">del </span><span class="s1">state[</span><span class="s2">&quot;_fetch_future&quot;</span><span class="s1">]</span>
+        <span class="s0">del </span><span class="s1">state[</span><span class="s2">&quot;_fetch_future_lock&quot;</span><span class="s1">]</span>
+        <span class="s0">return </span><span class="s1">state</span>
+
+    <span class="s0">def </span><span class="s1">__setstate__(self</span><span class="s0">, </span><span class="s1">state) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s1">self.__dict__.update(state)</span>
+        <span class="s1">self._fetch_block_cached = UpdatableLRU(self._fetch_block</span><span class="s0">, </span><span class="s1">state[</span><span class="s2">&quot;maxblocks&quot;</span><span class="s1">])</span>
+        <span class="s1">self._thread_executor = ThreadPoolExecutor(max_workers=</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">self._fetch_future_block_number = </span><span class="s0">None</span>
+        <span class="s1">self._fetch_future = </span><span class="s0">None</span>
+        <span class="s1">self._fetch_future_lock = threading.Lock()</span>
+
+    <span class="s0">def </span><span class="s1">_fetch(self</span><span class="s0">, </span><span class="s1">start: int | </span><span class="s0">None, </span><span class="s1">end: int | </span><span class="s0">None</span><span class="s1">) -&gt; bytes:</span>
+        <span class="s0">if </span><span class="s1">start </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">start = </span><span class="s5">0</span>
+        <span class="s0">if </span><span class="s1">end </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">end = self.size</span>
+        <span class="s0">if </span><span class="s1">start &gt;= self.size </span><span class="s0">or </span><span class="s1">start &gt;= end:</span>
+            <span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+
+        <span class="s3"># byte position -&gt; block numbers</span>
+        <span class="s1">start_block_number = start // self.blocksize</span>
+        <span class="s1">end_block_number = end // self.blocksize</span>
+
+        <span class="s1">fetch_future_block_number = </span><span class="s0">None</span>
+        <span class="s1">fetch_future = </span><span class="s0">None</span>
+        <span class="s0">with </span><span class="s1">self._fetch_future_lock:</span>
+            <span class="s3"># Background thread is running. Check we we can or must join it.</span>
+            <span class="s0">if </span><span class="s1">self._fetch_future </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s0">assert </span><span class="s1">self._fetch_future_block_number </span><span class="s0">is not None</span>
+                <span class="s0">if </span><span class="s1">self._fetch_future.done():</span>
+                    <span class="s1">logger.info(</span><span class="s2">&quot;BlockCache joined background fetch without waiting.&quot;</span><span class="s1">)</span>
+                    <span class="s1">self._fetch_block_cached.add_key(</span>
+                        <span class="s1">self._fetch_future.result()</span><span class="s0">, </span><span class="s1">self._fetch_future_block_number</span>
+                    <span class="s1">)</span>
+                    <span class="s3"># Cleanup the fetch variables. Done with fetching the block.</span>
+                    <span class="s1">self._fetch_future_block_number = </span><span class="s0">None</span>
+                    <span class="s1">self._fetch_future = </span><span class="s0">None</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s3"># Must join if we need the block for the current fetch</span>
+                    <span class="s1">must_join = bool(</span>
+                        <span class="s1">start_block_number</span>
+                        <span class="s1">&lt;= self._fetch_future_block_number</span>
+                        <span class="s1">&lt;= end_block_number</span>
+                    <span class="s1">)</span>
+                    <span class="s0">if </span><span class="s1">must_join:</span>
+                        <span class="s3"># Copy to the local variables to release lock</span>
+                        <span class="s3"># before waiting for result</span>
+                        <span class="s1">fetch_future_block_number = self._fetch_future_block_number</span>
+                        <span class="s1">fetch_future = self._fetch_future</span>
+
+                        <span class="s3"># Cleanup the fetch variables. Have a local copy.</span>
+                        <span class="s1">self._fetch_future_block_number = </span><span class="s0">None</span>
+                        <span class="s1">self._fetch_future = </span><span class="s0">None</span>
+
+        <span class="s3"># Need to wait for the future for the current read</span>
+        <span class="s0">if </span><span class="s1">fetch_future </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">logger.info(</span><span class="s2">&quot;BlockCache waiting for background fetch.&quot;</span><span class="s1">)</span>
+            <span class="s3"># Wait until result and put it in cache</span>
+            <span class="s1">self._fetch_block_cached.add_key(</span>
+                <span class="s1">fetch_future.result()</span><span class="s0">, </span><span class="s1">fetch_future_block_number</span>
+            <span class="s1">)</span>
+
+        <span class="s3"># these are cached, so safe to do multiple calls for the same start and end.</span>
+        <span class="s0">for </span><span class="s1">block_number </span><span class="s0">in </span><span class="s1">range(start_block_number</span><span class="s0">, </span><span class="s1">end_block_number + </span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">self._fetch_block_cached(block_number)</span>
+
+        <span class="s3"># fetch next block in the background if nothing is running in the background,</span>
+        <span class="s3"># the block is within file and it is not already cached</span>
+        <span class="s1">end_block_plus_1 = end_block_number + </span><span class="s5">1</span>
+        <span class="s0">with </span><span class="s1">self._fetch_future_lock:</span>
+            <span class="s0">if </span><span class="s1">(</span>
+                <span class="s1">self._fetch_future </span><span class="s0">is None</span>
+                <span class="s0">and </span><span class="s1">end_block_plus_1 &lt;= self.nblocks</span>
+                <span class="s0">and not </span><span class="s1">self._fetch_block_cached.is_key_cached(end_block_plus_1)</span>
+            <span class="s1">):</span>
+                <span class="s1">self._fetch_future_block_number = end_block_plus_1</span>
+                <span class="s1">self._fetch_future = self._thread_executor.submit(</span>
+                    <span class="s1">self._fetch_block</span><span class="s0">, </span><span class="s1">end_block_plus_1</span><span class="s0">, </span><span class="s2">&quot;async&quot;</span>
+                <span class="s1">)</span>
+
+        <span class="s0">return </span><span class="s1">self._read_cache(</span>
+            <span class="s1">start</span><span class="s0">,</span>
+            <span class="s1">end</span><span class="s0">,</span>
+            <span class="s1">start_block_number=start_block_number</span><span class="s0">,</span>
+            <span class="s1">end_block_number=end_block_number</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_fetch_block(self</span><span class="s0">, </span><span class="s1">block_number: int</span><span class="s0">, </span><span class="s1">log_info: str = </span><span class="s2">&quot;sync&quot;</span><span class="s1">) -&gt; bytes:</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Fetch the block of data for `block_number`. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">block_number &gt; self.nblocks:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s2">f&quot;'block_number=</span><span class="s0">{</span><span class="s1">block_number</span><span class="s0">}</span><span class="s2">' is greater than &quot;</span>
+                <span class="s2">f&quot;the number of blocks (</span><span class="s0">{</span><span class="s1">self.nblocks</span><span class="s0">}</span><span class="s2">)&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">start = block_number * self.blocksize</span>
+        <span class="s1">end = start + self.blocksize</span>
+        <span class="s1">logger.info(</span><span class="s2">&quot;BlockCache fetching block (%s) %d&quot;</span><span class="s0">, </span><span class="s1">log_info</span><span class="s0">, </span><span class="s1">block_number)</span>
+        <span class="s1">block_contents = super()._fetch(start</span><span class="s0">, </span><span class="s1">end)</span>
+        <span class="s0">return </span><span class="s1">block_contents</span>
+
+    <span class="s0">def </span><span class="s1">_read_cache(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">start: int</span><span class="s0">, </span><span class="s1">end: int</span><span class="s0">, </span><span class="s1">start_block_number: int</span><span class="s0">, </span><span class="s1">end_block_number: int</span>
+    <span class="s1">) -&gt; bytes:</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Read from our block cache. 
+ 
+        Parameters 
+        ---------- 
+        start, end : int 
+            The start and end byte positions. 
+        start_block_number, end_block_number : int 
+            The start and end block numbers. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">start_pos = start % self.blocksize</span>
+        <span class="s1">end_pos = end % self.blocksize</span>
+
+        <span class="s0">if </span><span class="s1">start_block_number == end_block_number:</span>
+            <span class="s1">block = self._fetch_block_cached(start_block_number)</span>
+            <span class="s0">return </span><span class="s1">block[start_pos:end_pos]</span>
+
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s3"># read from the initial</span>
+            <span class="s1">out = []</span>
+            <span class="s1">out.append(self._fetch_block_cached(start_block_number)[start_pos:])</span>
+
+            <span class="s3"># intermediate blocks</span>
+            <span class="s3"># Note: it'd be nice to combine these into one big request. However</span>
+            <span class="s3"># that doesn't play nicely with our LRU cache.</span>
+            <span class="s0">for </span><span class="s1">block_number </span><span class="s0">in </span><span class="s1">range(start_block_number + </span><span class="s5">1</span><span class="s0">, </span><span class="s1">end_block_number):</span>
+                <span class="s1">out.append(self._fetch_block_cached(block_number))</span>
+
+            <span class="s3"># final block</span>
+            <span class="s1">out.append(self._fetch_block_cached(end_block_number)[:end_pos])</span>
+
+            <span class="s0">return </span><span class="s6">b&quot;&quot;</span><span class="s1">.join(out)</span>
+
+
+<span class="s1">caches: dict[str | </span><span class="s0">None, </span><span class="s1">type[BaseCache]] = {</span>
+    <span class="s3"># one custom case</span>
+    <span class="s0">None</span><span class="s1">: BaseCache</span><span class="s0">,</span>
+<span class="s1">}</span>
+
+
+<span class="s0">def </span><span class="s1">register_cache(cls: type[BaseCache]</span><span class="s0">, </span><span class="s1">clobber: bool = </span><span class="s0">False</span><span class="s1">) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+    <span class="s4">&quot;&quot;&quot;'Register' cache implementation. 
+ 
+    Parameters 
+    ---------- 
+    clobber: bool, optional 
+        If set to True (default is False) - allow to overwrite existing 
+        entry. 
+ 
+    Raises 
+    ------ 
+    ValueError 
+    &quot;&quot;&quot;</span>
+    <span class="s1">name = cls.name</span>
+    <span class="s0">if not </span><span class="s1">clobber </span><span class="s0">and </span><span class="s1">name </span><span class="s0">in </span><span class="s1">caches:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">f&quot;Cache with name </span><span class="s0">{</span><span class="s1">name</span><span class="s0">!r} </span><span class="s2">is already known: </span><span class="s0">{</span><span class="s1">caches[name]</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+    <span class="s1">caches[name] = cls</span>
+
+
+<span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">(</span>
+    <span class="s1">BaseCache</span><span class="s0">,</span>
+    <span class="s1">MMapCache</span><span class="s0">,</span>
+    <span class="s1">BytesCache</span><span class="s0">,</span>
+    <span class="s1">ReadAheadCache</span><span class="s0">,</span>
+    <span class="s1">BlockCache</span><span class="s0">,</span>
+    <span class="s1">FirstChunkCache</span><span class="s0">,</span>
+    <span class="s1">AllBytes</span><span class="s0">,</span>
+    <span class="s1">KnownPartsOfAFile</span><span class="s0">,</span>
+    <span class="s1">BackgroundBlockCache</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s1">register_cache(c)</span>
+</pre>
+</body>
+</html>

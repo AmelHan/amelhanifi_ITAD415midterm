@@ -1,0 +1,347 @@
+<html>
+<head>
+<title>fuse.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+.s5 { color: #a5c261;}
+.s6 { color: #629755; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+fuse.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">argparse</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">stat</span>
+<span class="s0">import </span><span class="s1">threading</span>
+<span class="s0">import </span><span class="s1">time</span>
+<span class="s0">from </span><span class="s1">errno </span><span class="s0">import </span><span class="s1">EIO</span><span class="s0">, </span><span class="s1">ENOENT</span>
+
+<span class="s0">from </span><span class="s1">fuse </span><span class="s0">import </span><span class="s1">FUSE</span><span class="s0">, </span><span class="s1">FuseOSError</span><span class="s0">, </span><span class="s1">LoggingMixIn</span><span class="s0">, </span><span class="s1">Operations</span>
+
+<span class="s0">from </span><span class="s1">fsspec </span><span class="s0">import </span><span class="s1">__version__</span>
+<span class="s0">from </span><span class="s1">fsspec.core </span><span class="s0">import </span><span class="s1">url_to_fs</span>
+
+<span class="s1">logger = logging.getLogger(</span><span class="s2">&quot;fsspec.fuse&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">FUSEr(Operations):</span>
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">fs</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">ready_file=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s1">self.fs = fs</span>
+        <span class="s1">self.cache = {}</span>
+        <span class="s1">self.root = path.rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">) + </span><span class="s2">&quot;/&quot;</span>
+        <span class="s1">self.counter = </span><span class="s3">0</span>
+        <span class="s1">logger.info(</span><span class="s2">&quot;Starting FUSE at %s&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+        <span class="s1">self._ready_file = ready_file</span>
+
+    <span class="s0">def </span><span class="s1">getattr(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">fh=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;getattr %s&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+        <span class="s0">if </span><span class="s1">self._ready_file </span><span class="s0">and </span><span class="s1">path </span><span class="s0">in </span><span class="s1">[</span><span class="s2">&quot;/.fuse_ready&quot;</span><span class="s0">, </span><span class="s2">&quot;.fuse_ready&quot;</span><span class="s1">]:</span>
+            <span class="s0">return </span><span class="s1">{</span><span class="s2">&quot;type&quot;</span><span class="s1">: </span><span class="s2">&quot;file&quot;</span><span class="s0">, </span><span class="s2">&quot;st_size&quot;</span><span class="s1">: </span><span class="s3">5</span><span class="s1">}</span>
+
+        <span class="s1">path = </span><span class="s2">&quot;&quot;</span><span class="s1">.join([self.root</span><span class="s0">, </span><span class="s1">path.lstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)]).rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">info = self.fs.info(path)</span>
+        <span class="s0">except </span><span class="s1">FileNotFoundError:</span>
+            <span class="s0">raise </span><span class="s1">FuseOSError(ENOENT)</span>
+
+        <span class="s1">data = {</span><span class="s2">&quot;st_uid&quot;</span><span class="s1">: info.get(</span><span class="s2">&quot;uid&quot;</span><span class="s0">, </span><span class="s3">1000</span><span class="s1">)</span><span class="s0">, </span><span class="s2">&quot;st_gid&quot;</span><span class="s1">: info.get(</span><span class="s2">&quot;gid&quot;</span><span class="s0">, </span><span class="s3">1000</span><span class="s1">)}</span>
+        <span class="s1">perm = info.get(</span><span class="s2">&quot;mode&quot;</span><span class="s0">, </span><span class="s3">0o777</span><span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">info[</span><span class="s2">&quot;type&quot;</span><span class="s1">] != </span><span class="s2">&quot;file&quot;</span><span class="s1">:</span>
+            <span class="s1">data[</span><span class="s2">&quot;st_mode&quot;</span><span class="s1">] = stat.S_IFDIR | perm</span>
+            <span class="s1">data[</span><span class="s2">&quot;st_size&quot;</span><span class="s1">] = </span><span class="s3">0</span>
+            <span class="s1">data[</span><span class="s2">&quot;st_blksize&quot;</span><span class="s1">] = </span><span class="s3">0</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">data[</span><span class="s2">&quot;st_mode&quot;</span><span class="s1">] = stat.S_IFREG | perm</span>
+            <span class="s1">data[</span><span class="s2">&quot;st_size&quot;</span><span class="s1">] = info[</span><span class="s2">&quot;size&quot;</span><span class="s1">]</span>
+            <span class="s1">data[</span><span class="s2">&quot;st_blksize&quot;</span><span class="s1">] = </span><span class="s3">5 </span><span class="s1">* </span><span class="s3">2</span><span class="s1">**</span><span class="s3">20</span>
+            <span class="s1">data[</span><span class="s2">&quot;st_nlink&quot;</span><span class="s1">] = </span><span class="s3">1</span>
+        <span class="s1">data[</span><span class="s2">&quot;st_atime&quot;</span><span class="s1">] = info[</span><span class="s2">&quot;atime&quot;</span><span class="s1">] </span><span class="s0">if </span><span class="s2">&quot;atime&quot; </span><span class="s0">in </span><span class="s1">info </span><span class="s0">else </span><span class="s1">time.time()</span>
+        <span class="s1">data[</span><span class="s2">&quot;st_ctime&quot;</span><span class="s1">] = info[</span><span class="s2">&quot;ctime&quot;</span><span class="s1">] </span><span class="s0">if </span><span class="s2">&quot;ctime&quot; </span><span class="s0">in </span><span class="s1">info </span><span class="s0">else </span><span class="s1">time.time()</span>
+        <span class="s1">data[</span><span class="s2">&quot;st_mtime&quot;</span><span class="s1">] = info[</span><span class="s2">&quot;mtime&quot;</span><span class="s1">] </span><span class="s0">if </span><span class="s2">&quot;mtime&quot; </span><span class="s0">in </span><span class="s1">info </span><span class="s0">else </span><span class="s1">time.time()</span>
+        <span class="s0">return </span><span class="s1">data</span>
+
+    <span class="s0">def </span><span class="s1">readdir(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">fh):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;readdir %s&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+        <span class="s1">path = </span><span class="s2">&quot;&quot;</span><span class="s1">.join([self.root</span><span class="s0">, </span><span class="s1">path.lstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)])</span>
+        <span class="s1">files = self.fs.ls(path</span><span class="s0">, False</span><span class="s1">)</span>
+        <span class="s1">files = [os.path.basename(f.rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)) </span><span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">files]</span>
+        <span class="s0">return </span><span class="s1">[</span><span class="s2">&quot;.&quot;</span><span class="s0">, </span><span class="s2">&quot;..&quot;</span><span class="s1">] + files</span>
+
+    <span class="s0">def </span><span class="s1">mkdir(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode):</span>
+        <span class="s1">path = </span><span class="s2">&quot;&quot;</span><span class="s1">.join([self.root</span><span class="s0">, </span><span class="s1">path.lstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)])</span>
+        <span class="s1">self.fs.mkdir(path)</span>
+        <span class="s0">return </span><span class="s3">0</span>
+
+    <span class="s0">def </span><span class="s1">rmdir(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">path = </span><span class="s2">&quot;&quot;</span><span class="s1">.join([self.root</span><span class="s0">, </span><span class="s1">path.lstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)])</span>
+        <span class="s1">self.fs.rmdir(path)</span>
+        <span class="s0">return </span><span class="s3">0</span>
+
+    <span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">size</span><span class="s0">, </span><span class="s1">offset</span><span class="s0">, </span><span class="s1">fh):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;read %s&quot;</span><span class="s0">, </span><span class="s1">(path</span><span class="s0">, </span><span class="s1">size</span><span class="s0">, </span><span class="s1">offset))</span>
+        <span class="s0">if </span><span class="s1">self._ready_file </span><span class="s0">and </span><span class="s1">path </span><span class="s0">in </span><span class="s1">[</span><span class="s2">&quot;/.fuse_ready&quot;</span><span class="s0">, </span><span class="s2">&quot;.fuse_ready&quot;</span><span class="s1">]:</span>
+            <span class="s4"># status indicator</span>
+            <span class="s0">return </span><span class="s5">b&quot;ready&quot;</span>
+
+        <span class="s1">f = self.cache[fh]</span>
+        <span class="s1">f.seek(offset)</span>
+        <span class="s1">out = f.read(size)</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">offset</span><span class="s0">, </span><span class="s1">fh):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;write %s&quot;</span><span class="s0">, </span><span class="s1">(path</span><span class="s0">, </span><span class="s1">offset))</span>
+        <span class="s1">f = self.cache[fh]</span>
+        <span class="s1">f.seek(offset)</span>
+        <span class="s1">f.write(data)</span>
+        <span class="s0">return </span><span class="s1">len(data)</span>
+
+    <span class="s0">def </span><span class="s1">create(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">flags</span><span class="s0">, </span><span class="s1">fi=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;create %s&quot;</span><span class="s0">, </span><span class="s1">(path</span><span class="s0">, </span><span class="s1">flags))</span>
+        <span class="s1">fn = </span><span class="s2">&quot;&quot;</span><span class="s1">.join([self.root</span><span class="s0">, </span><span class="s1">path.lstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)])</span>
+        <span class="s1">self.fs.touch(fn)  </span><span class="s4"># OS will want to get attributes immediately</span>
+        <span class="s1">f = self.fs.open(fn</span><span class="s0">, </span><span class="s2">&quot;wb&quot;</span><span class="s1">)</span>
+        <span class="s1">self.cache[self.counter] = f</span>
+        <span class="s1">self.counter += </span><span class="s3">1</span>
+        <span class="s0">return </span><span class="s1">self.counter - </span><span class="s3">1</span>
+
+    <span class="s0">def </span><span class="s1">open(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">flags):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;open %s&quot;</span><span class="s0">, </span><span class="s1">(path</span><span class="s0">, </span><span class="s1">flags))</span>
+        <span class="s1">fn = </span><span class="s2">&quot;&quot;</span><span class="s1">.join([self.root</span><span class="s0">, </span><span class="s1">path.lstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)])</span>
+        <span class="s0">if </span><span class="s1">flags % </span><span class="s3">2 </span><span class="s1">== </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s4"># read</span>
+            <span class="s1">mode = </span><span class="s2">&quot;rb&quot;</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s4"># write/create</span>
+            <span class="s1">mode = </span><span class="s2">&quot;wb&quot;</span>
+        <span class="s1">self.cache[self.counter] = self.fs.open(fn</span><span class="s0">, </span><span class="s1">mode)</span>
+        <span class="s1">self.counter += </span><span class="s3">1</span>
+        <span class="s0">return </span><span class="s1">self.counter - </span><span class="s3">1</span>
+
+    <span class="s0">def </span><span class="s1">truncate(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">length</span><span class="s0">, </span><span class="s1">fh=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">fn = </span><span class="s2">&quot;&quot;</span><span class="s1">.join([self.root</span><span class="s0">, </span><span class="s1">path.lstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)])</span>
+        <span class="s0">if </span><span class="s1">length != </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+        <span class="s4"># maybe should be no-op since open with write sets size to zero anyway</span>
+        <span class="s1">self.fs.touch(fn)</span>
+
+    <span class="s0">def </span><span class="s1">unlink(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">fn = </span><span class="s2">&quot;&quot;</span><span class="s1">.join([self.root</span><span class="s0">, </span><span class="s1">path.lstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)])</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">self.fs.rm(fn</span><span class="s0">, False</span><span class="s1">)</span>
+        <span class="s0">except </span><span class="s1">(OSError</span><span class="s0">, </span><span class="s1">FileNotFoundError):</span>
+            <span class="s0">raise </span><span class="s1">FuseOSError(EIO)</span>
+
+    <span class="s0">def </span><span class="s1">release(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">fh):</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">fh </span><span class="s0">in </span><span class="s1">self.cache:</span>
+                <span class="s1">f = self.cache[fh]</span>
+                <span class="s1">f.close()</span>
+                <span class="s1">self.cache.pop(fh)</span>
+        <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e:</span>
+            <span class="s1">print(e)</span>
+        <span class="s0">return </span><span class="s3">0</span>
+
+    <span class="s0">def </span><span class="s1">chmod(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode):</span>
+        <span class="s0">if </span><span class="s1">hasattr(self.fs</span><span class="s0">, </span><span class="s2">&quot;chmod&quot;</span><span class="s1">):</span>
+            <span class="s1">path = </span><span class="s2">&quot;&quot;</span><span class="s1">.join([self.root</span><span class="s0">, </span><span class="s1">path.lstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)])</span>
+            <span class="s0">return </span><span class="s1">self.fs.chmod(path</span><span class="s0">, </span><span class="s1">mode)</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+
+<span class="s0">def </span><span class="s1">run(</span>
+    <span class="s1">fs</span><span class="s0">,</span>
+    <span class="s1">path</span><span class="s0">,</span>
+    <span class="s1">mount_point</span><span class="s0">,</span>
+    <span class="s1">foreground=</span><span class="s0">True,</span>
+    <span class="s1">threads=</span><span class="s0">False,</span>
+    <span class="s1">ready_file=</span><span class="s0">False,</span>
+    <span class="s1">ops_class=FUSEr</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s6">&quot;&quot;&quot;Mount stuff in a local directory 
+ 
+    This uses fusepy to make it appear as if a given path on an fsspec 
+    instance is in fact resident within the local file-system. 
+ 
+    This requires that fusepy by installed, and that FUSE be available on 
+    the system (typically requiring a package to be installed with 
+    apt, yum, brew, etc.). 
+ 
+    Parameters 
+    ---------- 
+    fs: file-system instance 
+        From one of the compatible implementations 
+    path: str 
+        Location on that file-system to regard as the root directory to 
+        mount. Note that you typically should include the terminating &quot;/&quot; 
+        character. 
+    mount_point: str 
+        An empty directory on the local file-system where the contents of 
+        the remote path will appear. 
+    foreground: bool 
+        Whether or not calling this function will block. Operation will 
+        typically be more stable if True. 
+    threads: bool 
+        Whether or not to create threads when responding to file operations 
+        within the mounter directory. Operation will typically be more 
+        stable if False. 
+    ready_file: bool 
+        Whether the FUSE process is ready. The ``.fuse_ready`` file will 
+        exist in the ``mount_point`` directory if True. Debugging purpose. 
+    ops_class: FUSEr or Subclass of FUSEr 
+        To override the default behavior of FUSEr. For Example, logging 
+        to file. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">func = </span><span class="s0">lambda</span><span class="s1">: FUSE(</span>
+        <span class="s1">ops_class(fs</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">ready_file=ready_file)</span><span class="s0">,</span>
+        <span class="s1">mount_point</span><span class="s0">,</span>
+        <span class="s1">nothreads=</span><span class="s0">not </span><span class="s1">threads</span><span class="s0">,</span>
+        <span class="s1">foreground=foreground</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s0">if not </span><span class="s1">foreground:</span>
+        <span class="s1">th = threading.Thread(target=func)</span>
+        <span class="s1">th.daemon = </span><span class="s0">True</span>
+        <span class="s1">th.start()</span>
+        <span class="s0">return </span><span class="s1">th</span>
+    <span class="s0">else</span><span class="s1">:  </span><span class="s4"># pragma: no cover</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">func()</span>
+        <span class="s0">except </span><span class="s1">KeyboardInterrupt:</span>
+            <span class="s0">pass</span>
+
+
+<span class="s0">def </span><span class="s1">main(args):</span>
+    <span class="s6">&quot;&quot;&quot;Mount filesystem from chained URL to MOUNT_POINT. 
+ 
+    Examples: 
+ 
+    python3 -m fsspec.fuse memory /usr/share /tmp/mem 
+ 
+    python3 -m fsspec.fuse local /tmp/source /tmp/local \\ 
+            -l /tmp/fsspecfuse.log 
+ 
+    You can also mount chained-URLs and use special settings: 
+ 
+    python3 -m fsspec.fuse 'filecache::zip::file://data.zip' \\ 
+            / /tmp/zip \\ 
+            -o 'filecache-cache_storage=/tmp/simplecache' 
+ 
+    You can specify the type of the setting by using `[int]` or `[bool]`, 
+    (`true`, `yes`, `1` represents the Boolean value `True`): 
+ 
+    python3 -m fsspec.fuse 'simplecache::ftp://ftp1.at.proftpd.org' \\ 
+            /historic/packages/RPMS /tmp/ftp \\ 
+            -o 'simplecache-cache_storage=/tmp/simplecache' \\ 
+            -o 'simplecache-check_files=false[bool]' \\ 
+            -o 'ftp-listings_expiry_time=60[int]' \\ 
+            -o 'ftp-username=anonymous' \\ 
+            -o 'ftp-password=xieyanbo' 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">class </span><span class="s1">RawDescriptionArgumentParser(argparse.ArgumentParser):</span>
+        <span class="s0">def </span><span class="s1">format_help(self):</span>
+            <span class="s1">usage = super().format_help()</span>
+            <span class="s1">parts = usage.split(</span><span class="s2">&quot;</span><span class="s0">\n\n</span><span class="s2">&quot;</span><span class="s1">)</span>
+            <span class="s1">parts[</span><span class="s3">1</span><span class="s1">] = self.description.rstrip()</span>
+            <span class="s0">return </span><span class="s2">&quot;</span><span class="s0">\n\n</span><span class="s2">&quot;</span><span class="s1">.join(parts)</span>
+
+    <span class="s1">parser = RawDescriptionArgumentParser(prog=</span><span class="s2">&quot;fsspec.fuse&quot;</span><span class="s0">, </span><span class="s1">description=main.__doc__)</span>
+    <span class="s1">parser.add_argument(</span><span class="s2">&quot;--version&quot;</span><span class="s0">, </span><span class="s1">action=</span><span class="s2">&quot;version&quot;</span><span class="s0">, </span><span class="s1">version=__version__)</span>
+    <span class="s1">parser.add_argument(</span><span class="s2">&quot;url&quot;</span><span class="s0">, </span><span class="s1">type=str</span><span class="s0">, </span><span class="s1">help=</span><span class="s2">&quot;fs url&quot;</span><span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span><span class="s2">&quot;source_path&quot;</span><span class="s0">, </span><span class="s1">type=str</span><span class="s0">, </span><span class="s1">help=</span><span class="s2">&quot;source directory in fs&quot;</span><span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span><span class="s2">&quot;mount_point&quot;</span><span class="s0">, </span><span class="s1">type=str</span><span class="s0">, </span><span class="s1">help=</span><span class="s2">&quot;local directory&quot;</span><span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span>
+        <span class="s2">&quot;-o&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;--option&quot;</span><span class="s0">,</span>
+        <span class="s1">action=</span><span class="s2">&quot;append&quot;</span><span class="s0">,</span>
+        <span class="s1">help=</span><span class="s2">&quot;Any options of protocol included in the chained URL&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span>
+        <span class="s2">&quot;-l&quot;</span><span class="s0">, </span><span class="s2">&quot;--log-file&quot;</span><span class="s0">, </span><span class="s1">type=str</span><span class="s0">, </span><span class="s1">help=</span><span class="s2">&quot;Logging FUSE debug info (Default: '')&quot;</span>
+    <span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span>
+        <span class="s2">&quot;-f&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;--foreground&quot;</span><span class="s0">,</span>
+        <span class="s1">action=</span><span class="s2">&quot;store_false&quot;</span><span class="s0">,</span>
+        <span class="s1">help=</span><span class="s2">&quot;Running in foreground or not (Default: False)&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span>
+        <span class="s2">&quot;-t&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;--threads&quot;</span><span class="s0">,</span>
+        <span class="s1">action=</span><span class="s2">&quot;store_false&quot;</span><span class="s0">,</span>
+        <span class="s1">help=</span><span class="s2">&quot;Running with threads support (Default: False)&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span>
+        <span class="s2">&quot;-r&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;--ready-file&quot;</span><span class="s0">,</span>
+        <span class="s1">action=</span><span class="s2">&quot;store_false&quot;</span><span class="s0">,</span>
+        <span class="s1">help=</span><span class="s2">&quot;The `.fuse_ready` file will exist after FUSE is ready. &quot;</span>
+        <span class="s2">&quot;(Debugging purpose, Default: False)&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">args = parser.parse_args(args)</span>
+
+    <span class="s1">kwargs = {}</span>
+    <span class="s0">for </span><span class="s1">item </span><span class="s0">in </span><span class="s1">args.option </span><span class="s0">or </span><span class="s1">[]:</span>
+        <span class="s1">key</span><span class="s0">, </span><span class="s1">sep</span><span class="s0">, </span><span class="s1">value = item.partition(</span><span class="s2">&quot;=&quot;</span><span class="s1">)</span>
+        <span class="s0">if not </span><span class="s1">sep:</span>
+            <span class="s1">parser.error(message=</span><span class="s2">f&quot;Wrong option: </span><span class="s0">{</span><span class="s1">item</span><span class="s0">!r}</span><span class="s2">&quot;</span><span class="s1">)</span>
+        <span class="s1">val = value.lower()</span>
+        <span class="s0">if </span><span class="s1">val.endswith(</span><span class="s2">&quot;[int]&quot;</span><span class="s1">):</span>
+            <span class="s1">value = int(value[: -len(</span><span class="s2">&quot;[int]&quot;</span><span class="s1">)])</span>
+        <span class="s0">elif </span><span class="s1">val.endswith(</span><span class="s2">&quot;[bool]&quot;</span><span class="s1">):</span>
+            <span class="s1">value = val[: -len(</span><span class="s2">&quot;[bool]&quot;</span><span class="s1">)] </span><span class="s0">in </span><span class="s1">[</span><span class="s2">&quot;1&quot;</span><span class="s0">, </span><span class="s2">&quot;yes&quot;</span><span class="s0">, </span><span class="s2">&quot;true&quot;</span><span class="s1">]</span>
+
+        <span class="s0">if </span><span class="s2">&quot;-&quot; </span><span class="s0">in </span><span class="s1">key:</span>
+            <span class="s1">fs_name</span><span class="s0">, </span><span class="s1">setting_name = key.split(</span><span class="s2">&quot;-&quot;</span><span class="s0">, </span><span class="s3">1</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">fs_name </span><span class="s0">in </span><span class="s1">kwargs:</span>
+                <span class="s1">kwargs[fs_name][setting_name] = value</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">kwargs[fs_name] = {setting_name: value}</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">kwargs[key] = value</span>
+
+    <span class="s0">if </span><span class="s1">args.log_file:</span>
+        <span class="s1">logging.basicConfig(</span>
+            <span class="s1">level=logging.DEBUG</span><span class="s0">,</span>
+            <span class="s1">filename=args.log_file</span><span class="s0">,</span>
+            <span class="s1">format=</span><span class="s2">&quot;%(asctime)s %(message)s&quot;</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+        <span class="s0">class </span><span class="s1">LoggingFUSEr(FUSEr</span><span class="s0">, </span><span class="s1">LoggingMixIn):</span>
+            <span class="s0">pass</span>
+
+        <span class="s1">fuser = LoggingFUSEr</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">fuser = FUSEr</span>
+
+    <span class="s1">fs</span><span class="s0">, </span><span class="s1">url_path = url_to_fs(args.url</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s1">logger.debug(</span><span class="s2">&quot;Mounting %s to %s&quot;</span><span class="s0">, </span><span class="s1">url_path</span><span class="s0">, </span><span class="s1">str(args.mount_point))</span>
+    <span class="s1">run(</span>
+        <span class="s1">fs</span><span class="s0">,</span>
+        <span class="s1">args.source_path</span><span class="s0">,</span>
+        <span class="s1">args.mount_point</span><span class="s0">,</span>
+        <span class="s1">foreground=args.foreground</span><span class="s0">,</span>
+        <span class="s1">threads=args.threads</span><span class="s0">,</span>
+        <span class="s1">ready_file=args.ready_file</span><span class="s0">,</span>
+        <span class="s1">ops_class=fuser</span><span class="s0">,</span>
+    <span class="s1">)</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ == </span><span class="s2">&quot;__main__&quot;</span><span class="s1">:</span>
+    <span class="s0">import </span><span class="s1">sys</span>
+
+    <span class="s1">main(sys.argv[</span><span class="s3">1</span><span class="s1">:])</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,266 @@
+<html>
+<head>
+<title>var_.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+var_.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Numba 1D var kernels that can be shared by 
+* Dataframe / Series 
+* groupby 
+* rolling / expanding 
+ 
+Mirrors pandas/_libs/window/aggregation.pyx 
+&quot;&quot;&quot;</span>
+<span class="s2">from </span><span class="s1">__future__ </span><span class="s2">import </span><span class="s1">annotations</span>
+
+<span class="s2">from </span><span class="s1">typing </span><span class="s2">import </span><span class="s1">TYPE_CHECKING</span>
+
+<span class="s2">import </span><span class="s1">numba</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">if </span><span class="s1">TYPE_CHECKING:</span>
+    <span class="s2">from </span><span class="s1">pandas._typing </span><span class="s2">import </span><span class="s1">npt</span>
+
+<span class="s2">from </span><span class="s1">pandas.core._numba.kernels.shared </span><span class="s2">import </span><span class="s1">is_monotonic_increasing</span>
+
+
+<span class="s1">@numba.jit(nopython=</span><span class="s2">True, </span><span class="s1">nogil=</span><span class="s2">True, </span><span class="s1">parallel=</span><span class="s2">False</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">add_var(</span>
+    <span class="s1">val: float</span><span class="s2">,</span>
+    <span class="s1">nobs: int</span><span class="s2">,</span>
+    <span class="s1">mean_x: float</span><span class="s2">,</span>
+    <span class="s1">ssqdm_x: float</span><span class="s2">,</span>
+    <span class="s1">compensation: float</span><span class="s2">,</span>
+    <span class="s1">num_consecutive_same_value: int</span><span class="s2">,</span>
+    <span class="s1">prev_value: float</span><span class="s2">,</span>
+<span class="s1">) -&gt; tuple[int</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s1">int</span><span class="s2">, </span><span class="s1">float]:</span>
+    <span class="s2">if not </span><span class="s1">np.isnan(val):</span>
+        <span class="s2">if </span><span class="s1">val == prev_value:</span>
+            <span class="s1">num_consecutive_same_value += </span><span class="s3">1</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">num_consecutive_same_value = </span><span class="s3">1</span>
+        <span class="s1">prev_value = val</span>
+
+        <span class="s1">nobs += </span><span class="s3">1</span>
+        <span class="s1">prev_mean = mean_x - compensation</span>
+        <span class="s1">y = val - compensation</span>
+        <span class="s1">t = y - mean_x</span>
+        <span class="s1">compensation = t + mean_x - y</span>
+        <span class="s1">delta = t</span>
+        <span class="s2">if </span><span class="s1">nobs:</span>
+            <span class="s1">mean_x += delta / nobs</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">mean_x = </span><span class="s3">0</span>
+        <span class="s1">ssqdm_x += (val - prev_mean) * (val - mean_x)</span>
+    <span class="s2">return </span><span class="s1">nobs</span><span class="s2">, </span><span class="s1">mean_x</span><span class="s2">, </span><span class="s1">ssqdm_x</span><span class="s2">, </span><span class="s1">compensation</span><span class="s2">, </span><span class="s1">num_consecutive_same_value</span><span class="s2">, </span><span class="s1">prev_value</span>
+
+
+<span class="s1">@numba.jit(nopython=</span><span class="s2">True, </span><span class="s1">nogil=</span><span class="s2">True, </span><span class="s1">parallel=</span><span class="s2">False</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">remove_var(</span>
+    <span class="s1">val: float</span><span class="s2">, </span><span class="s1">nobs: int</span><span class="s2">, </span><span class="s1">mean_x: float</span><span class="s2">, </span><span class="s1">ssqdm_x: float</span><span class="s2">, </span><span class="s1">compensation: float</span>
+<span class="s1">) -&gt; tuple[int</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s1">float]:</span>
+    <span class="s2">if not </span><span class="s1">np.isnan(val):</span>
+        <span class="s1">nobs -= </span><span class="s3">1</span>
+        <span class="s2">if </span><span class="s1">nobs:</span>
+            <span class="s1">prev_mean = mean_x - compensation</span>
+            <span class="s1">y = val - compensation</span>
+            <span class="s1">t = y - mean_x</span>
+            <span class="s1">compensation = t + mean_x - y</span>
+            <span class="s1">delta = t</span>
+            <span class="s1">mean_x -= delta / nobs</span>
+            <span class="s1">ssqdm_x -= (val - prev_mean) * (val - mean_x)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">mean_x = </span><span class="s3">0</span>
+            <span class="s1">ssqdm_x = </span><span class="s3">0</span>
+    <span class="s2">return </span><span class="s1">nobs</span><span class="s2">, </span><span class="s1">mean_x</span><span class="s2">, </span><span class="s1">ssqdm_x</span><span class="s2">, </span><span class="s1">compensation</span>
+
+
+<span class="s1">@numba.jit(nopython=</span><span class="s2">True, </span><span class="s1">nogil=</span><span class="s2">True, </span><span class="s1">parallel=</span><span class="s2">False</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">sliding_var(</span>
+    <span class="s1">values: np.ndarray</span><span class="s2">,</span>
+    <span class="s1">result_dtype: np.dtype</span><span class="s2">,</span>
+    <span class="s1">start: np.ndarray</span><span class="s2">,</span>
+    <span class="s1">end: np.ndarray</span><span class="s2">,</span>
+    <span class="s1">min_periods: int</span><span class="s2">,</span>
+    <span class="s1">ddof: int = </span><span class="s3">1</span><span class="s2">,</span>
+<span class="s1">) -&gt; tuple[np.ndarray</span><span class="s2">, </span><span class="s1">list[int]]:</span>
+    <span class="s1">N = len(start)</span>
+    <span class="s1">nobs = </span><span class="s3">0</span>
+    <span class="s1">mean_x = </span><span class="s3">0.0</span>
+    <span class="s1">ssqdm_x = </span><span class="s3">0.0</span>
+    <span class="s1">compensation_add = </span><span class="s3">0.0</span>
+    <span class="s1">compensation_remove = </span><span class="s3">0.0</span>
+
+    <span class="s1">min_periods = max(min_periods</span><span class="s2">, </span><span class="s3">1</span><span class="s1">)</span>
+    <span class="s1">is_monotonic_increasing_bounds = is_monotonic_increasing(</span>
+        <span class="s1">start</span>
+    <span class="s1">) </span><span class="s2">and </span><span class="s1">is_monotonic_increasing(end)</span>
+
+    <span class="s1">output = np.empty(N</span><span class="s2">, </span><span class="s1">dtype=result_dtype)</span>
+
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(N):</span>
+        <span class="s1">s = start[i]</span>
+        <span class="s1">e = end[i]</span>
+        <span class="s2">if </span><span class="s1">i == </span><span class="s3">0 </span><span class="s2">or not </span><span class="s1">is_monotonic_increasing_bounds:</span>
+            <span class="s1">prev_value = values[s]</span>
+            <span class="s1">num_consecutive_same_value = </span><span class="s3">0</span>
+
+            <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(s</span><span class="s2">, </span><span class="s1">e):</span>
+                <span class="s1">val = values[j]</span>
+                <span class="s1">(</span>
+                    <span class="s1">nobs</span><span class="s2">,</span>
+                    <span class="s1">mean_x</span><span class="s2">,</span>
+                    <span class="s1">ssqdm_x</span><span class="s2">,</span>
+                    <span class="s1">compensation_add</span><span class="s2">,</span>
+                    <span class="s1">num_consecutive_same_value</span><span class="s2">,</span>
+                    <span class="s1">prev_value</span><span class="s2">,</span>
+                <span class="s1">) = add_var(</span>
+                    <span class="s1">val</span><span class="s2">,</span>
+                    <span class="s1">nobs</span><span class="s2">,</span>
+                    <span class="s1">mean_x</span><span class="s2">,</span>
+                    <span class="s1">ssqdm_x</span><span class="s2">,</span>
+                    <span class="s1">compensation_add</span><span class="s2">,</span>
+                    <span class="s1">num_consecutive_same_value</span><span class="s2">,</span>
+                    <span class="s1">prev_value</span><span class="s2">,  </span><span class="s4"># pyright: ignore[reportGeneralTypeIssues]</span>
+                <span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(start[i - </span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">s):</span>
+                <span class="s1">val = values[j]</span>
+                <span class="s1">nobs</span><span class="s2">, </span><span class="s1">mean_x</span><span class="s2">, </span><span class="s1">ssqdm_x</span><span class="s2">, </span><span class="s1">compensation_remove = remove_var(</span>
+                    <span class="s1">val</span><span class="s2">, </span><span class="s1">nobs</span><span class="s2">, </span><span class="s1">mean_x</span><span class="s2">, </span><span class="s1">ssqdm_x</span><span class="s2">, </span><span class="s1">compensation_remove</span>
+                <span class="s1">)</span>
+
+            <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(end[i - </span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">e):</span>
+                <span class="s1">val = values[j]</span>
+                <span class="s1">(</span>
+                    <span class="s1">nobs</span><span class="s2">,</span>
+                    <span class="s1">mean_x</span><span class="s2">,</span>
+                    <span class="s1">ssqdm_x</span><span class="s2">,</span>
+                    <span class="s1">compensation_add</span><span class="s2">,</span>
+                    <span class="s1">num_consecutive_same_value</span><span class="s2">,</span>
+                    <span class="s1">prev_value</span><span class="s2">,</span>
+                <span class="s1">) = add_var(</span>
+                    <span class="s1">val</span><span class="s2">,</span>
+                    <span class="s1">nobs</span><span class="s2">,</span>
+                    <span class="s1">mean_x</span><span class="s2">,</span>
+                    <span class="s1">ssqdm_x</span><span class="s2">,</span>
+                    <span class="s1">compensation_add</span><span class="s2">,</span>
+                    <span class="s1">num_consecutive_same_value</span><span class="s2">,</span>
+                    <span class="s1">prev_value</span><span class="s2">,  </span><span class="s4"># pyright: ignore[reportGeneralTypeIssues]</span>
+                <span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">nobs &gt;= min_periods </span><span class="s2">and </span><span class="s1">nobs &gt; ddof:</span>
+            <span class="s2">if </span><span class="s1">nobs == </span><span class="s3">1 </span><span class="s2">or </span><span class="s1">num_consecutive_same_value &gt;= nobs:</span>
+                <span class="s1">result = </span><span class="s3">0.0</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">result = ssqdm_x / (nobs - ddof)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">result = np.nan</span>
+
+        <span class="s1">output[i] = result</span>
+
+        <span class="s2">if not </span><span class="s1">is_monotonic_increasing_bounds:</span>
+            <span class="s1">nobs = </span><span class="s3">0</span>
+            <span class="s1">mean_x = </span><span class="s3">0.0</span>
+            <span class="s1">ssqdm_x = </span><span class="s3">0.0</span>
+            <span class="s1">compensation_remove = </span><span class="s3">0.0</span>
+
+    <span class="s4"># na_position is empty list since float64 can already hold nans</span>
+    <span class="s4"># Do list comprehension, since numba cannot figure out that na_pos is</span>
+    <span class="s4"># empty list of ints on its own</span>
+    <span class="s1">na_pos = [</span><span class="s3">0 </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">0</span><span class="s1">)]</span>
+    <span class="s2">return </span><span class="s1">output</span><span class="s2">, </span><span class="s1">na_pos</span>
+
+
+<span class="s1">@numba.jit(nopython=</span><span class="s2">True, </span><span class="s1">nogil=</span><span class="s2">True, </span><span class="s1">parallel=</span><span class="s2">False</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">grouped_var(</span>
+    <span class="s1">values: np.ndarray</span><span class="s2">,</span>
+    <span class="s1">result_dtype: np.dtype</span><span class="s2">,</span>
+    <span class="s1">labels: npt.NDArray[np.intp]</span><span class="s2">,</span>
+    <span class="s1">ngroups: int</span><span class="s2">,</span>
+    <span class="s1">min_periods: int</span><span class="s2">,</span>
+    <span class="s1">ddof: int = </span><span class="s3">1</span><span class="s2">,</span>
+<span class="s1">) -&gt; tuple[np.ndarray</span><span class="s2">, </span><span class="s1">list[int]]:</span>
+    <span class="s1">N = len(labels)</span>
+
+    <span class="s1">nobs_arr = np.zeros(ngroups</span><span class="s2">, </span><span class="s1">dtype=np.int64)</span>
+    <span class="s1">comp_arr = np.zeros(ngroups</span><span class="s2">, </span><span class="s1">dtype=values.dtype)</span>
+    <span class="s1">consecutive_counts = np.zeros(ngroups</span><span class="s2">, </span><span class="s1">dtype=np.int64)</span>
+    <span class="s1">prev_vals = np.zeros(ngroups</span><span class="s2">, </span><span class="s1">dtype=values.dtype)</span>
+    <span class="s1">output = np.zeros(ngroups</span><span class="s2">, </span><span class="s1">dtype=result_dtype)</span>
+    <span class="s1">means = np.zeros(ngroups</span><span class="s2">, </span><span class="s1">dtype=result_dtype)</span>
+
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(N):</span>
+        <span class="s1">lab = labels[i]</span>
+        <span class="s1">val = values[i]</span>
+
+        <span class="s2">if </span><span class="s1">lab &lt; </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">mean_x = means[lab]</span>
+        <span class="s1">ssqdm_x = output[lab]</span>
+        <span class="s1">nobs = nobs_arr[lab]</span>
+        <span class="s1">compensation_add = comp_arr[lab]</span>
+        <span class="s1">num_consecutive_same_value = consecutive_counts[lab]</span>
+        <span class="s1">prev_value = prev_vals[lab]</span>
+
+        <span class="s1">(</span>
+            <span class="s1">nobs</span><span class="s2">,</span>
+            <span class="s1">mean_x</span><span class="s2">,</span>
+            <span class="s1">ssqdm_x</span><span class="s2">,</span>
+            <span class="s1">compensation_add</span><span class="s2">,</span>
+            <span class="s1">num_consecutive_same_value</span><span class="s2">,</span>
+            <span class="s1">prev_value</span><span class="s2">,</span>
+        <span class="s1">) = add_var(</span>
+            <span class="s1">val</span><span class="s2">,</span>
+            <span class="s1">nobs</span><span class="s2">,</span>
+            <span class="s1">mean_x</span><span class="s2">,</span>
+            <span class="s1">ssqdm_x</span><span class="s2">,</span>
+            <span class="s1">compensation_add</span><span class="s2">,</span>
+            <span class="s1">num_consecutive_same_value</span><span class="s2">,</span>
+            <span class="s1">prev_value</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+        <span class="s1">output[lab] = ssqdm_x</span>
+        <span class="s1">means[lab] = mean_x</span>
+        <span class="s1">consecutive_counts[lab] = num_consecutive_same_value</span>
+        <span class="s1">prev_vals[lab] = prev_value</span>
+        <span class="s1">comp_arr[lab] = compensation_add</span>
+        <span class="s1">nobs_arr[lab] = nobs</span>
+
+    <span class="s4"># Post-processing, replace vars that don't satisfy min_periods</span>
+    <span class="s2">for </span><span class="s1">lab </span><span class="s2">in </span><span class="s1">range(ngroups):</span>
+        <span class="s1">nobs = nobs_arr[lab]</span>
+        <span class="s1">num_consecutive_same_value = consecutive_counts[lab]</span>
+        <span class="s1">ssqdm_x = output[lab]</span>
+        <span class="s2">if </span><span class="s1">nobs &gt;= min_periods </span><span class="s2">and </span><span class="s1">nobs &gt; ddof:</span>
+            <span class="s2">if </span><span class="s1">nobs == </span><span class="s3">1 </span><span class="s2">or </span><span class="s1">num_consecutive_same_value &gt;= nobs:</span>
+                <span class="s1">result = </span><span class="s3">0.0</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">result = ssqdm_x / (nobs - ddof)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">result = np.nan</span>
+        <span class="s1">output[lab] = result</span>
+
+    <span class="s4"># Second pass to get the std.dev</span>
+    <span class="s4"># na_position is empty list since float64 can already hold nans</span>
+    <span class="s4"># Do list comprehension, since numba cannot figure out that na_pos is</span>
+    <span class="s4"># empty list of ints on its own</span>
+    <span class="s1">na_pos = [</span><span class="s3">0 </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">0</span><span class="s1">)]</span>
+    <span class="s2">return </span><span class="s1">output</span><span class="s2">, </span><span class="s1">na_pos</span>
+</pre>
+</body>
+</html>

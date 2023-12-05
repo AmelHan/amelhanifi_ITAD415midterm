@@ -1,0 +1,1027 @@
+<html>
+<head>
+<title>csv.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+csv.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">from </span><span class="s1">collections.abc </span><span class="s0">import </span><span class="s1">Mapping</span>
+<span class="s0">from </span><span class="s1">io </span><span class="s0">import </span><span class="s1">BytesIO</span>
+<span class="s0">from </span><span class="s1">warnings </span><span class="s0">import </span><span class="s1">catch_warnings</span><span class="s0">, </span><span class="s1">simplefilter</span><span class="s0">, </span><span class="s1">warn</span>
+
+<span class="s0">try</span><span class="s1">:</span>
+    <span class="s0">import </span><span class="s1">psutil</span>
+<span class="s0">except </span><span class="s1">ImportError:</span>
+    <span class="s1">psutil = </span><span class="s0">None  </span><span class="s2"># type: ignore</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">pandas </span><span class="s0">as </span><span class="s1">pd</span>
+<span class="s0">from </span><span class="s1">fsspec.compression </span><span class="s0">import </span><span class="s1">compr</span>
+<span class="s0">from </span><span class="s1">fsspec.core </span><span class="s0">import </span><span class="s1">get_fs_token_paths</span>
+<span class="s0">from </span><span class="s1">fsspec.core </span><span class="s0">import </span><span class="s1">open </span><span class="s0">as </span><span class="s1">open_file</span>
+<span class="s0">from </span><span class="s1">fsspec.core </span><span class="s0">import </span><span class="s1">open_files</span>
+<span class="s0">from </span><span class="s1">fsspec.utils </span><span class="s0">import </span><span class="s1">infer_compression</span>
+<span class="s0">from </span><span class="s1">pandas.api.types </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">CategoricalDtype</span><span class="s0">,</span>
+    <span class="s1">is_datetime64_any_dtype</span><span class="s0">,</span>
+    <span class="s1">is_float_dtype</span><span class="s0">,</span>
+    <span class="s1">is_integer_dtype</span><span class="s0">,</span>
+    <span class="s1">is_object_dtype</span><span class="s0">,</span>
+<span class="s1">)</span>
+
+<span class="s0">from </span><span class="s1">dask.base </span><span class="s0">import </span><span class="s1">tokenize</span>
+<span class="s0">from </span><span class="s1">dask.bytes </span><span class="s0">import </span><span class="s1">read_bytes</span>
+<span class="s0">from </span><span class="s1">dask.core </span><span class="s0">import </span><span class="s1">flatten</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.backends </span><span class="s0">import </span><span class="s1">dataframe_creation_dispatch</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.io.io </span><span class="s0">import </span><span class="s1">from_map</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.io.utils </span><span class="s0">import </span><span class="s1">DataFrameIOFunction</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.utils </span><span class="s0">import </span><span class="s1">clear_known_categories</span>
+<span class="s0">from </span><span class="s1">dask.delayed </span><span class="s0">import </span><span class="s1">delayed</span>
+<span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">asciitable</span><span class="s0">, </span><span class="s1">parse_bytes</span>
+
+
+<span class="s0">class </span><span class="s1">CSVFunctionWrapper(DataFrameIOFunction):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    CSV Function-Wrapper Class 
+    Reads CSV data from disk to produce a partition (given a key). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">full_columns</span><span class="s0">,</span>
+        <span class="s1">columns</span><span class="s0">,</span>
+        <span class="s1">colname</span><span class="s0">,</span>
+        <span class="s1">head</span><span class="s0">,</span>
+        <span class="s1">header</span><span class="s0">,</span>
+        <span class="s1">reader</span><span class="s0">,</span>
+        <span class="s1">dtypes</span><span class="s0">,</span>
+        <span class="s1">enforce</span><span class="s0">,</span>
+        <span class="s1">kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s1">self.full_columns = full_columns</span>
+        <span class="s1">self._columns = columns</span>
+        <span class="s1">self.colname = colname</span>
+        <span class="s1">self.head = head</span>
+        <span class="s1">self.header = header</span>
+        <span class="s1">self.reader = reader</span>
+        <span class="s1">self.dtypes = dtypes</span>
+        <span class="s1">self.enforce = enforce</span>
+        <span class="s1">self.kwargs = kwargs</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">columns(self):</span>
+        <span class="s0">if </span><span class="s1">self._columns </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self.full_columns</span>
+        <span class="s0">if </span><span class="s1">self.colname:</span>
+            <span class="s0">return </span><span class="s1">self._columns + [self.colname]</span>
+        <span class="s0">return </span><span class="s1">self._columns</span>
+
+    <span class="s0">def </span><span class="s1">project_columns(self</span><span class="s0">, </span><span class="s1">columns):</span>
+        <span class="s3">&quot;&quot;&quot;Return a new CSVFunctionWrapper object with 
+        a sub-column projection. 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># Make sure columns is ordered correctly</span>
+        <span class="s1">columns = [c </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self.head.columns </span><span class="s0">if </span><span class="s1">c </span><span class="s0">in </span><span class="s1">columns]</span>
+        <span class="s0">if </span><span class="s1">columns == self.columns:</span>
+            <span class="s0">return </span><span class="s1">self</span>
+        <span class="s0">if </span><span class="s1">self.colname </span><span class="s0">and </span><span class="s1">self.colname </span><span class="s0">not in </span><span class="s1">columns:</span>
+            <span class="s2"># when path-as-column is on, we must keep it at IO</span>
+            <span class="s2"># whatever the selection</span>
+            <span class="s1">head = self.head[columns + [self.colname]]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">head = self.head[columns]</span>
+        <span class="s0">return </span><span class="s1">CSVFunctionWrapper(</span>
+            <span class="s1">self.full_columns</span><span class="s0">,</span>
+            <span class="s1">columns</span><span class="s0">,</span>
+            <span class="s1">self.colname</span><span class="s0">,</span>
+            <span class="s1">head</span><span class="s0">,</span>
+            <span class="s1">self.header</span><span class="s0">,</span>
+            <span class="s1">self.reader</span><span class="s0">,</span>
+            <span class="s1">{c: self.dtypes[c] </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">columns}</span><span class="s0">,</span>
+            <span class="s1">self.enforce</span><span class="s0">,</span>
+            <span class="s1">self.kwargs</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">part):</span>
+        <span class="s2"># Part will be a 3-element tuple</span>
+        <span class="s1">block</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">is_first</span><span class="s0">, </span><span class="s1">is_last = part</span>
+
+        <span class="s2"># Construct `path_info`</span>
+        <span class="s0">if </span><span class="s1">path </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">path_info = (</span>
+                <span class="s1">self.colname</span><span class="s0">,</span>
+                <span class="s1">path</span><span class="s0">,</span>
+                <span class="s1">sorted(list(self.head[self.colname].cat.categories))</span><span class="s0">,</span>
+            <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">path_info = </span><span class="s0">None</span>
+
+        <span class="s2"># Deal with arguments that are special</span>
+        <span class="s2"># for the first block of each file</span>
+        <span class="s1">write_header = </span><span class="s0">False</span>
+        <span class="s1">rest_kwargs = self.kwargs.copy()</span>
+        <span class="s0">if not </span><span class="s1">is_first:</span>
+            <span class="s0">if </span><span class="s1">rest_kwargs.get(</span><span class="s4">&quot;names&quot;</span><span class="s0">, None</span><span class="s1">) </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s1">write_header = </span><span class="s0">True</span>
+            <span class="s1">rest_kwargs.pop(</span><span class="s4">&quot;skiprows&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">rest_kwargs.get(</span><span class="s4">&quot;header&quot;</span><span class="s0">, </span><span class="s5">0</span><span class="s1">) </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">rest_kwargs.pop(</span><span class="s4">&quot;header&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s0">if not </span><span class="s1">is_last:</span>
+            <span class="s1">rest_kwargs.pop(</span><span class="s4">&quot;skipfooter&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+
+        <span class="s2"># Deal with column projection</span>
+        <span class="s1">columns = self.full_columns</span>
+        <span class="s1">project_after_read = </span><span class="s0">False</span>
+        <span class="s0">if </span><span class="s1">self._columns </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">self.kwargs:</span>
+                <span class="s2"># To be safe, if any kwargs are defined, avoid</span>
+                <span class="s2"># changing `usecols` here. Instead, we can just</span>
+                <span class="s2"># select columns after the read</span>
+                <span class="s1">project_after_read = </span><span class="s0">True</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">columns = self._columns</span>
+                <span class="s1">rest_kwargs[</span><span class="s4">&quot;usecols&quot;</span><span class="s1">] = columns</span>
+
+        <span class="s2"># Call `pandas_read_text`</span>
+        <span class="s1">df = pandas_read_text(</span>
+            <span class="s1">self.reader</span><span class="s0">,</span>
+            <span class="s1">block</span><span class="s0">,</span>
+            <span class="s1">self.header</span><span class="s0">,</span>
+            <span class="s1">rest_kwargs</span><span class="s0">,</span>
+            <span class="s1">self.dtypes</span><span class="s0">,</span>
+            <span class="s1">columns</span><span class="s0">,</span>
+            <span class="s1">write_header</span><span class="s0">,</span>
+            <span class="s1">self.enforce</span><span class="s0">,</span>
+            <span class="s1">path_info</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">project_after_read:</span>
+            <span class="s0">return </span><span class="s1">df[self.columns]</span>
+        <span class="s0">return </span><span class="s1">df</span>
+
+
+<span class="s0">def </span><span class="s1">pandas_read_text(</span>
+    <span class="s1">reader</span><span class="s0">,</span>
+    <span class="s1">b</span><span class="s0">,</span>
+    <span class="s1">header</span><span class="s0">,</span>
+    <span class="s1">kwargs</span><span class="s0">,</span>
+    <span class="s1">dtypes=</span><span class="s0">None,</span>
+    <span class="s1">columns=</span><span class="s0">None,</span>
+    <span class="s1">write_header=</span><span class="s0">True,</span>
+    <span class="s1">enforce=</span><span class="s0">False,</span>
+    <span class="s1">path=</span><span class="s0">None,</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Convert a block of bytes to a Pandas DataFrame 
+ 
+    Parameters 
+    ---------- 
+    reader : callable 
+        ``pd.read_csv`` or ``pd.read_table``. 
+    b : bytestring 
+        The content to be parsed with ``reader`` 
+    header : bytestring 
+        An optional header to prepend to ``b`` 
+    kwargs : dict 
+        A dictionary of keyword arguments to be passed to ``reader`` 
+    dtypes : dict 
+        dtypes to assign to columns 
+    path : tuple 
+        A tuple containing path column name, path to file, and an ordered list of paths. 
+ 
+    See Also 
+    -------- 
+    dask.dataframe.csv.read_pandas_from_bytes 
+    &quot;&quot;&quot;</span>
+    <span class="s1">bio = BytesIO()</span>
+    <span class="s0">if </span><span class="s1">write_header </span><span class="s0">and not </span><span class="s1">b.startswith(header.rstrip()):</span>
+        <span class="s1">bio.write(header)</span>
+    <span class="s1">bio.write(b)</span>
+    <span class="s1">bio.seek(</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">df = reader(bio</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s0">if </span><span class="s1">dtypes:</span>
+        <span class="s1">coerce_dtypes(df</span><span class="s0">, </span><span class="s1">dtypes)</span>
+
+    <span class="s0">if </span><span class="s1">enforce </span><span class="s0">and </span><span class="s1">columns </span><span class="s0">and </span><span class="s1">(list(df.columns) != list(columns)):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Columns do not match&quot;</span><span class="s0">, </span><span class="s1">df.columns</span><span class="s0">, </span><span class="s1">columns)</span>
+    <span class="s0">if </span><span class="s1">path:</span>
+        <span class="s1">colname</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">paths = path</span>
+        <span class="s1">code = paths.index(path)</span>
+        <span class="s1">df = df.assign(</span>
+            <span class="s1">**{colname: pd.Categorical.from_codes(np.full(len(df)</span><span class="s0">, </span><span class="s1">code)</span><span class="s0">, </span><span class="s1">paths)}</span>
+        <span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">df</span>
+
+
+<span class="s0">def </span><span class="s1">coerce_dtypes(df</span><span class="s0">, </span><span class="s1">dtypes):</span>
+    <span class="s3">&quot;&quot;&quot;Coerce dataframe to dtypes safely 
+ 
+    Operates in place 
+ 
+    Parameters 
+    ---------- 
+    df: Pandas DataFrame 
+    dtypes: dict like {'x': float} 
+    &quot;&quot;&quot;</span>
+    <span class="s1">bad_dtypes = []</span>
+    <span class="s1">bad_dates = []</span>
+    <span class="s1">errors = []</span>
+    <span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">df.columns:</span>
+        <span class="s0">if </span><span class="s1">c </span><span class="s0">in </span><span class="s1">dtypes </span><span class="s0">and </span><span class="s1">df.dtypes[c] != dtypes[c]:</span>
+            <span class="s1">actual = df.dtypes[c]</span>
+            <span class="s1">desired = dtypes[c]</span>
+            <span class="s0">if </span><span class="s1">is_float_dtype(actual) </span><span class="s0">and </span><span class="s1">is_integer_dtype(desired):</span>
+                <span class="s1">bad_dtypes.append((c</span><span class="s0">, </span><span class="s1">actual</span><span class="s0">, </span><span class="s1">desired))</span>
+            <span class="s0">elif </span><span class="s1">is_object_dtype(actual) </span><span class="s0">and </span><span class="s1">is_datetime64_any_dtype(desired):</span>
+                <span class="s2"># This can only occur when parse_dates is specified, but an</span>
+                <span class="s2"># invalid date is encountered. Pandas then silently falls back</span>
+                <span class="s2"># to object dtype. Since `object_array.astype(datetime)` will</span>
+                <span class="s2"># silently overflow, error here and report.</span>
+                <span class="s1">bad_dates.append(c)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">try</span><span class="s1">:</span>
+                    <span class="s1">df[c] = df[c].astype(dtypes[c])</span>
+                <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e:</span>
+                    <span class="s1">bad_dtypes.append((c</span><span class="s0">, </span><span class="s1">actual</span><span class="s0">, </span><span class="s1">desired))</span>
+                    <span class="s1">errors.append((c</span><span class="s0">, </span><span class="s1">e))</span>
+
+    <span class="s0">if </span><span class="s1">bad_dtypes:</span>
+        <span class="s0">if </span><span class="s1">errors:</span>
+            <span class="s1">ex = </span><span class="s4">&quot;</span><span class="s0">\n</span><span class="s4">&quot;</span><span class="s1">.join(</span>
+                <span class="s4">f&quot;- </span><span class="s0">{</span><span class="s1">c</span><span class="s0">}\n  {</span><span class="s1">e</span><span class="s0">!r}</span><span class="s4">&quot; </span><span class="s0">for </span><span class="s1">c</span><span class="s0">, </span><span class="s1">e </span><span class="s0">in </span><span class="s1">sorted(errors</span><span class="s0">, </span><span class="s1">key=</span><span class="s0">lambda </span><span class="s1">x: str(x[</span><span class="s5">0</span><span class="s1">]))</span>
+            <span class="s1">)</span>
+            <span class="s1">exceptions = (</span>
+                <span class="s4">&quot;The following columns also raised exceptions on &quot;</span>
+                <span class="s4">&quot;conversion:</span><span class="s0">\n\n</span><span class="s4">%s</span><span class="s0">\n\n</span><span class="s4">&quot;</span>
+            <span class="s1">) % ex</span>
+            <span class="s1">extra = </span><span class="s4">&quot;&quot;</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">exceptions = </span><span class="s4">&quot;&quot;</span>
+            <span class="s2"># All mismatches are int-&gt;float, also suggest `assume_missing=True`</span>
+            <span class="s1">extra = (</span>
+                <span class="s4">&quot;</span><span class="s0">\n\n</span><span class="s4">Alternatively, provide `assume_missing=True` &quot;</span>
+                <span class="s4">&quot;to interpret</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                <span class="s4">&quot;all unspecified integer columns as floats.&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">bad_dtypes = sorted(bad_dtypes</span><span class="s0">, </span><span class="s1">key=</span><span class="s0">lambda </span><span class="s1">x: str(x[</span><span class="s5">0</span><span class="s1">]))</span>
+        <span class="s1">table = asciitable([</span><span class="s4">&quot;Column&quot;</span><span class="s0">, </span><span class="s4">&quot;Found&quot;</span><span class="s0">, </span><span class="s4">&quot;Expected&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s1">bad_dtypes)</span>
+        <span class="s1">dtype_kw = </span><span class="s4">&quot;dtype={%s}&quot; </span><span class="s1">% </span><span class="s4">&quot;,</span><span class="s0">\n       </span><span class="s4">&quot;</span><span class="s1">.join(</span>
+            <span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">k</span><span class="s0">!r}</span><span class="s4">: '</span><span class="s0">{</span><span class="s1">v</span><span class="s0">}</span><span class="s4">'&quot; </span><span class="s0">for </span><span class="s1">(k</span><span class="s0">, </span><span class="s1">v</span><span class="s0">, </span><span class="s1">_) </span><span class="s0">in </span><span class="s1">bad_dtypes</span>
+        <span class="s1">)</span>
+
+        <span class="s1">dtype_msg = (</span>
+            <span class="s4">&quot;{table}</span><span class="s0">\n\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;{exceptions}&quot;</span>
+            <span class="s4">&quot;Usually this is due to dask's dtype inference failing, and</span><span class="s0">\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;*may* be fixed by specifying dtypes manually by adding:</span><span class="s0">\n\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;{dtype_kw}</span><span class="s0">\n\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;to the call to `read_csv`/`read_table`.&quot;</span>
+            <span class="s4">&quot;{extra}&quot;</span>
+        <span class="s1">).format(table=table</span><span class="s0">, </span><span class="s1">exceptions=exceptions</span><span class="s0">, </span><span class="s1">dtype_kw=dtype_kw</span><span class="s0">, </span><span class="s1">extra=extra)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">dtype_msg = </span><span class="s0">None</span>
+
+    <span class="s0">if </span><span class="s1">bad_dates:</span>
+        <span class="s1">also = </span><span class="s4">&quot; also &quot; </span><span class="s0">if </span><span class="s1">bad_dtypes </span><span class="s0">else </span><span class="s4">&quot; &quot;</span>
+        <span class="s1">cols = </span><span class="s4">&quot;</span><span class="s0">\n</span><span class="s4">&quot;</span><span class="s1">.join(</span><span class="s4">&quot;- %s&quot; </span><span class="s1">% c </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">bad_dates)</span>
+        <span class="s1">date_msg = (</span>
+            <span class="s4">&quot;The following columns{also}failed to properly parse as dates:</span><span class="s0">\n\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;{cols}</span><span class="s0">\n\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;This is usually due to an invalid value in that column. To</span><span class="s0">\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;diagnose and fix it's recommended to drop these columns from the</span><span class="s0">\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;`parse_dates` keyword, and manually convert them to dates later</span><span class="s0">\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;using `dd.to_datetime`.&quot;</span>
+        <span class="s1">).format(also=also</span><span class="s0">, </span><span class="s1">cols=cols)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">date_msg = </span><span class="s0">None</span>
+
+    <span class="s0">if </span><span class="s1">bad_dtypes </span><span class="s0">or </span><span class="s1">bad_dates:</span>
+        <span class="s1">rule = </span><span class="s4">&quot;</span><span class="s0">\n\n</span><span class="s4">%s</span><span class="s0">\n\n</span><span class="s4">&quot; </span><span class="s1">% (</span><span class="s4">&quot;-&quot; </span><span class="s1">* </span><span class="s5">61</span><span class="s1">)</span>
+        <span class="s1">msg = </span><span class="s4">&quot;Mismatched dtypes found in `pd.read_csv`/`pd.read_table`.</span><span class="s0">\n\n</span><span class="s4">%s&quot; </span><span class="s1">% (</span>
+            <span class="s1">rule.join(filter(</span><span class="s0">None, </span><span class="s1">[dtype_msg</span><span class="s0">, </span><span class="s1">date_msg]))</span>
+        <span class="s1">)</span>
+        <span class="s0">raise </span><span class="s1">ValueError(msg)</span>
+
+
+<span class="s0">def </span><span class="s1">text_blocks_to_pandas(</span>
+    <span class="s1">reader</span><span class="s0">,</span>
+    <span class="s1">block_lists</span><span class="s0">,</span>
+    <span class="s1">header</span><span class="s0">,</span>
+    <span class="s1">head</span><span class="s0">,</span>
+    <span class="s1">kwargs</span><span class="s0">,</span>
+    <span class="s1">enforce=</span><span class="s0">False,</span>
+    <span class="s1">specified_dtypes=</span><span class="s0">None,</span>
+    <span class="s1">path=</span><span class="s0">None,</span>
+    <span class="s1">blocksize=</span><span class="s0">None,</span>
+    <span class="s1">urlpath=</span><span class="s0">None,</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Convert blocks of bytes to a dask.dataframe 
+ 
+    This accepts a list of lists of values of bytes where each list corresponds 
+    to one file, and the value of bytes concatenate to comprise the entire 
+    file, in order. 
+ 
+    Parameters 
+    ---------- 
+    reader : callable 
+        ``pd.read_csv`` or ``pd.read_table``. 
+    block_lists : list of lists of delayed values of bytes 
+        The lists of bytestrings where each list corresponds to one logical file 
+    header : bytestring 
+        The header, found at the front of the first file, to be prepended to 
+        all blocks 
+    head : pd.DataFrame 
+        An example Pandas DataFrame to be used for metadata. 
+    kwargs : dict 
+        Keyword arguments to pass down to ``reader`` 
+    path : tuple, optional 
+        A tuple containing column name for path and the path_converter if provided 
+ 
+    Returns 
+    ------- 
+    A dask.dataframe 
+    &quot;&quot;&quot;</span>
+    <span class="s1">dtypes = head.dtypes.to_dict()</span>
+    <span class="s2"># dtypes contains only instances of CategoricalDtype, which causes issues</span>
+    <span class="s2"># in coerce_dtypes for non-uniform categories across partitions.</span>
+    <span class="s2"># We will modify `dtype` (which is inferred) to</span>
+    <span class="s2"># 1. contain instances of CategoricalDtypes for user-provided types</span>
+    <span class="s2"># 2. contain 'category' for data inferred types</span>
+    <span class="s1">categoricals = head.select_dtypes(include=[</span><span class="s4">&quot;category&quot;</span><span class="s1">]).columns</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(specified_dtypes</span><span class="s0">, </span><span class="s1">Mapping):</span>
+        <span class="s1">known_categoricals = [</span>
+            <span class="s1">k</span>
+            <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">categoricals</span>
+            <span class="s0">if </span><span class="s1">isinstance(specified_dtypes.get(k)</span><span class="s0">, </span><span class="s1">CategoricalDtype)</span>
+            <span class="s0">and </span><span class="s1">specified_dtypes.get(k).categories </span><span class="s0">is not None</span>
+        <span class="s1">]</span>
+        <span class="s1">unknown_categoricals = categoricals.difference(known_categoricals)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">unknown_categoricals = categoricals</span>
+
+    <span class="s2"># Fixup the dtypes</span>
+    <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">unknown_categoricals:</span>
+        <span class="s1">dtypes[k] = </span><span class="s4">&quot;category&quot;</span>
+
+    <span class="s1">columns = list(head.columns)</span>
+
+    <span class="s1">blocks = tuple(flatten(block_lists))</span>
+    <span class="s2"># Create mask of first blocks from nested block_lists</span>
+    <span class="s1">is_first = tuple(block_mask(block_lists))</span>
+    <span class="s1">is_last = tuple(block_mask_last(block_lists))</span>
+
+    <span class="s0">if </span><span class="s1">path:</span>
+        <span class="s1">colname</span><span class="s0">, </span><span class="s1">path_converter = path</span>
+        <span class="s1">paths = [b[</span><span class="s5">1</span><span class="s1">].path </span><span class="s0">for </span><span class="s1">b </span><span class="s0">in </span><span class="s1">blocks]</span>
+        <span class="s0">if </span><span class="s1">path_converter:</span>
+            <span class="s1">paths = [path_converter(p) </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">paths]</span>
+        <span class="s1">head = head.assign(</span>
+            <span class="s1">**{</span>
+                <span class="s1">colname: pd.Categorical.from_codes(</span>
+                    <span class="s1">np.zeros(len(head)</span><span class="s0">, </span><span class="s1">dtype=int)</span><span class="s0">, </span><span class="s1">set(paths)</span>
+                <span class="s1">)</span>
+            <span class="s1">}</span>
+        <span class="s1">)</span>
+        <span class="s1">path = (colname</span><span class="s0">, </span><span class="s1">paths)</span>
+
+    <span class="s0">if </span><span class="s1">len(unknown_categoricals):</span>
+        <span class="s1">head = clear_known_categories(head</span><span class="s0">, </span><span class="s1">cols=unknown_categoricals)</span>
+
+    <span class="s2"># Define parts</span>
+    <span class="s1">parts = []</span>
+    <span class="s1">colname</span><span class="s0">, </span><span class="s1">paths = path </span><span class="s0">or </span><span class="s1">(</span><span class="s0">None, None</span><span class="s1">)</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(blocks)):</span>
+        <span class="s1">parts.append([blocks[i]</span><span class="s0">, </span><span class="s1">paths[i] </span><span class="s0">if </span><span class="s1">paths </span><span class="s0">else None, </span><span class="s1">is_first[i]</span><span class="s0">, </span><span class="s1">is_last[i]])</span>
+
+    <span class="s2"># Construct the output collection with from_map</span>
+    <span class="s0">return </span><span class="s1">from_map(</span>
+        <span class="s1">CSVFunctionWrapper(</span>
+            <span class="s1">columns</span><span class="s0">,</span>
+            <span class="s0">None,</span>
+            <span class="s1">colname</span><span class="s0">,</span>
+            <span class="s1">head</span><span class="s0">,</span>
+            <span class="s1">header</span><span class="s0">,</span>
+            <span class="s1">reader</span><span class="s0">,</span>
+            <span class="s1">dtypes</span><span class="s0">,</span>
+            <span class="s1">enforce</span><span class="s0">,</span>
+            <span class="s1">kwargs</span><span class="s0">,</span>
+        <span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">parts</span><span class="s0">,</span>
+        <span class="s1">meta=head</span><span class="s0">,</span>
+        <span class="s1">label=</span><span class="s4">&quot;read-csv&quot;</span><span class="s0">,</span>
+        <span class="s1">token=tokenize(reader</span><span class="s0">, </span><span class="s1">urlpath</span><span class="s0">, </span><span class="s1">columns</span><span class="s0">, </span><span class="s1">enforce</span><span class="s0">, </span><span class="s1">head</span><span class="s0">, </span><span class="s1">blocksize)</span><span class="s0">,</span>
+        <span class="s1">enforce_metadata=</span><span class="s0">False,</span>
+        <span class="s1">produces_tasks=</span><span class="s0">True,</span>
+    <span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">block_mask(block_lists):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Yields a flat iterable of booleans to mark the zeroth elements of the 
+    nested input ``block_lists`` in a flattened output. 
+ 
+    &gt;&gt;&gt; list(block_mask([[1, 2], [3, 4], [5]])) 
+    [True, False, True, False, True] 
+    &quot;&quot;&quot;</span>
+    <span class="s0">for </span><span class="s1">block </span><span class="s0">in </span><span class="s1">block_lists:</span>
+        <span class="s0">if not </span><span class="s1">block:</span>
+            <span class="s0">continue</span>
+        <span class="s0">yield True</span>
+        <span class="s0">yield from </span><span class="s1">(</span><span class="s0">False for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">block[</span><span class="s5">1</span><span class="s1">:])</span>
+
+
+<span class="s0">def </span><span class="s1">block_mask_last(block_lists):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Yields a flat iterable of booleans to mark the last element of the 
+    nested input ``block_lists`` in a flattened output. 
+ 
+    &gt;&gt;&gt; list(block_mask_last([[1, 2], [3, 4], [5]])) 
+    [False, True, False, True, True] 
+    &quot;&quot;&quot;</span>
+    <span class="s0">for </span><span class="s1">block </span><span class="s0">in </span><span class="s1">block_lists:</span>
+        <span class="s0">if not </span><span class="s1">block:</span>
+            <span class="s0">continue</span>
+        <span class="s0">yield from </span><span class="s1">(</span><span class="s0">False for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">block[:-</span><span class="s5">1</span><span class="s1">])</span>
+        <span class="s0">yield True</span>
+
+
+<span class="s0">def </span><span class="s1">auto_blocksize(total_memory</span><span class="s0">, </span><span class="s1">cpu_count):</span>
+    <span class="s1">memory_factor = </span><span class="s5">10</span>
+    <span class="s1">blocksize = int(total_memory // cpu_count / memory_factor)</span>
+    <span class="s0">return </span><span class="s1">min(blocksize</span><span class="s0">, </span><span class="s1">int(</span><span class="s5">64e6</span><span class="s1">))</span>
+
+
+<span class="s0">def </span><span class="s1">_infer_block_size():</span>
+    <span class="s1">default = </span><span class="s5">2</span><span class="s1">**</span><span class="s5">25</span>
+    <span class="s0">if </span><span class="s1">psutil </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s0">with </span><span class="s1">catch_warnings():</span>
+            <span class="s1">simplefilter(</span><span class="s4">&quot;ignore&quot;</span><span class="s0">, </span><span class="s1">RuntimeWarning)</span>
+            <span class="s1">mem = psutil.virtual_memory().total</span>
+            <span class="s1">cpu = psutil.cpu_count()</span>
+
+        <span class="s0">if </span><span class="s1">mem </span><span class="s0">and </span><span class="s1">cpu:</span>
+            <span class="s0">return </span><span class="s1">auto_blocksize(mem</span><span class="s0">, </span><span class="s1">cpu)</span>
+
+    <span class="s0">return </span><span class="s1">default</span>
+
+
+<span class="s2"># guess blocksize if psutil is installed or use acceptable default one if not</span>
+<span class="s1">AUTO_BLOCKSIZE = _infer_block_size()</span>
+
+
+<span class="s0">def </span><span class="s1">read_pandas(</span>
+    <span class="s1">reader</span><span class="s0">,</span>
+    <span class="s1">urlpath</span><span class="s0">,</span>
+    <span class="s1">blocksize=</span><span class="s4">&quot;default&quot;</span><span class="s0">,</span>
+    <span class="s1">lineterminator=</span><span class="s0">None,</span>
+    <span class="s1">compression=</span><span class="s4">&quot;infer&quot;</span><span class="s0">,</span>
+    <span class="s1">sample=</span><span class="s5">256000</span><span class="s0">,</span>
+    <span class="s1">sample_rows=</span><span class="s5">10</span><span class="s0">,</span>
+    <span class="s1">enforce=</span><span class="s0">False,</span>
+    <span class="s1">assume_missing=</span><span class="s0">False,</span>
+    <span class="s1">storage_options=</span><span class="s0">None,</span>
+    <span class="s1">include_path_column=</span><span class="s0">False,</span>
+    <span class="s1">**kwargs</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s1">reader_name = reader.__name__</span>
+    <span class="s0">if </span><span class="s1">lineterminator </span><span class="s0">is not None and </span><span class="s1">len(lineterminator) == </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s1">kwargs[</span><span class="s4">&quot;lineterminator&quot;</span><span class="s1">] = lineterminator</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">lineterminator = </span><span class="s4">&quot;</span><span class="s0">\n</span><span class="s4">&quot;</span>
+    <span class="s0">if </span><span class="s1">include_path_column </span><span class="s0">and </span><span class="s1">isinstance(include_path_column</span><span class="s0">, </span><span class="s1">bool):</span>
+        <span class="s1">include_path_column = </span><span class="s4">&quot;path&quot;</span>
+    <span class="s0">if </span><span class="s4">&quot;index&quot; </span><span class="s0">in </span><span class="s1">kwargs </span><span class="s0">or </span><span class="s1">(</span>
+        <span class="s4">&quot;index_col&quot; </span><span class="s0">in </span><span class="s1">kwargs </span><span class="s0">and </span><span class="s1">kwargs.get(</span><span class="s4">&quot;index_col&quot;</span><span class="s1">) </span><span class="s0">is not False</span>
+    <span class="s1">):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s4">&quot;Keywords 'index' and 'index_col' not supported, except for &quot;</span>
+            <span class="s4">&quot;'index_col=False'. Use dd.{reader_name}(...).set_index('my-index') instead&quot;</span>
+        <span class="s1">)</span>
+    <span class="s0">for </span><span class="s1">kw </span><span class="s0">in </span><span class="s1">[</span><span class="s4">&quot;iterator&quot;</span><span class="s0">, </span><span class="s4">&quot;chunksize&quot;</span><span class="s1">]:</span>
+        <span class="s0">if </span><span class="s1">kw </span><span class="s0">in </span><span class="s1">kwargs:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">kw</span><span class="s0">} </span><span class="s4">not supported for dd.</span><span class="s0">{</span><span class="s1">reader_name</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">kwargs.get(</span><span class="s4">&quot;nrows&quot;</span><span class="s0">, None</span><span class="s1">):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s4">&quot;The 'nrows' keyword is not supported by &quot;</span>
+            <span class="s4">&quot;`dd.{0}`. To achieve the same behavior, it's &quot;</span>
+            <span class="s4">&quot;recommended to use `dd.{0}(...).&quot;</span>
+            <span class="s4">&quot;head(n=nrows)`&quot;</span><span class="s1">.format(reader_name)</span>
+        <span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">isinstance(kwargs.get(</span><span class="s4">&quot;skiprows&quot;</span><span class="s1">)</span><span class="s0">, </span><span class="s1">int):</span>
+        <span class="s1">lastskiprow = firstrow = kwargs.get(</span><span class="s4">&quot;skiprows&quot;</span><span class="s1">)</span>
+    <span class="s0">elif </span><span class="s1">kwargs.get(</span><span class="s4">&quot;skiprows&quot;</span><span class="s1">) </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">lastskiprow = firstrow = </span><span class="s5">0</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s2"># When skiprows is a list, we expect more than max(skiprows) to</span>
+        <span class="s2"># be included in the sample. This means that [0,2] will work well,</span>
+        <span class="s2"># but [0, 440] might not work.</span>
+        <span class="s1">skiprows = set(kwargs.get(</span><span class="s4">&quot;skiprows&quot;</span><span class="s1">))</span>
+        <span class="s1">lastskiprow = max(skiprows)</span>
+        <span class="s2"># find the firstrow that is not skipped, for use as header</span>
+        <span class="s1">firstrow = min(set(range(len(skiprows) + </span><span class="s5">1</span><span class="s1">)) - set(skiprows))</span>
+    <span class="s0">if </span><span class="s1">isinstance(kwargs.get(</span><span class="s4">&quot;header&quot;</span><span class="s1">)</span><span class="s0">, </span><span class="s1">list):</span>
+        <span class="s0">raise </span><span class="s1">TypeError(</span><span class="s4">f&quot;List of header rows not supported for dd.</span><span class="s0">{</span><span class="s1">reader_name</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">isinstance(kwargs.get(</span><span class="s4">&quot;converters&quot;</span><span class="s1">)</span><span class="s0">, </span><span class="s1">dict) </span><span class="s0">and </span><span class="s1">include_path_column:</span>
+        <span class="s1">path_converter = kwargs.get(</span><span class="s4">&quot;converters&quot;</span><span class="s1">).get(include_path_column</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">path_converter = </span><span class="s0">None</span>
+
+    <span class="s2"># If compression is &quot;infer&quot;, inspect the (first) path suffix and</span>
+    <span class="s2"># set the proper compression option if the suffix is recongnized.</span>
+    <span class="s0">if </span><span class="s1">compression == </span><span class="s4">&quot;infer&quot;</span><span class="s1">:</span>
+        <span class="s2"># Translate the input urlpath to a simple path list</span>
+        <span class="s1">paths = get_fs_token_paths(urlpath</span><span class="s0">, </span><span class="s1">mode=</span><span class="s4">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">storage_options=storage_options)[</span>
+            <span class="s5">2</span>
+        <span class="s1">]</span>
+
+        <span class="s2"># Check for at least one valid path</span>
+        <span class="s0">if </span><span class="s1">len(paths) == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">OSError(</span><span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">urlpath</span><span class="s0">} </span><span class="s4">resolved to no files&quot;</span><span class="s1">)</span>
+
+        <span class="s2"># Infer compression from first path</span>
+        <span class="s1">compression = infer_compression(paths[</span><span class="s5">0</span><span class="s1">])</span>
+
+    <span class="s0">if </span><span class="s1">blocksize == </span><span class="s4">&quot;default&quot;</span><span class="s1">:</span>
+        <span class="s1">blocksize = AUTO_BLOCKSIZE</span>
+    <span class="s0">if </span><span class="s1">isinstance(blocksize</span><span class="s0">, </span><span class="s1">str):</span>
+        <span class="s1">blocksize = parse_bytes(blocksize)</span>
+    <span class="s0">if </span><span class="s1">blocksize </span><span class="s0">and </span><span class="s1">compression:</span>
+        <span class="s2"># NONE of the compressions should use chunking</span>
+        <span class="s1">warn(</span>
+            <span class="s4">&quot;Warning %s compression does not support breaking apart files</span><span class="s0">\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;Please ensure that each individual file can fit in memory and</span><span class="s0">\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;use the keyword ``blocksize=None to remove this message``</span><span class="s0">\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;Setting ``blocksize=None``&quot; </span><span class="s1">% compression</span>
+        <span class="s1">)</span>
+        <span class="s1">blocksize = </span><span class="s0">None</span>
+    <span class="s0">if </span><span class="s1">compression </span><span class="s0">not in </span><span class="s1">compr:</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError(</span><span class="s4">&quot;Compression format %s not installed&quot; </span><span class="s1">% compression)</span>
+    <span class="s0">if </span><span class="s1">blocksize </span><span class="s0">and </span><span class="s1">sample </span><span class="s0">and </span><span class="s1">blocksize &lt; sample </span><span class="s0">and </span><span class="s1">lastskiprow != </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s1">warn(</span>
+            <span class="s4">&quot;Unexpected behavior can result from passing skiprows when</span><span class="s0">\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;blocksize is smaller than sample size.</span><span class="s0">\n</span><span class="s4">&quot;</span>
+            <span class="s4">&quot;Setting ``sample=blocksize``&quot;</span>
+        <span class="s1">)</span>
+        <span class="s1">sample = blocksize</span>
+    <span class="s1">b_lineterminator = lineterminator.encode()</span>
+    <span class="s1">b_out = read_bytes(</span>
+        <span class="s1">urlpath</span><span class="s0">,</span>
+        <span class="s1">delimiter=b_lineterminator</span><span class="s0">,</span>
+        <span class="s1">blocksize=blocksize</span><span class="s0">,</span>
+        <span class="s1">sample=sample</span><span class="s0">,</span>
+        <span class="s1">compression=compression</span><span class="s0">,</span>
+        <span class="s1">include_path=include_path_column</span><span class="s0">,</span>
+        <span class="s1">**(storage_options </span><span class="s0">or </span><span class="s1">{})</span><span class="s0">,</span>
+    <span class="s1">)</span>
+
+    <span class="s0">if </span><span class="s1">include_path_column:</span>
+        <span class="s1">b_sample</span><span class="s0">, </span><span class="s1">values</span><span class="s0">, </span><span class="s1">paths = b_out</span>
+        <span class="s1">path = (include_path_column</span><span class="s0">, </span><span class="s1">path_converter)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">b_sample</span><span class="s0">, </span><span class="s1">values = b_out</span>
+        <span class="s1">path = </span><span class="s0">None</span>
+
+    <span class="s0">if not </span><span class="s1">isinstance(values[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">(tuple</span><span class="s0">, </span><span class="s1">list)):</span>
+        <span class="s1">values = [values]</span>
+    <span class="s2"># If we have not sampled, then use the first row of the first values</span>
+    <span class="s2"># as a representative sample.</span>
+    <span class="s0">if </span><span class="s1">b_sample </span><span class="s0">is False and </span><span class="s1">len(values[</span><span class="s5">0</span><span class="s1">]):</span>
+        <span class="s1">b_sample = values[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">].compute()</span>
+
+    <span class="s2"># Get header row, and check that sample is long enough. If the file</span>
+    <span class="s2"># contains a header row, we need at least 2 nonempty rows + the number of</span>
+    <span class="s2"># rows to skip.</span>
+    <span class="s1">names = kwargs.get(</span><span class="s4">&quot;names&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s1">header = kwargs.get(</span><span class="s4">&quot;header&quot;</span><span class="s0">, </span><span class="s4">&quot;infer&quot; </span><span class="s0">if </span><span class="s1">names </span><span class="s0">is None else None</span><span class="s1">)</span>
+    <span class="s1">need = </span><span class="s5">1 </span><span class="s0">if </span><span class="s1">header </span><span class="s0">is None else </span><span class="s5">2</span>
+    <span class="s0">if </span><span class="s1">isinstance(header</span><span class="s0">, </span><span class="s1">int):</span>
+        <span class="s1">firstrow += header</span>
+    <span class="s0">if </span><span class="s1">kwargs.get(</span><span class="s4">&quot;comment&quot;</span><span class="s1">):</span>
+        <span class="s2"># if comment is provided, step through lines of b_sample and strip out comments</span>
+        <span class="s1">parts = []</span>
+        <span class="s0">for </span><span class="s1">part </span><span class="s0">in </span><span class="s1">b_sample.split(b_lineterminator):</span>
+            <span class="s1">split_comment = part.decode().split(kwargs.get(</span><span class="s4">&quot;comment&quot;</span><span class="s1">))</span>
+            <span class="s0">if </span><span class="s1">len(split_comment) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s2"># if line starts with comment, don't include that line in parts.</span>
+                <span class="s0">if </span><span class="s1">len(split_comment[</span><span class="s5">0</span><span class="s1">]) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">parts.append(split_comment[</span><span class="s5">0</span><span class="s1">].strip().encode())</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">parts.append(part)</span>
+            <span class="s0">if </span><span class="s1">len(parts) &gt; need:</span>
+                <span class="s0">break</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">parts = b_sample.split(</span>
+            <span class="s1">b_lineterminator</span><span class="s0">, </span><span class="s1">max(lastskiprow + need</span><span class="s0">, </span><span class="s1">firstrow + need)</span>
+        <span class="s1">)</span>
+
+    <span class="s2"># If the last partition is empty, don't count it</span>
+    <span class="s1">nparts = </span><span class="s5">0 </span><span class="s0">if not </span><span class="s1">parts </span><span class="s0">else </span><span class="s1">len(parts) - int(</span><span class="s0">not </span><span class="s1">parts[-</span><span class="s5">1</span><span class="s1">])</span>
+
+    <span class="s0">if </span><span class="s1">sample </span><span class="s0">is not False and </span><span class="s1">nparts &lt; lastskiprow + need </span><span class="s0">and </span><span class="s1">len(b_sample) &gt;= sample:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s4">&quot;Sample is not large enough to include at least one &quot;</span>
+            <span class="s4">&quot;row of data. Please increase the number of bytes &quot;</span>
+            <span class="s4">&quot;in `sample` in the call to `read_csv`/`read_table`&quot;</span>
+        <span class="s1">)</span>
+
+    <span class="s1">header = </span><span class="s6">b&quot;&quot; </span><span class="s0">if </span><span class="s1">header </span><span class="s0">is None else </span><span class="s1">parts[firstrow] + b_lineterminator</span>
+
+    <span class="s2"># Use sample to infer dtypes and check for presence of include_path_column</span>
+    <span class="s1">head_kwargs = kwargs.copy()</span>
+    <span class="s1">head_kwargs.pop(</span><span class="s4">&quot;skipfooter&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">head_kwargs.get(</span><span class="s4">&quot;engine&quot;</span><span class="s1">) == </span><span class="s4">&quot;pyarrow&quot;</span><span class="s1">:</span>
+        <span class="s2"># Use c engine to infer since Arrow engine does not support nrows</span>
+        <span class="s1">head_kwargs[</span><span class="s4">&quot;engine&quot;</span><span class="s1">] = </span><span class="s4">&quot;c&quot;</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">head = reader(BytesIO(b_sample)</span><span class="s0">, </span><span class="s1">nrows=sample_rows</span><span class="s0">, </span><span class="s1">**head_kwargs)</span>
+    <span class="s0">except </span><span class="s1">pd.errors.ParserError </span><span class="s0">as </span><span class="s1">e:</span>
+        <span class="s0">if </span><span class="s4">&quot;EOF&quot; </span><span class="s0">in </span><span class="s1">str(e):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">&quot;EOF encountered while reading header. </span><span class="s0">\n</span><span class="s4">&quot;</span>
+                <span class="s4">&quot;Pass argument `sample_rows` and make sure the value of `sample` &quot;</span>
+                <span class="s4">&quot;is large enough to accommodate that many rows of data&quot;</span>
+            <span class="s1">) </span><span class="s0">from </span><span class="s1">e</span>
+        <span class="s0">raise</span>
+    <span class="s0">if </span><span class="s1">include_path_column </span><span class="s0">and </span><span class="s1">(include_path_column </span><span class="s0">in </span><span class="s1">head.columns):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s4">&quot;Files already contain the column name: %s, so the &quot;</span>
+            <span class="s4">&quot;path column cannot use this name. Please set &quot;</span>
+            <span class="s4">&quot;`include_path_column` to a unique name.&quot; </span><span class="s1">% include_path_column</span>
+        <span class="s1">)</span>
+
+    <span class="s1">specified_dtypes = kwargs.get(</span><span class="s4">&quot;dtype&quot;</span><span class="s0">, </span><span class="s1">{})</span>
+    <span class="s0">if </span><span class="s1">specified_dtypes </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">specified_dtypes = {}</span>
+    <span class="s2"># If specified_dtypes is a single type, then all columns were specified</span>
+    <span class="s0">if </span><span class="s1">assume_missing </span><span class="s0">and </span><span class="s1">isinstance(specified_dtypes</span><span class="s0">, </span><span class="s1">dict):</span>
+        <span class="s2"># Convert all non-specified integer columns to floats</span>
+        <span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">head.columns:</span>
+            <span class="s0">if </span><span class="s1">is_integer_dtype(head[c].dtype) </span><span class="s0">and </span><span class="s1">c </span><span class="s0">not in </span><span class="s1">specified_dtypes:</span>
+                <span class="s1">head[c] = head[c].astype(float)</span>
+
+    <span class="s1">values = [[list(dsk.dask.values()) </span><span class="s0">for </span><span class="s1">dsk </span><span class="s0">in </span><span class="s1">block] </span><span class="s0">for </span><span class="s1">block </span><span class="s0">in </span><span class="s1">values]</span>
+
+    <span class="s0">return </span><span class="s1">text_blocks_to_pandas(</span>
+        <span class="s1">reader</span><span class="s0">,</span>
+        <span class="s1">values</span><span class="s0">,</span>
+        <span class="s1">header</span><span class="s0">,</span>
+        <span class="s1">head</span><span class="s0">,</span>
+        <span class="s1">kwargs</span><span class="s0">,</span>
+        <span class="s1">enforce=enforce</span><span class="s0">,</span>
+        <span class="s1">specified_dtypes=specified_dtypes</span><span class="s0">,</span>
+        <span class="s1">path=path</span><span class="s0">,</span>
+        <span class="s1">blocksize=blocksize</span><span class="s0">,</span>
+        <span class="s1">urlpath=urlpath</span><span class="s0">,</span>
+    <span class="s1">)</span>
+
+
+<span class="s1">READ_DOC_TEMPLATE = </span><span class="s4">&quot;&quot;&quot; 
+Read {file_type} files into a Dask.DataFrame 
+ 
+This parallelizes the :func:`pandas.{reader}` function in the following ways: 
+ 
+- It supports loading many files at once using globstrings: 
+ 
+    &gt;&gt;&gt; df = dd.{reader}('myfiles.*.csv')  # doctest: +SKIP 
+ 
+- In some cases it can break up large files: 
+ 
+    &gt;&gt;&gt; df = dd.{reader}('largefile.csv', blocksize=25e6)  # 25MB chunks  # doctest: +SKIP 
+ 
+- It can read CSV files from external resources (e.g. S3, HDFS) by 
+  providing a URL: 
+ 
+    &gt;&gt;&gt; df = dd.{reader}('s3://bucket/myfiles.*.csv')  # doctest: +SKIP 
+    &gt;&gt;&gt; df = dd.{reader}('hdfs:///myfiles.*.csv')  # doctest: +SKIP 
+    &gt;&gt;&gt; df = dd.{reader}('hdfs://namenode.example.com/myfiles.*.csv')  # doctest: +SKIP 
+ 
+Internally ``dd.{reader}`` uses :func:`pandas.{reader}` and supports many of the 
+same keyword arguments with the same performance guarantees. See the docstring 
+for :func:`pandas.{reader}` for more information on available keyword arguments. 
+ 
+Parameters 
+---------- 
+urlpath : string or list 
+    Absolute or relative filepath(s). Prefix with a protocol like ``s3://`` 
+    to read from alternative filesystems. To read from multiple files you 
+    can pass a globstring or a list of paths, with the caveat that they 
+    must all have the same protocol. 
+blocksize : str, int or None, optional 
+    Number of bytes by which to cut up larger files. Default value is computed 
+    based on available physical memory and the number of cores, up to a maximum 
+    of 64MB. Can be a number like ``64000000`` or a string like ``&quot;64MB&quot;``. If 
+    ``None``, a single block is used for each file. 
+sample : int, optional 
+    Number of bytes to use when determining dtypes 
+assume_missing : bool, optional 
+    If True, all integer columns that aren't specified in ``dtype`` are assumed 
+    to contain missing values, and are converted to floats. Default is False. 
+storage_options : dict, optional 
+    Extra options that make sense for a particular storage connection, e.g. 
+    host, port, username, password, etc. 
+include_path_column : bool or str, optional 
+    Whether or not to include the path to each particular file. If True a new 
+    column is added to the dataframe called ``path``. If str, sets new column 
+    name. Default is False. 
+**kwargs 
+    Extra keyword arguments to forward to :func:`pandas.{reader}`. 
+ 
+Notes 
+----- 
+Dask dataframe tries to infer the ``dtype`` of each column by reading a sample 
+from the start of the file (or of the first file if it's a glob). Usually this 
+works fine, but if the ``dtype`` is different later in the file (or in other 
+files) this can cause issues. For example, if all the rows in the sample had 
+integer dtypes, but later on there was a ``NaN``, then this would error at 
+compute time. To fix this, you have a few options: 
+ 
+- Provide explicit dtypes for the offending columns using the ``dtype`` 
+  keyword. This is the recommended solution. 
+ 
+- Use the ``assume_missing`` keyword to assume that all columns inferred as 
+  integers contain missing values, and convert them to floats. 
+ 
+- Increase the size of the sample using the ``sample`` keyword. 
+ 
+It should also be noted that this function may fail if a {file_type} file 
+includes quoted strings that contain the line terminator. To get around this 
+you can specify ``blocksize=None`` to not split files into multiple partitions, 
+at the cost of reduced parallelism. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s0">def </span><span class="s1">make_reader(reader</span><span class="s0">, </span><span class="s1">reader_name</span><span class="s0">, </span><span class="s1">file_type):</span>
+    <span class="s0">def </span><span class="s1">read(</span>
+        <span class="s1">urlpath</span><span class="s0">,</span>
+        <span class="s1">blocksize=</span><span class="s4">&quot;default&quot;</span><span class="s0">,</span>
+        <span class="s1">lineterminator=</span><span class="s0">None,</span>
+        <span class="s1">compression=</span><span class="s4">&quot;infer&quot;</span><span class="s0">,</span>
+        <span class="s1">sample=</span><span class="s5">256000</span><span class="s0">,</span>
+        <span class="s1">sample_rows=</span><span class="s5">10</span><span class="s0">,</span>
+        <span class="s1">enforce=</span><span class="s0">False,</span>
+        <span class="s1">assume_missing=</span><span class="s0">False,</span>
+        <span class="s1">storage_options=</span><span class="s0">None,</span>
+        <span class="s1">include_path_column=</span><span class="s0">False,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s0">return </span><span class="s1">read_pandas(</span>
+            <span class="s1">reader</span><span class="s0">,</span>
+            <span class="s1">urlpath</span><span class="s0">,</span>
+            <span class="s1">blocksize=blocksize</span><span class="s0">,</span>
+            <span class="s1">lineterminator=lineterminator</span><span class="s0">,</span>
+            <span class="s1">compression=compression</span><span class="s0">,</span>
+            <span class="s1">sample=sample</span><span class="s0">,</span>
+            <span class="s1">sample_rows=sample_rows</span><span class="s0">,</span>
+            <span class="s1">enforce=enforce</span><span class="s0">,</span>
+            <span class="s1">assume_missing=assume_missing</span><span class="s0">,</span>
+            <span class="s1">storage_options=storage_options</span><span class="s0">,</span>
+            <span class="s1">include_path_column=include_path_column</span><span class="s0">,</span>
+            <span class="s1">**kwargs</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s1">read.__doc__ = READ_DOC_TEMPLATE.format(reader=reader_name</span><span class="s0">, </span><span class="s1">file_type=file_type)</span>
+    <span class="s1">read.__name__ = reader_name</span>
+    <span class="s0">return </span><span class="s1">read</span>
+
+
+<span class="s1">read_csv = dataframe_creation_dispatch.register_inplace(</span>
+    <span class="s1">backend=</span><span class="s4">&quot;pandas&quot;</span><span class="s0">,</span>
+    <span class="s1">name=</span><span class="s4">&quot;read_csv&quot;</span><span class="s0">,</span>
+<span class="s1">)(make_reader(pd.read_csv</span><span class="s0">, </span><span class="s4">&quot;read_csv&quot;</span><span class="s0">, </span><span class="s4">&quot;CSV&quot;</span><span class="s1">))</span>
+
+
+<span class="s1">read_table = make_reader(pd.read_table</span><span class="s0">, </span><span class="s4">&quot;read_table&quot;</span><span class="s0">, </span><span class="s4">&quot;delimited&quot;</span><span class="s1">)</span>
+<span class="s1">read_fwf = make_reader(pd.read_fwf</span><span class="s0">, </span><span class="s4">&quot;read_fwf&quot;</span><span class="s0">, </span><span class="s4">&quot;fixed-width&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">_write_csv(df</span><span class="s0">, </span><span class="s1">fil</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">depend_on=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+    <span class="s0">with </span><span class="s1">fil </span><span class="s0">as </span><span class="s1">f:</span>
+        <span class="s1">df.to_csv(f</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s0">return </span><span class="s1">os.path.normpath(fil.path)</span>
+
+
+<span class="s0">def </span><span class="s1">to_csv(</span>
+    <span class="s1">df</span><span class="s0">,</span>
+    <span class="s1">filename</span><span class="s0">,</span>
+    <span class="s1">single_file=</span><span class="s0">False,</span>
+    <span class="s1">encoding=</span><span class="s4">&quot;utf-8&quot;</span><span class="s0">,</span>
+    <span class="s1">mode=</span><span class="s4">&quot;wt&quot;</span><span class="s0">,</span>
+    <span class="s1">name_function=</span><span class="s0">None,</span>
+    <span class="s1">compression=</span><span class="s0">None,</span>
+    <span class="s1">compute=</span><span class="s0">True,</span>
+    <span class="s1">scheduler=</span><span class="s0">None,</span>
+    <span class="s1">storage_options=</span><span class="s0">None,</span>
+    <span class="s1">header_first_partition_only=</span><span class="s0">None,</span>
+    <span class="s1">compute_kwargs=</span><span class="s0">None,</span>
+    <span class="s1">**kwargs</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Store Dask DataFrame to CSV files 
+ 
+    One filename per partition will be created. You can specify the 
+    filenames in a variety of ways. 
+ 
+    Use a globstring:: 
+ 
+    &gt;&gt;&gt; df.to_csv('/path/to/data/export-*.csv')  # doctest: +SKIP 
+ 
+    The * will be replaced by the increasing sequence 0, 1, 2, ... 
+ 
+    :: 
+ 
+        /path/to/data/export-0.csv 
+        /path/to/data/export-1.csv 
+ 
+    Use a globstring and a ``name_function=`` keyword argument.  The 
+    name_function function should expect an integer and produce a string. 
+    Strings produced by name_function must preserve the order of their 
+    respective partition indices. 
+ 
+    &gt;&gt;&gt; from datetime import date, timedelta 
+    &gt;&gt;&gt; def name(i): 
+    ...     return str(date(2015, 1, 1) + i * timedelta(days=1)) 
+ 
+    &gt;&gt;&gt; name(0) 
+    '2015-01-01' 
+    &gt;&gt;&gt; name(15) 
+    '2015-01-16' 
+ 
+    &gt;&gt;&gt; df.to_csv('/path/to/data/export-*.csv', name_function=name)  # doctest: +SKIP 
+ 
+    :: 
+ 
+        /path/to/data/export-2015-01-01.csv 
+        /path/to/data/export-2015-01-02.csv 
+        ... 
+ 
+    You can also provide an explicit list of paths:: 
+ 
+    &gt;&gt;&gt; paths = ['/path/to/data/alice.csv', '/path/to/data/bob.csv', ...]  # doctest: +SKIP 
+    &gt;&gt;&gt; df.to_csv(paths) # doctest: +SKIP 
+ 
+    You can also provide a directory name: 
+ 
+    &gt;&gt;&gt; df.to_csv('/path/to/data') # doctest: +SKIP 
+ 
+    The files will be numbered 0, 1, 2, (and so on) suffixed with '.part': 
+ 
+    :: 
+ 
+        /path/to/data/0.part 
+        /path/to/data/1.part 
+ 
+    Parameters 
+    ---------- 
+    df : dask.DataFrame 
+        Data to save 
+    filename : string or list 
+        Absolute or relative filepath(s). Prefix with a protocol like ``s3://`` 
+        to save to remote filesystems. 
+    single_file : bool, default False 
+        Whether to save everything into a single CSV file. Under the 
+        single file mode, each partition is appended at the end of the 
+        specified CSV file. 
+    encoding : string, default 'utf-8' 
+        A string representing the encoding to use in the output file. 
+    mode : str, default 'w' 
+        Python file mode. The default is 'w' (or 'wt'), for writing 
+        a new file or overwriting an existing file in text mode. 'a' 
+        (or 'at') will append to an existing file in text mode or 
+        create a new file if it does not already exist. See :py:func:`open`. 
+    name_function : callable, default None 
+        Function accepting an integer (partition index) and producing a 
+        string to replace the asterisk in the given filename globstring. 
+        Should preserve the lexicographic order of partitions. Not 
+        supported when ``single_file`` is True. 
+    compression : string, optional 
+        A string representing the compression to use in the output file, 
+        allowed values are 'gzip', 'bz2', 'xz', 
+        only used when the first argument is a filename. 
+    compute : bool, default True 
+        If True, immediately executes. If False, returns a set of delayed 
+        objects, which can be computed at a later time. 
+    storage_options : dict 
+        Parameters passed on to the backend filesystem class. 
+    header_first_partition_only : bool, default None 
+        If set to True, only write the header row in the first output 
+        file. By default, headers are written to all partitions under 
+        the multiple file mode (``single_file`` is False) and written 
+        only once under the single file mode (``single_file`` is True). 
+        It must be True under the single file mode. 
+    compute_kwargs : dict, optional 
+        Options to be passed in to the compute method 
+    kwargs : dict, optional 
+        Additional parameters to pass to :meth:`pandas.DataFrame.to_csv`. 
+ 
+    Returns 
+    ------- 
+    The names of the file written if they were computed right away. 
+    If not, the delayed tasks associated with writing the files. 
+ 
+    Raises 
+    ------ 
+    ValueError 
+        If ``header_first_partition_only`` is set to False or 
+        ``name_function`` is specified when ``single_file`` is True. 
+ 
+    See Also 
+    -------- 
+    fsspec.open_files 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">single_file </span><span class="s0">and </span><span class="s1">name_function </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;name_function is not supported under the single file mode&quot;</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">header_first_partition_only </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">header_first_partition_only = single_file</span>
+    <span class="s0">elif not </span><span class="s1">header_first_partition_only </span><span class="s0">and </span><span class="s1">single_file:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s4">&quot;header_first_partition_only cannot be False in the single file mode.&quot;</span>
+        <span class="s1">)</span>
+    <span class="s1">file_options = dict(</span>
+        <span class="s1">compression=compression</span><span class="s0">,</span>
+        <span class="s1">encoding=encoding</span><span class="s0">,</span>
+        <span class="s1">newline=</span><span class="s4">&quot;&quot;</span><span class="s0">,</span>
+        <span class="s1">**(storage_options </span><span class="s0">or </span><span class="s1">{})</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">to_csv_chunk = delayed(_write_csv</span><span class="s0">, </span><span class="s1">pure=</span><span class="s0">False</span><span class="s1">)</span>
+    <span class="s1">dfs = df.to_delayed()</span>
+    <span class="s0">if </span><span class="s1">single_file:</span>
+        <span class="s1">first_file = open_file(filename</span><span class="s0">, </span><span class="s1">mode=mode</span><span class="s0">, </span><span class="s1">**file_options)</span>
+        <span class="s1">value = to_csv_chunk(dfs[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">first_file</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">append_mode = mode </span><span class="s0">if </span><span class="s4">&quot;a&quot; </span><span class="s0">in </span><span class="s1">mode </span><span class="s0">else </span><span class="s1">mode + </span><span class="s4">&quot;a&quot;</span>
+        <span class="s1">append_mode = append_mode.replace(</span><span class="s4">&quot;w&quot;</span><span class="s0">, </span><span class="s4">&quot;&quot;</span><span class="s1">).replace(</span><span class="s4">&quot;x&quot;</span><span class="s0">, </span><span class="s4">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s1">append_file = open_file(filename</span><span class="s0">, </span><span class="s1">mode=append_mode</span><span class="s0">, </span><span class="s1">**file_options)</span>
+        <span class="s1">kwargs[</span><span class="s4">&quot;header&quot;</span><span class="s1">] = </span><span class="s0">False</span>
+        <span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">dfs[</span><span class="s5">1</span><span class="s1">:]:</span>
+            <span class="s1">value = to_csv_chunk(d</span><span class="s0">, </span><span class="s1">append_file</span><span class="s0">, </span><span class="s1">depend_on=value</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">values = [value]</span>
+        <span class="s1">files = [first_file]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">files = open_files(</span>
+            <span class="s1">filename</span><span class="s0">,</span>
+            <span class="s1">mode=mode</span><span class="s0">,</span>
+            <span class="s1">name_function=name_function</span><span class="s0">,</span>
+            <span class="s1">num=df.npartitions</span><span class="s0">,</span>
+            <span class="s1">**file_options</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s1">values = [to_csv_chunk(dfs[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">files[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">**kwargs)]</span>
+        <span class="s0">if </span><span class="s1">header_first_partition_only:</span>
+            <span class="s1">kwargs[</span><span class="s4">&quot;header&quot;</span><span class="s1">] = </span><span class="s0">False</span>
+        <span class="s1">values.extend(</span>
+            <span class="s1">[to_csv_chunk(d</span><span class="s0">, </span><span class="s1">f</span><span class="s0">, </span><span class="s1">**kwargs) </span><span class="s0">for </span><span class="s1">d</span><span class="s0">, </span><span class="s1">f </span><span class="s0">in </span><span class="s1">zip(dfs[</span><span class="s5">1</span><span class="s1">:]</span><span class="s0">, </span><span class="s1">files[</span><span class="s5">1</span><span class="s1">:])]</span>
+        <span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">compute:</span>
+        <span class="s0">if </span><span class="s1">compute_kwargs </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">compute_kwargs = dict()</span>
+
+        <span class="s0">if </span><span class="s1">scheduler </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">warn(</span>
+                <span class="s4">&quot;The 'scheduler' keyword argument for `to_csv()` is deprecated and&quot;</span>
+                <span class="s4">&quot;will be removed in a future version. &quot;</span>
+                <span class="s4">&quot;Please use the `compute_kwargs` argument instead. &quot;</span>
+                <span class="s4">f&quot;For example, df.to_csv(..., compute_kwargs=</span><span class="s0">{{</span><span class="s4">scheduler: </span><span class="s0">{</span><span class="s1">scheduler</span><span class="s0">}}}</span><span class="s4">)&quot;</span><span class="s0">,</span>
+                <span class="s1">FutureWarning</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">scheduler </span><span class="s0">is not None</span>
+            <span class="s0">and </span><span class="s1">compute_kwargs.get(</span><span class="s4">&quot;scheduler&quot;</span><span class="s1">) </span><span class="s0">is not None</span>
+            <span class="s0">and </span><span class="s1">compute_kwargs.get(</span><span class="s4">&quot;scheduler&quot;</span><span class="s1">) != scheduler</span>
+        <span class="s1">):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">f&quot;Differing values for 'scheduler' have been passed in.</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                <span class="s4">f&quot;scheduler argument: </span><span class="s0">{</span><span class="s1">scheduler</span><span class="s0">}\n</span><span class="s4">&quot;</span>
+                <span class="s4">f&quot;via compute_kwargs: </span><span class="s0">{</span><span class="s1">compute_kwargs.get(</span><span class="s4">'scheduler'</span><span class="s1">)</span><span class="s0">}</span><span class="s4">&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">scheduler </span><span class="s0">is not None and </span><span class="s1">compute_kwargs.get(</span><span class="s4">&quot;scheduler&quot;</span><span class="s1">) </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">compute_kwargs[</span><span class="s4">&quot;scheduler&quot;</span><span class="s1">] = scheduler</span>
+
+        <span class="s0">import </span><span class="s1">dask</span>
+
+        <span class="s0">return </span><span class="s1">list(dask.compute(*values</span><span class="s0">, </span><span class="s1">**compute_kwargs))</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">values</span>
+
+
+<span class="s0">from </span><span class="s1">dask.dataframe.core </span><span class="s0">import </span><span class="s1">_Frame</span>
+
+<span class="s1">_Frame.to_csv.__doc__ = to_csv.__doc__</span>
+</pre>
+</body>
+</html>

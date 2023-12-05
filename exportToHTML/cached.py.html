@@ -1,0 +1,830 @@
+<html>
+<head>
+<title>cached.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+cached.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">inspect</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">tempfile</span>
+<span class="s0">import </span><span class="s1">time</span>
+<span class="s0">import </span><span class="s1">weakref</span>
+<span class="s0">from </span><span class="s1">shutil </span><span class="s0">import </span><span class="s1">rmtree</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">TYPE_CHECKING</span><span class="s0">, </span><span class="s1">Any</span><span class="s0">, </span><span class="s1">Callable</span><span class="s0">, </span><span class="s1">ClassVar</span>
+
+<span class="s0">from </span><span class="s1">fsspec </span><span class="s0">import </span><span class="s1">AbstractFileSystem</span><span class="s0">, </span><span class="s1">filesystem</span>
+<span class="s0">from </span><span class="s1">fsspec.callbacks </span><span class="s0">import </span><span class="s1">_DEFAULT_CALLBACK</span>
+<span class="s0">from </span><span class="s1">fsspec.compression </span><span class="s0">import </span><span class="s1">compr</span>
+<span class="s0">from </span><span class="s1">fsspec.core </span><span class="s0">import </span><span class="s1">BaseCache</span><span class="s0">, </span><span class="s1">MMapCache</span>
+<span class="s0">from </span><span class="s1">fsspec.exceptions </span><span class="s0">import </span><span class="s1">BlocksizeMismatchError</span>
+<span class="s0">from </span><span class="s1">fsspec.implementations.cache_mapper </span><span class="s0">import </span><span class="s1">create_cache_mapper</span>
+<span class="s0">from </span><span class="s1">fsspec.implementations.cache_metadata </span><span class="s0">import </span><span class="s1">CacheMetadata</span>
+<span class="s0">from </span><span class="s1">fsspec.spec </span><span class="s0">import </span><span class="s1">AbstractBufferedFile</span>
+<span class="s0">from </span><span class="s1">fsspec.utils </span><span class="s0">import </span><span class="s1">infer_compression</span>
+
+<span class="s0">if </span><span class="s1">TYPE_CHECKING:</span>
+    <span class="s0">from </span><span class="s1">fsspec.implementations.cache_mapper </span><span class="s0">import </span><span class="s1">AbstractCacheMapper</span>
+
+<span class="s1">logger = logging.getLogger(</span><span class="s2">&quot;fsspec.cached&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">CachingFileSystem(AbstractFileSystem):</span>
+    <span class="s3">&quot;&quot;&quot;Locally caching filesystem, layer over any other FS 
+ 
+    This class implements chunk-wise local storage of remote files, for quick 
+    access after the initial download. The files are stored in a given 
+    directory with hashes of URLs for the filenames. If no directory is given, 
+    a temporary one is used, which should be cleaned up by the OS after the 
+    process ends. The files themselves are sparse (as implemented in 
+    :class:`~fsspec.caching.MMapCache`), so only the data which is accessed 
+    takes up space. 
+ 
+    Restrictions: 
+ 
+    - the block-size must be the same for each access of a given file, unless 
+      all blocks of the file have already been read 
+    - caching can only be applied to file-systems which produce files 
+      derived from fsspec.spec.AbstractBufferedFile ; LocalFileSystem is also 
+      allowed, for testing 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">protocol: ClassVar[str | tuple[str</span><span class="s0">, </span><span class="s1">...]] = (</span><span class="s2">&quot;blockcache&quot;</span><span class="s0">, </span><span class="s2">&quot;cached&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">target_protocol=</span><span class="s0">None,</span>
+        <span class="s1">cache_storage=</span><span class="s2">&quot;TMP&quot;</span><span class="s0">,</span>
+        <span class="s1">cache_check=</span><span class="s4">10</span><span class="s0">,</span>
+        <span class="s1">check_files=</span><span class="s0">False,</span>
+        <span class="s1">expiry_time=</span><span class="s4">604800</span><span class="s0">,</span>
+        <span class="s1">target_options=</span><span class="s0">None,</span>
+        <span class="s1">fs=</span><span class="s0">None,</span>
+        <span class="s1">same_names: bool | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+        <span class="s1">compression=</span><span class="s0">None,</span>
+        <span class="s1">cache_mapper: AbstractCacheMapper | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+ 
+        Parameters 
+        ---------- 
+        target_protocol: str (optional) 
+            Target filesystem protocol. Provide either this or ``fs``. 
+        cache_storage: str or list(str) 
+            Location to store files. If &quot;TMP&quot;, this is a temporary directory, 
+            and will be cleaned up by the OS when this process ends (or later). 
+            If a list, each location will be tried in the order given, but 
+            only the last will be considered writable. 
+        cache_check: int 
+            Number of seconds between reload of cache metadata 
+        check_files: bool 
+            Whether to explicitly see if the UID of the remote file matches 
+            the stored one before using. Warning: some file systems such as 
+            HTTP cannot reliably give a unique hash of the contents of some 
+            path, so be sure to set this option to False. 
+        expiry_time: int 
+            The time in seconds after which a local copy is considered useless. 
+            Set to falsy to prevent expiry. The default is equivalent to one 
+            week. 
+        target_options: dict or None 
+            Passed to the instantiation of the FS, if fs is None. 
+        fs: filesystem instance 
+            The target filesystem to run against. Provide this or ``protocol``. 
+        same_names: bool (optional) 
+            By default, target URLs are hashed using a ``HashCacheMapper`` so 
+            that files from different backends with the same basename do not 
+            conflict. If this argument is ``true``, a ``BasenameCacheMapper`` 
+            is used instead. Other cache mapper options are available by using 
+            the ``cache_mapper`` keyword argument. Only one of this and 
+            ``cache_mapper`` should be specified. 
+        compression: str (optional) 
+            To decompress on download. Can be 'infer' (guess from the URL name), 
+            one of the entries in ``fsspec.compression.compr``, or None for no 
+            decompression. 
+        cache_mapper: AbstractCacheMapper (optional) 
+            The object use to map from original filenames to cached filenames. 
+            Only one of this and ``same_names`` should be specified. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">super().__init__(**kwargs)</span>
+        <span class="s0">if </span><span class="s1">fs </span><span class="s0">is None and </span><span class="s1">target_protocol </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s2">&quot;Please provide filesystem instance(fs) or target_protocol&quot;</span>
+            <span class="s1">)</span>
+        <span class="s0">if not </span><span class="s1">(fs </span><span class="s0">is None</span><span class="s1">) ^ (target_protocol </span><span class="s0">is None</span><span class="s1">):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s2">&quot;Both filesystems (fs) and target_protocol may not be both given.&quot;</span>
+            <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">cache_storage == </span><span class="s2">&quot;TMP&quot;</span><span class="s1">:</span>
+            <span class="s1">tempdir = tempfile.mkdtemp()</span>
+            <span class="s1">storage = [tempdir]</span>
+            <span class="s1">weakref.finalize(self</span><span class="s0">, </span><span class="s1">self._remove_tempdir</span><span class="s0">, </span><span class="s1">tempdir)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">isinstance(cache_storage</span><span class="s0">, </span><span class="s1">str):</span>
+                <span class="s1">storage = [cache_storage]</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">storage = cache_storage</span>
+        <span class="s1">os.makedirs(storage[-</span><span class="s4">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s1">self.storage = storage</span>
+        <span class="s1">self.kwargs = target_options </span><span class="s0">or </span><span class="s1">{}</span>
+        <span class="s1">self.cache_check = cache_check</span>
+        <span class="s1">self.check_files = check_files</span>
+        <span class="s1">self.expiry = expiry_time</span>
+        <span class="s1">self.compression = compression</span>
+
+        <span class="s5"># Size of cache in bytes. If None then the size is unknown and will be</span>
+        <span class="s5"># recalculated the next time cache_size() is called. On writes to the</span>
+        <span class="s5"># cache this is reset to None.</span>
+        <span class="s1">self._cache_size = </span><span class="s0">None</span>
+
+        <span class="s0">if </span><span class="s1">same_names </span><span class="s0">is not None and </span><span class="s1">cache_mapper </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s2">&quot;Cannot specify both same_names and cache_mapper in &quot;</span>
+                <span class="s2">&quot;CachingFileSystem.__init__&quot;</span>
+            <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">cache_mapper </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">self._mapper = cache_mapper</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self._mapper = create_cache_mapper(</span>
+                <span class="s1">same_names </span><span class="s0">if </span><span class="s1">same_names </span><span class="s0">is not None else False</span>
+            <span class="s1">)</span>
+
+        <span class="s1">self.target_protocol = (</span>
+            <span class="s1">target_protocol</span>
+            <span class="s0">if </span><span class="s1">isinstance(target_protocol</span><span class="s0">, </span><span class="s1">str)</span>
+            <span class="s0">else </span><span class="s1">(fs.protocol </span><span class="s0">if </span><span class="s1">isinstance(fs.protocol</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">else </span><span class="s1">fs.protocol[</span><span class="s4">0</span><span class="s1">])</span>
+        <span class="s1">)</span>
+        <span class="s1">self._metadata = CacheMetadata(self.storage)</span>
+        <span class="s1">self.load_cache()</span>
+        <span class="s1">self.fs = fs </span><span class="s0">if </span><span class="s1">fs </span><span class="s0">is not None else </span><span class="s1">filesystem(target_protocol</span><span class="s0">, </span><span class="s1">**self.kwargs)</span>
+
+        <span class="s0">def </span><span class="s1">_strip_protocol(path):</span>
+            <span class="s5"># acts as a method, since each instance has a difference target</span>
+            <span class="s0">return </span><span class="s1">self.fs._strip_protocol(type(self)._strip_protocol(path))</span>
+
+        <span class="s1">self._strip_protocol: Callable = _strip_protocol</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s0">def </span><span class="s1">_remove_tempdir(tempdir):</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">rmtree(tempdir)</span>
+        <span class="s0">except </span><span class="s1">Exception:</span>
+            <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">_mkcache(self):</span>
+        <span class="s1">os.makedirs(self.storage[-</span><span class="s4">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">cache_size(self):</span>
+        <span class="s3">&quot;&quot;&quot;Return size of cache in bytes. 
+ 
+        If more than one cache directory is in use, only the size of the last 
+        one (the writable cache directory) is returned. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self._cache_size </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">cache_dir = self.storage[-</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">self._cache_size = filesystem(</span><span class="s2">&quot;file&quot;</span><span class="s1">).du(cache_dir</span><span class="s0">, </span><span class="s1">withdirs=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">self._cache_size</span>
+
+    <span class="s0">def </span><span class="s1">load_cache(self):</span>
+        <span class="s3">&quot;&quot;&quot;Read set of stored blocks from file&quot;&quot;&quot;</span>
+        <span class="s1">self._metadata.load()</span>
+        <span class="s1">self._mkcache()</span>
+        <span class="s1">self.last_cache = time.time()</span>
+
+    <span class="s0">def </span><span class="s1">save_cache(self):</span>
+        <span class="s3">&quot;&quot;&quot;Save set of stored blocks from file&quot;&quot;&quot;</span>
+        <span class="s1">self._mkcache()</span>
+        <span class="s1">self._metadata.save()</span>
+        <span class="s1">self.last_cache = time.time()</span>
+        <span class="s1">self._cache_size = </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">_check_cache(self):</span>
+        <span class="s3">&quot;&quot;&quot;Reload caches if time elapsed or any disappeared&quot;&quot;&quot;</span>
+        <span class="s1">self._mkcache()</span>
+        <span class="s0">if not </span><span class="s1">self.cache_check:</span>
+            <span class="s5"># explicitly told not to bother checking</span>
+            <span class="s0">return</span>
+        <span class="s1">timecond = time.time() - self.last_cache &gt; self.cache_check</span>
+        <span class="s1">existcond = all(os.path.exists(storage) </span><span class="s0">for </span><span class="s1">storage </span><span class="s0">in </span><span class="s1">self.storage)</span>
+        <span class="s0">if </span><span class="s1">timecond </span><span class="s0">or not </span><span class="s1">existcond:</span>
+            <span class="s1">self.load_cache()</span>
+
+    <span class="s0">def </span><span class="s1">_check_file(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Is path in cache and still valid&quot;&quot;&quot;</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">self._check_cache()</span>
+        <span class="s0">return </span><span class="s1">self._metadata.check_file(path</span><span class="s0">, </span><span class="s1">self)</span>
+
+    <span class="s0">def </span><span class="s1">clear_cache(self):</span>
+        <span class="s3">&quot;&quot;&quot;Remove all files and metadata from the cache 
+ 
+        In the case of multiple cache locations, this clears only the last one, 
+        which is assumed to be the read/write one. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">rmtree(self.storage[-</span><span class="s4">1</span><span class="s1">])</span>
+        <span class="s1">self.load_cache()</span>
+        <span class="s1">self._cache_size = </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">clear_expired_cache(self</span><span class="s0">, </span><span class="s1">expiry_time=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Remove all expired files and metadata from the cache 
+ 
+        In the case of multiple cache locations, this clears only the last one, 
+        which is assumed to be the read/write one. 
+ 
+        Parameters 
+        ---------- 
+        expiry_time: int 
+            The time in seconds after which a local copy is considered useless. 
+            If not defined the default is equivalent to the attribute from the 
+            file caching instantiation. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">if not </span><span class="s1">expiry_time:</span>
+            <span class="s1">expiry_time = self.expiry</span>
+
+        <span class="s1">self._check_cache()</span>
+
+        <span class="s1">expired_files</span><span class="s0">, </span><span class="s1">writable_cache_empty = self._metadata.clear_expired(expiry_time)</span>
+        <span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">expired_files:</span>
+            <span class="s0">if </span><span class="s1">os.path.exists(fn):</span>
+                <span class="s1">os.remove(fn)</span>
+
+        <span class="s0">if </span><span class="s1">writable_cache_empty:</span>
+            <span class="s1">rmtree(self.storage[-</span><span class="s4">1</span><span class="s1">])</span>
+            <span class="s1">self.load_cache()</span>
+
+        <span class="s1">self._cache_size = </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">pop_from_cache(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Remove cached version of given file 
+ 
+        Deletes local copy of the given (remote) path. If it is found in a cache 
+        location which is not the last, it is assumed to be read-only, and 
+        raises PermissionError 
+        &quot;&quot;&quot;</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">fn = self._metadata.pop_file(path)</span>
+        <span class="s0">if </span><span class="s1">fn </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">os.remove(fn)</span>
+        <span class="s1">self._cache_size = </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">_open(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">path</span><span class="s0">,</span>
+        <span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s0">,</span>
+        <span class="s1">block_size=</span><span class="s0">None,</span>
+        <span class="s1">autocommit=</span><span class="s0">True,</span>
+        <span class="s1">cache_options=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Wrap the target _open 
+ 
+        If the whole file exists in the cache, just open it locally and 
+        return that. 
+ 
+        Otherwise, open the file on the target FS, and make it have a mmap 
+        cache pointing to the location which we determine, in our cache. 
+        The ``blocks`` instance is shared, so as the mmap cache instance 
+        updates, so does the entry in our ``cached_files`` attribute. 
+        We monkey-patch this file, so that when it closes, we call 
+        ``close_and_update`` to save the state of the blocks. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+
+        <span class="s1">path = self.fs._strip_protocol(path)</span>
+        <span class="s0">if </span><span class="s2">&quot;r&quot; </span><span class="s0">not in </span><span class="s1">mode:</span>
+            <span class="s0">return </span><span class="s1">self.fs._open(</span>
+                <span class="s1">path</span><span class="s0">,</span>
+                <span class="s1">mode=mode</span><span class="s0">,</span>
+                <span class="s1">block_size=block_size</span><span class="s0">,</span>
+                <span class="s1">autocommit=autocommit</span><span class="s0">,</span>
+                <span class="s1">cache_options=cache_options</span><span class="s0">,</span>
+                <span class="s1">**kwargs</span><span class="s0">,</span>
+            <span class="s1">)</span>
+        <span class="s1">detail = self._check_file(path)</span>
+        <span class="s0">if </span><span class="s1">detail:</span>
+            <span class="s5"># file is in cache</span>
+            <span class="s1">detail</span><span class="s0">, </span><span class="s1">fn = detail</span>
+            <span class="s1">hash</span><span class="s0">, </span><span class="s1">blocks = detail[</span><span class="s2">&quot;fn&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s1">detail[</span><span class="s2">&quot;blocks&quot;</span><span class="s1">]</span>
+            <span class="s0">if </span><span class="s1">blocks </span><span class="s0">is True</span><span class="s1">:</span>
+                <span class="s5"># stored file is complete</span>
+                <span class="s1">logger.debug(</span><span class="s2">&quot;Opening local copy of %s&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+                <span class="s0">return </span><span class="s1">open(fn</span><span class="s0">, </span><span class="s1">mode)</span>
+            <span class="s5"># TODO: action where partial file exists in read-only cache</span>
+            <span class="s1">logger.debug(</span><span class="s2">&quot;Opening partially cached copy of %s&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">hash = self._mapper(path)</span>
+            <span class="s1">fn = os.path.join(self.storage[-</span><span class="s4">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">hash)</span>
+            <span class="s1">blocks = set()</span>
+            <span class="s1">detail = {</span>
+                <span class="s2">&quot;original&quot;</span><span class="s1">: path</span><span class="s0">,</span>
+                <span class="s2">&quot;fn&quot;</span><span class="s1">: hash</span><span class="s0">,</span>
+                <span class="s2">&quot;blocks&quot;</span><span class="s1">: blocks</span><span class="s0">,</span>
+                <span class="s2">&quot;time&quot;</span><span class="s1">: time.time()</span><span class="s0">,</span>
+                <span class="s2">&quot;uid&quot;</span><span class="s1">: self.fs.ukey(path)</span><span class="s0">,</span>
+            <span class="s1">}</span>
+            <span class="s1">self._metadata.update_file(path</span><span class="s0">, </span><span class="s1">detail)</span>
+            <span class="s1">logger.debug(</span><span class="s2">&quot;Creating local sparse file for %s&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+
+        <span class="s5"># call target filesystems open</span>
+        <span class="s1">self._mkcache()</span>
+        <span class="s1">f = self.fs._open(</span>
+            <span class="s1">path</span><span class="s0">,</span>
+            <span class="s1">mode=mode</span><span class="s0">,</span>
+            <span class="s1">block_size=block_size</span><span class="s0">,</span>
+            <span class="s1">autocommit=autocommit</span><span class="s0">,</span>
+            <span class="s1">cache_options=cache_options</span><span class="s0">,</span>
+            <span class="s1">cache_type=</span><span class="s2">&quot;none&quot;</span><span class="s0">,</span>
+            <span class="s1">**kwargs</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.compression:</span>
+            <span class="s1">comp = (</span>
+                <span class="s1">infer_compression(path)</span>
+                <span class="s0">if </span><span class="s1">self.compression == </span><span class="s2">&quot;infer&quot;</span>
+                <span class="s0">else </span><span class="s1">self.compression</span>
+            <span class="s1">)</span>
+            <span class="s1">f = compr[comp](f</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s2">&quot;blocksize&quot; </span><span class="s0">in </span><span class="s1">detail:</span>
+            <span class="s0">if </span><span class="s1">detail[</span><span class="s2">&quot;blocksize&quot;</span><span class="s1">] != f.blocksize:</span>
+                <span class="s0">raise </span><span class="s1">BlocksizeMismatchError(</span>
+                    <span class="s2">f&quot;Cached file must be reopened with same block&quot;</span>
+                    <span class="s2">f&quot; size as original (old: </span><span class="s0">{</span><span class="s1">detail[</span><span class="s2">'blocksize'</span><span class="s1">]</span><span class="s0">}</span><span class="s2">,&quot;</span>
+                    <span class="s2">f&quot; new </span><span class="s0">{</span><span class="s1">f.blocksize</span><span class="s0">}</span><span class="s2">)&quot;</span>
+                <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">detail[</span><span class="s2">&quot;blocksize&quot;</span><span class="s1">] = f.blocksize</span>
+        <span class="s1">f.cache = MMapCache(f.blocksize</span><span class="s0">, </span><span class="s1">f._fetch_range</span><span class="s0">, </span><span class="s1">f.size</span><span class="s0">, </span><span class="s1">fn</span><span class="s0">, </span><span class="s1">blocks)</span>
+        <span class="s1">close = f.close</span>
+        <span class="s1">f.close = </span><span class="s0">lambda</span><span class="s1">: self.close_and_update(f</span><span class="s0">, </span><span class="s1">close)</span>
+        <span class="s1">self.save_cache()</span>
+        <span class="s0">return </span><span class="s1">f</span>
+
+    <span class="s0">def </span><span class="s1">hash_name(self</span><span class="s0">, </span><span class="s1">path: str</span><span class="s0">, </span><span class="s1">*args: Any) -&gt; str:</span>
+        <span class="s5"># Kept for backward compatibility with downstream libraries.</span>
+        <span class="s5"># Ignores extra arguments, previously same_name boolean.</span>
+        <span class="s0">return </span><span class="s1">self._mapper(path)</span>
+
+    <span class="s0">def </span><span class="s1">close_and_update(self</span><span class="s0">, </span><span class="s1">f</span><span class="s0">, </span><span class="s1">close):</span>
+        <span class="s3">&quot;&quot;&quot;Called when a file is closing, so store the set of blocks&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">f.closed:</span>
+            <span class="s0">return</span>
+        <span class="s1">path = self._strip_protocol(f.path)</span>
+        <span class="s1">self._metadata.on_close_cached_file(f</span><span class="s0">, </span><span class="s1">path)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">logger.debug(</span><span class="s2">&quot;going to save&quot;</span><span class="s1">)</span>
+            <span class="s1">self.save_cache()</span>
+            <span class="s1">logger.debug(</span><span class="s2">&quot;saved&quot;</span><span class="s1">)</span>
+        <span class="s0">except </span><span class="s1">OSError:</span>
+            <span class="s1">logger.debug(</span><span class="s2">&quot;Cache saving failed while closing file&quot;</span><span class="s1">)</span>
+        <span class="s0">except </span><span class="s1">NameError:</span>
+            <span class="s1">logger.debug(</span><span class="s2">&quot;Cache save failed due to interpreter shutdown&quot;</span><span class="s1">)</span>
+        <span class="s1">close()</span>
+        <span class="s1">f.closed = </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">__getattribute__(self</span><span class="s0">, </span><span class="s1">item):</span>
+        <span class="s0">if </span><span class="s1">item </span><span class="s0">in </span><span class="s1">[</span>
+            <span class="s2">&quot;load_cache&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;_open&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;save_cache&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;close_and_update&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;__init__&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;__getattribute__&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;__reduce__&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;_make_local_details&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;open&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;cat&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;cat_file&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;get&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;read_block&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;tail&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;head&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;_check_file&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;_check_cache&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;_mkcache&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;clear_cache&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;clear_expired_cache&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;pop_from_cache&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;_mkcache&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;local_file&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;_paths_from_path&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;get_mapper&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;open_many&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;commit_many&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;hash_name&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;__hash__&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;__eq__&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;to_json&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;cache_size&quot;</span><span class="s0">,</span>
+        <span class="s1">]:</span>
+            <span class="s5"># all the methods defined in this class. Note `open` here, since</span>
+            <span class="s5"># it calls `_open`, but is actually in superclass</span>
+            <span class="s0">return lambda </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kw: getattr(type(self)</span><span class="s0">, </span><span class="s1">item).__get__(self)(</span>
+                <span class="s1">*args</span><span class="s0">, </span><span class="s1">**kw</span>
+            <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">item </span><span class="s0">in </span><span class="s1">[</span><span class="s2">&quot;__reduce_ex__&quot;</span><span class="s1">]:</span>
+            <span class="s0">raise </span><span class="s1">AttributeError</span>
+        <span class="s0">if </span><span class="s1">item </span><span class="s0">in </span><span class="s1">[</span><span class="s2">&quot;_cache&quot;</span><span class="s1">]:</span>
+            <span class="s5"># class attributes</span>
+            <span class="s0">return </span><span class="s1">getattr(type(self)</span><span class="s0">, </span><span class="s1">item)</span>
+        <span class="s0">if </span><span class="s1">item == </span><span class="s2">&quot;__class__&quot;</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">type(self)</span>
+        <span class="s1">d = object.__getattribute__(self</span><span class="s0">, </span><span class="s2">&quot;__dict__&quot;</span><span class="s1">)</span>
+        <span class="s1">fs = d.get(</span><span class="s2">&quot;fs&quot;</span><span class="s0">, None</span><span class="s1">)  </span><span class="s5"># fs is not immediately defined</span>
+        <span class="s0">if </span><span class="s1">item </span><span class="s0">in </span><span class="s1">d:</span>
+            <span class="s0">return </span><span class="s1">d[item]</span>
+        <span class="s0">elif </span><span class="s1">fs </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">item </span><span class="s0">in </span><span class="s1">fs.__dict__:</span>
+                <span class="s5"># attribute of instance</span>
+                <span class="s0">return </span><span class="s1">fs.__dict__[item]</span>
+            <span class="s5"># attributed belonging to the target filesystem</span>
+            <span class="s1">cls = type(fs)</span>
+            <span class="s1">m = getattr(cls</span><span class="s0">, </span><span class="s1">item)</span>
+            <span class="s0">if </span><span class="s1">(inspect.isfunction(m) </span><span class="s0">or </span><span class="s1">inspect.isdatadescriptor(m)) </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s0">not </span><span class="s1">hasattr(m</span><span class="s0">, </span><span class="s2">&quot;__self__&quot;</span><span class="s1">) </span><span class="s0">or </span><span class="s1">m.__self__ </span><span class="s0">is None</span>
+            <span class="s1">):</span>
+                <span class="s5"># instance method</span>
+                <span class="s0">return </span><span class="s1">m.__get__(fs</span><span class="s0">, </span><span class="s1">cls)</span>
+            <span class="s0">return </span><span class="s1">m  </span><span class="s5"># class method or attribute</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s5"># attributes of the superclass, while target is being set up</span>
+            <span class="s0">return </span><span class="s1">super().__getattribute__(item)</span>
+
+    <span class="s0">def </span><span class="s1">__eq__(self</span><span class="s0">, </span><span class="s1">other):</span>
+        <span class="s3">&quot;&quot;&quot;Test for equality.&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self </span><span class="s0">is </span><span class="s1">other:</span>
+            <span class="s0">return True</span>
+        <span class="s0">if not </span><span class="s1">isinstance(other</span><span class="s0">, </span><span class="s1">type(self)):</span>
+            <span class="s0">return False</span>
+        <span class="s0">return </span><span class="s1">(</span>
+            <span class="s1">self.storage == other.storage</span>
+            <span class="s0">and </span><span class="s1">self.kwargs == other.kwargs</span>
+            <span class="s0">and </span><span class="s1">self.cache_check == other.cache_check</span>
+            <span class="s0">and </span><span class="s1">self.check_files == other.check_files</span>
+            <span class="s0">and </span><span class="s1">self.expiry == other.expiry</span>
+            <span class="s0">and </span><span class="s1">self.compression == other.compression</span>
+            <span class="s0">and </span><span class="s1">self._mapper == other._mapper</span>
+            <span class="s0">and </span><span class="s1">self.target_protocol == other.target_protocol</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__hash__(self):</span>
+        <span class="s3">&quot;&quot;&quot;Calculate hash.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">(</span>
+            <span class="s1">hash(tuple(self.storage))</span>
+            <span class="s1">^ hash(str(self.kwargs))</span>
+            <span class="s1">^ hash(self.cache_check)</span>
+            <span class="s1">^ hash(self.check_files)</span>
+            <span class="s1">^ hash(self.expiry)</span>
+            <span class="s1">^ hash(self.compression)</span>
+            <span class="s1">^ hash(self._mapper)</span>
+            <span class="s1">^ hash(self.target_protocol)</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">to_json(self):</span>
+        <span class="s3">&quot;&quot;&quot;Calculate JSON representation. 
+ 
+        Not implemented yet for CachingFileSystem. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError(</span>
+            <span class="s2">&quot;CachingFileSystem JSON representation not implemented&quot;</span>
+        <span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">WholeFileCacheFileSystem(CachingFileSystem):</span>
+    <span class="s3">&quot;&quot;&quot;Caches whole remote files on first access 
+ 
+    This class is intended as a layer over any other file system, and 
+    will make a local copy of each file accessed, so that all subsequent 
+    reads are local. This is similar to ``CachingFileSystem``, but without 
+    the block-wise functionality and so can work even when sparse files 
+    are not allowed. See its docstring for definition of the init 
+    arguments. 
+ 
+    The class still needs access to the remote store for listing files, 
+    and may refresh cached files. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">protocol = </span><span class="s2">&quot;filecache&quot;</span>
+    <span class="s1">local_file = </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">open_many(self</span><span class="s0">, </span><span class="s1">open_files):</span>
+        <span class="s1">paths = [of.path </span><span class="s0">for </span><span class="s1">of </span><span class="s0">in </span><span class="s1">open_files]</span>
+        <span class="s0">if </span><span class="s2">&quot;r&quot; </span><span class="s0">in </span><span class="s1">open_files.mode:</span>
+            <span class="s1">self._mkcache()</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">[</span>
+                <span class="s1">LocalTempFile(self.fs</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode=open_files.mode) </span><span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">paths</span>
+            <span class="s1">]</span>
+
+        <span class="s0">if </span><span class="s1">self.compression:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+        <span class="s1">details = [self._check_file(sp) </span><span class="s0">for </span><span class="s1">sp </span><span class="s0">in </span><span class="s1">paths]</span>
+        <span class="s1">downpath = [p </span><span class="s0">for </span><span class="s1">p</span><span class="s0">, </span><span class="s1">d </span><span class="s0">in </span><span class="s1">zip(paths</span><span class="s0">, </span><span class="s1">details) </span><span class="s0">if not </span><span class="s1">d]</span>
+        <span class="s1">downfn0 = [</span>
+            <span class="s1">os.path.join(self.storage[-</span><span class="s4">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">self._mapper(p))</span>
+            <span class="s0">for </span><span class="s1">p</span><span class="s0">, </span><span class="s1">d </span><span class="s0">in </span><span class="s1">zip(paths</span><span class="s0">, </span><span class="s1">details)</span>
+        <span class="s1">]  </span><span class="s5"># keep these path names for opening later</span>
+        <span class="s1">downfn = [fn </span><span class="s0">for </span><span class="s1">fn</span><span class="s0">, </span><span class="s1">d </span><span class="s0">in </span><span class="s1">zip(downfn0</span><span class="s0">, </span><span class="s1">details) </span><span class="s0">if not </span><span class="s1">d]</span>
+        <span class="s0">if </span><span class="s1">downpath:</span>
+            <span class="s5"># skip if all files are already cached and up to date</span>
+            <span class="s1">self.fs.get(downpath</span><span class="s0">, </span><span class="s1">downfn)</span>
+
+            <span class="s5"># update metadata - only happens when downloads are successful</span>
+            <span class="s1">newdetail = [</span>
+                <span class="s1">{</span>
+                    <span class="s2">&quot;original&quot;</span><span class="s1">: path</span><span class="s0">,</span>
+                    <span class="s2">&quot;fn&quot;</span><span class="s1">: self._mapper(path)</span><span class="s0">,</span>
+                    <span class="s2">&quot;blocks&quot;</span><span class="s1">: </span><span class="s0">True,</span>
+                    <span class="s2">&quot;time&quot;</span><span class="s1">: time.time()</span><span class="s0">,</span>
+                    <span class="s2">&quot;uid&quot;</span><span class="s1">: self.fs.ukey(path)</span><span class="s0">,</span>
+                <span class="s1">}</span>
+                <span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">downpath</span>
+            <span class="s1">]</span>
+            <span class="s0">for </span><span class="s1">path</span><span class="s0">, </span><span class="s1">detail </span><span class="s0">in </span><span class="s1">zip(downpath</span><span class="s0">, </span><span class="s1">newdetail):</span>
+                <span class="s1">self._metadata.update_file(path</span><span class="s0">, </span><span class="s1">detail)</span>
+            <span class="s1">self.save_cache()</span>
+
+        <span class="s0">def </span><span class="s1">firstpart(fn):</span>
+            <span class="s5"># helper to adapt both whole-file and simple-cache</span>
+            <span class="s0">return </span><span class="s1">fn[</span><span class="s4">1</span><span class="s1">] </span><span class="s0">if </span><span class="s1">isinstance(fn</span><span class="s0">, </span><span class="s1">tuple) </span><span class="s0">else </span><span class="s1">fn</span>
+
+        <span class="s0">return </span><span class="s1">[</span>
+            <span class="s1">open(firstpart(fn0) </span><span class="s0">if </span><span class="s1">fn0 </span><span class="s0">else </span><span class="s1">fn1</span><span class="s0">, </span><span class="s1">mode=open_files.mode)</span>
+            <span class="s0">for </span><span class="s1">fn0</span><span class="s0">, </span><span class="s1">fn1 </span><span class="s0">in </span><span class="s1">zip(details</span><span class="s0">, </span><span class="s1">downfn0)</span>
+        <span class="s1">]</span>
+
+    <span class="s0">def </span><span class="s1">commit_many(self</span><span class="s0">, </span><span class="s1">open_files):</span>
+        <span class="s1">self.fs.put([f.fn </span><span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">open_files]</span><span class="s0">, </span><span class="s1">[f.path </span><span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">open_files])</span>
+        <span class="s1">[f.close() </span><span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">open_files]</span>
+        <span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">open_files:</span>
+            <span class="s5"># in case autocommit is off, and so close did not already delete</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">os.remove(f.name)</span>
+            <span class="s0">except </span><span class="s1">FileNotFoundError:</span>
+                <span class="s0">pass</span>
+        <span class="s1">self._cache_size = </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">_make_local_details(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">hash = self._mapper(path)</span>
+        <span class="s1">fn = os.path.join(self.storage[-</span><span class="s4">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">hash)</span>
+        <span class="s1">detail = {</span>
+            <span class="s2">&quot;original&quot;</span><span class="s1">: path</span><span class="s0">,</span>
+            <span class="s2">&quot;fn&quot;</span><span class="s1">: hash</span><span class="s0">,</span>
+            <span class="s2">&quot;blocks&quot;</span><span class="s1">: </span><span class="s0">True,</span>
+            <span class="s2">&quot;time&quot;</span><span class="s1">: time.time()</span><span class="s0">,</span>
+            <span class="s2">&quot;uid&quot;</span><span class="s1">: self.fs.ukey(path)</span><span class="s0">,</span>
+        <span class="s1">}</span>
+        <span class="s1">self._metadata.update_file(path</span><span class="s0">, </span><span class="s1">detail)</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;Copying %s to local cache&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+        <span class="s0">return </span><span class="s1">fn</span>
+
+    <span class="s0">def </span><span class="s1">cat(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">path</span><span class="s0">,</span>
+        <span class="s1">recursive=</span><span class="s0">False,</span>
+        <span class="s1">on_error=</span><span class="s2">&quot;raise&quot;</span><span class="s0">,</span>
+        <span class="s1">callback=_DEFAULT_CALLBACK</span><span class="s0">,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s1">paths = self.expand_path(</span>
+            <span class="s1">path</span><span class="s0">, </span><span class="s1">recursive=recursive</span><span class="s0">, </span><span class="s1">maxdepth=kwargs.get(</span><span class="s2">&quot;maxdepth&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">)</span>
+        <span class="s1">getpaths = []</span>
+        <span class="s1">storepaths = []</span>
+        <span class="s1">fns = []</span>
+        <span class="s1">out = {}</span>
+        <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">paths.copy():</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">detail = self._check_file(p)</span>
+                <span class="s0">if not </span><span class="s1">detail:</span>
+                    <span class="s1">fn = self._make_local_details(p)</span>
+                    <span class="s1">getpaths.append(p)</span>
+                    <span class="s1">storepaths.append(fn)</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">detail</span><span class="s0">, </span><span class="s1">fn = detail </span><span class="s0">if </span><span class="s1">isinstance(detail</span><span class="s0">, </span><span class="s1">tuple) </span><span class="s0">else </span><span class="s1">(</span><span class="s0">None, </span><span class="s1">detail)</span>
+                <span class="s1">fns.append(fn)</span>
+            <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e:</span>
+                <span class="s0">if </span><span class="s1">on_error == </span><span class="s2">&quot;raise&quot;</span><span class="s1">:</span>
+                    <span class="s0">raise</span>
+                <span class="s0">if </span><span class="s1">on_error == </span><span class="s2">&quot;return&quot;</span><span class="s1">:</span>
+                    <span class="s1">out[p] = e</span>
+                <span class="s1">paths.remove(p)</span>
+
+        <span class="s0">if </span><span class="s1">getpaths:</span>
+            <span class="s1">self.fs.get(getpaths</span><span class="s0">, </span><span class="s1">storepaths)</span>
+            <span class="s1">self.save_cache()</span>
+
+        <span class="s1">callback.set_size(len(paths))</span>
+        <span class="s0">for </span><span class="s1">p</span><span class="s0">, </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">zip(paths</span><span class="s0">, </span><span class="s1">fns):</span>
+            <span class="s0">with </span><span class="s1">open(fn</span><span class="s0">, </span><span class="s2">&quot;rb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">f:</span>
+                <span class="s1">out[p] = f.read()</span>
+            <span class="s1">callback.relative_update(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">isinstance(path</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">and </span><span class="s1">len(paths) == </span><span class="s4">1 </span><span class="s0">and </span><span class="s1">recursive </span><span class="s0">is False</span><span class="s1">:</span>
+            <span class="s1">out = out[paths[</span><span class="s4">0</span><span class="s1">]]</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">_open(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s0">if </span><span class="s2">&quot;r&quot; </span><span class="s0">not in </span><span class="s1">mode:</span>
+            <span class="s0">return </span><span class="s1">LocalTempFile(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode=mode)</span>
+        <span class="s1">detail = self._check_file(path)</span>
+        <span class="s0">if </span><span class="s1">detail:</span>
+            <span class="s1">detail</span><span class="s0">, </span><span class="s1">fn = detail</span>
+            <span class="s1">_</span><span class="s0">, </span><span class="s1">blocks = detail[</span><span class="s2">&quot;fn&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s1">detail[</span><span class="s2">&quot;blocks&quot;</span><span class="s1">]</span>
+            <span class="s0">if </span><span class="s1">blocks </span><span class="s0">is True</span><span class="s1">:</span>
+                <span class="s1">logger.debug(</span><span class="s2">&quot;Opening local copy of %s&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+
+                <span class="s5"># In order to support downstream filesystems to be able to</span>
+                <span class="s5"># infer the compression from the original filename, like</span>
+                <span class="s5"># the `TarFileSystem`, let's extend the `io.BufferedReader`</span>
+                <span class="s5"># fileobject protocol by adding a dedicated attribute</span>
+                <span class="s5"># `original`.</span>
+                <span class="s1">f = open(fn</span><span class="s0">, </span><span class="s1">mode)</span>
+                <span class="s1">f.original = detail.get(</span><span class="s2">&quot;original&quot;</span><span class="s1">)</span>
+                <span class="s0">return </span><span class="s1">f</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s2">f&quot;Attempt to open partially cached file </span><span class="s0">{</span><span class="s1">path</span><span class="s0">}</span><span class="s2">&quot;</span>
+                    <span class="s2">f&quot; as a wholly cached file&quot;</span>
+                <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">fn = self._make_local_details(path)</span>
+        <span class="s1">kwargs[</span><span class="s2">&quot;mode&quot;</span><span class="s1">] = mode</span>
+
+        <span class="s5"># call target filesystems open</span>
+        <span class="s1">self._mkcache()</span>
+        <span class="s0">if </span><span class="s1">self.compression:</span>
+            <span class="s0">with </span><span class="s1">self.fs._open(path</span><span class="s0">, </span><span class="s1">**kwargs) </span><span class="s0">as </span><span class="s1">f</span><span class="s0">, </span><span class="s1">open(fn</span><span class="s0">, </span><span class="s2">&quot;wb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">f2:</span>
+                <span class="s0">if </span><span class="s1">isinstance(f</span><span class="s0">, </span><span class="s1">AbstractBufferedFile):</span>
+                    <span class="s5"># want no type of caching if just downloading whole thing</span>
+                    <span class="s1">f.cache = BaseCache(</span><span class="s4">0</span><span class="s0">, </span><span class="s1">f.cache.fetcher</span><span class="s0">, </span><span class="s1">f.size)</span>
+                <span class="s1">comp = (</span>
+                    <span class="s1">infer_compression(path)</span>
+                    <span class="s0">if </span><span class="s1">self.compression == </span><span class="s2">&quot;infer&quot;</span>
+                    <span class="s0">else </span><span class="s1">self.compression</span>
+                <span class="s1">)</span>
+                <span class="s1">f = compr[comp](f</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s1">)</span>
+                <span class="s1">data = </span><span class="s0">True</span>
+                <span class="s0">while </span><span class="s1">data:</span>
+                    <span class="s1">block = getattr(f</span><span class="s0">, </span><span class="s2">&quot;blocksize&quot;</span><span class="s0">, </span><span class="s4">5 </span><span class="s1">* </span><span class="s4">2</span><span class="s1">**</span><span class="s4">20</span><span class="s1">)</span>
+                    <span class="s1">data = f.read(block)</span>
+                    <span class="s1">f2.write(data)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.fs.get_file(path</span><span class="s0">, </span><span class="s1">fn)</span>
+        <span class="s1">self.save_cache()</span>
+        <span class="s0">return </span><span class="s1">self._open(path</span><span class="s0">, </span><span class="s1">mode)</span>
+
+
+<span class="s0">class </span><span class="s1">SimpleCacheFileSystem(WholeFileCacheFileSystem):</span>
+    <span class="s3">&quot;&quot;&quot;Caches whole remote files on first access 
+ 
+    This class is intended as a layer over any other file system, and 
+    will make a local copy of each file accessed, so that all subsequent 
+    reads are local. This implementation only copies whole files, and 
+    does not keep any metadata about the download time or file details. 
+    It is therefore safer to use in multi-threaded/concurrent situations. 
+ 
+    This is the only of the caching filesystems that supports write: you will 
+    be given a real local open file, and upon close and commit, it will be 
+    uploaded to the target filesystem; the writability or the target URL is 
+    not checked until that time. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">protocol = </span><span class="s2">&quot;simplecache&quot;</span>
+    <span class="s1">local_file = </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">kw = kwargs.copy()</span>
+        <span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">[</span><span class="s2">&quot;cache_check&quot;</span><span class="s0">, </span><span class="s2">&quot;expiry_time&quot;</span><span class="s0">, </span><span class="s2">&quot;check_files&quot;</span><span class="s1">]:</span>
+            <span class="s1">kw[key] = </span><span class="s0">False</span>
+        <span class="s1">super().__init__(**kw)</span>
+        <span class="s0">for </span><span class="s1">storage </span><span class="s0">in </span><span class="s1">self.storage:</span>
+            <span class="s0">if not </span><span class="s1">os.path.exists(storage):</span>
+                <span class="s1">os.makedirs(storage</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_check_file(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">self._check_cache()</span>
+        <span class="s1">sha = self._mapper(path)</span>
+        <span class="s0">for </span><span class="s1">storage </span><span class="s0">in </span><span class="s1">self.storage:</span>
+            <span class="s1">fn = os.path.join(storage</span><span class="s0">, </span><span class="s1">sha)</span>
+            <span class="s0">if </span><span class="s1">os.path.exists(fn):</span>
+                <span class="s0">return </span><span class="s1">fn</span>
+
+    <span class="s0">def </span><span class="s1">save_cache(self):</span>
+        <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">load_cache(self):</span>
+        <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">_open(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+
+        <span class="s0">if </span><span class="s2">&quot;r&quot; </span><span class="s0">not in </span><span class="s1">mode:</span>
+            <span class="s0">return </span><span class="s1">LocalTempFile(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode=mode)</span>
+        <span class="s1">fn = self._check_file(path)</span>
+        <span class="s0">if </span><span class="s1">fn:</span>
+            <span class="s0">return </span><span class="s1">open(fn</span><span class="s0">, </span><span class="s1">mode)</span>
+
+        <span class="s1">sha = self._mapper(path)</span>
+        <span class="s1">fn = os.path.join(self.storage[-</span><span class="s4">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">sha)</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;Copying %s to local cache&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+        <span class="s1">kwargs[</span><span class="s2">&quot;mode&quot;</span><span class="s1">] = mode</span>
+
+        <span class="s1">self._mkcache()</span>
+        <span class="s1">self._cache_size = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">self.compression:</span>
+            <span class="s0">with </span><span class="s1">self.fs._open(path</span><span class="s0">, </span><span class="s1">**kwargs) </span><span class="s0">as </span><span class="s1">f</span><span class="s0">, </span><span class="s1">open(fn</span><span class="s0">, </span><span class="s2">&quot;wb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">f2:</span>
+                <span class="s0">if </span><span class="s1">isinstance(f</span><span class="s0">, </span><span class="s1">AbstractBufferedFile):</span>
+                    <span class="s5"># want no type of caching if just downloading whole thing</span>
+                    <span class="s1">f.cache = BaseCache(</span><span class="s4">0</span><span class="s0">, </span><span class="s1">f.cache.fetcher</span><span class="s0">, </span><span class="s1">f.size)</span>
+                <span class="s1">comp = (</span>
+                    <span class="s1">infer_compression(path)</span>
+                    <span class="s0">if </span><span class="s1">self.compression == </span><span class="s2">&quot;infer&quot;</span>
+                    <span class="s0">else </span><span class="s1">self.compression</span>
+                <span class="s1">)</span>
+                <span class="s1">f = compr[comp](f</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s1">)</span>
+                <span class="s1">data = </span><span class="s0">True</span>
+                <span class="s0">while </span><span class="s1">data:</span>
+                    <span class="s1">block = getattr(f</span><span class="s0">, </span><span class="s2">&quot;blocksize&quot;</span><span class="s0">, </span><span class="s4">5 </span><span class="s1">* </span><span class="s4">2</span><span class="s1">**</span><span class="s4">20</span><span class="s1">)</span>
+                    <span class="s1">data = f.read(block)</span>
+                    <span class="s1">f2.write(data)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.fs.get_file(path</span><span class="s0">, </span><span class="s1">fn)</span>
+        <span class="s0">return </span><span class="s1">self._open(path</span><span class="s0">, </span><span class="s1">mode)</span>
+
+
+<span class="s0">class </span><span class="s1">LocalTempFile:</span>
+    <span class="s3">&quot;&quot;&quot;A temporary local file, which will be uploaded on commit&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">fs</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">fn=</span><span class="s0">None, </span><span class="s1">mode=</span><span class="s2">&quot;wb&quot;</span><span class="s0">, </span><span class="s1">autocommit=</span><span class="s0">True, </span><span class="s1">seek=</span><span class="s4">0</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">fn:</span>
+            <span class="s1">self.fn = fn</span>
+            <span class="s1">self.fh = open(fn</span><span class="s0">, </span><span class="s1">mode)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">fd</span><span class="s0">, </span><span class="s1">self.fn = tempfile.mkstemp()</span>
+            <span class="s1">self.fh = open(fd</span><span class="s0">, </span><span class="s1">mode)</span>
+        <span class="s1">self.mode = mode</span>
+        <span class="s0">if </span><span class="s1">seek:</span>
+            <span class="s1">self.fh.seek(seek)</span>
+        <span class="s1">self.path = path</span>
+        <span class="s1">self.fs = fs</span>
+        <span class="s1">self.closed = </span><span class="s0">False</span>
+        <span class="s1">self.autocommit = autocommit</span>
+
+    <span class="s0">def </span><span class="s1">__reduce__(self):</span>
+        <span class="s5"># always open in rb+ to allow continuing writing at a location</span>
+        <span class="s0">return </span><span class="s1">(</span>
+            <span class="s1">LocalTempFile</span><span class="s0">,</span>
+            <span class="s1">(self.fs</span><span class="s0">, </span><span class="s1">self.path</span><span class="s0">, </span><span class="s1">self.fn</span><span class="s0">, </span><span class="s2">&quot;rb+&quot;</span><span class="s0">, </span><span class="s1">self.autocommit</span><span class="s0">, </span><span class="s1">self.tell())</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__enter__(self):</span>
+        <span class="s0">return </span><span class="s1">self.fh</span>
+
+    <span class="s0">def </span><span class="s1">__exit__(self</span><span class="s0">, </span><span class="s1">exc_type</span><span class="s0">, </span><span class="s1">exc_val</span><span class="s0">, </span><span class="s1">exc_tb):</span>
+        <span class="s1">self.close()</span>
+
+    <span class="s0">def </span><span class="s1">close(self):</span>
+        <span class="s0">if </span><span class="s1">self.closed:</span>
+            <span class="s0">return</span>
+        <span class="s1">self.fh.close()</span>
+        <span class="s1">self.closed = </span><span class="s0">True</span>
+        <span class="s0">if </span><span class="s1">self.autocommit:</span>
+            <span class="s1">self.commit()</span>
+
+    <span class="s0">def </span><span class="s1">discard(self):</span>
+        <span class="s1">self.fh.close()</span>
+        <span class="s1">os.remove(self.fn)</span>
+
+    <span class="s0">def </span><span class="s1">commit(self):</span>
+        <span class="s1">self.fs.put(self.fn</span><span class="s0">, </span><span class="s1">self.path)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">os.remove(self.fn)</span>
+        <span class="s0">except </span><span class="s1">(PermissionError</span><span class="s0">, </span><span class="s1">FileNotFoundError):</span>
+            <span class="s5"># file path may be held by new version of the file on windows</span>
+            <span class="s0">pass</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">name(self):</span>
+        <span class="s0">return </span><span class="s1">self.fn</span>
+
+    <span class="s0">def </span><span class="s1">__getattr__(self</span><span class="s0">, </span><span class="s1">item):</span>
+        <span class="s0">return </span><span class="s1">getattr(self.fh</span><span class="s0">, </span><span class="s1">item)</span>
+</pre>
+</body>
+</html>

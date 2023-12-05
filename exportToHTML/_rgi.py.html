@@ -1,0 +1,693 @@
+<html>
+<head>
+<title>_rgi.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+.s1 { color: #6a8759;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #629755; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_rgi.py</font>
+</center></td></tr></table>
+<pre><span class="s0">__all__ = [</span><span class="s1">'RegularGridInterpolator'</span><span class="s2">, </span><span class="s1">'interpn'</span><span class="s0">]</span>
+
+<span class="s2">import </span><span class="s0">itertools</span>
+
+<span class="s2">import </span><span class="s0">numpy </span><span class="s2">as </span><span class="s0">np</span>
+
+<span class="s2">from </span><span class="s0">.interpnd </span><span class="s2">import </span><span class="s0">_ndim_coords_from_arrays</span>
+<span class="s2">from </span><span class="s0">._cubic </span><span class="s2">import </span><span class="s0">PchipInterpolator</span>
+<span class="s2">from </span><span class="s0">._rgi_cython </span><span class="s2">import </span><span class="s0">evaluate_linear_2d</span><span class="s2">, </span><span class="s0">find_indices</span>
+<span class="s2">from </span><span class="s0">._bsplines </span><span class="s2">import </span><span class="s0">make_interp_spline</span>
+<span class="s2">from </span><span class="s0">._fitpack2 </span><span class="s2">import </span><span class="s0">RectBivariateSpline</span>
+
+
+<span class="s2">def </span><span class="s0">_check_points(points):</span>
+    <span class="s0">descending_dimensions = []</span>
+    <span class="s0">grid = []</span>
+    <span class="s2">for </span><span class="s0">i</span><span class="s2">, </span><span class="s0">p </span><span class="s2">in </span><span class="s0">enumerate(points):</span>
+        <span class="s3"># early make points float</span>
+        <span class="s3"># see https://github.com/scipy/scipy/pull/17230</span>
+        <span class="s0">p = np.asarray(p</span><span class="s2">, </span><span class="s0">dtype=float)</span>
+        <span class="s2">if not </span><span class="s0">np.all(p[</span><span class="s4">1</span><span class="s0">:] &gt; p[:-</span><span class="s4">1</span><span class="s0">]):</span>
+            <span class="s2">if </span><span class="s0">np.all(p[</span><span class="s4">1</span><span class="s0">:] &lt; p[:-</span><span class="s4">1</span><span class="s0">]):</span>
+                <span class="s3"># input is descending, so make it ascending</span>
+                <span class="s0">descending_dimensions.append(i)</span>
+                <span class="s0">p = np.flip(p)</span>
+            <span class="s2">else</span><span class="s0">:</span>
+                <span class="s2">raise </span><span class="s0">ValueError(</span>
+                    <span class="s1">&quot;The points in dimension %d must be strictly &quot;</span>
+                    <span class="s1">&quot;ascending or descending&quot; </span><span class="s0">% i)</span>
+        <span class="s3"># see https://github.com/scipy/scipy/issues/17716</span>
+        <span class="s0">p = np.ascontiguousarray(p)</span>
+        <span class="s0">grid.append(p)</span>
+    <span class="s2">return </span><span class="s0">tuple(grid)</span><span class="s2">, </span><span class="s0">tuple(descending_dimensions)</span>
+
+
+<span class="s2">def </span><span class="s0">_check_dimensionality(points</span><span class="s2">, </span><span class="s0">values):</span>
+    <span class="s2">if </span><span class="s0">len(points) &gt; values.ndim:</span>
+        <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;There are %d point arrays, but values has %d &quot;</span>
+                         <span class="s1">&quot;dimensions&quot; </span><span class="s0">% (len(points)</span><span class="s2">, </span><span class="s0">values.ndim))</span>
+    <span class="s2">for </span><span class="s0">i</span><span class="s2">, </span><span class="s0">p </span><span class="s2">in </span><span class="s0">enumerate(points):</span>
+        <span class="s2">if not </span><span class="s0">np.asarray(p).ndim == </span><span class="s4">1</span><span class="s0">:</span>
+            <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;The points in dimension %d must be &quot;</span>
+                             <span class="s1">&quot;1-dimensional&quot; </span><span class="s0">% i)</span>
+        <span class="s2">if not </span><span class="s0">values.shape[i] == len(p):</span>
+            <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;There are %d points and %d values in &quot;</span>
+                             <span class="s1">&quot;dimension %d&quot; </span><span class="s0">% (len(p)</span><span class="s2">, </span><span class="s0">values.shape[i]</span><span class="s2">, </span><span class="s0">i))</span>
+
+
+<span class="s2">class </span><span class="s0">RegularGridInterpolator:</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Interpolation on a regular or rectilinear grid in arbitrary dimensions. 
+ 
+    The data must be defined on a rectilinear grid; that is, a rectangular 
+    grid with even or uneven spacing. Linear, nearest-neighbor, spline 
+    interpolations are supported. After setting up the interpolator object, 
+    the interpolation method may be chosen at each evaluation. 
+ 
+    Parameters 
+    ---------- 
+    points : tuple of ndarray of float, with shapes (m1, ), ..., (mn, ) 
+        The points defining the regular grid in n dimensions. The points in 
+        each dimension (i.e. every elements of the points tuple) must be 
+        strictly ascending or descending. 
+ 
+    values : array_like, shape (m1, ..., mn, ...) 
+        The data on the regular grid in n dimensions. Complex data can be 
+        acceptable. 
+ 
+    method : str, optional 
+        The method of interpolation to perform. Supported are &quot;linear&quot;, 
+        &quot;nearest&quot;, &quot;slinear&quot;, &quot;cubic&quot;, &quot;quintic&quot; and &quot;pchip&quot;. This 
+        parameter will become the default for the object's ``__call__`` 
+        method. Default is &quot;linear&quot;. 
+ 
+    bounds_error : bool, optional 
+        If True, when interpolated values are requested outside of the 
+        domain of the input data, a ValueError is raised. 
+        If False, then `fill_value` is used. 
+        Default is True. 
+ 
+    fill_value : float or None, optional 
+        The value to use for points outside of the interpolation domain. 
+        If None, values outside the domain are extrapolated. 
+        Default is ``np.nan``. 
+ 
+    Methods 
+    ------- 
+    __call__ 
+ 
+    Attributes 
+    ---------- 
+    grid : tuple of ndarrays 
+        The points defining the regular grid in n dimensions. 
+        This tuple defines the full grid via 
+        ``np.meshgrid(*grid, indexing='ij')`` 
+    values : ndarray 
+        Data values at the grid. 
+    method : str 
+        Interpolation method. 
+    fill_value : float or ``None`` 
+        Use this value for out-of-bounds arguments to `__call__`. 
+    bounds_error : bool 
+        If ``True``, out-of-bounds argument raise a ``ValueError``. 
+ 
+    Notes 
+    ----- 
+    Contrary to `LinearNDInterpolator` and `NearestNDInterpolator`, this class 
+    avoids expensive triangulation of the input data by taking advantage of the 
+    regular grid structure. 
+ 
+    In other words, this class assumes that the data is defined on a 
+    *rectilinear* grid. 
+ 
+    .. versionadded:: 0.14 
+ 
+    The 'slinear'(k=1), 'cubic'(k=3), and 'quintic'(k=5) methods are 
+    tensor-product spline interpolators, where `k` is the spline degree, 
+    If any dimension has fewer points than `k` + 1, an error will be raised. 
+ 
+    .. versionadded:: 1.9 
+ 
+    If the input data is such that dimensions have incommensurate 
+    units and differ by many orders of magnitude, the interpolant may have 
+    numerical artifacts. Consider rescaling the data before interpolating. 
+ 
+    Examples 
+    -------- 
+    **Evaluate a function on the points of a 3-D grid** 
+ 
+    As a first example, we evaluate a simple example function on the points of 
+    a 3-D grid: 
+ 
+    &gt;&gt;&gt; from scipy.interpolate import RegularGridInterpolator 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; def f(x, y, z): 
+    ...     return 2 * x**3 + 3 * y**2 - z 
+    &gt;&gt;&gt; x = np.linspace(1, 4, 11) 
+    &gt;&gt;&gt; y = np.linspace(4, 7, 22) 
+    &gt;&gt;&gt; z = np.linspace(7, 9, 33) 
+    &gt;&gt;&gt; xg, yg ,zg = np.meshgrid(x, y, z, indexing='ij', sparse=True) 
+    &gt;&gt;&gt; data = f(xg, yg, zg) 
+ 
+    ``data`` is now a 3-D array with ``data[i, j, k] = f(x[i], y[j], z[k])``. 
+    Next, define an interpolating function from this data: 
+ 
+    &gt;&gt;&gt; interp = RegularGridInterpolator((x, y, z), data) 
+ 
+    Evaluate the interpolating function at the two points 
+    ``(x,y,z) = (2.1, 6.2, 8.3)`` and ``(3.3, 5.2, 7.1)``: 
+ 
+    &gt;&gt;&gt; pts = np.array([[2.1, 6.2, 8.3], 
+    ...                 [3.3, 5.2, 7.1]]) 
+    &gt;&gt;&gt; interp(pts) 
+    array([ 125.80469388,  146.30069388]) 
+ 
+    which is indeed a close approximation to 
+ 
+    &gt;&gt;&gt; f(2.1, 6.2, 8.3), f(3.3, 5.2, 7.1) 
+    (125.54200000000002, 145.894) 
+ 
+    **Interpolate and extrapolate a 2D dataset** 
+ 
+    As a second example, we interpolate and extrapolate a 2D data set: 
+ 
+    &gt;&gt;&gt; x, y = np.array([-2, 0, 4]), np.array([-2, 0, 2, 5]) 
+    &gt;&gt;&gt; def ff(x, y): 
+    ...     return x**2 + y**2 
+ 
+    &gt;&gt;&gt; xg, yg = np.meshgrid(x, y, indexing='ij') 
+    &gt;&gt;&gt; data = ff(xg, yg) 
+    &gt;&gt;&gt; interp = RegularGridInterpolator((x, y), data, 
+    ...                                  bounds_error=False, fill_value=None) 
+ 
+    &gt;&gt;&gt; import matplotlib.pyplot as plt 
+    &gt;&gt;&gt; fig = plt.figure() 
+    &gt;&gt;&gt; ax = fig.add_subplot(projection='3d') 
+    &gt;&gt;&gt; ax.scatter(xg.ravel(), yg.ravel(), data.ravel(), 
+    ...            s=60, c='k', label='data') 
+ 
+    Evaluate and plot the interpolator on a finer grid 
+ 
+    &gt;&gt;&gt; xx = np.linspace(-4, 9, 31) 
+    &gt;&gt;&gt; yy = np.linspace(-4, 9, 31) 
+    &gt;&gt;&gt; X, Y = np.meshgrid(xx, yy, indexing='ij') 
+ 
+    &gt;&gt;&gt; # interpolator 
+    &gt;&gt;&gt; ax.plot_wireframe(X, Y, interp((X, Y)), rstride=3, cstride=3, 
+    ...                   alpha=0.4, color='m', label='linear interp') 
+ 
+    &gt;&gt;&gt; # ground truth 
+    &gt;&gt;&gt; ax.plot_wireframe(X, Y, ff(X, Y), rstride=3, cstride=3, 
+    ...                   alpha=0.4, label='ground truth') 
+    &gt;&gt;&gt; plt.legend() 
+    &gt;&gt;&gt; plt.show() 
+ 
+    Other examples are given 
+    :ref:`in the tutorial &lt;tutorial-interpolate_regular_grid_interpolator&gt;`. 
+ 
+    See Also 
+    -------- 
+    NearestNDInterpolator : Nearest neighbor interpolation on *unstructured* 
+                            data in N dimensions 
+ 
+    LinearNDInterpolator : Piecewise linear interpolant on *unstructured* data 
+                           in N dimensions 
+ 
+    interpn : a convenience function which wraps `RegularGridInterpolator` 
+ 
+    scipy.ndimage.map_coordinates : interpolation on grids with equal spacing 
+                                    (suitable for e.g., N-D image resampling) 
+ 
+    References 
+    ---------- 
+    .. [1] Python package *regulargrid* by Johannes Buchner, see 
+           https://pypi.python.org/pypi/regulargrid/ 
+    .. [2] Wikipedia, &quot;Trilinear interpolation&quot;, 
+           https://en.wikipedia.org/wiki/Trilinear_interpolation 
+    .. [3] Weiser, Alan, and Sergio E. Zarantonello. &quot;A note on piecewise linear 
+           and multilinear table interpolation in many dimensions.&quot; MATH. 
+           COMPUT. 50.181 (1988): 189-196. 
+           https://www.ams.org/journals/mcom/1988-50-181/S0025-5718-1988-0917826-0/S0025-5718-1988-0917826-0.pdf 
+           :doi:`10.1090/S0025-5718-1988-0917826-0` 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># this class is based on code originally programmed by Johannes Buchner,</span>
+    <span class="s3"># see https://github.com/JohannesBuchner/regulargrid</span>
+
+    <span class="s0">_SPLINE_DEGREE_MAP = {</span><span class="s1">&quot;slinear&quot;</span><span class="s0">: </span><span class="s4">1</span><span class="s2">, </span><span class="s1">&quot;cubic&quot;</span><span class="s0">: </span><span class="s4">3</span><span class="s2">, </span><span class="s1">&quot;quintic&quot;</span><span class="s0">: </span><span class="s4">5</span><span class="s2">, </span><span class="s1">'pchip'</span><span class="s0">: </span><span class="s4">3</span><span class="s0">}</span>
+    <span class="s0">_SPLINE_METHODS = list(_SPLINE_DEGREE_MAP.keys())</span>
+    <span class="s0">_ALL_METHODS = [</span><span class="s1">&quot;linear&quot;</span><span class="s2">, </span><span class="s1">&quot;nearest&quot;</span><span class="s0">] + _SPLINE_METHODS</span>
+
+    <span class="s2">def </span><span class="s0">__init__(self</span><span class="s2">, </span><span class="s0">points</span><span class="s2">, </span><span class="s0">values</span><span class="s2">, </span><span class="s0">method=</span><span class="s1">&quot;linear&quot;</span><span class="s2">, </span><span class="s0">bounds_error=</span><span class="s2">True,</span>
+                 <span class="s0">fill_value=np.nan):</span>
+        <span class="s2">if </span><span class="s0">method </span><span class="s2">not in </span><span class="s0">self._ALL_METHODS:</span>
+            <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;Method '%s' is not defined&quot; </span><span class="s0">% method)</span>
+        <span class="s2">elif </span><span class="s0">method </span><span class="s2">in </span><span class="s0">self._SPLINE_METHODS:</span>
+            <span class="s0">self._validate_grid_dimensions(points</span><span class="s2">, </span><span class="s0">method)</span>
+        <span class="s0">self.method = method</span>
+        <span class="s0">self.bounds_error = bounds_error</span>
+        <span class="s0">self.grid</span><span class="s2">, </span><span class="s0">self._descending_dimensions = _check_points(points)</span>
+        <span class="s0">self.values = self._check_values(values)</span>
+        <span class="s0">self._check_dimensionality(self.grid</span><span class="s2">, </span><span class="s0">self.values)</span>
+        <span class="s0">self.fill_value = self._check_fill_value(self.values</span><span class="s2">, </span><span class="s0">fill_value)</span>
+        <span class="s2">if </span><span class="s0">self._descending_dimensions:</span>
+            <span class="s0">self.values = np.flip(values</span><span class="s2">, </span><span class="s0">axis=self._descending_dimensions)</span>
+
+    <span class="s2">def </span><span class="s0">_check_dimensionality(self</span><span class="s2">, </span><span class="s0">grid</span><span class="s2">, </span><span class="s0">values):</span>
+        <span class="s0">_check_dimensionality(grid</span><span class="s2">, </span><span class="s0">values)</span>
+
+    <span class="s2">def </span><span class="s0">_check_points(self</span><span class="s2">, </span><span class="s0">points):</span>
+        <span class="s2">return </span><span class="s0">_check_points(points)</span>
+
+    <span class="s2">def </span><span class="s0">_check_values(self</span><span class="s2">, </span><span class="s0">values):</span>
+        <span class="s2">if not </span><span class="s0">hasattr(values</span><span class="s2">, </span><span class="s1">'ndim'</span><span class="s0">):</span>
+            <span class="s3"># allow reasonable duck-typed values</span>
+            <span class="s0">values = np.asarray(values)</span>
+
+        <span class="s2">if </span><span class="s0">hasattr(values</span><span class="s2">, </span><span class="s1">'dtype'</span><span class="s0">) </span><span class="s2">and </span><span class="s0">hasattr(values</span><span class="s2">, </span><span class="s1">'astype'</span><span class="s0">):</span>
+            <span class="s2">if not </span><span class="s0">np.issubdtype(values.dtype</span><span class="s2">, </span><span class="s0">np.inexact):</span>
+                <span class="s0">values = values.astype(float)</span>
+
+        <span class="s2">return </span><span class="s0">values</span>
+
+    <span class="s2">def </span><span class="s0">_check_fill_value(self</span><span class="s2">, </span><span class="s0">values</span><span class="s2">, </span><span class="s0">fill_value):</span>
+        <span class="s2">if </span><span class="s0">fill_value </span><span class="s2">is not None</span><span class="s0">:</span>
+            <span class="s0">fill_value_dtype = np.asarray(fill_value).dtype</span>
+            <span class="s2">if </span><span class="s0">(hasattr(values</span><span class="s2">, </span><span class="s1">'dtype'</span><span class="s0">) </span><span class="s2">and not</span>
+                    <span class="s0">np.can_cast(fill_value_dtype</span><span class="s2">, </span><span class="s0">values.dtype</span><span class="s2">,</span>
+                                <span class="s0">casting=</span><span class="s1">'same_kind'</span><span class="s0">)):</span>
+                <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;fill_value must be either 'None' or &quot;</span>
+                                 <span class="s1">&quot;of a type compatible with values&quot;</span><span class="s0">)</span>
+        <span class="s2">return </span><span class="s0">fill_value</span>
+
+    <span class="s2">def </span><span class="s0">__call__(self</span><span class="s2">, </span><span class="s0">xi</span><span class="s2">, </span><span class="s0">method=</span><span class="s2">None</span><span class="s0">):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Interpolation at coordinates. 
+ 
+        Parameters 
+        ---------- 
+        xi : ndarray of shape (..., ndim) 
+            The coordinates to evaluate the interpolator at. 
+ 
+        method : str, optional 
+            The method of interpolation to perform. Supported are &quot;linear&quot;, 
+            &quot;nearest&quot;, &quot;slinear&quot;, &quot;cubic&quot;, &quot;quintic&quot; and &quot;pchip&quot;. Default is 
+            the method chosen when the interpolator was created. 
+ 
+        Returns 
+        ------- 
+        values_x : ndarray, shape xi.shape[:-1] + values.shape[ndim:] 
+            Interpolated values at `xi`. See notes for behaviour when 
+            ``xi.ndim == 1``. 
+ 
+        Notes 
+        ----- 
+        In the case that ``xi.ndim == 1`` a new axis is inserted into 
+        the 0 position of the returned array, values_x, so its shape is 
+        instead ``(1,) + values.shape[ndim:]``. 
+ 
+        Examples 
+        -------- 
+        Here we define a nearest-neighbor interpolator of a simple function 
+ 
+        &gt;&gt;&gt; import numpy as np 
+        &gt;&gt;&gt; x, y = np.array([0, 1, 2]), np.array([1, 3, 7]) 
+        &gt;&gt;&gt; def f(x, y): 
+        ...     return x**2 + y**2 
+        &gt;&gt;&gt; data = f(*np.meshgrid(x, y, indexing='ij', sparse=True)) 
+        &gt;&gt;&gt; from scipy.interpolate import RegularGridInterpolator 
+        &gt;&gt;&gt; interp = RegularGridInterpolator((x, y), data, method='nearest') 
+ 
+        By construction, the interpolator uses the nearest-neighbor 
+        interpolation 
+ 
+        &gt;&gt;&gt; interp([[1.5, 1.3], [0.3, 4.5]]) 
+        array([2., 9.]) 
+ 
+        We can however evaluate the linear interpolant by overriding the 
+        `method` parameter 
+ 
+        &gt;&gt;&gt; interp([[1.5, 1.3], [0.3, 4.5]], method='linear') 
+        array([ 4.7, 24.3]) 
+        &quot;&quot;&quot;</span>
+        <span class="s0">is_method_changed = self.method != method</span>
+        <span class="s0">method = self.method </span><span class="s2">if </span><span class="s0">method </span><span class="s2">is None else </span><span class="s0">method</span>
+        <span class="s2">if </span><span class="s0">method </span><span class="s2">not in </span><span class="s0">self._ALL_METHODS:</span>
+            <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;Method '%s' is not defined&quot; </span><span class="s0">% method)</span>
+
+        <span class="s0">xi</span><span class="s2">, </span><span class="s0">xi_shape</span><span class="s2">, </span><span class="s0">ndim</span><span class="s2">, </span><span class="s0">nans</span><span class="s2">, </span><span class="s0">out_of_bounds = self._prepare_xi(xi)</span>
+
+        <span class="s2">if </span><span class="s0">method == </span><span class="s1">&quot;linear&quot;</span><span class="s0">:</span>
+            <span class="s0">indices</span><span class="s2">, </span><span class="s0">norm_distances = self._find_indices(xi.T)</span>
+            <span class="s2">if </span><span class="s0">(ndim == </span><span class="s4">2 </span><span class="s2">and </span><span class="s0">hasattr(self.values</span><span class="s2">, </span><span class="s1">'dtype'</span><span class="s0">) </span><span class="s2">and</span>
+                    <span class="s0">self.values.ndim == </span><span class="s4">2 </span><span class="s2">and </span><span class="s0">self.values.flags.writeable </span><span class="s2">and</span>
+                    <span class="s0">self.values.dtype </span><span class="s2">in </span><span class="s0">(np.float64</span><span class="s2">, </span><span class="s0">np.complex128) </span><span class="s2">and</span>
+                    <span class="s0">self.values.dtype.byteorder == </span><span class="s1">'='</span><span class="s0">):</span>
+                <span class="s3"># until cython supports const fused types, the fast path</span>
+                <span class="s3"># cannot support non-writeable values</span>
+                <span class="s3"># a fast path</span>
+                <span class="s0">out = np.empty(indices.shape[</span><span class="s4">1</span><span class="s0">]</span><span class="s2">, </span><span class="s0">dtype=self.values.dtype)</span>
+                <span class="s0">result = evaluate_linear_2d(self.values</span><span class="s2">,</span>
+                                            <span class="s0">indices</span><span class="s2">,</span>
+                                            <span class="s0">norm_distances</span><span class="s2">,</span>
+                                            <span class="s0">self.grid</span><span class="s2">,</span>
+                                            <span class="s0">out)</span>
+            <span class="s2">else</span><span class="s0">:</span>
+                <span class="s0">result = self._evaluate_linear(indices</span><span class="s2">, </span><span class="s0">norm_distances)</span>
+        <span class="s2">elif </span><span class="s0">method == </span><span class="s1">&quot;nearest&quot;</span><span class="s0">:</span>
+            <span class="s0">indices</span><span class="s2">, </span><span class="s0">norm_distances = self._find_indices(xi.T)</span>
+            <span class="s0">result = self._evaluate_nearest(indices</span><span class="s2">, </span><span class="s0">norm_distances)</span>
+        <span class="s2">elif </span><span class="s0">method </span><span class="s2">in </span><span class="s0">self._SPLINE_METHODS:</span>
+            <span class="s2">if </span><span class="s0">is_method_changed:</span>
+                <span class="s0">self._validate_grid_dimensions(self.grid</span><span class="s2">, </span><span class="s0">method)</span>
+            <span class="s0">result = self._evaluate_spline(xi</span><span class="s2">, </span><span class="s0">method)</span>
+
+        <span class="s2">if not </span><span class="s0">self.bounds_error </span><span class="s2">and </span><span class="s0">self.fill_value </span><span class="s2">is not None</span><span class="s0">:</span>
+            <span class="s0">result[out_of_bounds] = self.fill_value</span>
+
+        <span class="s3"># f(nan) = nan, if any</span>
+        <span class="s2">if </span><span class="s0">np.any(nans):</span>
+            <span class="s0">result[nans] = np.nan</span>
+        <span class="s2">return </span><span class="s0">result.reshape(xi_shape[:-</span><span class="s4">1</span><span class="s0">] + self.values.shape[ndim:])</span>
+
+    <span class="s2">def </span><span class="s0">_prepare_xi(self</span><span class="s2">, </span><span class="s0">xi):</span>
+        <span class="s0">ndim = len(self.grid)</span>
+        <span class="s0">xi = _ndim_coords_from_arrays(xi</span><span class="s2">, </span><span class="s0">ndim=ndim)</span>
+        <span class="s2">if </span><span class="s0">xi.shape[-</span><span class="s4">1</span><span class="s0">] != len(self.grid):</span>
+            <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;The requested sample points xi have dimension &quot;</span>
+                             <span class="s1">f&quot;</span><span class="s2">{</span><span class="s0">xi.shape[-</span><span class="s4">1</span><span class="s0">]</span><span class="s2">} </span><span class="s1">but this &quot;</span>
+                             <span class="s1">f&quot;RegularGridInterpolator has dimension </span><span class="s2">{</span><span class="s0">ndim</span><span class="s2">}</span><span class="s1">&quot;</span><span class="s0">)</span>
+
+        <span class="s0">xi_shape = xi.shape</span>
+        <span class="s0">xi = xi.reshape(-</span><span class="s4">1</span><span class="s2">, </span><span class="s0">xi_shape[-</span><span class="s4">1</span><span class="s0">])</span>
+        <span class="s0">xi = np.asarray(xi</span><span class="s2">, </span><span class="s0">dtype=float)</span>
+
+        <span class="s3"># find nans in input</span>
+        <span class="s0">nans = np.any(np.isnan(xi)</span><span class="s2">, </span><span class="s0">axis=-</span><span class="s4">1</span><span class="s0">)</span>
+
+        <span class="s2">if </span><span class="s0">self.bounds_error:</span>
+            <span class="s2">for </span><span class="s0">i</span><span class="s2">, </span><span class="s0">p </span><span class="s2">in </span><span class="s0">enumerate(xi.T):</span>
+                <span class="s2">if not </span><span class="s0">np.logical_and(np.all(self.grid[i][</span><span class="s4">0</span><span class="s0">] &lt;= p)</span><span class="s2">,</span>
+                                      <span class="s0">np.all(p &lt;= self.grid[i][-</span><span class="s4">1</span><span class="s0">])):</span>
+                    <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;One of the requested xi is out of bounds &quot;</span>
+                                     <span class="s1">&quot;in dimension %d&quot; </span><span class="s0">% i)</span>
+            <span class="s0">out_of_bounds = </span><span class="s2">None</span>
+        <span class="s2">else</span><span class="s0">:</span>
+            <span class="s0">out_of_bounds = self._find_out_of_bounds(xi.T)</span>
+
+        <span class="s2">return </span><span class="s0">xi</span><span class="s2">, </span><span class="s0">xi_shape</span><span class="s2">, </span><span class="s0">ndim</span><span class="s2">, </span><span class="s0">nans</span><span class="s2">, </span><span class="s0">out_of_bounds</span>
+
+    <span class="s2">def </span><span class="s0">_evaluate_linear(self</span><span class="s2">, </span><span class="s0">indices</span><span class="s2">, </span><span class="s0">norm_distances):</span>
+        <span class="s3"># slice for broadcasting over trailing dimensions in self.values</span>
+        <span class="s0">vslice = (slice(</span><span class="s2">None</span><span class="s0">)</span><span class="s2">,</span><span class="s0">) + (</span><span class="s2">None,</span><span class="s0">)*(self.values.ndim - len(indices))</span>
+
+        <span class="s3"># Compute shifting up front before zipping everything together</span>
+        <span class="s0">shift_norm_distances = [</span><span class="s4">1 </span><span class="s0">- yi </span><span class="s2">for </span><span class="s0">yi </span><span class="s2">in </span><span class="s0">norm_distances]</span>
+        <span class="s0">shift_indices = [i + </span><span class="s4">1 </span><span class="s2">for </span><span class="s0">i </span><span class="s2">in </span><span class="s0">indices]</span>
+
+        <span class="s3"># The formula for linear interpolation in 2d takes the form:</span>
+        <span class="s3"># values = self.values[(i0, i1)] * (1 - y0) * (1 - y1) + \</span>
+        <span class="s3">#          self.values[(i0, i1 + 1)] * (1 - y0) * y1 + \</span>
+        <span class="s3">#          self.values[(i0 + 1, i1)] * y0 * (1 - y1) + \</span>
+        <span class="s3">#          self.values[(i0 + 1, i1 + 1)] * y0 * y1</span>
+        <span class="s3"># We pair i with 1 - yi (zipped1) and i + 1 with yi (zipped2)</span>
+        <span class="s0">zipped1 = zip(indices</span><span class="s2">, </span><span class="s0">shift_norm_distances)</span>
+        <span class="s0">zipped2 = zip(shift_indices</span><span class="s2">, </span><span class="s0">norm_distances)</span>
+
+        <span class="s3"># Take all products of zipped1 and zipped2 and iterate over them</span>
+        <span class="s3"># to get the terms in the above formula. This corresponds to iterating</span>
+        <span class="s3"># over the vertices of a hypercube.</span>
+        <span class="s0">hypercube = itertools.product(*zip(zipped1</span><span class="s2">, </span><span class="s0">zipped2))</span>
+        <span class="s0">value = np.array([</span><span class="s4">0.</span><span class="s0">])</span>
+        <span class="s2">for </span><span class="s0">h </span><span class="s2">in </span><span class="s0">hypercube:</span>
+            <span class="s0">edge_indices</span><span class="s2">, </span><span class="s0">weights = zip(*h)</span>
+            <span class="s0">weight = np.array([</span><span class="s4">1.</span><span class="s0">])</span>
+            <span class="s2">for </span><span class="s0">w </span><span class="s2">in </span><span class="s0">weights:</span>
+                <span class="s0">weight = weight * w</span>
+            <span class="s0">term = np.asarray(self.values[edge_indices]) * weight[vslice]</span>
+            <span class="s0">value = value + term   </span><span class="s3"># cannot use += because broadcasting</span>
+        <span class="s2">return </span><span class="s0">value</span>
+
+    <span class="s2">def </span><span class="s0">_evaluate_nearest(self</span><span class="s2">, </span><span class="s0">indices</span><span class="s2">, </span><span class="s0">norm_distances):</span>
+        <span class="s0">idx_res = [np.where(yi &lt;= </span><span class="s4">.5</span><span class="s2">, </span><span class="s0">i</span><span class="s2">, </span><span class="s0">i + </span><span class="s4">1</span><span class="s0">)</span>
+                   <span class="s2">for </span><span class="s0">i</span><span class="s2">, </span><span class="s0">yi </span><span class="s2">in </span><span class="s0">zip(indices</span><span class="s2">, </span><span class="s0">norm_distances)]</span>
+        <span class="s2">return </span><span class="s0">self.values[tuple(idx_res)]</span>
+
+    <span class="s2">def </span><span class="s0">_validate_grid_dimensions(self</span><span class="s2">, </span><span class="s0">points</span><span class="s2">, </span><span class="s0">method):</span>
+        <span class="s0">k = self._SPLINE_DEGREE_MAP[method]</span>
+        <span class="s2">for </span><span class="s0">i</span><span class="s2">, </span><span class="s0">point </span><span class="s2">in </span><span class="s0">enumerate(points):</span>
+            <span class="s0">ndim = len(np.atleast_1d(point))</span>
+            <span class="s2">if </span><span class="s0">ndim &lt;= k:</span>
+                <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">f&quot;There are </span><span class="s2">{</span><span class="s0">ndim</span><span class="s2">} </span><span class="s1">points in dimension </span><span class="s2">{</span><span class="s0">i</span><span class="s2">}</span><span class="s1">,&quot;</span>
+                                 <span class="s1">f&quot; but method </span><span class="s2">{</span><span class="s0">method</span><span class="s2">} </span><span class="s1">requires at least &quot;</span>
+                                 <span class="s1">f&quot; </span><span class="s2">{</span><span class="s0">k+</span><span class="s4">1</span><span class="s2">} </span><span class="s1">points per dimension.&quot;</span><span class="s0">)</span>
+
+    <span class="s2">def </span><span class="s0">_evaluate_spline(self</span><span class="s2">, </span><span class="s0">xi</span><span class="s2">, </span><span class="s0">method):</span>
+        <span class="s3"># ensure xi is 2D list of points to evaluate (`m` is the number of</span>
+        <span class="s3"># points and `n` is the number of interpolation dimensions,</span>
+        <span class="s3"># ``n == len(self.grid)``.)</span>
+        <span class="s2">if </span><span class="s0">xi.ndim == </span><span class="s4">1</span><span class="s0">:</span>
+            <span class="s0">xi = xi.reshape((</span><span class="s4">1</span><span class="s2">, </span><span class="s0">xi.size))</span>
+        <span class="s0">m</span><span class="s2">, </span><span class="s0">n = xi.shape</span>
+
+        <span class="s3"># Reorder the axes: n-dimensional process iterates over the</span>
+        <span class="s3"># interpolation axes from the last axis downwards: E.g. for a 4D grid</span>
+        <span class="s3"># the order of axes is 3, 2, 1, 0. Each 1D interpolation works along</span>
+        <span class="s3"># the 0th axis of its argument array (for 1D routine it's its ``y``</span>
+        <span class="s3"># array). Thus permute the interpolation axes of `values` *and keep</span>
+        <span class="s3"># trailing dimensions trailing*.</span>
+        <span class="s0">axes = tuple(range(self.values.ndim))</span>
+        <span class="s0">axx = axes[:n][::-</span><span class="s4">1</span><span class="s0">] + axes[n:]</span>
+        <span class="s0">values = self.values.transpose(axx)</span>
+
+        <span class="s2">if </span><span class="s0">method == </span><span class="s1">'pchip'</span><span class="s0">:</span>
+            <span class="s0">_eval_func = self._do_pchip</span>
+        <span class="s2">else</span><span class="s0">:</span>
+            <span class="s0">_eval_func = self._do_spline_fit</span>
+        <span class="s0">k = self._SPLINE_DEGREE_MAP[method]</span>
+
+        <span class="s3"># Non-stationary procedure: difficult to vectorize this part entirely</span>
+        <span class="s3"># into numpy-level operations. Unfortunately this requires explicit</span>
+        <span class="s3"># looping over each point in xi.</span>
+
+        <span class="s3"># can at least vectorize the first pass across all points in the</span>
+        <span class="s3"># last variable of xi.</span>
+        <span class="s0">last_dim = n - </span><span class="s4">1</span>
+        <span class="s0">first_values = _eval_func(self.grid[last_dim]</span><span class="s2">,</span>
+                                  <span class="s0">values</span><span class="s2">,</span>
+                                  <span class="s0">xi[:</span><span class="s2">, </span><span class="s0">last_dim]</span><span class="s2">,</span>
+                                  <span class="s0">k)</span>
+
+        <span class="s3"># the rest of the dimensions have to be on a per point-in-xi basis</span>
+        <span class="s0">shape = (m</span><span class="s2">, </span><span class="s0">*self.values.shape[n:])</span>
+        <span class="s0">result = np.empty(shape</span><span class="s2">, </span><span class="s0">dtype=self.values.dtype)</span>
+        <span class="s2">for </span><span class="s0">j </span><span class="s2">in </span><span class="s0">range(m):</span>
+            <span class="s3"># Main process: Apply 1D interpolate in each dimension</span>
+            <span class="s3"># sequentially, starting with the last dimension.</span>
+            <span class="s3"># These are then &quot;folded&quot; into the next dimension in-place.</span>
+            <span class="s0">folded_values = first_values[j</span><span class="s2">, </span><span class="s0">...]</span>
+            <span class="s2">for </span><span class="s0">i </span><span class="s2">in </span><span class="s0">range(last_dim-</span><span class="s4">1</span><span class="s2">, </span><span class="s0">-</span><span class="s4">1</span><span class="s2">, </span><span class="s0">-</span><span class="s4">1</span><span class="s0">):</span>
+                <span class="s3"># Interpolate for each 1D from the last dimensions.</span>
+                <span class="s3"># This collapses each 1D sequence into a scalar.</span>
+                <span class="s0">folded_values = _eval_func(self.grid[i]</span><span class="s2">,</span>
+                                           <span class="s0">folded_values</span><span class="s2">,</span>
+                                           <span class="s0">xi[j</span><span class="s2">, </span><span class="s0">i]</span><span class="s2">,</span>
+                                           <span class="s0">k)</span>
+            <span class="s0">result[j</span><span class="s2">, </span><span class="s0">...] = folded_values</span>
+
+        <span class="s2">return </span><span class="s0">result</span>
+
+    <span class="s0">@staticmethod</span>
+    <span class="s2">def </span><span class="s0">_do_spline_fit(x</span><span class="s2">, </span><span class="s0">y</span><span class="s2">, </span><span class="s0">pt</span><span class="s2">, </span><span class="s0">k):</span>
+        <span class="s0">local_interp = make_interp_spline(x</span><span class="s2">, </span><span class="s0">y</span><span class="s2">, </span><span class="s0">k=k</span><span class="s2">, </span><span class="s0">axis=</span><span class="s4">0</span><span class="s0">)</span>
+        <span class="s0">values = local_interp(pt)</span>
+        <span class="s2">return </span><span class="s0">values</span>
+
+    <span class="s0">@staticmethod</span>
+    <span class="s2">def </span><span class="s0">_do_pchip(x</span><span class="s2">, </span><span class="s0">y</span><span class="s2">, </span><span class="s0">pt</span><span class="s2">, </span><span class="s0">k):</span>
+        <span class="s0">local_interp = PchipInterpolator(x</span><span class="s2">, </span><span class="s0">y</span><span class="s2">, </span><span class="s0">axis=</span><span class="s4">0</span><span class="s0">)</span>
+        <span class="s0">values = local_interp(pt)</span>
+        <span class="s2">return </span><span class="s0">values</span>
+
+    <span class="s2">def </span><span class="s0">_find_indices(self</span><span class="s2">, </span><span class="s0">xi):</span>
+        <span class="s2">return </span><span class="s0">find_indices(self.grid</span><span class="s2">, </span><span class="s0">xi)</span>
+
+    <span class="s2">def </span><span class="s0">_find_out_of_bounds(self</span><span class="s2">, </span><span class="s0">xi):</span>
+        <span class="s3"># check for out of bounds xi</span>
+        <span class="s0">out_of_bounds = np.zeros((xi.shape[</span><span class="s4">1</span><span class="s0">])</span><span class="s2">, </span><span class="s0">dtype=bool)</span>
+        <span class="s3"># iterate through dimensions</span>
+        <span class="s2">for </span><span class="s0">x</span><span class="s2">, </span><span class="s0">grid </span><span class="s2">in </span><span class="s0">zip(xi</span><span class="s2">, </span><span class="s0">self.grid):</span>
+            <span class="s0">out_of_bounds += x &lt; grid[</span><span class="s4">0</span><span class="s0">]</span>
+            <span class="s0">out_of_bounds += x &gt; grid[-</span><span class="s4">1</span><span class="s0">]</span>
+        <span class="s2">return </span><span class="s0">out_of_bounds</span>
+
+
+<span class="s2">def </span><span class="s0">interpn(points</span><span class="s2">, </span><span class="s0">values</span><span class="s2">, </span><span class="s0">xi</span><span class="s2">, </span><span class="s0">method=</span><span class="s1">&quot;linear&quot;</span><span class="s2">, </span><span class="s0">bounds_error=</span><span class="s2">True,</span>
+            <span class="s0">fill_value=np.nan):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Multidimensional interpolation on regular or rectilinear grids. 
+ 
+    Strictly speaking, not all regular grids are supported - this function 
+    works on *rectilinear* grids, that is, a rectangular grid with even or 
+    uneven spacing. 
+ 
+    Parameters 
+    ---------- 
+    points : tuple of ndarray of float, with shapes (m1, ), ..., (mn, ) 
+        The points defining the regular grid in n dimensions. The points in 
+        each dimension (i.e. every elements of the points tuple) must be 
+        strictly ascending or descending. 
+ 
+    values : array_like, shape (m1, ..., mn, ...) 
+        The data on the regular grid in n dimensions. Complex data can be 
+        acceptable. 
+ 
+    xi : ndarray of shape (..., ndim) 
+        The coordinates to sample the gridded data at 
+ 
+    method : str, optional 
+        The method of interpolation to perform. Supported are &quot;linear&quot;, 
+        &quot;nearest&quot;, &quot;slinear&quot;, &quot;cubic&quot;, &quot;quintic&quot;, &quot;pchip&quot;, and &quot;splinef2d&quot;. 
+        &quot;splinef2d&quot; is only supported for 2-dimensional data. 
+ 
+    bounds_error : bool, optional 
+        If True, when interpolated values are requested outside of the 
+        domain of the input data, a ValueError is raised. 
+        If False, then `fill_value` is used. 
+ 
+    fill_value : number, optional 
+        If provided, the value to use for points outside of the 
+        interpolation domain. If None, values outside 
+        the domain are extrapolated.  Extrapolation is not supported by method 
+        &quot;splinef2d&quot;. 
+ 
+    Returns 
+    ------- 
+    values_x : ndarray, shape xi.shape[:-1] + values.shape[ndim:] 
+        Interpolated values at `xi`. See notes for behaviour when 
+        ``xi.ndim == 1``. 
+ 
+    See Also 
+    -------- 
+    NearestNDInterpolator : Nearest neighbor interpolation on unstructured 
+                            data in N dimensions 
+    LinearNDInterpolator : Piecewise linear interpolant on unstructured data 
+                           in N dimensions 
+    RegularGridInterpolator : interpolation on a regular or rectilinear grid 
+                              in arbitrary dimensions (`interpn` wraps this 
+                              class). 
+    RectBivariateSpline : Bivariate spline approximation over a rectangular mesh 
+    scipy.ndimage.map_coordinates : interpolation on grids with equal spacing 
+                                    (suitable for e.g., N-D image resampling) 
+ 
+    Notes 
+    ----- 
+ 
+    .. versionadded:: 0.14 
+ 
+    In the case that ``xi.ndim == 1`` a new axis is inserted into 
+    the 0 position of the returned array, values_x, so its shape is 
+    instead ``(1,) + values.shape[ndim:]``. 
+ 
+    If the input data is such that input dimensions have incommensurate 
+    units and differ by many orders of magnitude, the interpolant may have 
+    numerical artifacts. Consider rescaling the data before interpolation. 
+ 
+    Examples 
+    -------- 
+    Evaluate a simple example function on the points of a regular 3-D grid: 
+ 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.interpolate import interpn 
+    &gt;&gt;&gt; def value_func_3d(x, y, z): 
+    ...     return 2 * x + 3 * y - z 
+    &gt;&gt;&gt; x = np.linspace(0, 4, 5) 
+    &gt;&gt;&gt; y = np.linspace(0, 5, 6) 
+    &gt;&gt;&gt; z = np.linspace(0, 6, 7) 
+    &gt;&gt;&gt; points = (x, y, z) 
+    &gt;&gt;&gt; values = value_func_3d(*np.meshgrid(*points, indexing='ij')) 
+ 
+    Evaluate the interpolating function at a point 
+ 
+    &gt;&gt;&gt; point = np.array([2.21, 3.12, 1.15]) 
+    &gt;&gt;&gt; print(interpn(points, values, point)) 
+    [12.63] 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># sanity check 'method' kwarg</span>
+    <span class="s2">if </span><span class="s0">method </span><span class="s2">not in </span><span class="s0">[</span><span class="s1">&quot;linear&quot;</span><span class="s2">, </span><span class="s1">&quot;nearest&quot;</span><span class="s2">, </span><span class="s1">&quot;cubic&quot;</span><span class="s2">, </span><span class="s1">&quot;quintic&quot;</span><span class="s2">, </span><span class="s1">&quot;pchip&quot;</span><span class="s2">,</span>
+                      <span class="s1">&quot;splinef2d&quot;</span><span class="s2">, </span><span class="s1">&quot;slinear&quot;</span><span class="s0">]:</span>
+        <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;interpn only understands the methods 'linear', &quot;</span>
+                         <span class="s1">&quot;'nearest', 'slinear', 'cubic', 'quintic', 'pchip', &quot;</span>
+                         <span class="s1">f&quot;and 'splinef2d'. You provided </span><span class="s2">{</span><span class="s0">method</span><span class="s2">}</span><span class="s1">.&quot;</span><span class="s0">)</span>
+
+    <span class="s2">if not </span><span class="s0">hasattr(values</span><span class="s2">, </span><span class="s1">'ndim'</span><span class="s0">):</span>
+        <span class="s0">values = np.asarray(values)</span>
+
+    <span class="s0">ndim = values.ndim</span>
+    <span class="s2">if </span><span class="s0">ndim &gt; </span><span class="s4">2 </span><span class="s2">and </span><span class="s0">method == </span><span class="s1">&quot;splinef2d&quot;</span><span class="s0">:</span>
+        <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;The method splinef2d can only be used for &quot;</span>
+                         <span class="s1">&quot;2-dimensional input data&quot;</span><span class="s0">)</span>
+    <span class="s2">if not </span><span class="s0">bounds_error </span><span class="s2">and </span><span class="s0">fill_value </span><span class="s2">is None and </span><span class="s0">method == </span><span class="s1">&quot;splinef2d&quot;</span><span class="s0">:</span>
+        <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;The method splinef2d does not support extrapolation.&quot;</span><span class="s0">)</span>
+
+    <span class="s3"># sanity check consistency of input dimensions</span>
+    <span class="s2">if </span><span class="s0">len(points) &gt; ndim:</span>
+        <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;There are %d point arrays, but values has %d &quot;</span>
+                         <span class="s1">&quot;dimensions&quot; </span><span class="s0">% (len(points)</span><span class="s2">, </span><span class="s0">ndim))</span>
+    <span class="s2">if </span><span class="s0">len(points) != ndim </span><span class="s2">and </span><span class="s0">method == </span><span class="s1">'splinef2d'</span><span class="s0">:</span>
+        <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;The method splinef2d can only be used for &quot;</span>
+                         <span class="s1">&quot;scalar data with one point per coordinate&quot;</span><span class="s0">)</span>
+
+    <span class="s0">grid</span><span class="s2">, </span><span class="s0">descending_dimensions = _check_points(points)</span>
+    <span class="s0">_check_dimensionality(grid</span><span class="s2">, </span><span class="s0">values)</span>
+
+    <span class="s3"># sanity check requested xi</span>
+    <span class="s0">xi = _ndim_coords_from_arrays(xi</span><span class="s2">, </span><span class="s0">ndim=len(grid))</span>
+    <span class="s2">if </span><span class="s0">xi.shape[-</span><span class="s4">1</span><span class="s0">] != len(grid):</span>
+        <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;The requested sample points xi have dimension &quot;</span>
+                         <span class="s1">&quot;%d, but this RegularGridInterpolator has &quot;</span>
+                         <span class="s1">&quot;dimension %d&quot; </span><span class="s0">% (xi.shape[-</span><span class="s4">1</span><span class="s0">]</span><span class="s2">, </span><span class="s0">len(grid)))</span>
+
+    <span class="s2">if </span><span class="s0">bounds_error:</span>
+        <span class="s2">for </span><span class="s0">i</span><span class="s2">, </span><span class="s0">p </span><span class="s2">in </span><span class="s0">enumerate(xi.T):</span>
+            <span class="s2">if not </span><span class="s0">np.logical_and(np.all(grid[i][</span><span class="s4">0</span><span class="s0">] &lt;= p)</span><span class="s2">,</span>
+                                  <span class="s0">np.all(p &lt;= grid[i][-</span><span class="s4">1</span><span class="s0">])):</span>
+                <span class="s2">raise </span><span class="s0">ValueError(</span><span class="s1">&quot;One of the requested xi is out of bounds &quot;</span>
+                                 <span class="s1">&quot;in dimension %d&quot; </span><span class="s0">% i)</span>
+
+    <span class="s3"># perform interpolation</span>
+    <span class="s2">if </span><span class="s0">method </span><span class="s2">in </span><span class="s0">[</span><span class="s1">&quot;linear&quot;</span><span class="s2">, </span><span class="s1">&quot;nearest&quot;</span><span class="s2">, </span><span class="s1">&quot;slinear&quot;</span><span class="s2">, </span><span class="s1">&quot;cubic&quot;</span><span class="s2">, </span><span class="s1">&quot;quintic&quot;</span><span class="s2">, </span><span class="s1">&quot;pchip&quot;</span><span class="s0">]:</span>
+        <span class="s0">interp = RegularGridInterpolator(points</span><span class="s2">, </span><span class="s0">values</span><span class="s2">, </span><span class="s0">method=method</span><span class="s2">,</span>
+                                         <span class="s0">bounds_error=bounds_error</span><span class="s2">,</span>
+                                         <span class="s0">fill_value=fill_value)</span>
+        <span class="s2">return </span><span class="s0">interp(xi)</span>
+    <span class="s2">elif </span><span class="s0">method == </span><span class="s1">&quot;splinef2d&quot;</span><span class="s0">:</span>
+        <span class="s0">xi_shape = xi.shape</span>
+        <span class="s0">xi = xi.reshape(-</span><span class="s4">1</span><span class="s2">, </span><span class="s0">xi.shape[-</span><span class="s4">1</span><span class="s0">])</span>
+
+        <span class="s3"># RectBivariateSpline doesn't support fill_value; we need to wrap here</span>
+        <span class="s0">idx_valid = np.all((grid[</span><span class="s4">0</span><span class="s0">][</span><span class="s4">0</span><span class="s0">] &lt;= xi[:</span><span class="s2">, </span><span class="s4">0</span><span class="s0">]</span><span class="s2">, </span><span class="s0">xi[:</span><span class="s2">, </span><span class="s4">0</span><span class="s0">] &lt;= grid[</span><span class="s4">0</span><span class="s0">][-</span><span class="s4">1</span><span class="s0">]</span><span class="s2">,</span>
+                            <span class="s0">grid[</span><span class="s4">1</span><span class="s0">][</span><span class="s4">0</span><span class="s0">] &lt;= xi[:</span><span class="s2">, </span><span class="s4">1</span><span class="s0">]</span><span class="s2">, </span><span class="s0">xi[:</span><span class="s2">, </span><span class="s4">1</span><span class="s0">] &lt;= grid[</span><span class="s4">1</span><span class="s0">][-</span><span class="s4">1</span><span class="s0">])</span><span class="s2">,</span>
+                           <span class="s0">axis=</span><span class="s4">0</span><span class="s0">)</span>
+        <span class="s0">result = np.empty_like(xi[:</span><span class="s2">, </span><span class="s4">0</span><span class="s0">])</span>
+
+        <span class="s3"># make a copy of values for RectBivariateSpline</span>
+        <span class="s0">interp = RectBivariateSpline(points[</span><span class="s4">0</span><span class="s0">]</span><span class="s2">, </span><span class="s0">points[</span><span class="s4">1</span><span class="s0">]</span><span class="s2">, </span><span class="s0">values[:])</span>
+        <span class="s0">result[idx_valid] = interp.ev(xi[idx_valid</span><span class="s2">, </span><span class="s4">0</span><span class="s0">]</span><span class="s2">, </span><span class="s0">xi[idx_valid</span><span class="s2">, </span><span class="s4">1</span><span class="s0">])</span>
+        <span class="s0">result[np.logical_not(idx_valid)] = fill_value</span>
+
+        <span class="s2">return </span><span class="s0">result.reshape(xi_shape[:-</span><span class="s4">1</span><span class="s0">])</span>
+</pre>
+</body>
+</html>

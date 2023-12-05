@@ -1,0 +1,1834 @@
+<html>
+<head>
+<title>gmm.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+gmm.py</font>
+</center></td></tr></table>
+<pre><span class="s0">'''Generalized Method of Moments, GMM, and Two-Stage Least Squares for 
+instrumental variables IV2SLS 
+ 
+ 
+ 
+Issues 
+------ 
+* number of parameters, nparams, and starting values for parameters 
+  Where to put them? start was initially taken from global scope (bug) 
+* When optimal weighting matrix cannot be calculated numerically 
+  In DistQuantilesGMM, we only have one row of moment conditions, not a 
+  moment condition for each observation, calculation for cov of moments 
+  breaks down. iter=1 works (weights is identity matrix) 
+  -&gt; need method to do one iteration with an identity matrix or an 
+     analytical weighting matrix given as parameter. 
+  -&gt; add result statistics for this case, e.g. cov_params, I have it in the 
+     standalone function (and in calc_covparams which is a copy of it), 
+     but not tested yet. 
+  DONE `fitonce` in DistQuantilesGMM, params are the same as in direct call to fitgmm 
+      move it to GMM class (once it's clearer for which cases I need this.) 
+* GMM does not know anything about the underlying model, e.g. y = X beta + u or panel 
+  data model. It would be good if we can reuse methods from regressions, e.g. 
+  predict, fitted values, calculating the error term, and some result statistics. 
+  What's the best way to do this, multiple inheritance, outsourcing the functions, 
+  mixins or delegation (a model creates a GMM instance just for estimation). 
+ 
+ 
+Unclear 
+------- 
+* dof in Hausman 
+  - based on rank 
+  - differs between IV2SLS method and function used with GMM or (IV2SLS) 
+  - with GMM, covariance matrix difference has negative eigenvalues in iv example, ??? 
+* jtest/jval 
+  - I'm not sure about the normalization (multiply or divide by nobs) in jtest. 
+    need a test case. Scaling of jval is irrelevant for estimation. 
+    jval in jtest looks to large in example, but I have no idea about the size 
+* bse for fitonce look too large (no time for checking now) 
+    formula for calc_cov_params for the case without optimal weighting matrix 
+    is wrong. I do not have an estimate for omega in that case. And I'm confusing 
+    between weights and omega, which are *not* the same in this case. 
+ 
+ 
+ 
+Author: josef-pktd 
+License: BSD (3-clause) 
+ 
+'''</span>
+
+
+<span class="s2">from </span><span class="s1">statsmodels.compat.python </span><span class="s2">import </span><span class="s1">lrange</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">optimize</span><span class="s2">, </span><span class="s1">stats</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.tools.numdiff </span><span class="s2">import </span><span class="s1">approx_fprime</span>
+<span class="s2">from </span><span class="s1">statsmodels.base.model </span><span class="s2">import </span><span class="s1">(Model</span><span class="s2">,</span>
+                                    <span class="s1">LikelihoodModel</span><span class="s2">, </span><span class="s1">LikelihoodModelResults)</span>
+<span class="s2">from </span><span class="s1">statsmodels.regression.linear_model </span><span class="s2">import </span><span class="s1">(OLS</span><span class="s2">, </span><span class="s1">RegressionResults</span><span class="s2">,</span>
+                                                 <span class="s1">RegressionResultsWrapper)</span>
+<span class="s2">import </span><span class="s1">statsmodels.stats.sandwich_covariance </span><span class="s2">as </span><span class="s1">smcov</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.decorators </span><span class="s2">import </span><span class="s1">cache_readonly</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.tools </span><span class="s2">import </span><span class="s1">_ensure_2d</span>
+
+<span class="s1">DEBUG = </span><span class="s3">0</span>
+
+
+<span class="s2">def </span><span class="s1">maxabs(x):</span>
+    <span class="s0">'''just a shortcut to np.abs(x).max() 
+    '''</span>
+    <span class="s2">return </span><span class="s1">np.abs(x).max()</span>
+
+
+<span class="s2">class </span><span class="s1">IV2SLS(LikelihoodModel):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Instrumental variables estimation using Two-Stage Least-Squares (2SLS) 
+ 
+ 
+    Parameters 
+    ---------- 
+    endog : ndarray 
+       Endogenous variable, 1-dimensional or 2-dimensional array nobs by 1 
+    exog : ndarray 
+       Explanatory variables, 1-dimensional or 2-dimensional array nobs by k 
+    instrument : ndarray 
+       Instruments for explanatory variables. Must contain both exog 
+       variables that are not being instrumented and instruments 
+ 
+    Notes 
+    ----- 
+    All variables in exog are instrumented in the calculations. If variables 
+    in exog are not supposed to be instrumented, then these variables 
+    must also to be included in the instrument array. 
+ 
+    Degrees of freedom in the calculation of the standard errors uses 
+    `df_resid = (nobs - k_vars)`. 
+    (This corresponds to the `small` option in Stata's ivreg2.) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">instrument=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">self.instrument</span><span class="s2">, </span><span class="s1">self.instrument_names = _ensure_2d(instrument</span><span class="s2">, True</span><span class="s1">)</span>
+        <span class="s1">super(IV2SLS</span><span class="s2">, </span><span class="s1">self).__init__(endog</span><span class="s2">, </span><span class="s1">exog)</span>
+        <span class="s4"># where is this supposed to be handled</span>
+        <span class="s4"># Note: Greene p.77/78 dof correction is not necessary (because only</span>
+        <span class="s4">#       asy results), but most packages do it anyway</span>
+        <span class="s1">self.df_resid = self.exog.shape[</span><span class="s3">0</span><span class="s1">] - self.exog.shape[</span><span class="s3">1</span><span class="s1">]</span>
+        <span class="s4">#self.df_model = float(self.rank - self.k_constant)</span>
+        <span class="s1">self.df_model = float(self.exog.shape[</span><span class="s3">1</span><span class="s1">] - self.k_constant)</span>
+
+    <span class="s2">def </span><span class="s1">initialize(self):</span>
+        <span class="s1">self.wendog = self.endog</span>
+        <span class="s1">self.wexog = self.exog</span>
+
+    <span class="s2">def </span><span class="s1">whiten(self</span><span class="s2">, </span><span class="s1">X):</span>
+        <span class="s0">&quot;&quot;&quot;Not implemented&quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">fit(self):</span>
+        <span class="s0">'''estimate model using 2SLS IV regression 
+ 
+        Returns 
+        ------- 
+        results : instance of RegressionResults 
+           regression result 
+ 
+        Notes 
+        ----- 
+        This returns a generic RegressioResults instance as defined for the 
+        linear models. 
+ 
+        Parameter estimates and covariance are correct, but other results 
+        have not been tested yet, to see whether they apply without changes. 
+ 
+        '''</span>
+        <span class="s4">#Greene 5th edt., p.78 section 5.4</span>
+        <span class="s4">#move this maybe</span>
+        <span class="s1">y</span><span class="s2">,</span><span class="s1">x</span><span class="s2">,</span><span class="s1">z = self.endog</span><span class="s2">, </span><span class="s1">self.exog</span><span class="s2">, </span><span class="s1">self.instrument</span>
+        <span class="s4"># TODO: this uses &quot;textbook&quot; calculation, improve linalg</span>
+        <span class="s1">ztz = np.dot(z.T</span><span class="s2">, </span><span class="s1">z)</span>
+        <span class="s1">ztx = np.dot(z.T</span><span class="s2">, </span><span class="s1">x)</span>
+        <span class="s1">self.xhatparams = xhatparams = np.linalg.solve(ztz</span><span class="s2">, </span><span class="s1">ztx)</span>
+        <span class="s4">#print 'x.T.shape, xhatparams.shape', x.shape, xhatparams.shape</span>
+        <span class="s1">F = xhat = np.dot(z</span><span class="s2">, </span><span class="s1">xhatparams)</span>
+        <span class="s1">FtF = np.dot(F.T</span><span class="s2">, </span><span class="s1">F)</span>
+        <span class="s1">self.xhatprod = FtF  </span><span class="s4">#store for Housman specification test</span>
+        <span class="s1">Ftx = np.dot(F.T</span><span class="s2">, </span><span class="s1">x)</span>
+        <span class="s1">Fty = np.dot(F.T</span><span class="s2">, </span><span class="s1">y)</span>
+        <span class="s1">params = np.linalg.solve(FtF</span><span class="s2">, </span><span class="s1">Fty)</span>
+        <span class="s1">Ftxinv = np.linalg.inv(Ftx)</span>
+        <span class="s1">self.normalized_cov_params = np.dot(Ftxinv.T</span><span class="s2">, </span><span class="s1">np.dot(FtF</span><span class="s2">, </span><span class="s1">Ftxinv))</span>
+
+        <span class="s1">lfit = IVRegressionResults(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">,</span>
+                       <span class="s1">normalized_cov_params=self.normalized_cov_params)</span>
+
+        <span class="s1">lfit.exog_hat_params = xhatparams</span>
+        <span class="s1">lfit.exog_hat = xhat  </span><span class="s4"># TODO: do we want to store this, might be large</span>
+        <span class="s1">self._results_ols2nd = OLS(y</span><span class="s2">, </span><span class="s1">xhat).fit()</span>
+
+        <span class="s2">return </span><span class="s1">RegressionResultsWrapper(lfit)</span>
+
+    <span class="s4"># copied from GLS, because I subclass currently LikelihoodModel and not GLS</span>
+    <span class="s2">def </span><span class="s1">predict(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">exog=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return linear predicted values from a design matrix. 
+ 
+        Parameters 
+        ---------- 
+        exog : array_like 
+            Design / exogenous data 
+        params : array_like, optional after fit has been called 
+            Parameters of a linear model 
+ 
+        Returns 
+        ------- 
+        An array of fitted values 
+ 
+        Notes 
+        ----- 
+        If the model as not yet been fit, params is not optional. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">exog </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">exog = self.exog</span>
+
+        <span class="s2">return </span><span class="s1">np.dot(exog</span><span class="s2">, </span><span class="s1">params)</span>
+
+
+<span class="s2">class </span><span class="s1">IVRegressionResults(RegressionResults):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Results class for for an OLS model. 
+ 
+    Most of the methods and attributes are inherited from RegressionResults. 
+    The special methods that are only available for OLS are: 
+ 
+    - get_influence 
+    - outlier_test 
+    - el_test 
+    - conf_int_el 
+ 
+    See Also 
+    -------- 
+    RegressionResults 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">fvalue(self):</span>
+        <span class="s1">const_idx = self.model.data.const_idx</span>
+        <span class="s4"># if constant is implicit or missing, return nan see #2444, #3544</span>
+        <span class="s2">if </span><span class="s1">const_idx </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">np.nan</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">k_vars = len(self.params)</span>
+            <span class="s1">restriction = np.eye(k_vars)</span>
+            <span class="s1">idx_noconstant = lrange(k_vars)</span>
+            <span class="s2">del </span><span class="s1">idx_noconstant[const_idx]</span>
+            <span class="s1">fval = self.f_test(restriction[idx_noconstant]).fvalue </span><span class="s4"># without constant</span>
+            <span class="s2">return </span><span class="s1">fval</span>
+
+
+    <span class="s2">def </span><span class="s1">spec_hausman(self</span><span class="s2">, </span><span class="s1">dof=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">'''Hausman's specification test 
+ 
+        See Also 
+        -------- 
+        spec_hausman : generic function for Hausman's specification test 
+ 
+        '''</span>
+        <span class="s4">#use normalized cov_params for OLS</span>
+
+        <span class="s1">endog</span><span class="s2">, </span><span class="s1">exog = self.model.endog</span><span class="s2">, </span><span class="s1">self.model.exog</span>
+        <span class="s1">resols = OLS(endog</span><span class="s2">, </span><span class="s1">exog).fit()</span>
+        <span class="s1">normalized_cov_params_ols = resols.model.normalized_cov_params</span>
+        <span class="s4"># Stata `ivendog` does not use df correction for se</span>
+        <span class="s4">#se2 = resols.mse_resid #* resols.df_resid * 1. / len(endog)</span>
+        <span class="s1">se2 = resols.ssr / len(endog)</span>
+
+        <span class="s1">params_diff = self.params - resols.params</span>
+
+        <span class="s1">cov_diff = np.linalg.pinv(self.model.xhatprod) - normalized_cov_params_ols</span>
+        <span class="s4">#TODO: the following is very inefficient, solves problem (svd) twice</span>
+        <span class="s4">#use linalg.lstsq or svd directly</span>
+        <span class="s4">#cov_diff will very often be in-definite (singular)</span>
+        <span class="s2">if not </span><span class="s1">dof:</span>
+            <span class="s1">dof = np.linalg.matrix_rank(cov_diff)</span>
+        <span class="s1">cov_diffpinv = np.linalg.pinv(cov_diff)</span>
+        <span class="s1">H = np.dot(params_diff</span><span class="s2">, </span><span class="s1">np.dot(cov_diffpinv</span><span class="s2">, </span><span class="s1">params_diff))/se2</span>
+        <span class="s1">pval = stats.chi2.sf(H</span><span class="s2">, </span><span class="s1">dof)</span>
+
+        <span class="s2">return </span><span class="s1">H</span><span class="s2">, </span><span class="s1">pval</span><span class="s2">, </span><span class="s1">dof</span>
+
+
+<span class="s4"># copied from regression results with small changes, no llf</span>
+    <span class="s2">def </span><span class="s1">summary(self</span><span class="s2">, </span><span class="s1">yname=</span><span class="s2">None, </span><span class="s1">xname=</span><span class="s2">None, </span><span class="s1">title=</span><span class="s2">None, </span><span class="s1">alpha=</span><span class="s3">.05</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Summarize the Regression Results 
+ 
+        Parameters 
+        ---------- 
+        yname : str, optional 
+            Default is `y` 
+        xname : list[str], optional 
+            Default is `var_##` for ## in p the number of regressors 
+        title : str, optional 
+            Title for the top table. If not None, then this replaces the 
+            default title 
+        alpha : float 
+            significance level for the confidence intervals 
+ 
+        Returns 
+        ------- 
+        smry : Summary instance 
+            this holds the summary tables and text, which can be printed or 
+            converted to various output formats. 
+ 
+        See Also 
+        -------- 
+        statsmodels.iolib.summary.Summary : class to hold summary 
+            results 
+        &quot;&quot;&quot;</span>
+
+        <span class="s4">#TODO: import where we need it (for now), add as cached attributes</span>
+        <span class="s2">from </span><span class="s1">statsmodels.stats.stattools </span><span class="s2">import </span><span class="s1">(jarque_bera</span><span class="s2">,</span>
+                <span class="s1">omni_normtest</span><span class="s2">, </span><span class="s1">durbin_watson)</span>
+        <span class="s1">jb</span><span class="s2">, </span><span class="s1">jbpv</span><span class="s2">, </span><span class="s1">skew</span><span class="s2">, </span><span class="s1">kurtosis = jarque_bera(self.wresid)</span>
+        <span class="s1">omni</span><span class="s2">, </span><span class="s1">omnipv = omni_normtest(self.wresid)</span>
+
+        <span class="s4">#TODO: reuse condno from somewhere else ?</span>
+        <span class="s4">#condno = np.linalg.cond(np.dot(self.wexog.T, self.wexog))</span>
+        <span class="s1">wexog = self.model.wexog</span>
+        <span class="s1">eigvals = np.linalg.linalg.eigvalsh(np.dot(wexog.T</span><span class="s2">, </span><span class="s1">wexog))</span>
+        <span class="s1">eigvals = np.sort(eigvals) </span><span class="s4">#in increasing order</span>
+        <span class="s1">condno = np.sqrt(eigvals[-</span><span class="s3">1</span><span class="s1">]/eigvals[</span><span class="s3">0</span><span class="s1">])</span>
+
+        <span class="s4"># TODO: check what is valid.</span>
+        <span class="s4"># box-pierce, breusch-pagan, durbin's h are not with endogenous on rhs</span>
+        <span class="s4"># use Cumby Huizinga 1992 instead</span>
+        <span class="s1">self.diagn = dict(jb=jb</span><span class="s2">, </span><span class="s1">jbpv=jbpv</span><span class="s2">, </span><span class="s1">skew=skew</span><span class="s2">, </span><span class="s1">kurtosis=kurtosis</span><span class="s2">,</span>
+                          <span class="s1">omni=omni</span><span class="s2">, </span><span class="s1">omnipv=omnipv</span><span class="s2">, </span><span class="s1">condno=condno</span><span class="s2">,</span>
+                          <span class="s1">mineigval=eigvals[</span><span class="s3">0</span><span class="s1">])</span>
+
+        <span class="s4">#TODO not used yet</span>
+        <span class="s4">#diagn_left_header = ['Models stats']</span>
+        <span class="s4">#diagn_right_header = ['Residual stats']</span>
+
+        <span class="s4">#TODO: requiring list/iterable is a bit annoying</span>
+        <span class="s4">#need more control over formatting</span>
+        <span class="s4">#TODO: default do not work if it's not identically spelled</span>
+
+        <span class="s1">top_left = [(</span><span class="s5">'Dep. Variable:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">'Model:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">'Method:'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">'Two Stage'</span><span class="s1">])</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">''</span><span class="s2">, </span><span class="s1">[</span><span class="s5">'Least Squares'</span><span class="s1">])</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">'Date:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">'Time:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">'No. Observations:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">'Df Residuals:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">, </span><span class="s4">#[self.df_resid]), #TODO: spelling</span>
+                    <span class="s1">(</span><span class="s5">'Df Model:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">, </span><span class="s4">#[self.df_model])</span>
+                    <span class="s1">]</span>
+
+        <span class="s1">top_right = [(</span><span class="s5">'R-squared:'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#8.3f&quot; </span><span class="s1">% self.rsquared])</span><span class="s2">,</span>
+                     <span class="s1">(</span><span class="s5">'Adj. R-squared:'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#8.3f&quot; </span><span class="s1">% self.rsquared_adj])</span><span class="s2">,</span>
+                     <span class="s1">(</span><span class="s5">'F-statistic:'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#8.4g&quot; </span><span class="s1">% self.fvalue] )</span><span class="s2">,</span>
+                     <span class="s1">(</span><span class="s5">'Prob (F-statistic):'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#6.3g&quot; </span><span class="s1">% self.f_pvalue])</span><span class="s2">,</span>
+                     <span class="s4">#('Log-Likelihood:', None), #[&quot;%#6.4g&quot; % self.llf]),</span>
+                     <span class="s4">#('AIC:', [&quot;%#8.4g&quot; % self.aic]),</span>
+                     <span class="s4">#('BIC:', [&quot;%#8.4g&quot; % self.bic])</span>
+                     <span class="s1">]</span>
+
+        <span class="s1">diagn_left = [(</span><span class="s5">'Omnibus:'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#6.3f&quot; </span><span class="s1">% omni])</span><span class="s2">,</span>
+                      <span class="s1">(</span><span class="s5">'Prob(Omnibus):'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#6.3f&quot; </span><span class="s1">% omnipv])</span><span class="s2">,</span>
+                      <span class="s1">(</span><span class="s5">'Skew:'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#6.3f&quot; </span><span class="s1">% skew])</span><span class="s2">,</span>
+                      <span class="s1">(</span><span class="s5">'Kurtosis:'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#6.3f&quot; </span><span class="s1">% kurtosis])</span>
+                      <span class="s1">]</span>
+
+        <span class="s1">diagn_right = [(</span><span class="s5">'Durbin-Watson:'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#8.3f&quot; </span><span class="s1">% durbin_watson(self.wresid)])</span><span class="s2">,</span>
+                       <span class="s1">(</span><span class="s5">'Jarque-Bera (JB):'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#8.3f&quot; </span><span class="s1">% jb])</span><span class="s2">,</span>
+                       <span class="s1">(</span><span class="s5">'Prob(JB):'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#8.3g&quot; </span><span class="s1">% jbpv])</span><span class="s2">,</span>
+                       <span class="s1">(</span><span class="s5">'Cond. No.'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#8.3g&quot; </span><span class="s1">% condno])</span>
+                       <span class="s1">]</span>
+
+
+        <span class="s2">if </span><span class="s1">title </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">title = self.model.__class__.__name__ + </span><span class="s5">' ' </span><span class="s1">+ </span><span class="s5">&quot;Regression Results&quot;</span>
+
+        <span class="s4">#create summary table instance</span>
+        <span class="s2">from </span><span class="s1">statsmodels.iolib.summary </span><span class="s2">import </span><span class="s1">Summary</span>
+        <span class="s1">smry = Summary()</span>
+        <span class="s1">smry.add_table_2cols(self</span><span class="s2">, </span><span class="s1">gleft=top_left</span><span class="s2">, </span><span class="s1">gright=top_right</span><span class="s2">,</span>
+                          <span class="s1">yname=yname</span><span class="s2">, </span><span class="s1">xname=xname</span><span class="s2">, </span><span class="s1">title=title)</span>
+        <span class="s1">smry.add_table_params(self</span><span class="s2">, </span><span class="s1">yname=yname</span><span class="s2">, </span><span class="s1">xname=xname</span><span class="s2">, </span><span class="s1">alpha=alpha</span><span class="s2">,</span>
+                             <span class="s1">use_t=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s1">smry.add_table_2cols(self</span><span class="s2">, </span><span class="s1">gleft=diagn_left</span><span class="s2">, </span><span class="s1">gright=diagn_right</span><span class="s2">,</span>
+                          <span class="s1">yname=yname</span><span class="s2">, </span><span class="s1">xname=xname</span><span class="s2">,</span>
+                          <span class="s1">title=</span><span class="s5">&quot;&quot;</span><span class="s1">)</span>
+
+
+
+        <span class="s2">return </span><span class="s1">smry</span>
+
+
+
+
+<span class="s4">############# classes for Generalized Method of Moments GMM</span>
+
+<span class="s1">_gmm_options = </span><span class="s5">'''</span><span class="s2">\ 
+</span>
+<span class="s5">Options for GMM 
+--------------- 
+ 
+Type of GMM 
+~~~~~~~~~~~ 
+ 
+ - one-step 
+ - iterated 
+ - CUE : not tested yet 
+ 
+weight matrix 
+~~~~~~~~~~~~~ 
+ 
+ - `weights_method` : str, defines method for robust 
+   Options here are similar to :mod:`statsmodels.stats.robust_covariance` 
+   default is heteroscedasticity consistent, HC0 
+ 
+   currently available methods are 
+ 
+   - `cov` : HC0, optionally with degrees of freedom correction 
+   - `hac` : 
+   - `iid` : untested, only for Z*u case, IV cases with u as error indep of Z 
+   - `ac` : not available yet 
+   - `cluster` : not connected yet 
+   - others from robust_covariance 
+ 
+other arguments: 
+ 
+ - `wargs` : tuple or dict, required arguments for weights_method 
+ 
+   - `centered` : bool, 
+     indicates whether moments are centered for the calculation of the weights 
+     and covariance matrix, applies to all weight_methods 
+   - `ddof` : int 
+     degrees of freedom correction, applies currently only to `cov` 
+   - maxlag : int 
+     number of lags to include in HAC calculation , applies only to `hac` 
+   - others not yet, e.g. groups for cluster robust 
+ 
+covariance matrix 
+~~~~~~~~~~~~~~~~~ 
+ 
+The same options as for weight matrix also apply to the calculation of the 
+estimate of the covariance matrix of the parameter estimates. 
+The additional option is 
+ 
+ - `has_optimal_weights`: If true, then the calculation of the covariance 
+   matrix assumes that we have optimal GMM with :math:`W = S^{-1}`. 
+   Default is True. 
+   TODO: do we want to have a different default after `onestep`? 
+ 
+ 
+'''</span>
+
+<span class="s2">class </span><span class="s1">GMM(Model):</span>
+    <span class="s0">''' 
+    Class for estimation by Generalized Method of Moments 
+ 
+    needs to be subclassed, where the subclass defined the moment conditions 
+    `momcond` 
+ 
+    Parameters 
+    ---------- 
+    endog : ndarray 
+        endogenous variable, see notes 
+    exog : ndarray 
+        array of exogenous variables, see notes 
+    instrument : ndarray 
+        array of instruments, see notes 
+    nmoms : None or int 
+        number of moment conditions, if None then it is set equal to the 
+        number of columns of instruments. Mainly needed to determine the shape 
+        or size of start parameters and starting weighting matrix. 
+    kwds : anything 
+        this is mainly if additional variables need to be stored for the 
+        calculations of the moment conditions 
+ 
+    Attributes 
+    ---------- 
+    results : instance of GMMResults 
+        currently just a storage class for params and cov_params without it's 
+        own methods 
+    bse : property 
+        return bse 
+ 
+ 
+ 
+    Notes 
+    ----- 
+    The GMM class only uses the moment conditions and does not use any data 
+    directly. endog, exog, instrument and kwds in the creation of the class 
+    instance are only used to store them for access in the moment conditions. 
+    Which of this are required and how they are used depends on the moment 
+    conditions of the subclass. 
+ 
+    Warning: 
+ 
+    Options for various methods have not been fully implemented and 
+    are still missing in several methods. 
+ 
+ 
+    TODO: 
+    currently onestep (maxiter=0) still produces an updated estimate of bse 
+    and cov_params. 
+ 
+    '''</span>
+
+    <span class="s1">results_class = </span><span class="s5">'GMMResults'</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">instrument</span><span class="s2">, </span><span class="s1">k_moms=</span><span class="s2">None, </span><span class="s1">k_params=</span><span class="s2">None,</span>
+                 <span class="s1">missing=</span><span class="s5">'none'</span><span class="s2">, </span><span class="s1">**kwds):</span>
+        <span class="s0">''' 
+        maybe drop and use mixin instead 
+ 
+        TODO: GMM does not really care about the data, just the moment conditions 
+        '''</span>
+        <span class="s1">instrument = self._check_inputs(instrument</span><span class="s2">, </span><span class="s1">endog) </span><span class="s4"># attaches if needed</span>
+        <span class="s1">super(GMM</span><span class="s2">, </span><span class="s1">self).__init__(endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">missing=missing</span><span class="s2">,</span>
+                <span class="s1">instrument=instrument)</span>
+<span class="s4">#         self.endog = endog</span>
+<span class="s4">#         self.exog = exog</span>
+<span class="s4">#         self.instrument = instrument</span>
+        <span class="s1">self.nobs = endog.shape[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">k_moms </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.nmoms = k_moms</span>
+        <span class="s2">elif </span><span class="s1">instrument </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.nmoms = instrument.shape[</span><span class="s3">1</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.nmoms = np.nan</span>
+
+        <span class="s2">if </span><span class="s1">k_params </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.k_params = k_params</span>
+        <span class="s2">elif </span><span class="s1">instrument </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.k_params = exog.shape[</span><span class="s3">1</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.k_params = np.nan</span>
+
+        <span class="s1">self.__dict__.update(kwds)</span>
+        <span class="s1">self.epsilon_iter = </span><span class="s3">1e-6</span>
+
+    <span class="s2">def </span><span class="s1">_check_inputs(self</span><span class="s2">, </span><span class="s1">instrument</span><span class="s2">, </span><span class="s1">endog):</span>
+        <span class="s2">if </span><span class="s1">instrument </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">offset = np.asarray(instrument)</span>
+            <span class="s2">if </span><span class="s1">offset.shape[</span><span class="s3">0</span><span class="s1">] != endog.shape[</span><span class="s3">0</span><span class="s1">]:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;instrument is not the same length as endog&quot;</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">instrument</span>
+
+    <span class="s2">def </span><span class="s1">_fix_param_names(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">param_names=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># TODO: this is a temporary fix, need</span>
+        <span class="s1">xnames = self.data.xnames</span>
+
+        <span class="s2">if </span><span class="s1">param_names </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">len(params) == len(param_names):</span>
+                <span class="s1">self.data.xnames = param_names</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'param_names has the wrong length'</span><span class="s1">)</span>
+
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">len(params) &lt; len(xnames):</span>
+                <span class="s4"># cut in front for poisson multiplicative</span>
+                <span class="s1">self.data.xnames = xnames[-len(params):]</span>
+            <span class="s2">elif </span><span class="s1">len(params) &gt; len(xnames):</span>
+                <span class="s4"># use generic names</span>
+                <span class="s1">self.data.xnames = [</span><span class="s5">'p%2d' </span><span class="s1">% i </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(params))]</span>
+
+    <span class="s2">def </span><span class="s1">set_param_names(self</span><span class="s2">, </span><span class="s1">param_names</span><span class="s2">, </span><span class="s1">k_params=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;set the parameter names in the model 
+ 
+        Parameters 
+        ---------- 
+        param_names : list[str] 
+            param_names should have the same length as the number of params 
+        k_params : None or int 
+            If k_params is None, then the k_params attribute is used, unless 
+            it is None. 
+            If k_params is not None, then it will also set the k_params 
+            attribute. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">k_params </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.k_params = k_params</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">k_params = self.k_params</span>
+
+        <span class="s2">if </span><span class="s1">k_params == len(param_names):</span>
+            <span class="s1">self.data.xnames = param_names</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'param_names has the wrong length'</span><span class="s1">)</span>
+
+
+    <span class="s2">def </span><span class="s1">fit(self</span><span class="s2">, </span><span class="s1">start_params=</span><span class="s2">None, </span><span class="s1">maxiter=</span><span class="s3">10</span><span class="s2">, </span><span class="s1">inv_weights=</span><span class="s2">None,</span>
+                  <span class="s1">weights_method=</span><span class="s5">'cov'</span><span class="s2">, </span><span class="s1">wargs=()</span><span class="s2">,</span>
+                  <span class="s1">has_optimal_weights=</span><span class="s2">True,</span>
+                  <span class="s1">optim_method=</span><span class="s5">'bfgs'</span><span class="s2">, </span><span class="s1">optim_args=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">''' 
+        Estimate parameters using GMM and return GMMResults 
+ 
+        TODO: weight and covariance arguments still need to be made consistent 
+        with similar options in other models, 
+        see RegressionResult.get_robustcov_results 
+ 
+        Parameters 
+        ---------- 
+        start_params : array (optional) 
+            starting value for parameters ub minimization. If None then 
+            fitstart method is called for the starting values. 
+        maxiter : int or 'cue' 
+            Number of iterations in iterated GMM. The onestep estimate can be 
+            obtained with maxiter=0 or 1. If maxiter is large, then the 
+            iteration will stop either at maxiter or on convergence of the 
+            parameters (TODO: no options for convergence criteria yet.) 
+            If `maxiter == 'cue'`, the the continuously updated GMM is 
+            calculated which updates the weight matrix during the minimization 
+            of the GMM objective function. The CUE estimation uses the onestep 
+            parameters as starting values. 
+        inv_weights : None or ndarray 
+            inverse of the starting weighting matrix. If inv_weights are not 
+            given then the method `start_weights` is used which depends on 
+            the subclass, for IV subclasses `inv_weights = z'z` where `z` are 
+            the instruments, otherwise an identity matrix is used. 
+        weights_method : str, defines method for robust 
+            Options here are similar to :mod:`statsmodels.stats.robust_covariance` 
+            default is heteroscedasticity consistent, HC0 
+ 
+            currently available methods are 
+ 
+            - `cov` : HC0, optionally with degrees of freedom correction 
+            - `hac` : 
+            - `iid` : untested, only for Z*u case, IV cases with u as error indep of Z 
+            - `ac` : not available yet 
+            - `cluster` : not connected yet 
+            - others from robust_covariance 
+ 
+        wargs` : tuple or dict, 
+            required and optional arguments for weights_method 
+ 
+            - `centered` : bool, 
+              indicates whether moments are centered for the calculation of the weights 
+              and covariance matrix, applies to all weight_methods 
+            - `ddof` : int 
+              degrees of freedom correction, applies currently only to `cov` 
+            - `maxlag` : int 
+              number of lags to include in HAC calculation , applies only to `hac` 
+            - others not yet, e.g. groups for cluster robust 
+ 
+        has_optimal_weights: If true, then the calculation of the covariance 
+              matrix assumes that we have optimal GMM with :math:`W = S^{-1}`. 
+              Default is True. 
+              TODO: do we want to have a different default after `onestep`? 
+        optim_method : str, default is 'bfgs' 
+            numerical optimization method. Currently not all optimizers that 
+            are available in LikelihoodModels are connected. 
+        optim_args : dict 
+            keyword arguments for the numerical optimizer. 
+ 
+        Returns 
+        ------- 
+        results : instance of GMMResults 
+            this is also attached as attribute results 
+ 
+        Notes 
+        ----- 
+ 
+        Warning: One-step estimation, `maxiter` either 0 or 1, still has 
+        problems (at least compared to Stata's gmm). 
+        By default it uses a heteroscedasticity robust covariance matrix, but 
+        uses the assumption that the weight matrix is optimal. 
+        See options for cov_params in the results instance. 
+ 
+        The same options as for weight matrix also apply to the calculation of 
+        the estimate of the covariance matrix of the parameter estimates. 
+ 
+        '''</span>
+        <span class="s4"># TODO: add check for correct wargs keys</span>
+        <span class="s4">#       currently a misspelled key is not detected,</span>
+        <span class="s4">#       because I'm still adding options</span>
+
+        <span class="s4"># TODO: check repeated calls to fit with different options</span>
+        <span class="s4">#       arguments are dictionaries, i.e. mutable</span>
+        <span class="s4">#       unit test if anything  is stale or spilled over.</span>
+
+        <span class="s4">#bug: where does start come from ???</span>
+        <span class="s1">start = start_params  </span><span class="s4"># alias for renaming</span>
+        <span class="s2">if </span><span class="s1">start </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">start = self.fitstart() </span><span class="s4">#TODO: temporary hack</span>
+
+        <span class="s2">if </span><span class="s1">inv_weights </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">inv_weights</span>
+
+        <span class="s2">if </span><span class="s1">optim_args </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">optim_args = {}</span>
+        <span class="s2">if </span><span class="s5">'disp' </span><span class="s2">not in </span><span class="s1">optim_args:</span>
+            <span class="s1">optim_args[</span><span class="s5">'disp'</span><span class="s1">] = </span><span class="s3">1</span>
+
+        <span class="s2">if </span><span class="s1">maxiter == </span><span class="s3">0 </span><span class="s2">or </span><span class="s1">maxiter == </span><span class="s5">'cue'</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">inv_weights </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">weights = np.linalg.pinv(inv_weights)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s4"># let start_weights handle the inv=False for maxiter=0</span>
+                <span class="s1">weights = self.start_weights(inv=</span><span class="s2">False</span><span class="s1">)</span>
+
+            <span class="s1">params = self.fitgmm(start</span><span class="s2">, </span><span class="s1">weights=weights</span><span class="s2">,</span>
+                                 <span class="s1">optim_method=optim_method</span><span class="s2">, </span><span class="s1">optim_args=optim_args)</span>
+            <span class="s1">weights_ = weights  </span><span class="s4"># temporary alias used in jval</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">params</span><span class="s2">, </span><span class="s1">weights = self.fititer(start</span><span class="s2">,</span>
+                                           <span class="s1">maxiter=maxiter</span><span class="s2">,</span>
+                                           <span class="s1">start_invweights=inv_weights</span><span class="s2">,</span>
+                                           <span class="s1">weights_method=weights_method</span><span class="s2">,</span>
+                                           <span class="s1">wargs=wargs</span><span class="s2">,</span>
+                                           <span class="s1">optim_method=optim_method</span><span class="s2">,</span>
+                                           <span class="s1">optim_args=optim_args)</span>
+            <span class="s4"># TODO weights returned by fititer is inv_weights - not true anymore</span>
+            <span class="s4"># weights_ currently not necessary and used anymore</span>
+            <span class="s1">weights_ = np.linalg.pinv(weights)</span>
+
+        <span class="s2">if </span><span class="s1">maxiter == </span><span class="s5">'cue'</span><span class="s1">:</span>
+            <span class="s4">#we have params from maxiter= 0 as starting value</span>
+            <span class="s4"># TODO: need to give weights options to gmmobjective_cu</span>
+            <span class="s1">params = self.fitgmm_cu(params</span><span class="s2">,</span>
+                                     <span class="s1">optim_method=optim_method</span><span class="s2">,</span>
+                                     <span class="s1">optim_args=optim_args)</span>
+            <span class="s4"># weights is stored as attribute</span>
+            <span class="s1">weights = self._weights_cu</span>
+
+        <span class="s4">#TODO: use Bunch instead ?</span>
+        <span class="s1">options_other = {</span><span class="s5">'weights_method'</span><span class="s1">:weights_method</span><span class="s2">,</span>
+                         <span class="s5">'has_optimal_weights'</span><span class="s1">:has_optimal_weights</span><span class="s2">,</span>
+                         <span class="s5">'optim_method'</span><span class="s1">:optim_method}</span>
+
+        <span class="s4"># check that we have the right number of xnames</span>
+        <span class="s1">self._fix_param_names(params</span><span class="s2">, </span><span class="s1">param_names=</span><span class="s2">None</span><span class="s1">)</span>
+        <span class="s1">results = results_class_dict[self.results_class](</span>
+                                        <span class="s1">model = self</span><span class="s2">,</span>
+                                        <span class="s1">params = params</span><span class="s2">,</span>
+                                        <span class="s1">weights = weights</span><span class="s2">,</span>
+                                        <span class="s1">wargs = wargs</span><span class="s2">,</span>
+                                        <span class="s1">options_other = options_other</span><span class="s2">,</span>
+                                        <span class="s1">optim_args = optim_args)</span>
+
+        <span class="s1">self.results = results </span><span class="s4"># FIXME: remove, still keeping it temporarily</span>
+        <span class="s2">return </span><span class="s1">results</span>
+
+    <span class="s2">def </span><span class="s1">fitgmm(self</span><span class="s2">, </span><span class="s1">start</span><span class="s2">, </span><span class="s1">weights=</span><span class="s2">None, </span><span class="s1">optim_method=</span><span class="s5">'bfgs'</span><span class="s2">, </span><span class="s1">optim_args=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">'''estimate parameters using GMM 
+ 
+        Parameters 
+        ---------- 
+        start : array_like 
+            starting values for minimization 
+        weights : ndarray 
+            weighting matrix for moment conditions. If weights is None, then 
+            the identity matrix is used 
+ 
+ 
+        Returns 
+        ------- 
+        paramest : ndarray 
+            estimated parameters 
+ 
+        Notes 
+        ----- 
+        todo: add fixed parameter option, not here ??? 
+ 
+        uses scipy.optimize.fmin 
+ 
+        '''</span>
+<span class="s4">##        if not fixed is None:  #fixed not defined in this version</span>
+<span class="s4">##            raise NotImplementedError</span>
+
+        <span class="s4"># TODO: should start_weights only be in `fit`</span>
+        <span class="s2">if </span><span class="s1">weights </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">weights = self.start_weights(inv=</span><span class="s2">False</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">optim_args </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">optim_args = {}</span>
+
+        <span class="s2">if </span><span class="s1">optim_method == </span><span class="s5">'nm'</span><span class="s1">:</span>
+            <span class="s1">optimizer = optimize.fmin</span>
+        <span class="s2">elif </span><span class="s1">optim_method == </span><span class="s5">'bfgs'</span><span class="s1">:</span>
+            <span class="s1">optimizer = optimize.fmin_bfgs</span>
+            <span class="s4"># TODO: add score</span>
+            <span class="s1">optim_args[</span><span class="s5">'fprime'</span><span class="s1">] = self.score </span><span class="s4">#lambda params: self.score(params, weights)</span>
+        <span class="s2">elif </span><span class="s1">optim_method == </span><span class="s5">'ncg'</span><span class="s1">:</span>
+            <span class="s1">optimizer = optimize.fmin_ncg</span>
+            <span class="s1">optim_args[</span><span class="s5">'fprime'</span><span class="s1">] = self.score</span>
+        <span class="s2">elif </span><span class="s1">optim_method == </span><span class="s5">'cg'</span><span class="s1">:</span>
+            <span class="s1">optimizer = optimize.fmin_cg</span>
+            <span class="s1">optim_args[</span><span class="s5">'fprime'</span><span class="s1">] = self.score</span>
+        <span class="s2">elif </span><span class="s1">optim_method == </span><span class="s5">'fmin_l_bfgs_b'</span><span class="s1">:</span>
+            <span class="s1">optimizer = optimize.fmin_l_bfgs_b</span>
+            <span class="s1">optim_args[</span><span class="s5">'fprime'</span><span class="s1">] = self.score</span>
+        <span class="s2">elif </span><span class="s1">optim_method == </span><span class="s5">'powell'</span><span class="s1">:</span>
+            <span class="s1">optimizer = optimize.fmin_powell</span>
+        <span class="s2">elif </span><span class="s1">optim_method == </span><span class="s5">'slsqp'</span><span class="s1">:</span>
+            <span class="s1">optimizer = optimize.fmin_slsqp</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'optimizer method not available'</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">DEBUG:</span>
+            <span class="s1">print(np.linalg.det(weights))</span>
+
+        <span class="s4">#TODO: add other optimization options and results</span>
+        <span class="s2">return </span><span class="s1">optimizer(self.gmmobjective</span><span class="s2">, </span><span class="s1">start</span><span class="s2">, </span><span class="s1">args=(weights</span><span class="s2">,</span><span class="s1">)</span><span class="s2">,</span>
+                         <span class="s1">**optim_args)</span>
+
+
+    <span class="s2">def </span><span class="s1">fitgmm_cu(self</span><span class="s2">, </span><span class="s1">start</span><span class="s2">, </span><span class="s1">optim_method=</span><span class="s5">'bfgs'</span><span class="s2">, </span><span class="s1">optim_args=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">'''estimate parameters using continuously updating GMM 
+ 
+        Parameters 
+        ---------- 
+        start : array_like 
+            starting values for minimization 
+ 
+        Returns 
+        ------- 
+        paramest : ndarray 
+            estimated parameters 
+ 
+        Notes 
+        ----- 
+        todo: add fixed parameter option, not here ??? 
+ 
+        uses scipy.optimize.fmin 
+ 
+        '''</span>
+<span class="s4">##        if not fixed is None:  #fixed not defined in this version</span>
+<span class="s4">##            raise NotImplementedError</span>
+
+        <span class="s2">if </span><span class="s1">optim_args </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">optim_args = {}</span>
+
+        <span class="s2">if </span><span class="s1">optim_method == </span><span class="s5">'nm'</span><span class="s1">:</span>
+            <span class="s1">optimizer = optimize.fmin</span>
+        <span class="s2">elif </span><span class="s1">optim_method == </span><span class="s5">'bfgs'</span><span class="s1">:</span>
+            <span class="s1">optimizer = optimize.fmin_bfgs</span>
+            <span class="s1">optim_args[</span><span class="s5">'fprime'</span><span class="s1">] = self.score_cu</span>
+        <span class="s2">elif </span><span class="s1">optim_method == </span><span class="s5">'ncg'</span><span class="s1">:</span>
+            <span class="s1">optimizer = optimize.fmin_ncg</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'optimizer method not available'</span><span class="s1">)</span>
+
+        <span class="s4">#TODO: add other optimization options and results</span>
+        <span class="s2">return </span><span class="s1">optimizer(self.gmmobjective_cu</span><span class="s2">, </span><span class="s1">start</span><span class="s2">, </span><span class="s1">args=()</span><span class="s2">, </span><span class="s1">**optim_args)</span>
+
+    <span class="s2">def </span><span class="s1">start_weights(self</span><span class="s2">, </span><span class="s1">inv=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Create identity matrix for starting weights&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">np.eye(self.nmoms)</span>
+
+    <span class="s2">def </span><span class="s1">gmmobjective(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">weights):</span>
+        <span class="s0">''' 
+        objective function for GMM minimization 
+ 
+        Parameters 
+        ---------- 
+        params : ndarray 
+            parameter values at which objective is evaluated 
+        weights : ndarray 
+            weighting matrix 
+ 
+        Returns 
+        ------- 
+        jval : float 
+            value of objective function 
+ 
+        '''</span>
+        <span class="s1">moms = self.momcond_mean(params)</span>
+        <span class="s2">return </span><span class="s1">np.dot(np.dot(moms</span><span class="s2">, </span><span class="s1">weights)</span><span class="s2">, </span><span class="s1">moms)</span>
+        <span class="s4">#moms = self.momcond(params)</span>
+        <span class="s4">#return np.dot(np.dot(moms.mean(0),weights), moms.mean(0))</span>
+
+
+    <span class="s2">def </span><span class="s1">gmmobjective_cu(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">weights_method=</span><span class="s5">'cov'</span><span class="s2">,</span>
+                        <span class="s1">wargs=()):</span>
+        <span class="s0">''' 
+        objective function for continuously updating  GMM minimization 
+ 
+        Parameters 
+        ---------- 
+        params : ndarray 
+            parameter values at which objective is evaluated 
+ 
+        Returns 
+        ------- 
+        jval : float 
+            value of objective function 
+ 
+        '''</span>
+        <span class="s1">moms = self.momcond(params)</span>
+        <span class="s1">inv_weights = self.calc_weightmatrix(moms</span><span class="s2">, </span><span class="s1">weights_method=weights_method</span><span class="s2">,</span>
+                                             <span class="s1">wargs=wargs)</span>
+        <span class="s1">weights = np.linalg.pinv(inv_weights)</span>
+        <span class="s1">self._weights_cu = weights  </span><span class="s4"># store if we need it later</span>
+        <span class="s2">return </span><span class="s1">np.dot(np.dot(moms.mean(</span><span class="s3">0</span><span class="s1">)</span><span class="s2">, </span><span class="s1">weights)</span><span class="s2">, </span><span class="s1">moms.mean(</span><span class="s3">0</span><span class="s1">))</span>
+
+
+    <span class="s2">def </span><span class="s1">fititer(self</span><span class="s2">, </span><span class="s1">start</span><span class="s2">, </span><span class="s1">maxiter=</span><span class="s3">2</span><span class="s2">, </span><span class="s1">start_invweights=</span><span class="s2">None,</span>
+                    <span class="s1">weights_method=</span><span class="s5">'cov'</span><span class="s2">, </span><span class="s1">wargs=()</span><span class="s2">, </span><span class="s1">optim_method=</span><span class="s5">'bfgs'</span><span class="s2">,</span>
+                    <span class="s1">optim_args=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">'''iterative estimation with updating of optimal weighting matrix 
+ 
+        stopping criteria are maxiter or change in parameter estimate less 
+        than self.epsilon_iter, with default 1e-6. 
+ 
+        Parameters 
+        ---------- 
+        start : ndarray 
+            starting value for parameters 
+        maxiter : int 
+            maximum number of iterations 
+        start_weights : array (nmoms, nmoms) 
+            initial weighting matrix; if None, then the identity matrix 
+            is used 
+        weights_method : {'cov', ...} 
+            method to use to estimate the optimal weighting matrix, 
+            see calc_weightmatrix for details 
+ 
+        Returns 
+        ------- 
+        params : ndarray 
+            estimated parameters 
+        weights : ndarray 
+            optimal weighting matrix calculated with final parameter 
+            estimates 
+ 
+        Notes 
+        ----- 
+ 
+ 
+ 
+ 
+        '''</span>
+        <span class="s1">self.history = []</span>
+        <span class="s1">momcond = self.momcond</span>
+
+        <span class="s2">if </span><span class="s1">start_invweights </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">w = self.start_weights(inv=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">w = start_invweights</span>
+
+        <span class="s4">#call fitgmm function</span>
+        <span class="s4">#args = (self.endog, self.exog, self.instrument)</span>
+        <span class="s4">#args is not used in the method version</span>
+        <span class="s1">winv_new = w</span>
+        <span class="s2">for </span><span class="s1">it </span><span class="s2">in </span><span class="s1">range(maxiter):</span>
+            <span class="s1">winv = winv_new</span>
+            <span class="s1">w = np.linalg.pinv(winv)</span>
+            <span class="s4">#this is still calling function not method</span>
+<span class="s4">##            resgmm = fitgmm(momcond, (), start, weights=winv, fixed=None,</span>
+<span class="s4">##                            weightsoptimal=False)</span>
+            <span class="s1">resgmm = self.fitgmm(start</span><span class="s2">, </span><span class="s1">weights=w</span><span class="s2">, </span><span class="s1">optim_method=optim_method</span><span class="s2">,</span>
+                                 <span class="s1">optim_args=optim_args)</span>
+
+            <span class="s1">moms = momcond(resgmm)</span>
+            <span class="s4"># the following is S = cov_moments</span>
+            <span class="s1">winv_new = self.calc_weightmatrix(moms</span><span class="s2">,</span>
+                                              <span class="s1">weights_method=weights_method</span><span class="s2">,</span>
+                                              <span class="s1">wargs=wargs</span><span class="s2">, </span><span class="s1">params=resgmm)</span>
+
+            <span class="s2">if </span><span class="s1">it &gt; </span><span class="s3">2 </span><span class="s2">and </span><span class="s1">maxabs(resgmm - start) &lt; self.epsilon_iter:</span>
+                <span class="s4">#check rule for early stopping</span>
+                <span class="s4"># TODO: set has_optimal_weights = True</span>
+                <span class="s2">break</span>
+
+            <span class="s1">start = resgmm</span>
+        <span class="s2">return </span><span class="s1">resgmm</span><span class="s2">, </span><span class="s1">w</span>
+
+
+    <span class="s2">def </span><span class="s1">calc_weightmatrix(self</span><span class="s2">, </span><span class="s1">moms</span><span class="s2">, </span><span class="s1">weights_method=</span><span class="s5">'cov'</span><span class="s2">, </span><span class="s1">wargs=()</span><span class="s2">,</span>
+                          <span class="s1">params=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">''' 
+        calculate omega or the weighting matrix 
+ 
+        Parameters 
+        ---------- 
+        moms : ndarray 
+            moment conditions (nobs x nmoms) for all observations evaluated at 
+            a parameter value 
+        weights_method : str 'cov' 
+            If method='cov' is cov then the matrix is calculated as simple 
+            covariance of the moment conditions. 
+            see fit method for available aoptions for the weight and covariance 
+            matrix 
+        wargs : tuple or dict 
+            parameters that are required by some kernel methods to 
+            estimate the long-run covariance. Not used yet. 
+ 
+        Returns 
+        ------- 
+        w : array (nmoms, nmoms) 
+            estimate for the weighting matrix or covariance of the moment 
+            condition 
+ 
+ 
+        Notes 
+        ----- 
+ 
+        currently a constant cutoff window is used 
+        TODO: implement long-run cov estimators, kernel-based 
+ 
+        Newey-West 
+        Andrews 
+        Andrews-Moy???? 
+ 
+        References 
+        ---------- 
+        Greene 
+        Hansen, Bruce 
+ 
+        '''</span>
+        <span class="s1">nobs</span><span class="s2">, </span><span class="s1">k_moms = moms.shape</span>
+        <span class="s4"># TODO: wargs are tuple or dict ?</span>
+        <span class="s2">if </span><span class="s1">DEBUG:</span>
+            <span class="s1">print(</span><span class="s5">' momcov wargs'</span><span class="s2">, </span><span class="s1">wargs)</span>
+
+        <span class="s1">centered = </span><span class="s2">not </span><span class="s1">(</span><span class="s5">'centered' </span><span class="s2">in </span><span class="s1">wargs </span><span class="s2">and not </span><span class="s1">wargs[</span><span class="s5">'centered'</span><span class="s1">])</span>
+        <span class="s2">if not </span><span class="s1">centered:</span>
+            <span class="s4"># caller does not want centered moment conditions</span>
+            <span class="s1">moms_ = moms</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">moms_ = moms - moms.mean()</span>
+
+        <span class="s4"># TODO: store this outside to avoid doing this inside optimization loop</span>
+        <span class="s4"># TODO: subclasses need to be able to add weights_methods, and remove</span>
+        <span class="s4">#       IVGMM can have homoscedastic (OLS),</span>
+        <span class="s4">#       some options will not make sense in some cases</span>
+        <span class="s4">#       possible add all here and allow subclasses to define a list</span>
+        <span class="s4"># TODO: should other weights_methods also have `ddof`</span>
+        <span class="s2">if </span><span class="s1">weights_method == </span><span class="s5">'cov'</span><span class="s1">:</span>
+            <span class="s1">w = np.dot(moms_.T</span><span class="s2">, </span><span class="s1">moms_)</span>
+            <span class="s2">if </span><span class="s5">'ddof' </span><span class="s2">in </span><span class="s1">wargs:</span>
+                <span class="s4"># caller requests degrees of freedom correction</span>
+                <span class="s2">if </span><span class="s1">wargs[</span><span class="s5">'ddof'</span><span class="s1">] == </span><span class="s5">'k_params'</span><span class="s1">:</span>
+                    <span class="s1">w /= (nobs - self.k_params)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">if </span><span class="s1">DEBUG:</span>
+                        <span class="s1">print(</span><span class="s5">' momcov ddof'</span><span class="s2">, </span><span class="s1">wargs[</span><span class="s5">'ddof'</span><span class="s1">])</span>
+                    <span class="s1">w /= (nobs - wargs[</span><span class="s5">'ddof'</span><span class="s1">])</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s4"># default: divide by nobs</span>
+                <span class="s1">w /= nobs</span>
+
+        <span class="s2">elif </span><span class="s1">weights_method == </span><span class="s5">'flatkernel'</span><span class="s1">:</span>
+            <span class="s4">#uniform cut-off window</span>
+            <span class="s4"># This was a trial version, can use HAC with flatkernel</span>
+            <span class="s2">if </span><span class="s5">'maxlag' </span><span class="s2">not in </span><span class="s1">wargs:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'flatkernel requires maxlag'</span><span class="s1">)</span>
+
+            <span class="s1">maxlag = wargs[</span><span class="s5">'maxlag'</span><span class="s1">]</span>
+            <span class="s1">h = np.ones(maxlag + </span><span class="s3">1</span><span class="s1">)</span>
+            <span class="s1">w = np.dot(moms_.T</span><span class="s2">, </span><span class="s1">moms_)/nobs</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">1</span><span class="s2">,</span><span class="s1">maxlag+</span><span class="s3">1</span><span class="s1">):</span>
+                <span class="s1">w += (h[i] * np.dot(moms_[i:].T</span><span class="s2">, </span><span class="s1">moms_[:-i]) / (nobs-i))</span>
+
+        <span class="s2">elif </span><span class="s1">weights_method == </span><span class="s5">'hac'</span><span class="s1">:</span>
+            <span class="s1">maxlag = wargs[</span><span class="s5">'maxlag'</span><span class="s1">]</span>
+            <span class="s2">if </span><span class="s5">'kernel' </span><span class="s2">in </span><span class="s1">wargs:</span>
+                <span class="s1">weights_func = wargs[</span><span class="s5">'kernel'</span><span class="s1">]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">weights_func = smcov.weights_bartlett</span>
+                <span class="s1">wargs[</span><span class="s5">'kernel'</span><span class="s1">] = weights_func</span>
+
+            <span class="s1">w = smcov.S_hac_simple(moms_</span><span class="s2">, </span><span class="s1">nlags=maxlag</span><span class="s2">,</span>
+                                   <span class="s1">weights_func=weights_func)</span>
+            <span class="s1">w /= nobs </span><span class="s4">#(nobs - self.k_params)</span>
+
+        <span class="s2">elif </span><span class="s1">weights_method == </span><span class="s5">'iid'</span><span class="s1">:</span>
+            <span class="s4"># only when we have instruments and residual mom = Z * u</span>
+            <span class="s4"># TODO: problem we do not have params in argument</span>
+            <span class="s4">#       I cannot keep everything in here w/o params as argument</span>
+            <span class="s1">u = self.get_error(params)</span>
+
+            <span class="s2">if </span><span class="s1">centered:</span>
+                <span class="s4"># Note: I'm not centering instruments,</span>
+                <span class="s4">#    should not we always center u? Ok, with centered as default</span>
+                <span class="s1">u -= u.mean(</span><span class="s3">0</span><span class="s1">)  </span><span class="s4">#demean inplace, we do not need original u</span>
+
+            <span class="s1">instrument = self.instrument</span>
+            <span class="s1">w = np.dot(instrument.T</span><span class="s2">, </span><span class="s1">instrument).dot(np.dot(u.T</span><span class="s2">, </span><span class="s1">u)) / nobs</span>
+            <span class="s2">if </span><span class="s5">'ddof' </span><span class="s2">in </span><span class="s1">wargs:</span>
+                <span class="s4"># caller requests degrees of freedom correction</span>
+                <span class="s2">if </span><span class="s1">wargs[</span><span class="s5">'ddof'</span><span class="s1">] == </span><span class="s5">'k_params'</span><span class="s1">:</span>
+                    <span class="s1">w /= (nobs - self.k_params)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s4"># assume ddof is a number</span>
+                    <span class="s2">if </span><span class="s1">DEBUG:</span>
+                        <span class="s1">print(</span><span class="s5">' momcov ddof'</span><span class="s2">, </span><span class="s1">wargs[</span><span class="s5">'ddof'</span><span class="s1">])</span>
+                    <span class="s1">w /= (nobs - wargs[</span><span class="s5">'ddof'</span><span class="s1">])</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s4"># default: divide by nobs</span>
+                <span class="s1">w /= nobs</span>
+
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'weight method not available'</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">w</span>
+
+
+    <span class="s2">def </span><span class="s1">momcond_mean(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">''' 
+        mean of moment conditions, 
+ 
+        '''</span>
+
+        <span class="s1">momcond = self.momcond(params)</span>
+        <span class="s1">self.nobs_moms</span><span class="s2">, </span><span class="s1">self.k_moms = momcond.shape</span>
+        <span class="s2">return </span><span class="s1">momcond.mean(</span><span class="s3">0</span><span class="s1">)</span>
+
+
+    <span class="s2">def </span><span class="s1">gradient_momcond(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">epsilon=</span><span class="s3">1e-4</span><span class="s2">, </span><span class="s1">centered=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">'''gradient of moment conditions 
+ 
+        Parameters 
+        ---------- 
+        params : ndarray 
+            parameter at which the moment conditions are evaluated 
+        epsilon : float 
+            stepsize for finite difference calculation 
+        centered : bool 
+            This refers to the finite difference calculation. If `centered` 
+            is true, then the centered finite difference calculation is 
+            used. Otherwise the one-sided forward differences are used. 
+ 
+        TODO: looks like not used yet 
+              missing argument `weights` 
+ 
+        '''</span>
+
+        <span class="s1">momcond = self.momcond_mean</span>
+
+        <span class="s4"># TODO: approx_fprime has centered keyword</span>
+        <span class="s2">if </span><span class="s1">centered:</span>
+            <span class="s1">gradmoms = (approx_fprime(params</span><span class="s2">, </span><span class="s1">momcond</span><span class="s2">, </span><span class="s1">epsilon=epsilon) +</span>
+                    <span class="s1">approx_fprime(params</span><span class="s2">, </span><span class="s1">momcond</span><span class="s2">, </span><span class="s1">epsilon=-epsilon))/</span><span class="s3">2</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">gradmoms = approx_fprime(params</span><span class="s2">, </span><span class="s1">momcond</span><span class="s2">, </span><span class="s1">epsilon=epsilon)</span>
+
+        <span class="s2">return </span><span class="s1">gradmoms</span>
+
+    <span class="s2">def </span><span class="s1">score(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">epsilon=</span><span class="s2">None, </span><span class="s1">centered=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Score&quot;&quot;&quot;</span>
+        <span class="s1">deriv = approx_fprime(params</span><span class="s2">, </span><span class="s1">self.gmmobjective</span><span class="s2">, </span><span class="s1">args=(weights</span><span class="s2">,</span><span class="s1">)</span><span class="s2">,</span>
+                              <span class="s1">centered=centered</span><span class="s2">, </span><span class="s1">epsilon=epsilon)</span>
+
+        <span class="s2">return </span><span class="s1">deriv</span>
+
+    <span class="s2">def </span><span class="s1">score_cu(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">epsilon=</span><span class="s2">None, </span><span class="s1">centered=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Score cu&quot;&quot;&quot;</span>
+        <span class="s1">deriv = approx_fprime(params</span><span class="s2">, </span><span class="s1">self.gmmobjective_cu</span><span class="s2">, </span><span class="s1">args=()</span><span class="s2">,</span>
+                              <span class="s1">centered=centered</span><span class="s2">, </span><span class="s1">epsilon=epsilon)</span>
+
+        <span class="s2">return </span><span class="s1">deriv</span>
+
+
+<span class="s4"># TODO: wrong superclass, I want tvalues, ... right now</span>
+<span class="s2">class </span><span class="s1">GMMResults(LikelihoodModelResults):</span>
+    <span class="s0">'''just a storage class right now'''</span>
+
+    <span class="s1">use_t = </span><span class="s2">False</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwds):</span>
+        <span class="s1">self.__dict__.update(kwds)</span>
+
+        <span class="s1">self.nobs = self.model.nobs</span>
+        <span class="s1">self.df_resid = np.inf</span>
+
+        <span class="s1">self.cov_params_default = self._cov_params()</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">q(self):</span>
+        <span class="s0">&quot;&quot;&quot;Objective function at params&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.model.gmmobjective(self.params</span><span class="s2">, </span><span class="s1">self.weights)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">jval(self):</span>
+        <span class="s0">&quot;&quot;&quot;nobs_moms attached by momcond_mean&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.q * self.model.nobs_moms</span>
+
+    <span class="s2">def </span><span class="s1">_cov_params(self</span><span class="s2">, </span><span class="s1">**kwds):</span>
+        <span class="s4">#TODO add options ???)</span>
+        <span class="s4"># this should use by default whatever options have been specified in</span>
+        <span class="s4"># fit</span>
+
+        <span class="s4"># TODO: do not do this when we want to change options</span>
+<span class="s4">#         if hasattr(self, '_cov_params'):</span>
+<span class="s4">#             #replace with decorator later</span>
+<span class="s4">#             return self._cov_params</span>
+
+        <span class="s4"># set defaults based on fit arguments</span>
+        <span class="s2">if </span><span class="s5">'wargs' </span><span class="s2">not in </span><span class="s1">kwds:</span>
+            <span class="s4"># Note: we do not check the keys in wargs, use either all or nothing</span>
+            <span class="s1">kwds[</span><span class="s5">'wargs'</span><span class="s1">] = self.wargs</span>
+        <span class="s2">if </span><span class="s5">'weights_method' </span><span class="s2">not in </span><span class="s1">kwds:</span>
+            <span class="s1">kwds[</span><span class="s5">'weights_method'</span><span class="s1">] = self.options_other[</span><span class="s5">'weights_method'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s5">'has_optimal_weights' </span><span class="s2">not in </span><span class="s1">kwds:</span>
+            <span class="s1">kwds[</span><span class="s5">'has_optimal_weights'</span><span class="s1">] = self.options_other[</span><span class="s5">'has_optimal_weights'</span><span class="s1">]</span>
+
+        <span class="s1">gradmoms = self.model.gradient_momcond(self.params)</span>
+        <span class="s1">moms = self.model.momcond(self.params)</span>
+        <span class="s1">covparams = self.calc_cov_params(moms</span><span class="s2">, </span><span class="s1">gradmoms</span><span class="s2">, </span><span class="s1">**kwds)</span>
+
+        <span class="s2">return </span><span class="s1">covparams</span>
+
+
+    <span class="s2">def </span><span class="s1">calc_cov_params(self</span><span class="s2">, </span><span class="s1">moms</span><span class="s2">, </span><span class="s1">gradmoms</span><span class="s2">, </span><span class="s1">weights=</span><span class="s2">None, </span><span class="s1">use_weights=</span><span class="s2">False,</span>
+                                              <span class="s1">has_optimal_weights=</span><span class="s2">True,</span>
+                                              <span class="s1">weights_method=</span><span class="s5">'cov'</span><span class="s2">, </span><span class="s1">wargs=()):</span>
+        <span class="s0">'''calculate covariance of parameter estimates 
+ 
+        not all options tried out yet 
+ 
+        If weights matrix is given, then the formula use to calculate cov_params 
+        depends on whether has_optimal_weights is true. 
+        If no weights are given, then the weight matrix is calculated with 
+        the given method, and has_optimal_weights is assumed to be true. 
+ 
+        (API Note: The latter assumption could be changed if we allow for 
+        has_optimal_weights=None.) 
+ 
+        '''</span>
+
+        <span class="s1">nobs = moms.shape[</span><span class="s3">0</span><span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">weights </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s4">#omegahat = self.model.calc_weightmatrix(moms, method=method, wargs=wargs)</span>
+            <span class="s4">#has_optimal_weights = True</span>
+            <span class="s4">#add other options, Barzen, ...  longrun var estimators</span>
+            <span class="s4"># TODO: this might still be inv_weights after fititer</span>
+            <span class="s1">weights = self.weights</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">pass</span>
+            <span class="s4">#omegahat = weights   #2 different names used,</span>
+            <span class="s4">#TODO: this is wrong, I need an estimate for omega</span>
+
+        <span class="s2">if </span><span class="s1">use_weights:</span>
+            <span class="s1">omegahat = weights</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">omegahat = self.model.calc_weightmatrix(</span>
+                                                <span class="s1">moms</span><span class="s2">,</span>
+                                                <span class="s1">weights_method=weights_method</span><span class="s2">,</span>
+                                                <span class="s1">wargs=wargs</span><span class="s2">,</span>
+                                                <span class="s1">params=self.params)</span>
+
+
+        <span class="s2">if </span><span class="s1">has_optimal_weights: </span><span class="s4">#has_optimal_weights:</span>
+            <span class="s4"># TOD0 make has_optimal_weights depend on convergence or iter &gt;2</span>
+            <span class="s1">cov = np.linalg.inv(np.dot(gradmoms.T</span><span class="s2">,</span>
+                                    <span class="s1">np.dot(np.linalg.inv(omegahat)</span><span class="s2">, </span><span class="s1">gradmoms)))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">gw = np.dot(gradmoms.T</span><span class="s2">, </span><span class="s1">weights)</span>
+            <span class="s1">gwginv = np.linalg.inv(np.dot(gw</span><span class="s2">, </span><span class="s1">gradmoms))</span>
+            <span class="s1">cov = np.dot(np.dot(gwginv</span><span class="s2">, </span><span class="s1">np.dot(np.dot(gw</span><span class="s2">, </span><span class="s1">omegahat)</span><span class="s2">, </span><span class="s1">gw.T))</span><span class="s2">, </span><span class="s1">gwginv)</span>
+            <span class="s4">#cov /= nobs</span>
+
+        <span class="s2">return </span><span class="s1">cov/nobs</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">bse_(self):</span>
+        <span class="s0">'''standard error of the parameter estimates 
+        '''</span>
+        <span class="s2">return </span><span class="s1">self.get_bse()</span>
+
+    <span class="s2">def </span><span class="s1">get_bse(self</span><span class="s2">, </span><span class="s1">**kwds):</span>
+        <span class="s0">'''standard error of the parameter estimates with options 
+ 
+        Parameters 
+        ---------- 
+        kwds : optional keywords 
+            options for calculating cov_params 
+ 
+        Returns 
+        ------- 
+        bse : ndarray 
+            estimated standard error of parameter estimates 
+ 
+        '''</span>
+        <span class="s2">return </span><span class="s1">np.sqrt(np.diag(self.cov_params(**kwds)))</span>
+
+    <span class="s2">def </span><span class="s1">jtest(self):</span>
+        <span class="s0">'''overidentification test 
+ 
+        I guess this is missing a division by nobs, 
+        what's the normalization in jval ? 
+        '''</span>
+
+        <span class="s1">jstat = self.jval</span>
+        <span class="s1">nparams = self.params.size </span><span class="s4">#self.nparams</span>
+        <span class="s1">df = self.model.nmoms - nparams</span>
+        <span class="s2">return </span><span class="s1">jstat</span><span class="s2">, </span><span class="s1">stats.chi2.sf(jstat</span><span class="s2">, </span><span class="s1">df)</span><span class="s2">, </span><span class="s1">df</span>
+
+
+    <span class="s2">def </span><span class="s1">compare_j(self</span><span class="s2">, </span><span class="s1">other):</span>
+        <span class="s0">'''overidentification test for comparing two nested gmm estimates 
+ 
+        This assumes that some moment restrictions have been dropped in one 
+        of the GMM estimates relative to the other. 
+ 
+        Not tested yet 
+ 
+        We are comparing two separately estimated models, that use different 
+        weighting matrices. It is not guaranteed that the resulting 
+        difference is positive. 
+ 
+        TODO: Check in which cases Stata programs use the same weigths 
+ 
+        '''</span>
+        <span class="s1">jstat1 = self.jval</span>
+        <span class="s1">k_moms1 = self.model.nmoms</span>
+        <span class="s1">jstat2 = other.jval</span>
+        <span class="s1">k_moms2 = other.model.nmoms</span>
+        <span class="s1">jdiff = jstat1 - jstat2</span>
+        <span class="s1">df = k_moms1 - k_moms2</span>
+        <span class="s2">if </span><span class="s1">df &lt; </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s4"># possible nested in other way, TODO allow this or not</span>
+            <span class="s4"># flip sign instead of absolute</span>
+            <span class="s1">df = - df</span>
+            <span class="s1">jdiff = - jdiff</span>
+        <span class="s2">return </span><span class="s1">jdiff</span><span class="s2">, </span><span class="s1">stats.chi2.sf(jdiff</span><span class="s2">, </span><span class="s1">df)</span><span class="s2">, </span><span class="s1">df</span>
+
+    <span class="s2">def </span><span class="s1">summary(self</span><span class="s2">, </span><span class="s1">yname=</span><span class="s2">None, </span><span class="s1">xname=</span><span class="s2">None, </span><span class="s1">title=</span><span class="s2">None, </span><span class="s1">alpha=</span><span class="s3">.05</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Summarize the Regression Results 
+ 
+        Parameters 
+        ---------- 
+        yname : str, optional 
+            Default is `y` 
+        xname : list[str], optional 
+            Default is `var_##` for ## in p the number of regressors 
+        title : str, optional 
+            Title for the top table. If not None, then this replaces the 
+            default title 
+        alpha : float 
+            significance level for the confidence intervals 
+ 
+        Returns 
+        ------- 
+        smry : Summary instance 
+            this holds the summary tables and text, which can be printed or 
+            converted to various output formats. 
+ 
+        See Also 
+        -------- 
+        statsmodels.iolib.summary.Summary : class to hold summary 
+            results 
+        &quot;&quot;&quot;</span>
+        <span class="s4">#TODO: add a summary text for options that have been used</span>
+
+        <span class="s1">jvalue</span><span class="s2">, </span><span class="s1">jpvalue</span><span class="s2">, </span><span class="s1">jdf = self.jtest()</span>
+
+        <span class="s1">top_left = [(</span><span class="s5">'Dep. Variable:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">'Model:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">'Method:'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">'GMM'</span><span class="s1">])</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">'Date:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">'Time:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">(</span><span class="s5">'No. Observations:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s4">#('Df Residuals:', None), #[self.df_resid]), #TODO: spelling</span>
+                    <span class="s4">#('Df Model:', None), #[self.df_model])</span>
+                    <span class="s1">]</span>
+
+        <span class="s1">top_right = [</span><span class="s4">#('R-squared:', [&quot;%#8.3f&quot; % self.rsquared]),</span>
+                     <span class="s4">#('Adj. R-squared:', [&quot;%#8.3f&quot; % self.rsquared_adj]),</span>
+                     <span class="s1">(</span><span class="s5">'Hansen J:'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#8.4g&quot; </span><span class="s1">% jvalue] )</span><span class="s2">,</span>
+                     <span class="s1">(</span><span class="s5">'Prob (Hansen J):'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">&quot;%#6.3g&quot; </span><span class="s1">% jpvalue])</span><span class="s2">,</span>
+                     <span class="s4">#('F-statistic:', [&quot;%#8.4g&quot; % self.fvalue] ),</span>
+                     <span class="s4">#('Prob (F-statistic):', [&quot;%#6.3g&quot; % self.f_pvalue]),</span>
+                     <span class="s4">#('Log-Likelihood:', None), #[&quot;%#6.4g&quot; % self.llf]),</span>
+                     <span class="s4">#('AIC:', [&quot;%#8.4g&quot; % self.aic]),</span>
+                     <span class="s4">#('BIC:', [&quot;%#8.4g&quot; % self.bic])</span>
+                     <span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">title </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">title = self.model.__class__.__name__ + </span><span class="s5">' ' </span><span class="s1">+ </span><span class="s5">&quot;Results&quot;</span>
+
+        <span class="s4"># create summary table instance</span>
+        <span class="s2">from </span><span class="s1">statsmodels.iolib.summary </span><span class="s2">import </span><span class="s1">Summary</span>
+        <span class="s1">smry = Summary()</span>
+        <span class="s1">smry.add_table_2cols(self</span><span class="s2">, </span><span class="s1">gleft=top_left</span><span class="s2">, </span><span class="s1">gright=top_right</span><span class="s2">,</span>
+                             <span class="s1">yname=yname</span><span class="s2">, </span><span class="s1">xname=xname</span><span class="s2">, </span><span class="s1">title=title)</span>
+        <span class="s1">smry.add_table_params(self</span><span class="s2">, </span><span class="s1">yname=yname</span><span class="s2">, </span><span class="s1">xname=xname</span><span class="s2">, </span><span class="s1">alpha=alpha</span><span class="s2">,</span>
+                              <span class="s1">use_t=self.use_t)</span>
+
+        <span class="s2">return </span><span class="s1">smry</span>
+
+
+
+<span class="s2">class </span><span class="s1">IVGMM(GMM):</span>
+    <span class="s0">''' 
+    Basic class for instrumental variables estimation using GMM 
+ 
+    A linear function for the conditional mean is defined as default but the 
+    methods should be overwritten by subclasses, currently `LinearIVGMM` and 
+    `NonlinearIVGMM` are implemented as subclasses. 
+ 
+    See Also 
+    -------- 
+    LinearIVGMM 
+    NonlinearIVGMM 
+ 
+    '''</span>
+
+    <span class="s1">results_class = </span><span class="s5">'IVGMMResults'</span>
+
+    <span class="s2">def </span><span class="s1">fitstart(self):</span>
+        <span class="s0">&quot;&quot;&quot;Create array of zeros&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">np.zeros(self.exog.shape[</span><span class="s3">1</span><span class="s1">])</span>
+
+    <span class="s2">def </span><span class="s1">start_weights(self</span><span class="s2">, </span><span class="s1">inv=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Starting weights&quot;&quot;&quot;</span>
+        <span class="s1">zz = np.dot(self.instrument.T</span><span class="s2">, </span><span class="s1">self.instrument)</span>
+        <span class="s1">nobs = self.instrument.shape[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">inv:</span>
+            <span class="s2">return </span><span class="s1">zz / nobs</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">np.linalg.pinv(zz / nobs)</span>
+
+    <span class="s2">def </span><span class="s1">get_error(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot;Get error at params&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.endog - self.predict(params)</span>
+
+    <span class="s2">def </span><span class="s1">predict(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">exog=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Get prediction at params&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">exog </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">exog = self.exog</span>
+
+        <span class="s2">return </span><span class="s1">np.dot(exog</span><span class="s2">, </span><span class="s1">params)</span>
+
+    <span class="s2">def </span><span class="s1">momcond(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot;Error times instrument&quot;&quot;&quot;</span>
+        <span class="s1">instrument = self.instrument</span>
+        <span class="s2">return </span><span class="s1">instrument * self.get_error(params)[:</span><span class="s2">, None</span><span class="s1">]</span>
+
+
+<span class="s2">class </span><span class="s1">LinearIVGMM(IVGMM):</span>
+    <span class="s0">&quot;&quot;&quot;class for linear instrumental variables models estimated with GMM 
+ 
+    Uses closed form expression instead of nonlinear optimizers for each step 
+    of the iterative GMM. 
+ 
+    The model is assumed to have the following moment condition 
+ 
+        E( z * (y - x beta)) = 0 
+ 
+    Where `y` is the dependent endogenous variable, `x` are the explanatory 
+    variables and `z` are the instruments. Variables in `x` that are exogenous 
+    need also be included in `z`. 
+ 
+    Notation Warning: our name `exog` stands for the explanatory variables, 
+    and includes both exogenous and explanatory variables that are endogenous, 
+    i.e. included endogenous variables 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        dependent endogenous variable 
+    exog : array_like 
+        explanatory, right hand side variables, including explanatory variables 
+        that are endogenous 
+    instrument : array_like 
+        Instrumental variables, variables that are exogenous to the error 
+        in the linear model containing both included and excluded exogenous 
+        variables 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">fitgmm(self</span><span class="s2">, </span><span class="s1">start</span><span class="s2">, </span><span class="s1">weights=</span><span class="s2">None, </span><span class="s1">optim_method=</span><span class="s2">None, </span><span class="s1">**kwds):</span>
+        <span class="s0">'''estimate parameters using GMM for linear model 
+ 
+        Uses closed form expression instead of nonlinear optimizers 
+ 
+        Parameters 
+        ---------- 
+        start : not used 
+            starting values for minimization, not used, only for consistency 
+            of method signature 
+        weights : ndarray 
+            weighting matrix for moment conditions. If weights is None, then 
+            the identity matrix is used 
+        optim_method : not used, 
+            optimization method, not used, only for consistency of method 
+            signature 
+        **kwds : keyword arguments 
+            not used, will be silently ignored (for compatibility with generic) 
+ 
+ 
+        Returns 
+        ------- 
+        paramest : ndarray 
+            estimated parameters 
+ 
+        '''</span>
+<span class="s4">##        if not fixed is None:  #fixed not defined in this version</span>
+<span class="s4">##            raise NotImplementedError</span>
+
+        <span class="s4"># TODO: should start_weights only be in `fit`</span>
+        <span class="s2">if </span><span class="s1">weights </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">weights = self.start_weights(inv=</span><span class="s2">False</span><span class="s1">)</span>
+
+        <span class="s1">y</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">z = self.endog</span><span class="s2">, </span><span class="s1">self.exog</span><span class="s2">, </span><span class="s1">self.instrument</span>
+
+        <span class="s1">zTx = np.dot(z.T</span><span class="s2">, </span><span class="s1">x)</span>
+        <span class="s1">zTy = np.dot(z.T</span><span class="s2">, </span><span class="s1">y)</span>
+        <span class="s4"># normal equation, solved with pinv</span>
+        <span class="s1">part0 = zTx.T.dot(weights)</span>
+        <span class="s1">part1 = part0.dot(zTx)</span>
+        <span class="s1">part2 = part0.dot(zTy)</span>
+        <span class="s1">params = np.linalg.pinv(part1).dot(part2)</span>
+
+        <span class="s2">return </span><span class="s1">params</span>
+
+
+    <span class="s2">def </span><span class="s1">predict(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">exog=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">exog </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">exog = self.exog</span>
+
+        <span class="s2">return </span><span class="s1">np.dot(exog</span><span class="s2">, </span><span class="s1">params)</span>
+
+
+    <span class="s2">def </span><span class="s1">gradient_momcond(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">**kwds):</span>
+        <span class="s4"># **kwds for compatibility not used</span>
+
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">z = self.exog</span><span class="s2">, </span><span class="s1">self.instrument</span>
+        <span class="s1">gradmoms = -np.dot(z.T</span><span class="s2">, </span><span class="s1">x) / self.nobs</span>
+
+        <span class="s2">return </span><span class="s1">gradmoms</span>
+
+    <span class="s2">def </span><span class="s1">score(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">**kwds):</span>
+        <span class="s4"># **kwds for compatibility, not used</span>
+        <span class="s4"># Note: I coud use general formula with gradient_momcond instead</span>
+
+        <span class="s1">x</span><span class="s2">, </span><span class="s1">z = self.exog</span><span class="s2">, </span><span class="s1">self.instrument</span>
+        <span class="s1">nobs = z.shape[</span><span class="s3">0</span><span class="s1">]</span>
+
+        <span class="s1">u = self.get_errors(params)</span>
+        <span class="s1">score = -</span><span class="s3">2 </span><span class="s1">* np.dot(x.T</span><span class="s2">, </span><span class="s1">z).dot(weights.dot(np.dot(z.T</span><span class="s2">, </span><span class="s1">u)))</span>
+        <span class="s1">score /= nobs * nobs</span>
+
+        <span class="s2">return </span><span class="s1">score</span>
+
+
+
+<span class="s2">class </span><span class="s1">NonlinearIVGMM(IVGMM):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Class for non-linear instrumental variables estimation using GMM 
+ 
+    The model is assumed to have the following moment condition 
+ 
+        E[ z * (y - f(X, beta)] = 0 
+ 
+    Where `y` is the dependent endogenous variable, `x` are the explanatory 
+    variables and `z` are the instruments. Variables in `x` that are exogenous 
+    need also be included in z. `f` is a nonlinear function. 
+ 
+    Notation Warning: our name `exog` stands for the explanatory variables, 
+    and includes both exogenous and explanatory variables that are endogenous, 
+    i.e. included endogenous variables 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        dependent endogenous variable 
+    exog : array_like 
+        explanatory, right hand side variables, including explanatory variables 
+        that are endogenous. 
+    instruments : array_like 
+        Instrumental variables, variables that are exogenous to the error 
+        in the linear model containing both included and excluded exogenous 
+        variables 
+    func : callable 
+        function for the mean or conditional expectation of the endogenous 
+        variable. The function will be called with parameters and the array of 
+        explanatory, right hand side variables, `func(params, exog)` 
+ 
+    Notes 
+    ----- 
+    This class uses numerical differences to obtain the derivative of the 
+    objective function. If the jacobian of the conditional mean function, `func` 
+    is available, then it can be used by subclassing this class and defining 
+    a method `jac_func`. 
+ 
+    TODO: check required signature of jac_error and jac_func 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># This should be reversed:</span>
+    <span class="s4"># NonlinearIVGMM is IVGMM and need LinearIVGMM as special case (fit, predict)</span>
+
+
+    <span class="s2">def </span><span class="s1">fitstart(self):</span>
+        <span class="s4">#might not make sense for more general functions</span>
+        <span class="s2">return </span><span class="s1">np.zeros(self.exog.shape[</span><span class="s3">1</span><span class="s1">])</span>
+
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">instrument</span><span class="s2">, </span><span class="s1">func</span><span class="s2">, </span><span class="s1">**kwds):</span>
+        <span class="s1">self.func = func</span>
+        <span class="s1">super(NonlinearIVGMM</span><span class="s2">, </span><span class="s1">self).__init__(endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">instrument</span><span class="s2">, </span><span class="s1">**kwds)</span>
+
+
+    <span class="s2">def </span><span class="s1">predict(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">exog=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">exog </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">exog = self.exog</span>
+
+        <span class="s2">return </span><span class="s1">self.func(params</span><span class="s2">, </span><span class="s1">exog)</span>
+
+    <span class="s4">#----------  the following a semi-general versions,</span>
+    <span class="s4"># TODO: move to higher class after testing</span>
+
+    <span class="s2">def </span><span class="s1">jac_func(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">args=</span><span class="s2">None, </span><span class="s1">centered=</span><span class="s2">True, </span><span class="s1">epsilon=</span><span class="s2">None</span><span class="s1">):</span>
+
+        <span class="s4"># TODO: Why are ther weights in the signature - copy-paste error?</span>
+        <span class="s1">deriv = approx_fprime(params</span><span class="s2">, </span><span class="s1">self.func</span><span class="s2">, </span><span class="s1">args=(self.exog</span><span class="s2">,</span><span class="s1">)</span><span class="s2">,</span>
+                              <span class="s1">centered=centered</span><span class="s2">, </span><span class="s1">epsilon=epsilon)</span>
+
+        <span class="s2">return </span><span class="s1">deriv</span>
+
+
+    <span class="s2">def </span><span class="s1">jac_error(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">args=</span><span class="s2">None, </span><span class="s1">centered=</span><span class="s2">True,</span>
+                   <span class="s1">epsilon=</span><span class="s2">None</span><span class="s1">):</span>
+
+        <span class="s1">jac_func = self.jac_func(params</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">args=</span><span class="s2">None, </span><span class="s1">centered=</span><span class="s2">True,</span>
+                                 <span class="s1">epsilon=</span><span class="s2">None</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">-jac_func</span>
+
+
+    <span class="s2">def </span><span class="s1">score(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">**kwds):</span>
+        <span class="s4"># **kwds for compatibility not used</span>
+        <span class="s4"># Note: I coud use general formula with gradient_momcond instead</span>
+
+        <span class="s1">z = self.instrument</span>
+        <span class="s1">nobs = z.shape[</span><span class="s3">0</span><span class="s1">]</span>
+
+        <span class="s1">jac_u = self.jac_error(params</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">args=</span><span class="s2">None, </span><span class="s1">epsilon=</span><span class="s2">None,</span>
+                               <span class="s1">centered=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">x = -jac_u  </span><span class="s4"># alias, plays the same role as X in linear model</span>
+
+        <span class="s1">u = self.get_error(params)</span>
+
+        <span class="s1">score = -</span><span class="s3">2 </span><span class="s1">* np.dot(np.dot(x.T</span><span class="s2">, </span><span class="s1">z)</span><span class="s2">, </span><span class="s1">weights).dot(np.dot(z.T</span><span class="s2">, </span><span class="s1">u))</span>
+        <span class="s1">score /= nobs * nobs</span>
+
+        <span class="s2">return </span><span class="s1">score</span>
+
+
+<span class="s2">class </span><span class="s1">IVGMMResults(GMMResults):</span>
+    <span class="s0">&quot;&quot;&quot;Results class of IVGMM&quot;&quot;&quot;</span>
+    <span class="s4"># this assumes that we have an additive error model `(y - f(x, params))`</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">fittedvalues(self):</span>
+        <span class="s0">&quot;&quot;&quot;Fitted values&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.model.predict(self.params)</span>
+
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">resid(self):</span>
+        <span class="s0">&quot;&quot;&quot;Residuals&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.model.endog - self.fittedvalues</span>
+
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">ssr(self):</span>
+        <span class="s0">&quot;&quot;&quot;Sum of square errors&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">(self.resid * self.resid).sum(</span><span class="s3">0</span><span class="s1">)</span>
+
+
+
+
+<span class="s2">def </span><span class="s1">spec_hausman(params_e</span><span class="s2">, </span><span class="s1">params_i</span><span class="s2">, </span><span class="s1">cov_params_e</span><span class="s2">, </span><span class="s1">cov_params_i</span><span class="s2">, </span><span class="s1">dof=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">'''Hausmans specification test 
+ 
+    Parameters 
+    ---------- 
+    params_e : ndarray 
+        efficient and consistent under Null hypothesis, 
+        inconsistent under alternative hypothesis 
+    params_i : ndarray 
+        consistent under Null hypothesis, 
+        consistent under alternative hypothesis 
+    cov_params_e : ndarray, 2d 
+        covariance matrix of parameter estimates for params_e 
+    cov_params_i : ndarray, 2d 
+        covariance matrix of parameter estimates for params_i 
+ 
+    example instrumental variables OLS estimator is `e`, IV estimator is `i` 
+ 
+ 
+    Notes 
+    ----- 
+ 
+    Todos,Issues 
+    - check dof calculations and verify for linear case 
+    - check one-sided hypothesis 
+ 
+ 
+    References 
+    ---------- 
+    Greene section 5.5 p.82/83 
+ 
+ 
+    '''</span>
+    <span class="s1">params_diff = (params_i - params_e)</span>
+    <span class="s1">cov_diff = cov_params_i - cov_params_e</span>
+    <span class="s4">#TODO: the following is very inefficient, solves problem (svd) twice</span>
+    <span class="s4">#use linalg.lstsq or svd directly</span>
+    <span class="s4">#cov_diff will very often be in-definite (singular)</span>
+    <span class="s2">if not </span><span class="s1">dof:</span>
+        <span class="s1">dof = np.linalg.matrix_rank(cov_diff)</span>
+    <span class="s1">cov_diffpinv = np.linalg.pinv(cov_diff)</span>
+    <span class="s1">H = np.dot(params_diff</span><span class="s2">, </span><span class="s1">np.dot(cov_diffpinv</span><span class="s2">, </span><span class="s1">params_diff))</span>
+    <span class="s1">pval = stats.chi2.sf(H</span><span class="s2">, </span><span class="s1">dof)</span>
+
+    <span class="s1">evals = np.linalg.eigvalsh(cov_diff)</span>
+
+    <span class="s2">return </span><span class="s1">H</span><span class="s2">, </span><span class="s1">pval</span><span class="s2">, </span><span class="s1">dof</span><span class="s2">, </span><span class="s1">evals</span>
+
+
+
+
+<span class="s4">###########</span>
+
+<span class="s2">class </span><span class="s1">DistQuantilesGMM(GMM):</span>
+    <span class="s0">''' 
+    Estimate distribution parameters by GMM based on matching quantiles 
+ 
+    Currently mainly to try out different requirements for GMM when we cannot 
+    calculate the optimal weighting matrix. 
+ 
+    '''</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">instrument</span><span class="s2">, </span><span class="s1">**kwds):</span>
+        <span class="s4">#TODO: something wrong with super</span>
+        <span class="s1">super(DistQuantilesGMM</span><span class="s2">, </span><span class="s1">self).__init__(endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">instrument)</span>
+        <span class="s4">#self.func = func</span>
+        <span class="s1">self.epsilon_iter = </span><span class="s3">1e-5</span>
+
+        <span class="s1">self.distfn = kwds[</span><span class="s5">'distfn'</span><span class="s1">]</span>
+        <span class="s4">#done by super does not work yet</span>
+        <span class="s4">#TypeError: super does not take keyword arguments</span>
+        <span class="s1">self.endog = endog</span>
+
+        <span class="s4">#make this optional for fit</span>
+        <span class="s2">if </span><span class="s5">'pquant' </span><span class="s2">not in </span><span class="s1">kwds:</span>
+            <span class="s1">self.pquant = pquant = np.array([</span><span class="s3">0.01</span><span class="s2">, </span><span class="s3">0.05</span><span class="s2">,</span><span class="s3">0.1</span><span class="s2">,</span><span class="s3">0.4</span><span class="s2">,</span><span class="s3">0.6</span><span class="s2">,</span><span class="s3">0.9</span><span class="s2">,</span><span class="s3">0.95</span><span class="s2">,</span><span class="s3">0.99</span><span class="s1">])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.pquant = pquant = kwds[</span><span class="s5">'pquant'</span><span class="s1">]</span>
+
+        <span class="s4">#TODO: vectorize this: use edf</span>
+        <span class="s1">self.xquant = np.array([stats.scoreatpercentile(endog</span><span class="s2">, </span><span class="s1">p) </span><span class="s2">for </span><span class="s1">p</span>
+                                <span class="s2">in </span><span class="s1">pquant*</span><span class="s3">100</span><span class="s1">])</span>
+        <span class="s1">self.nmoms = len(self.pquant)</span>
+
+        <span class="s4">#TODOcopied from GMM, make super work</span>
+        <span class="s1">self.endog = endog</span>
+        <span class="s1">self.exog = exog</span>
+        <span class="s1">self.instrument = instrument</span>
+        <span class="s1">self.results = GMMResults(model=self)</span>
+        <span class="s4">#self.__dict__.update(kwds)</span>
+        <span class="s1">self.epsilon_iter = </span><span class="s3">1e-6</span>
+
+    <span class="s2">def </span><span class="s1">fitstart(self):</span>
+        <span class="s4">#todo: replace with or add call to distfn._fitstart</span>
+        <span class="s4">#      added but not used during testing</span>
+        <span class="s1">distfn = self.distfn</span>
+        <span class="s2">if </span><span class="s1">hasattr(distfn</span><span class="s2">, </span><span class="s5">'_fitstart'</span><span class="s1">):</span>
+            <span class="s1">start = distfn._fitstart(self.endog)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">start = [</span><span class="s3">1</span><span class="s1">]*distfn.numargs + [</span><span class="s3">0.</span><span class="s2">,</span><span class="s3">1.</span><span class="s1">]</span>
+
+        <span class="s2">return </span><span class="s1">np.asarray(start)</span>
+
+    <span class="s2">def </span><span class="s1">momcond(self</span><span class="s2">, </span><span class="s1">params): </span><span class="s4">#drop distfn as argument</span>
+        <span class="s4">#, mom2, quantile=None, shape=None</span>
+        <span class="s0">'''moment conditions for estimating distribution parameters by matching 
+        quantiles, defines as many moment conditions as quantiles. 
+ 
+        Returns 
+        ------- 
+        difference : ndarray 
+            difference between theoretical and empirical quantiles 
+ 
+        Notes 
+        ----- 
+        This can be used for method of moments or for generalized method of 
+        moments. 
+ 
+        '''</span>
+        <span class="s4">#this check looks redundant/unused know</span>
+        <span class="s2">if </span><span class="s1">len(params) == </span><span class="s3">2</span><span class="s1">:</span>
+            <span class="s1">loc</span><span class="s2">, </span><span class="s1">scale = params</span>
+        <span class="s2">elif </span><span class="s1">len(params) == </span><span class="s3">3</span><span class="s1">:</span>
+            <span class="s1">shape</span><span class="s2">, </span><span class="s1">loc</span><span class="s2">, </span><span class="s1">scale = params</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s4">#raise NotImplementedError</span>
+            <span class="s2">pass </span><span class="s4">#see whether this might work, seems to work for beta with 2 shape args</span>
+
+        <span class="s4">#mom2diff = np.array(distfn.stats(*params)) - mom2</span>
+        <span class="s4">#if not quantile is None:</span>
+        <span class="s1">pq</span><span class="s2">, </span><span class="s1">xq = self.pquant</span><span class="s2">, </span><span class="s1">self.xquant</span>
+        <span class="s4">#ppfdiff = distfn.ppf(pq, alpha)</span>
+        <span class="s1">cdfdiff = self.distfn.cdf(xq</span><span class="s2">, </span><span class="s1">*params) - pq</span>
+        <span class="s4">#return np.concatenate([mom2diff, cdfdiff[:1]])</span>
+        <span class="s2">return </span><span class="s1">np.atleast_2d(cdfdiff)</span>
+
+    <span class="s2">def </span><span class="s1">fitonce(self</span><span class="s2">, </span><span class="s1">start=</span><span class="s2">None, </span><span class="s1">weights=</span><span class="s2">None, </span><span class="s1">has_optimal_weights=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">'''fit without estimating an optimal weighting matrix and return results 
+ 
+        This is a convenience function that calls fitgmm and covparams with 
+        a given weight matrix or the identity weight matrix. 
+        This is useful if the optimal weight matrix is know (or is analytically 
+        given) or if an optimal weight matrix cannot be calculated. 
+ 
+        (Developer Notes: this function could go into GMM, but is needed in this 
+        class, at least at the moment.) 
+ 
+        Parameters 
+        ---------- 
+ 
+ 
+        Returns 
+        ------- 
+        results : GMMResult instance 
+            result instance with params and _cov_params attached 
+ 
+        See Also 
+        -------- 
+        fitgmm 
+        cov_params 
+ 
+        '''</span>
+        <span class="s2">if </span><span class="s1">weights </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">weights = np.eye(self.nmoms)</span>
+        <span class="s1">params = self.fitgmm(start=start)</span>
+        <span class="s4"># TODO: rewrite this old hack, should use fitgmm or fit maxiter=0</span>
+        <span class="s1">self.results.params = params  </span><span class="s4">#required before call to self.cov_params</span>
+        <span class="s1">self.results.wargs = {} </span><span class="s4">#required before call to self.cov_params</span>
+        <span class="s1">self.results.options_other = {</span><span class="s5">'weights_method'</span><span class="s1">:</span><span class="s5">'cov'</span><span class="s1">}</span>
+        <span class="s4"># TODO: which weights_method?  There should not be any needed ?</span>
+        <span class="s1">_cov_params = self.results.cov_params(weights=weights</span><span class="s2">,</span>
+                                      <span class="s1">has_optimal_weights=has_optimal_weights)</span>
+
+        <span class="s1">self.results.weights = weights</span>
+        <span class="s1">self.results.jval = self.gmmobjective(params</span><span class="s2">, </span><span class="s1">weights)</span>
+        <span class="s1">self.results.options_other.update({</span><span class="s5">'has_optimal_weights'</span><span class="s1">:has_optimal_weights})</span>
+
+        <span class="s2">return </span><span class="s1">self.results</span>
+
+
+<span class="s1">results_class_dict = {</span><span class="s5">'GMMResults'</span><span class="s1">: GMMResults</span><span class="s2">,</span>
+                      <span class="s5">'IVGMMResults'</span><span class="s1">: IVGMMResults</span><span class="s2">,</span>
+                      <span class="s5">'DistQuantilesGMM'</span><span class="s1">: GMMResults}  </span><span class="s4">#TODO: should be a default</span>
+</pre>
+</body>
+</html>

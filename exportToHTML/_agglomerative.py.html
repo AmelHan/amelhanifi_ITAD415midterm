@@ -1,0 +1,1380 @@
+<html>
+<head>
+<title>_agglomerative.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_agglomerative.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Hierarchical Agglomerative Clustering 
+ 
+These routines perform some hierarchical agglomerative clustering of some 
+input data. 
+ 
+Authors : Vincent Michel, Bertrand Thirion, Alexandre Gramfort, 
+          Gael Varoquaux 
+License: BSD 3 clause 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">from </span><span class="s1">heapq </span><span class="s2">import </span><span class="s1">heapify</span><span class="s2">, </span><span class="s1">heappop</span><span class="s2">, </span><span class="s1">heappush</span><span class="s2">, </span><span class="s1">heappushpop</span>
+<span class="s2">from </span><span class="s1">numbers </span><span class="s2">import </span><span class="s1">Integral</span><span class="s2">, </span><span class="s1">Real</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">sparse</span>
+<span class="s2">from </span><span class="s1">scipy.sparse.csgraph </span><span class="s2">import </span><span class="s1">connected_components</span>
+
+<span class="s2">from </span><span class="s1">..base </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">BaseEstimator</span><span class="s2">,</span>
+    <span class="s1">ClassNamePrefixFeaturesOutMixin</span><span class="s2">,</span>
+    <span class="s1">ClusterMixin</span><span class="s2">,</span>
+    <span class="s1">_fit_context</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s2">from </span><span class="s1">..metrics </span><span class="s2">import </span><span class="s1">DistanceMetric</span>
+<span class="s2">from </span><span class="s1">..metrics._dist_metrics </span><span class="s2">import </span><span class="s1">METRIC_MAPPING64</span>
+<span class="s2">from </span><span class="s1">..metrics.pairwise </span><span class="s2">import </span><span class="s1">_VALID_METRICS</span><span class="s2">, </span><span class="s1">paired_distances</span>
+<span class="s2">from </span><span class="s1">..utils </span><span class="s2">import </span><span class="s1">check_array</span>
+<span class="s2">from </span><span class="s1">..utils._fast_dict </span><span class="s2">import </span><span class="s1">IntFloatDict</span>
+<span class="s2">from </span><span class="s1">..utils._param_validation </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">HasMethods</span><span class="s2">,</span>
+    <span class="s1">Hidden</span><span class="s2">,</span>
+    <span class="s1">Interval</span><span class="s2">,</span>
+    <span class="s1">StrOptions</span><span class="s2">,</span>
+    <span class="s1">validate_params</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s2">from </span><span class="s1">..utils.graph </span><span class="s2">import </span><span class="s1">_fix_connected_components</span>
+<span class="s2">from </span><span class="s1">..utils.validation </span><span class="s2">import </span><span class="s1">check_memory</span>
+
+<span class="s3"># mypy error: Module 'sklearn.cluster' has no attribute '_hierarchical_fast'</span>
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">_hierarchical_fast </span><span class="s2">as </span><span class="s1">_hierarchical  </span><span class="s3"># type: ignore</span>
+<span class="s2">from </span><span class="s1">._feature_agglomeration </span><span class="s2">import </span><span class="s1">AgglomerationTransform</span>
+
+<span class="s3">###############################################################################</span>
+<span class="s3"># For non fully-connected graphs</span>
+
+
+<span class="s2">def </span><span class="s1">_fix_connectivity(X</span><span class="s2">, </span><span class="s1">connectivity</span><span class="s2">, </span><span class="s1">affinity):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Fixes the connectivity matrix. 
+ 
+    The different steps are: 
+ 
+    - copies it 
+    - makes it symmetric 
+    - converts it to LIL if necessary 
+    - completes it if necessary. 
+ 
+    Parameters 
+    ---------- 
+    X : array-like of shape (n_samples, n_features) 
+        Feature matrix representing `n_samples` samples to be clustered. 
+ 
+    connectivity : sparse matrix, default=None 
+        Connectivity matrix. Defines for each sample the neighboring samples 
+        following a given structure of the data. The matrix is assumed to 
+        be symmetric and only the upper triangular half is used. 
+        Default is `None`, i.e, the Ward algorithm is unstructured. 
+ 
+    affinity : {&quot;euclidean&quot;, &quot;precomputed&quot;}, default=&quot;euclidean&quot; 
+        Which affinity to use. At the moment `precomputed` and 
+        ``euclidean`` are supported. `euclidean` uses the 
+        negative squared Euclidean distance between points. 
+ 
+    Returns 
+    ------- 
+    connectivity : sparse matrix 
+        The fixed connectivity matrix. 
+ 
+    n_connected_components : int 
+        The number of connected components in the graph. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">n_samples = X.shape[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s2">if </span><span class="s1">connectivity.shape[</span><span class="s4">0</span><span class="s1">] != n_samples </span><span class="s2">or </span><span class="s1">connectivity.shape[</span><span class="s4">1</span><span class="s1">] != n_samples:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span>
+            <span class="s5">&quot;Wrong shape for connectivity matrix: %s when X is %s&quot;</span>
+            <span class="s1">% (connectivity.shape</span><span class="s2">, </span><span class="s1">X.shape)</span>
+        <span class="s1">)</span>
+
+    <span class="s3"># Make the connectivity matrix symmetric:</span>
+    <span class="s1">connectivity = connectivity + connectivity.T</span>
+
+    <span class="s3"># Convert connectivity matrix to LIL</span>
+    <span class="s2">if not </span><span class="s1">sparse.issparse(connectivity):</span>
+        <span class="s1">connectivity = sparse.lil_matrix(connectivity)</span>
+
+    <span class="s3"># `connectivity` is a sparse matrix at this point</span>
+    <span class="s2">if </span><span class="s1">connectivity.format != </span><span class="s5">&quot;lil&quot;</span><span class="s1">:</span>
+        <span class="s1">connectivity = connectivity.tolil()</span>
+
+    <span class="s3"># Compute the number of nodes</span>
+    <span class="s1">n_connected_components</span><span class="s2">, </span><span class="s1">labels = connected_components(connectivity)</span>
+
+    <span class="s2">if </span><span class="s1">n_connected_components &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">warnings.warn(</span>
+            <span class="s5">&quot;the number of connected components of the &quot;</span>
+            <span class="s5">&quot;connectivity matrix is %d &gt; 1. Completing it to avoid &quot;</span>
+            <span class="s5">&quot;stopping the tree early.&quot; </span><span class="s1">% n_connected_components</span><span class="s2">,</span>
+            <span class="s1">stacklevel=</span><span class="s4">2</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s3"># XXX: Can we do without completing the matrix?</span>
+        <span class="s1">connectivity = _fix_connected_components(</span>
+            <span class="s1">X=X</span><span class="s2">,</span>
+            <span class="s1">graph=connectivity</span><span class="s2">,</span>
+            <span class="s1">n_connected_components=n_connected_components</span><span class="s2">,</span>
+            <span class="s1">component_labels=labels</span><span class="s2">,</span>
+            <span class="s1">metric=affinity</span><span class="s2">,</span>
+            <span class="s1">mode=</span><span class="s5">&quot;connectivity&quot;</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+    <span class="s2">return </span><span class="s1">connectivity</span><span class="s2">, </span><span class="s1">n_connected_components</span>
+
+
+<span class="s2">def </span><span class="s1">_single_linkage_tree(</span>
+    <span class="s1">connectivity</span><span class="s2">,</span>
+    <span class="s1">n_samples</span><span class="s2">,</span>
+    <span class="s1">n_nodes</span><span class="s2">,</span>
+    <span class="s1">n_clusters</span><span class="s2">,</span>
+    <span class="s1">n_connected_components</span><span class="s2">,</span>
+    <span class="s1">return_distance</span><span class="s2">,</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Perform single linkage clustering on sparse data via the minimum 
+    spanning tree from scipy.sparse.csgraph, then using union-find to label. 
+    The parent array is then generated by walking through the tree. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">from </span><span class="s1">scipy.sparse.csgraph </span><span class="s2">import </span><span class="s1">minimum_spanning_tree</span>
+
+    <span class="s3"># explicitly cast connectivity to ensure safety</span>
+    <span class="s1">connectivity = connectivity.astype(np.float64</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">False</span><span class="s1">)</span>
+
+    <span class="s3"># Ensure zero distances aren't ignored by setting them to &quot;epsilon&quot;</span>
+    <span class="s1">epsilon_value = np.finfo(dtype=connectivity.data.dtype).eps</span>
+    <span class="s1">connectivity.data[connectivity.data == </span><span class="s4">0</span><span class="s1">] = epsilon_value</span>
+
+    <span class="s3"># Use scipy.sparse.csgraph to generate a minimum spanning tree</span>
+    <span class="s1">mst = minimum_spanning_tree(connectivity.tocsr())</span>
+
+    <span class="s3"># Convert the graph to scipy.cluster.hierarchy array format</span>
+    <span class="s1">mst = mst.tocoo()</span>
+
+    <span class="s3"># Undo the epsilon values</span>
+    <span class="s1">mst.data[mst.data == epsilon_value] = </span><span class="s4">0</span>
+
+    <span class="s1">mst_array = np.vstack([mst.row</span><span class="s2">, </span><span class="s1">mst.col</span><span class="s2">, </span><span class="s1">mst.data]).T</span>
+
+    <span class="s3"># Sort edges of the min_spanning_tree by weight</span>
+    <span class="s1">mst_array = mst_array[np.argsort(mst_array.T[</span><span class="s4">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">kind=</span><span class="s5">&quot;mergesort&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">:]</span>
+
+    <span class="s3"># Convert edge list into standard hierarchical clustering format</span>
+    <span class="s1">single_linkage_tree = _hierarchical._single_linkage_label(mst_array)</span>
+    <span class="s1">children_ = single_linkage_tree[:</span><span class="s2">, </span><span class="s1">:</span><span class="s4">2</span><span class="s1">].astype(int)</span>
+
+    <span class="s3"># Compute parents</span>
+    <span class="s1">parent = np.arange(n_nodes</span><span class="s2">, </span><span class="s1">dtype=np.intp)</span>
+    <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">(left</span><span class="s2">, </span><span class="s1">right) </span><span class="s2">in </span><span class="s1">enumerate(children_</span><span class="s2">, </span><span class="s1">n_samples):</span>
+        <span class="s2">if </span><span class="s1">n_clusters </span><span class="s2">is not None and </span><span class="s1">i &gt;= n_nodes:</span>
+            <span class="s2">break</span>
+        <span class="s2">if </span><span class="s1">left &lt; n_nodes:</span>
+            <span class="s1">parent[left] = i</span>
+        <span class="s2">if </span><span class="s1">right &lt; n_nodes:</span>
+            <span class="s1">parent[right] = i</span>
+
+    <span class="s2">if </span><span class="s1">return_distance:</span>
+        <span class="s1">distances = single_linkage_tree[:</span><span class="s2">, </span><span class="s4">2</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">children_</span><span class="s2">, </span><span class="s1">n_connected_components</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, </span><span class="s1">parent</span><span class="s2">, </span><span class="s1">distances</span>
+    <span class="s2">return </span><span class="s1">children_</span><span class="s2">, </span><span class="s1">n_connected_components</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, </span><span class="s1">parent</span>
+
+
+<span class="s3">###############################################################################</span>
+<span class="s3"># Hierarchical tree building functions</span>
+
+
+<span class="s1">@validate_params(</span>
+    <span class="s1">{</span>
+        <span class="s5">&quot;X&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;connectivity&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s2">, </span><span class="s5">&quot;sparse matrix&quot;</span><span class="s2">, None</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;n_clusters&quot;</span><span class="s1">: [Interval(Integral</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, None, </span><span class="s1">closed=</span><span class="s5">&quot;left&quot;</span><span class="s1">)</span><span class="s2">, None</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;return_distance&quot;</span><span class="s1">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s1">}</span><span class="s2">,</span>
+    <span class="s1">prefer_skip_nested_validation=</span><span class="s2">True,</span>
+<span class="s1">)</span>
+<span class="s2">def </span><span class="s1">ward_tree(X</span><span class="s2">, </span><span class="s1">*</span><span class="s2">, </span><span class="s1">connectivity=</span><span class="s2">None, </span><span class="s1">n_clusters=</span><span class="s2">None, </span><span class="s1">return_distance=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Ward clustering based on a Feature matrix. 
+ 
+    Recursively merges the pair of clusters that minimally increases 
+    within-cluster variance. 
+ 
+    The inertia matrix uses a Heapq-based representation. 
+ 
+    This is the structured version, that takes into account some topological 
+    structure between samples. 
+ 
+    Read more in the :ref:`User Guide &lt;hierarchical_clustering&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    X : array-like of shape (n_samples, n_features) 
+        Feature matrix representing `n_samples` samples to be clustered. 
+ 
+    connectivity : {array-like, sparse matrix}, default=None 
+        Connectivity matrix. Defines for each sample the neighboring samples 
+        following a given structure of the data. The matrix is assumed to 
+        be symmetric and only the upper triangular half is used. 
+        Default is None, i.e, the Ward algorithm is unstructured. 
+ 
+    n_clusters : int, default=None 
+        `n_clusters` should be less than `n_samples`.  Stop early the 
+        construction of the tree at `n_clusters.` This is useful to decrease 
+        computation time if the number of clusters is not small compared to the 
+        number of samples. In this case, the complete tree is not computed, thus 
+        the 'children' output is of limited use, and the 'parents' output should 
+        rather be used. This option is valid only when specifying a connectivity 
+        matrix. 
+ 
+    return_distance : bool, default=False 
+        If `True`, return the distance between the clusters. 
+ 
+    Returns 
+    ------- 
+    children : ndarray of shape (n_nodes-1, 2) 
+        The children of each non-leaf node. Values less than `n_samples` 
+        correspond to leaves of the tree which are the original samples. 
+        A node `i` greater than or equal to `n_samples` is a non-leaf 
+        node and has children `children_[i - n_samples]`. Alternatively 
+        at the i-th iteration, children[i][0] and children[i][1] 
+        are merged to form node `n_samples + i`. 
+ 
+    n_connected_components : int 
+        The number of connected components in the graph. 
+ 
+    n_leaves : int 
+        The number of leaves in the tree. 
+ 
+    parents : ndarray of shape (n_nodes,) or None 
+        The parent of each node. Only returned when a connectivity matrix 
+        is specified, elsewhere 'None' is returned. 
+ 
+    distances : ndarray of shape (n_nodes-1,) 
+        Only returned if `return_distance` is set to `True` (for compatibility). 
+        The distances between the centers of the nodes. `distances[i]` 
+        corresponds to a weighted Euclidean distance between 
+        the nodes `children[i, 1]` and `children[i, 2]`. If the nodes refer to 
+        leaves of the tree, then `distances[i]` is their unweighted Euclidean 
+        distance. Distances are updated in the following way 
+        (from scipy.hierarchy.linkage): 
+ 
+        The new entry :math:`d(u,v)` is computed as follows, 
+ 
+        .. math:: 
+ 
+           d(u,v) = \\sqrt{\\frac{|v|+|s|} 
+                               {T}d(v,s)^2 
+                        + \\frac{|v|+|t|} 
+                               {T}d(v,t)^2 
+                        - \\frac{|v|} 
+                               {T}d(s,t)^2} 
+ 
+        where :math:`u` is the newly joined cluster consisting of 
+        clusters :math:`s` and :math:`t`, :math:`v` is an unused 
+        cluster in the forest, :math:`T=|v|+|s|+|t|`, and 
+        :math:`|*|` is the cardinality of its argument. This is also 
+        known as the incremental algorithm. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">X = np.asarray(X)</span>
+    <span class="s2">if </span><span class="s1">X.ndim == </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">X = np.reshape(X</span><span class="s2">, </span><span class="s1">(-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">))</span>
+    <span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_features = X.shape</span>
+
+    <span class="s2">if </span><span class="s1">connectivity </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">from </span><span class="s1">scipy.cluster </span><span class="s2">import </span><span class="s1">hierarchy  </span><span class="s3"># imports PIL</span>
+
+        <span class="s2">if </span><span class="s1">n_clusters </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">warnings.warn(</span>
+                <span class="s1">(</span>
+                    <span class="s5">&quot;Partial build of the tree is implemented &quot;</span>
+                    <span class="s5">&quot;only for structured clustering (i.e. with &quot;</span>
+                    <span class="s5">&quot;explicit connectivity). The algorithm &quot;</span>
+                    <span class="s5">&quot;will build the full tree and only &quot;</span>
+                    <span class="s5">&quot;retain the lower branches required &quot;</span>
+                    <span class="s5">&quot;for the specified number of clusters&quot;</span>
+                <span class="s1">)</span><span class="s2">,</span>
+                <span class="s1">stacklevel=</span><span class="s4">2</span><span class="s2">,</span>
+            <span class="s1">)</span>
+        <span class="s1">X = np.require(X</span><span class="s2">, </span><span class="s1">requirements=</span><span class="s5">&quot;W&quot;</span><span class="s1">)</span>
+        <span class="s1">out = hierarchy.ward(X)</span>
+        <span class="s1">children_ = out[:</span><span class="s2">, </span><span class="s1">:</span><span class="s4">2</span><span class="s1">].astype(np.intp)</span>
+
+        <span class="s2">if </span><span class="s1">return_distance:</span>
+            <span class="s1">distances = out[:</span><span class="s2">, </span><span class="s4">2</span><span class="s1">]</span>
+            <span class="s2">return </span><span class="s1">children_</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, None, </span><span class="s1">distances</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">children_</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, None</span>
+
+    <span class="s1">connectivity</span><span class="s2">, </span><span class="s1">n_connected_components = _fix_connectivity(</span>
+        <span class="s1">X</span><span class="s2">, </span><span class="s1">connectivity</span><span class="s2">, </span><span class="s1">affinity=</span><span class="s5">&quot;euclidean&quot;</span>
+    <span class="s1">)</span>
+    <span class="s2">if </span><span class="s1">n_clusters </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">n_nodes = </span><span class="s4">2 </span><span class="s1">* n_samples - </span><span class="s4">1</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">if </span><span class="s1">n_clusters &gt; n_samples:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;Cannot provide more clusters than samples. &quot;</span>
+                <span class="s5">&quot;%i n_clusters was asked, and there are %i &quot;</span>
+                <span class="s5">&quot;samples.&quot; </span><span class="s1">% (n_clusters</span><span class="s2">, </span><span class="s1">n_samples)</span>
+            <span class="s1">)</span>
+        <span class="s1">n_nodes = </span><span class="s4">2 </span><span class="s1">* n_samples - n_clusters</span>
+
+    <span class="s3"># create inertia matrix</span>
+    <span class="s1">coord_row = []</span>
+    <span class="s1">coord_col = []</span>
+    <span class="s1">A = []</span>
+    <span class="s2">for </span><span class="s1">ind</span><span class="s2">, </span><span class="s1">row </span><span class="s2">in </span><span class="s1">enumerate(connectivity.rows):</span>
+        <span class="s1">A.append(row)</span>
+        <span class="s3"># We keep only the upper triangular for the moments</span>
+        <span class="s3"># Generator expressions are faster than arrays on the following</span>
+        <span class="s1">row = [i </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">row </span><span class="s2">if </span><span class="s1">i &lt; ind]</span>
+        <span class="s1">coord_row.extend(</span>
+            <span class="s1">len(row)</span>
+            <span class="s1">* [</span>
+                <span class="s1">ind</span><span class="s2">,</span>
+            <span class="s1">]</span>
+        <span class="s1">)</span>
+        <span class="s1">coord_col.extend(row)</span>
+
+    <span class="s1">coord_row = np.array(coord_row</span><span class="s2">, </span><span class="s1">dtype=np.intp</span><span class="s2">, </span><span class="s1">order=</span><span class="s5">&quot;C&quot;</span><span class="s1">)</span>
+    <span class="s1">coord_col = np.array(coord_col</span><span class="s2">, </span><span class="s1">dtype=np.intp</span><span class="s2">, </span><span class="s1">order=</span><span class="s5">&quot;C&quot;</span><span class="s1">)</span>
+
+    <span class="s3"># build moments as a list</span>
+    <span class="s1">moments_1 = np.zeros(n_nodes</span><span class="s2">, </span><span class="s1">order=</span><span class="s5">&quot;C&quot;</span><span class="s1">)</span>
+    <span class="s1">moments_1[:n_samples] = </span><span class="s4">1</span>
+    <span class="s1">moments_2 = np.zeros((n_nodes</span><span class="s2">, </span><span class="s1">n_features)</span><span class="s2">, </span><span class="s1">order=</span><span class="s5">&quot;C&quot;</span><span class="s1">)</span>
+    <span class="s1">moments_2[:n_samples] = X</span>
+    <span class="s1">inertia = np.empty(len(coord_row)</span><span class="s2">, </span><span class="s1">dtype=np.float64</span><span class="s2">, </span><span class="s1">order=</span><span class="s5">&quot;C&quot;</span><span class="s1">)</span>
+    <span class="s1">_hierarchical.compute_ward_dist(moments_1</span><span class="s2">, </span><span class="s1">moments_2</span><span class="s2">, </span><span class="s1">coord_row</span><span class="s2">, </span><span class="s1">coord_col</span><span class="s2">, </span><span class="s1">inertia)</span>
+    <span class="s1">inertia = list(zip(inertia</span><span class="s2">, </span><span class="s1">coord_row</span><span class="s2">, </span><span class="s1">coord_col))</span>
+    <span class="s1">heapify(inertia)</span>
+
+    <span class="s3"># prepare the main fields</span>
+    <span class="s1">parent = np.arange(n_nodes</span><span class="s2">, </span><span class="s1">dtype=np.intp)</span>
+    <span class="s1">used_node = np.ones(n_nodes</span><span class="s2">, </span><span class="s1">dtype=bool)</span>
+    <span class="s1">children = []</span>
+    <span class="s2">if </span><span class="s1">return_distance:</span>
+        <span class="s1">distances = np.empty(n_nodes - n_samples)</span>
+
+    <span class="s1">not_visited = np.empty(n_nodes</span><span class="s2">, </span><span class="s1">dtype=bool</span><span class="s2">, </span><span class="s1">order=</span><span class="s5">&quot;C&quot;</span><span class="s1">)</span>
+
+    <span class="s3"># recursive merge loop</span>
+    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range(n_samples</span><span class="s2">, </span><span class="s1">n_nodes):</span>
+        <span class="s3"># identify the merge</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            <span class="s1">inert</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">j = heappop(inertia)</span>
+            <span class="s2">if </span><span class="s1">used_node[i] </span><span class="s2">and </span><span class="s1">used_node[j]:</span>
+                <span class="s2">break</span>
+        <span class="s1">parent[i]</span><span class="s2">, </span><span class="s1">parent[j] = k</span><span class="s2">, </span><span class="s1">k</span>
+        <span class="s1">children.append((i</span><span class="s2">, </span><span class="s1">j))</span>
+        <span class="s1">used_node[i] = used_node[j] = </span><span class="s2">False</span>
+        <span class="s2">if </span><span class="s1">return_distance:  </span><span class="s3"># store inertia value</span>
+            <span class="s1">distances[k - n_samples] = inert</span>
+
+        <span class="s3"># update the moments</span>
+        <span class="s1">moments_1[k] = moments_1[i] + moments_1[j]</span>
+        <span class="s1">moments_2[k] = moments_2[i] + moments_2[j]</span>
+
+        <span class="s3"># update the structure matrix A and the inertia matrix</span>
+        <span class="s1">coord_col = []</span>
+        <span class="s1">not_visited.fill(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">not_visited[k] = </span><span class="s4">0</span>
+        <span class="s1">_hierarchical._get_parents(A[i]</span><span class="s2">, </span><span class="s1">coord_col</span><span class="s2">, </span><span class="s1">parent</span><span class="s2">, </span><span class="s1">not_visited)</span>
+        <span class="s1">_hierarchical._get_parents(A[j]</span><span class="s2">, </span><span class="s1">coord_col</span><span class="s2">, </span><span class="s1">parent</span><span class="s2">, </span><span class="s1">not_visited)</span>
+        <span class="s3"># List comprehension is faster than a for loop</span>
+        <span class="s1">[A[col].append(k) </span><span class="s2">for </span><span class="s1">col </span><span class="s2">in </span><span class="s1">coord_col]</span>
+        <span class="s1">A.append(coord_col)</span>
+        <span class="s1">coord_col = np.array(coord_col</span><span class="s2">, </span><span class="s1">dtype=np.intp</span><span class="s2">, </span><span class="s1">order=</span><span class="s5">&quot;C&quot;</span><span class="s1">)</span>
+        <span class="s1">coord_row = np.empty(coord_col.shape</span><span class="s2">, </span><span class="s1">dtype=np.intp</span><span class="s2">, </span><span class="s1">order=</span><span class="s5">&quot;C&quot;</span><span class="s1">)</span>
+        <span class="s1">coord_row.fill(k)</span>
+        <span class="s1">n_additions = len(coord_row)</span>
+        <span class="s1">ini = np.empty(n_additions</span><span class="s2">, </span><span class="s1">dtype=np.float64</span><span class="s2">, </span><span class="s1">order=</span><span class="s5">&quot;C&quot;</span><span class="s1">)</span>
+
+        <span class="s1">_hierarchical.compute_ward_dist(moments_1</span><span class="s2">, </span><span class="s1">moments_2</span><span class="s2">, </span><span class="s1">coord_row</span><span class="s2">, </span><span class="s1">coord_col</span><span class="s2">, </span><span class="s1">ini)</span>
+
+        <span class="s3"># List comprehension is faster than a for loop</span>
+        <span class="s1">[heappush(inertia</span><span class="s2">, </span><span class="s1">(ini[idx]</span><span class="s2">, </span><span class="s1">k</span><span class="s2">, </span><span class="s1">coord_col[idx])) </span><span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">range(n_additions)]</span>
+
+    <span class="s3"># Separate leaves in children (empty lists up to now)</span>
+    <span class="s1">n_leaves = n_samples</span>
+    <span class="s3"># sort children to get consistent output with unstructured version</span>
+    <span class="s1">children = [c[::-</span><span class="s4">1</span><span class="s1">] </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">children]</span>
+    <span class="s1">children = np.array(children)  </span><span class="s3"># return numpy array for efficient caching</span>
+
+    <span class="s2">if </span><span class="s1">return_distance:</span>
+        <span class="s3"># 2 is scaling factor to compare w/ unstructured version</span>
+        <span class="s1">distances = np.sqrt(</span><span class="s4">2.0 </span><span class="s1">* distances)</span>
+        <span class="s2">return </span><span class="s1">children</span><span class="s2">, </span><span class="s1">n_connected_components</span><span class="s2">, </span><span class="s1">n_leaves</span><span class="s2">, </span><span class="s1">parent</span><span class="s2">, </span><span class="s1">distances</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">children</span><span class="s2">, </span><span class="s1">n_connected_components</span><span class="s2">, </span><span class="s1">n_leaves</span><span class="s2">, </span><span class="s1">parent</span>
+
+
+<span class="s3"># single average and complete linkage</span>
+<span class="s2">def </span><span class="s1">linkage_tree(</span>
+    <span class="s1">X</span><span class="s2">,</span>
+    <span class="s1">connectivity=</span><span class="s2">None,</span>
+    <span class="s1">n_clusters=</span><span class="s2">None,</span>
+    <span class="s1">linkage=</span><span class="s5">&quot;complete&quot;</span><span class="s2">,</span>
+    <span class="s1">affinity=</span><span class="s5">&quot;euclidean&quot;</span><span class="s2">,</span>
+    <span class="s1">return_distance=</span><span class="s2">False,</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Linkage agglomerative clustering based on a Feature matrix. 
+ 
+    The inertia matrix uses a Heapq-based representation. 
+ 
+    This is the structured version, that takes into account some topological 
+    structure between samples. 
+ 
+    Read more in the :ref:`User Guide &lt;hierarchical_clustering&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    X : array-like of shape (n_samples, n_features) 
+        Feature matrix representing `n_samples` samples to be clustered. 
+ 
+    connectivity : sparse matrix, default=None 
+        Connectivity matrix. Defines for each sample the neighboring samples 
+        following a given structure of the data. The matrix is assumed to 
+        be symmetric and only the upper triangular half is used. 
+        Default is `None`, i.e, the Ward algorithm is unstructured. 
+ 
+    n_clusters : int, default=None 
+        Stop early the construction of the tree at `n_clusters`. This is 
+        useful to decrease computation time if the number of clusters is 
+        not small compared to the number of samples. In this case, the 
+        complete tree is not computed, thus the 'children' output is of 
+        limited use, and the 'parents' output should rather be used. 
+        This option is valid only when specifying a connectivity matrix. 
+ 
+    linkage : {&quot;average&quot;, &quot;complete&quot;, &quot;single&quot;}, default=&quot;complete&quot; 
+        Which linkage criteria to use. The linkage criterion determines which 
+        distance to use between sets of observation. 
+            - &quot;average&quot; uses the average of the distances of each observation of 
+              the two sets. 
+            - &quot;complete&quot; or maximum linkage uses the maximum distances between 
+              all observations of the two sets. 
+            - &quot;single&quot; uses the minimum of the distances between all 
+              observations of the two sets. 
+ 
+    affinity : str or callable, default='euclidean' 
+        Which metric to use. Can be 'euclidean', 'manhattan', or any 
+        distance known to paired distance (see metric.pairwise). 
+ 
+    return_distance : bool, default=False 
+        Whether or not to return the distances between the clusters. 
+ 
+    Returns 
+    ------- 
+    children : ndarray of shape (n_nodes-1, 2) 
+        The children of each non-leaf node. Values less than `n_samples` 
+        correspond to leaves of the tree which are the original samples. 
+        A node `i` greater than or equal to `n_samples` is a non-leaf 
+        node and has children `children_[i - n_samples]`. Alternatively 
+        at the i-th iteration, children[i][0] and children[i][1] 
+        are merged to form node `n_samples + i`. 
+ 
+    n_connected_components : int 
+        The number of connected components in the graph. 
+ 
+    n_leaves : int 
+        The number of leaves in the tree. 
+ 
+    parents : ndarray of shape (n_nodes, ) or None 
+        The parent of each node. Only returned when a connectivity matrix 
+        is specified, elsewhere 'None' is returned. 
+ 
+    distances : ndarray of shape (n_nodes-1,) 
+        Returned when `return_distance` is set to `True`. 
+ 
+        distances[i] refers to the distance between children[i][0] and 
+        children[i][1] when they are merged. 
+ 
+    See Also 
+    -------- 
+    ward_tree : Hierarchical clustering with ward linkage. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">X = np.asarray(X)</span>
+    <span class="s2">if </span><span class="s1">X.ndim == </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">X = np.reshape(X</span><span class="s2">, </span><span class="s1">(-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">))</span>
+    <span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_features = X.shape</span>
+
+    <span class="s1">linkage_choices = {</span>
+        <span class="s5">&quot;complete&quot;</span><span class="s1">: _hierarchical.max_merge</span><span class="s2">,</span>
+        <span class="s5">&quot;average&quot;</span><span class="s1">: _hierarchical.average_merge</span><span class="s2">,</span>
+        <span class="s5">&quot;single&quot;</span><span class="s1">: </span><span class="s2">None,</span>
+    <span class="s1">}  </span><span class="s3"># Single linkage is handled differently</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">join_func = linkage_choices[linkage]</span>
+    <span class="s2">except </span><span class="s1">KeyError </span><span class="s2">as </span><span class="s1">e:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span>
+            <span class="s5">&quot;Unknown linkage option, linkage should be one of %s, but %s was given&quot;</span>
+            <span class="s1">% (linkage_choices.keys()</span><span class="s2">, </span><span class="s1">linkage)</span>
+        <span class="s1">) </span><span class="s2">from </span><span class="s1">e</span>
+
+    <span class="s2">if </span><span class="s1">affinity == </span><span class="s5">&quot;cosine&quot; </span><span class="s2">and </span><span class="s1">np.any(~np.any(X</span><span class="s2">, </span><span class="s1">axis=</span><span class="s4">1</span><span class="s1">)):</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;Cosine affinity cannot be used when X contains zero vectors&quot;</span><span class="s1">)</span>
+
+    <span class="s2">if </span><span class="s1">connectivity </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">from </span><span class="s1">scipy.cluster </span><span class="s2">import </span><span class="s1">hierarchy  </span><span class="s3"># imports PIL</span>
+
+        <span class="s2">if </span><span class="s1">n_clusters </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">warnings.warn(</span>
+                <span class="s1">(</span>
+                    <span class="s5">&quot;Partial build of the tree is implemented &quot;</span>
+                    <span class="s5">&quot;only for structured clustering (i.e. with &quot;</span>
+                    <span class="s5">&quot;explicit connectivity). The algorithm &quot;</span>
+                    <span class="s5">&quot;will build the full tree and only &quot;</span>
+                    <span class="s5">&quot;retain the lower branches required &quot;</span>
+                    <span class="s5">&quot;for the specified number of clusters&quot;</span>
+                <span class="s1">)</span><span class="s2">,</span>
+                <span class="s1">stacklevel=</span><span class="s4">2</span><span class="s2">,</span>
+            <span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">affinity == </span><span class="s5">&quot;precomputed&quot;</span><span class="s1">:</span>
+            <span class="s3"># for the linkage function of hierarchy to work on precomputed</span>
+            <span class="s3"># data, provide as first argument an ndarray of the shape returned</span>
+            <span class="s3"># by sklearn.metrics.pairwise_distances.</span>
+            <span class="s2">if </span><span class="s1">X.shape[</span><span class="s4">0</span><span class="s1">] != X.shape[</span><span class="s4">1</span><span class="s1">]:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span>
+                    <span class="s5">f&quot;Distance matrix should be square, got matrix of shape </span><span class="s2">{</span><span class="s1">X.shape</span><span class="s2">}</span><span class="s5">&quot;</span>
+                <span class="s1">)</span>
+            <span class="s1">i</span><span class="s2">, </span><span class="s1">j = np.triu_indices(X.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">k=</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s1">X = X[i</span><span class="s2">, </span><span class="s1">j]</span>
+        <span class="s2">elif </span><span class="s1">affinity == </span><span class="s5">&quot;l2&quot;</span><span class="s1">:</span>
+            <span class="s3"># Translate to something understood by scipy</span>
+            <span class="s1">affinity = </span><span class="s5">&quot;euclidean&quot;</span>
+        <span class="s2">elif </span><span class="s1">affinity </span><span class="s2">in </span><span class="s1">(</span><span class="s5">&quot;l1&quot;</span><span class="s2">, </span><span class="s5">&quot;manhattan&quot;</span><span class="s1">):</span>
+            <span class="s1">affinity = </span><span class="s5">&quot;cityblock&quot;</span>
+        <span class="s2">elif </span><span class="s1">callable(affinity):</span>
+            <span class="s1">X = affinity(X)</span>
+            <span class="s1">i</span><span class="s2">, </span><span class="s1">j = np.triu_indices(X.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">k=</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s1">X = X[i</span><span class="s2">, </span><span class="s1">j]</span>
+        <span class="s2">if </span><span class="s1">(</span>
+            <span class="s1">linkage == </span><span class="s5">&quot;single&quot;</span>
+            <span class="s2">and </span><span class="s1">affinity != </span><span class="s5">&quot;precomputed&quot;</span>
+            <span class="s2">and not </span><span class="s1">callable(affinity)</span>
+            <span class="s2">and </span><span class="s1">affinity </span><span class="s2">in </span><span class="s1">METRIC_MAPPING64</span>
+        <span class="s1">):</span>
+            <span class="s3"># We need the fast cythonized metric from neighbors</span>
+            <span class="s1">dist_metric = DistanceMetric.get_metric(affinity)</span>
+
+            <span class="s3"># The Cython routines used require contiguous arrays</span>
+            <span class="s1">X = np.ascontiguousarray(X</span><span class="s2">, </span><span class="s1">dtype=np.double)</span>
+
+            <span class="s1">mst = _hierarchical.mst_linkage_core(X</span><span class="s2">, </span><span class="s1">dist_metric)</span>
+            <span class="s3"># Sort edges of the min_spanning_tree by weight</span>
+            <span class="s1">mst = mst[np.argsort(mst.T[</span><span class="s4">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">kind=</span><span class="s5">&quot;mergesort&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">:]</span>
+
+            <span class="s3"># Convert edge list into standard hierarchical clustering format</span>
+            <span class="s1">out = _hierarchical.single_linkage_label(mst)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">out = hierarchy.linkage(X</span><span class="s2">, </span><span class="s1">method=linkage</span><span class="s2">, </span><span class="s1">metric=affinity)</span>
+        <span class="s1">children_ = out[:</span><span class="s2">, </span><span class="s1">:</span><span class="s4">2</span><span class="s1">].astype(int</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">False</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">return_distance:</span>
+            <span class="s1">distances = out[:</span><span class="s2">, </span><span class="s4">2</span><span class="s1">]</span>
+            <span class="s2">return </span><span class="s1">children_</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, None, </span><span class="s1">distances</span>
+        <span class="s2">return </span><span class="s1">children_</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, None</span>
+
+    <span class="s1">connectivity</span><span class="s2">, </span><span class="s1">n_connected_components = _fix_connectivity(</span>
+        <span class="s1">X</span><span class="s2">, </span><span class="s1">connectivity</span><span class="s2">, </span><span class="s1">affinity=affinity</span>
+    <span class="s1">)</span>
+    <span class="s1">connectivity = connectivity.tocoo()</span>
+    <span class="s3"># Put the diagonal to zero</span>
+    <span class="s1">diag_mask = connectivity.row != connectivity.col</span>
+    <span class="s1">connectivity.row = connectivity.row[diag_mask]</span>
+    <span class="s1">connectivity.col = connectivity.col[diag_mask]</span>
+    <span class="s1">connectivity.data = connectivity.data[diag_mask]</span>
+    <span class="s2">del </span><span class="s1">diag_mask</span>
+
+    <span class="s2">if </span><span class="s1">affinity == </span><span class="s5">&quot;precomputed&quot;</span><span class="s1">:</span>
+        <span class="s1">distances = X[connectivity.row</span><span class="s2">, </span><span class="s1">connectivity.col].astype(np.float64</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">False</span><span class="s1">)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s3"># FIXME We compute all the distances, while we could have only computed</span>
+        <span class="s3"># the &quot;interesting&quot; distances</span>
+        <span class="s1">distances = paired_distances(</span>
+            <span class="s1">X[connectivity.row]</span><span class="s2">, </span><span class="s1">X[connectivity.col]</span><span class="s2">, </span><span class="s1">metric=affinity</span>
+        <span class="s1">)</span>
+    <span class="s1">connectivity.data = distances</span>
+
+    <span class="s2">if </span><span class="s1">n_clusters </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">n_nodes = </span><span class="s4">2 </span><span class="s1">* n_samples - </span><span class="s4">1</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">assert </span><span class="s1">n_clusters &lt;= n_samples</span>
+        <span class="s1">n_nodes = </span><span class="s4">2 </span><span class="s1">* n_samples - n_clusters</span>
+
+    <span class="s2">if </span><span class="s1">linkage == </span><span class="s5">&quot;single&quot;</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">_single_linkage_tree(</span>
+            <span class="s1">connectivity</span><span class="s2">,</span>
+            <span class="s1">n_samples</span><span class="s2">,</span>
+            <span class="s1">n_nodes</span><span class="s2">,</span>
+            <span class="s1">n_clusters</span><span class="s2">,</span>
+            <span class="s1">n_connected_components</span><span class="s2">,</span>
+            <span class="s1">return_distance</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+    <span class="s2">if </span><span class="s1">return_distance:</span>
+        <span class="s1">distances = np.empty(n_nodes - n_samples)</span>
+    <span class="s3"># create inertia heap and connection matrix</span>
+    <span class="s1">A = np.empty(n_nodes</span><span class="s2">, </span><span class="s1">dtype=object)</span>
+    <span class="s1">inertia = list()</span>
+
+    <span class="s3"># LIL seems to the best format to access the rows quickly,</span>
+    <span class="s3"># without the numpy overhead of slicing CSR indices and data.</span>
+    <span class="s1">connectivity = connectivity.tolil()</span>
+    <span class="s3"># We are storing the graph in a list of IntFloatDict</span>
+    <span class="s2">for </span><span class="s1">ind</span><span class="s2">, </span><span class="s1">(data</span><span class="s2">, </span><span class="s1">row) </span><span class="s2">in </span><span class="s1">enumerate(zip(connectivity.data</span><span class="s2">, </span><span class="s1">connectivity.rows)):</span>
+        <span class="s1">A[ind] = IntFloatDict(</span>
+            <span class="s1">np.asarray(row</span><span class="s2">, </span><span class="s1">dtype=np.intp)</span><span class="s2">, </span><span class="s1">np.asarray(data</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">)</span>
+        <span class="s3"># We keep only the upper triangular for the heap</span>
+        <span class="s3"># Generator expressions are faster than arrays on the following</span>
+        <span class="s1">inertia.extend(</span>
+            <span class="s1">_hierarchical.WeightedEdge(d</span><span class="s2">, </span><span class="s1">ind</span><span class="s2">, </span><span class="s1">r) </span><span class="s2">for </span><span class="s1">r</span><span class="s2">, </span><span class="s1">d </span><span class="s2">in </span><span class="s1">zip(row</span><span class="s2">, </span><span class="s1">data) </span><span class="s2">if </span><span class="s1">r &lt; ind</span>
+        <span class="s1">)</span>
+    <span class="s2">del </span><span class="s1">connectivity</span>
+
+    <span class="s1">heapify(inertia)</span>
+
+    <span class="s3"># prepare the main fields</span>
+    <span class="s1">parent = np.arange(n_nodes</span><span class="s2">, </span><span class="s1">dtype=np.intp)</span>
+    <span class="s1">used_node = np.ones(n_nodes</span><span class="s2">, </span><span class="s1">dtype=np.intp)</span>
+    <span class="s1">children = []</span>
+
+    <span class="s3"># recursive merge loop</span>
+    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range(n_samples</span><span class="s2">, </span><span class="s1">n_nodes):</span>
+        <span class="s3"># identify the merge</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            <span class="s1">edge = heappop(inertia)</span>
+            <span class="s2">if </span><span class="s1">used_node[edge.a] </span><span class="s2">and </span><span class="s1">used_node[edge.b]:</span>
+                <span class="s2">break</span>
+        <span class="s1">i = edge.a</span>
+        <span class="s1">j = edge.b</span>
+
+        <span class="s2">if </span><span class="s1">return_distance:</span>
+            <span class="s3"># store distances</span>
+            <span class="s1">distances[k - n_samples] = edge.weight</span>
+
+        <span class="s1">parent[i] = parent[j] = k</span>
+        <span class="s1">children.append((i</span><span class="s2">, </span><span class="s1">j))</span>
+        <span class="s3"># Keep track of the number of elements per cluster</span>
+        <span class="s1">n_i = used_node[i]</span>
+        <span class="s1">n_j = used_node[j]</span>
+        <span class="s1">used_node[k] = n_i + n_j</span>
+        <span class="s1">used_node[i] = used_node[j] = </span><span class="s2">False</span>
+
+        <span class="s3"># update the structure matrix A and the inertia matrix</span>
+        <span class="s3"># a clever 'min', or 'max' operation between A[i] and A[j]</span>
+        <span class="s1">coord_col = join_func(A[i]</span><span class="s2">, </span><span class="s1">A[j]</span><span class="s2">, </span><span class="s1">used_node</span><span class="s2">, </span><span class="s1">n_i</span><span class="s2">, </span><span class="s1">n_j)</span>
+        <span class="s2">for </span><span class="s1">col</span><span class="s2">, </span><span class="s1">d </span><span class="s2">in </span><span class="s1">coord_col:</span>
+            <span class="s1">A[col].append(k</span><span class="s2">, </span><span class="s1">d)</span>
+            <span class="s3"># Here we use the information from coord_col (containing the</span>
+            <span class="s3"># distances) to update the heap</span>
+            <span class="s1">heappush(inertia</span><span class="s2">, </span><span class="s1">_hierarchical.WeightedEdge(d</span><span class="s2">, </span><span class="s1">k</span><span class="s2">, </span><span class="s1">col))</span>
+        <span class="s1">A[k] = coord_col</span>
+        <span class="s3"># Clear A[i] and A[j] to save memory</span>
+        <span class="s1">A[i] = A[j] = </span><span class="s4">0</span>
+
+    <span class="s3"># Separate leaves in children (empty lists up to now)</span>
+    <span class="s1">n_leaves = n_samples</span>
+
+    <span class="s3"># # return numpy array for efficient caching</span>
+    <span class="s1">children = np.array(children)[:</span><span class="s2">, </span><span class="s1">::-</span><span class="s4">1</span><span class="s1">]</span>
+
+    <span class="s2">if </span><span class="s1">return_distance:</span>
+        <span class="s2">return </span><span class="s1">children</span><span class="s2">, </span><span class="s1">n_connected_components</span><span class="s2">, </span><span class="s1">n_leaves</span><span class="s2">, </span><span class="s1">parent</span><span class="s2">, </span><span class="s1">distances</span>
+    <span class="s2">return </span><span class="s1">children</span><span class="s2">, </span><span class="s1">n_connected_components</span><span class="s2">, </span><span class="s1">n_leaves</span><span class="s2">, </span><span class="s1">parent</span>
+
+
+<span class="s3"># Matching names to tree-building strategies</span>
+<span class="s2">def </span><span class="s1">_complete_linkage(*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+    <span class="s1">kwargs[</span><span class="s5">&quot;linkage&quot;</span><span class="s1">] = </span><span class="s5">&quot;complete&quot;</span>
+    <span class="s2">return </span><span class="s1">linkage_tree(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s2">def </span><span class="s1">_average_linkage(*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+    <span class="s1">kwargs[</span><span class="s5">&quot;linkage&quot;</span><span class="s1">] = </span><span class="s5">&quot;average&quot;</span>
+    <span class="s2">return </span><span class="s1">linkage_tree(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s2">def </span><span class="s1">_single_linkage(*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+    <span class="s1">kwargs[</span><span class="s5">&quot;linkage&quot;</span><span class="s1">] = </span><span class="s5">&quot;single&quot;</span>
+    <span class="s2">return </span><span class="s1">linkage_tree(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s1">_TREE_BUILDERS = dict(</span>
+    <span class="s1">ward=ward_tree</span><span class="s2">,</span>
+    <span class="s1">complete=_complete_linkage</span><span class="s2">,</span>
+    <span class="s1">average=_average_linkage</span><span class="s2">,</span>
+    <span class="s1">single=_single_linkage</span><span class="s2">,</span>
+<span class="s1">)</span>
+
+<span class="s3">###############################################################################</span>
+<span class="s3"># Functions for cutting hierarchical clustering tree</span>
+
+
+<span class="s2">def </span><span class="s1">_hc_cut(n_clusters</span><span class="s2">, </span><span class="s1">children</span><span class="s2">, </span><span class="s1">n_leaves):</span>
+    <span class="s0">&quot;&quot;&quot;Function cutting the ward tree for a given number of clusters. 
+ 
+    Parameters 
+    ---------- 
+    n_clusters : int or ndarray 
+        The number of clusters to form. 
+ 
+    children : ndarray of shape (n_nodes-1, 2) 
+        The children of each non-leaf node. Values less than `n_samples` 
+        correspond to leaves of the tree which are the original samples. 
+        A node `i` greater than or equal to `n_samples` is a non-leaf 
+        node and has children `children_[i - n_samples]`. Alternatively 
+        at the i-th iteration, children[i][0] and children[i][1] 
+        are merged to form node `n_samples + i`. 
+ 
+    n_leaves : int 
+        Number of leaves of the tree. 
+ 
+    Returns 
+    ------- 
+    labels : array [n_samples] 
+        Cluster labels for each point. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">n_clusters &gt; n_leaves:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span>
+            <span class="s5">&quot;Cannot extract more clusters than samples: &quot;</span>
+            <span class="s5">&quot;%s clusters where given for a tree with %s leaves.&quot;</span>
+            <span class="s1">% (n_clusters</span><span class="s2">, </span><span class="s1">n_leaves)</span>
+        <span class="s1">)</span>
+    <span class="s3"># In this function, we store nodes as a heap to avoid recomputing</span>
+    <span class="s3"># the max of the nodes: the first element is always the smallest</span>
+    <span class="s3"># We use negated indices as heaps work on smallest elements, and we</span>
+    <span class="s3"># are interested in largest elements</span>
+    <span class="s3"># children[-1] is the root of the tree</span>
+    <span class="s1">nodes = [-(max(children[-</span><span class="s4">1</span><span class="s1">]) + </span><span class="s4">1</span><span class="s1">)]</span>
+    <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range(n_clusters - </span><span class="s4">1</span><span class="s1">):</span>
+        <span class="s3"># As we have a heap, nodes[0] is the smallest element</span>
+        <span class="s1">these_children = children[-nodes[</span><span class="s4">0</span><span class="s1">] - n_leaves]</span>
+        <span class="s3"># Insert the 2 children and remove the largest node</span>
+        <span class="s1">heappush(nodes</span><span class="s2">, </span><span class="s1">-these_children[</span><span class="s4">0</span><span class="s1">])</span>
+        <span class="s1">heappushpop(nodes</span><span class="s2">, </span><span class="s1">-these_children[</span><span class="s4">1</span><span class="s1">])</span>
+    <span class="s1">label = np.zeros(n_leaves</span><span class="s2">, </span><span class="s1">dtype=np.intp)</span>
+    <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">node </span><span class="s2">in </span><span class="s1">enumerate(nodes):</span>
+        <span class="s1">label[_hierarchical._hc_get_descendent(-node</span><span class="s2">, </span><span class="s1">children</span><span class="s2">, </span><span class="s1">n_leaves)] = i</span>
+    <span class="s2">return </span><span class="s1">label</span>
+
+
+<span class="s3">###############################################################################</span>
+
+
+<span class="s2">class </span><span class="s1">AgglomerativeClustering(ClusterMixin</span><span class="s2">, </span><span class="s1">BaseEstimator):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Agglomerative Clustering. 
+ 
+    Recursively merges pair of clusters of sample data; uses linkage distance. 
+ 
+    Read more in the :ref:`User Guide &lt;hierarchical_clustering&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    n_clusters : int or None, default=2 
+        The number of clusters to find. It must be ``None`` if 
+        ``distance_threshold`` is not ``None``. 
+ 
+    affinity : str or callable, default='euclidean' 
+        The metric to use when calculating distance between instances in a 
+        feature array. If metric is a string or callable, it must be one of 
+        the options allowed by :func:`sklearn.metrics.pairwise_distances` for 
+        its metric parameter. 
+        If linkage is &quot;ward&quot;, only &quot;euclidean&quot; is accepted. 
+        If &quot;precomputed&quot;, a distance matrix (instead of a similarity matrix) 
+        is needed as input for the fit method. 
+ 
+        .. deprecated:: 1.2 
+            `affinity` was deprecated in version 1.2 and will be renamed to 
+            `metric` in 1.4. 
+ 
+    metric : str or callable, default=None 
+        Metric used to compute the linkage. Can be &quot;euclidean&quot;, &quot;l1&quot;, &quot;l2&quot;, 
+        &quot;manhattan&quot;, &quot;cosine&quot;, or &quot;precomputed&quot;. If set to `None` then 
+        &quot;euclidean&quot; is used. If linkage is &quot;ward&quot;, only &quot;euclidean&quot; is 
+        accepted. If &quot;precomputed&quot;, a distance matrix is needed as input for 
+        the fit method. 
+ 
+        .. versionadded:: 1.2 
+ 
+    memory : str or object with the joblib.Memory interface, default=None 
+        Used to cache the output of the computation of the tree. 
+        By default, no caching is done. If a string is given, it is the 
+        path to the caching directory. 
+ 
+    connectivity : array-like or callable, default=None 
+        Connectivity matrix. Defines for each sample the neighboring 
+        samples following a given structure of the data. 
+        This can be a connectivity matrix itself or a callable that transforms 
+        the data into a connectivity matrix, such as derived from 
+        `kneighbors_graph`. Default is ``None``, i.e, the 
+        hierarchical clustering algorithm is unstructured. 
+ 
+    compute_full_tree : 'auto' or bool, default='auto' 
+        Stop early the construction of the tree at ``n_clusters``. This is 
+        useful to decrease computation time if the number of clusters is not 
+        small compared to the number of samples. This option is useful only 
+        when specifying a connectivity matrix. Note also that when varying the 
+        number of clusters and using caching, it may be advantageous to compute 
+        the full tree. It must be ``True`` if ``distance_threshold`` is not 
+        ``None``. By default `compute_full_tree` is &quot;auto&quot;, which is equivalent 
+        to `True` when `distance_threshold` is not `None` or that `n_clusters` 
+        is inferior to the maximum between 100 or `0.02 * n_samples`. 
+        Otherwise, &quot;auto&quot; is equivalent to `False`. 
+ 
+    linkage : {'ward', 'complete', 'average', 'single'}, default='ward' 
+        Which linkage criterion to use. The linkage criterion determines which 
+        distance to use between sets of observation. The algorithm will merge 
+        the pairs of cluster that minimize this criterion. 
+ 
+        - 'ward' minimizes the variance of the clusters being merged. 
+        - 'average' uses the average of the distances of each observation of 
+          the two sets. 
+        - 'complete' or 'maximum' linkage uses the maximum distances between 
+          all observations of the two sets. 
+        - 'single' uses the minimum of the distances between all observations 
+          of the two sets. 
+ 
+        .. versionadded:: 0.20 
+            Added the 'single' option 
+ 
+    distance_threshold : float, default=None 
+        The linkage distance threshold at or above which clusters will not be 
+        merged. If not ``None``, ``n_clusters`` must be ``None`` and 
+        ``compute_full_tree`` must be ``True``. 
+ 
+        .. versionadded:: 0.21 
+ 
+    compute_distances : bool, default=False 
+        Computes distances between clusters even if `distance_threshold` is not 
+        used. This can be used to make dendrogram visualization, but introduces 
+        a computational and memory overhead. 
+ 
+        .. versionadded:: 0.24 
+ 
+    Attributes 
+    ---------- 
+    n_clusters_ : int 
+        The number of clusters found by the algorithm. If 
+        ``distance_threshold=None``, it will be equal to the given 
+        ``n_clusters``. 
+ 
+    labels_ : ndarray of shape (n_samples) 
+        Cluster labels for each point. 
+ 
+    n_leaves_ : int 
+        Number of leaves in the hierarchical tree. 
+ 
+    n_connected_components_ : int 
+        The estimated number of connected components in the graph. 
+ 
+        .. versionadded:: 0.21 
+            ``n_connected_components_`` was added to replace ``n_components_``. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    children_ : array-like of shape (n_samples-1, 2) 
+        The children of each non-leaf node. Values less than `n_samples` 
+        correspond to leaves of the tree which are the original samples. 
+        A node `i` greater than or equal to `n_samples` is a non-leaf 
+        node and has children `children_[i - n_samples]`. Alternatively 
+        at the i-th iteration, children[i][0] and children[i][1] 
+        are merged to form node `n_samples + i`. 
+ 
+    distances_ : array-like of shape (n_nodes-1,) 
+        Distances between nodes in the corresponding place in `children_`. 
+        Only computed if `distance_threshold` is used or `compute_distances` 
+        is set to `True`. 
+ 
+    See Also 
+    -------- 
+    FeatureAgglomeration : Agglomerative clustering but for features instead of 
+        samples. 
+    ward_tree : Hierarchical clustering with ward linkage. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.cluster import AgglomerativeClustering 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; X = np.array([[1, 2], [1, 4], [1, 0], 
+    ...               [4, 2], [4, 4], [4, 0]]) 
+    &gt;&gt;&gt; clustering = AgglomerativeClustering().fit(X) 
+    &gt;&gt;&gt; clustering 
+    AgglomerativeClustering() 
+    &gt;&gt;&gt; clustering.labels_ 
+    array([1, 1, 1, 0, 0, 0]) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span>
+        <span class="s5">&quot;n_clusters&quot;</span><span class="s1">: [Interval(Integral</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, None, </span><span class="s1">closed=</span><span class="s5">&quot;left&quot;</span><span class="s1">)</span><span class="s2">, None</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;affinity&quot;</span><span class="s1">: [</span>
+            <span class="s1">Hidden(StrOptions({</span><span class="s5">&quot;deprecated&quot;</span><span class="s1">}))</span><span class="s2">,</span>
+            <span class="s1">StrOptions(set(_VALID_METRICS) | {</span><span class="s5">&quot;precomputed&quot;</span><span class="s1">})</span><span class="s2">,</span>
+            <span class="s1">callable</span><span class="s2">,</span>
+        <span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;metric&quot;</span><span class="s1">: [</span>
+            <span class="s1">StrOptions(set(_VALID_METRICS) | {</span><span class="s5">&quot;precomputed&quot;</span><span class="s1">})</span><span class="s2">,</span>
+            <span class="s1">callable</span><span class="s2">,</span>
+            <span class="s2">None,</span>
+        <span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;memory&quot;</span><span class="s1">: [str</span><span class="s2">, </span><span class="s1">HasMethods(</span><span class="s5">&quot;cache&quot;</span><span class="s1">)</span><span class="s2">, None</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;connectivity&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s2">, </span><span class="s1">callable</span><span class="s2">, None</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;compute_full_tree&quot;</span><span class="s1">: [StrOptions({</span><span class="s5">&quot;auto&quot;</span><span class="s1">})</span><span class="s2">, </span><span class="s5">&quot;boolean&quot;</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;linkage&quot;</span><span class="s1">: [StrOptions(set(_TREE_BUILDERS.keys()))]</span><span class="s2">,</span>
+        <span class="s5">&quot;distance_threshold&quot;</span><span class="s1">: [Interval(Real</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, None, </span><span class="s1">closed=</span><span class="s5">&quot;left&quot;</span><span class="s1">)</span><span class="s2">, None</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;compute_distances&quot;</span><span class="s1">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">n_clusters=</span><span class="s4">2</span><span class="s2">,</span>
+        <span class="s1">*</span><span class="s2">,</span>
+        <span class="s1">affinity=</span><span class="s5">&quot;deprecated&quot;</span><span class="s2">,  </span><span class="s3"># TODO(1.4): Remove</span>
+        <span class="s1">metric=</span><span class="s2">None,  </span><span class="s3"># TODO(1.4): Set to &quot;euclidean&quot;</span>
+        <span class="s1">memory=</span><span class="s2">None,</span>
+        <span class="s1">connectivity=</span><span class="s2">None,</span>
+        <span class="s1">compute_full_tree=</span><span class="s5">&quot;auto&quot;</span><span class="s2">,</span>
+        <span class="s1">linkage=</span><span class="s5">&quot;ward&quot;</span><span class="s2">,</span>
+        <span class="s1">distance_threshold=</span><span class="s2">None,</span>
+        <span class="s1">compute_distances=</span><span class="s2">False,</span>
+    <span class="s1">):</span>
+        <span class="s1">self.n_clusters = n_clusters</span>
+        <span class="s1">self.distance_threshold = distance_threshold</span>
+        <span class="s1">self.memory = memory</span>
+        <span class="s1">self.connectivity = connectivity</span>
+        <span class="s1">self.compute_full_tree = compute_full_tree</span>
+        <span class="s1">self.linkage = linkage</span>
+        <span class="s1">self.affinity = affinity</span>
+        <span class="s1">self.metric = metric</span>
+        <span class="s1">self.compute_distances = compute_distances</span>
+
+    <span class="s1">@_fit_context(prefer_skip_nested_validation=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">fit(self</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the hierarchical clustering from features, or distance matrix. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like, shape (n_samples, n_features) or \ 
+                (n_samples, n_samples) 
+            Training instances to cluster, or distances between instances if 
+            ``metric='precomputed'``. 
+ 
+        y : Ignored 
+            Not used, present here for API consistency by convention. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Returns the fitted instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">X = self._validate_data(X</span><span class="s2">, </span><span class="s1">ensure_min_samples=</span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">self._fit(X)</span>
+
+    <span class="s2">def </span><span class="s1">_fit(self</span><span class="s2">, </span><span class="s1">X):</span>
+        <span class="s0">&quot;&quot;&quot;Fit without validation 
+ 
+        Parameters 
+        ---------- 
+        X : ndarray of shape (n_samples, n_features) or (n_samples, n_samples) 
+            Training instances to cluster, or distances between instances if 
+            ``affinity='precomputed'``. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Returns the fitted instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">memory = check_memory(self.memory)</span>
+
+        <span class="s1">self._metric = self.metric</span>
+        <span class="s3"># TODO(1.4): Remove</span>
+        <span class="s2">if </span><span class="s1">self.affinity != </span><span class="s5">&quot;deprecated&quot;</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">self.metric </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span>
+                    <span class="s5">&quot;Both `affinity` and `metric` attributes were set. Attribute&quot;</span>
+                    <span class="s5">&quot; `affinity` was deprecated in version 1.2 and will be removed in&quot;</span>
+                    <span class="s5">&quot; 1.4. To avoid this error, only set the `metric` attribute.&quot;</span>
+                <span class="s1">)</span>
+            <span class="s1">warnings.warn(</span>
+                <span class="s1">(</span>
+                    <span class="s5">&quot;Attribute `affinity` was deprecated in version 1.2 and will be&quot;</span>
+                    <span class="s5">&quot; removed in 1.4. Use `metric` instead&quot;</span>
+                <span class="s1">)</span><span class="s2">,</span>
+                <span class="s1">FutureWarning</span><span class="s2">,</span>
+            <span class="s1">)</span>
+            <span class="s1">self._metric = self.affinity</span>
+        <span class="s2">elif </span><span class="s1">self.metric </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._metric = </span><span class="s5">&quot;euclidean&quot;</span>
+
+        <span class="s2">if not </span><span class="s1">((self.n_clusters </span><span class="s2">is None</span><span class="s1">) ^ (self.distance_threshold </span><span class="s2">is None</span><span class="s1">)):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;Exactly one of n_clusters and &quot;</span>
+                <span class="s5">&quot;distance_threshold has to be set, and the other &quot;</span>
+                <span class="s5">&quot;needs to be None.&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">self.distance_threshold </span><span class="s2">is not None and not </span><span class="s1">self.compute_full_tree:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;compute_full_tree must be True if distance_threshold is set.&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">self.linkage == </span><span class="s5">&quot;ward&quot; </span><span class="s2">and </span><span class="s1">self._metric != </span><span class="s5">&quot;euclidean&quot;</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">self._metric</span><span class="s2">} </span><span class="s5">was provided as metric. Ward can only &quot;</span>
+                <span class="s5">&quot;work with euclidean distances.&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">tree_builder = _TREE_BUILDERS[self.linkage]</span>
+
+        <span class="s1">connectivity = self.connectivity</span>
+        <span class="s2">if </span><span class="s1">self.connectivity </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">callable(self.connectivity):</span>
+                <span class="s1">connectivity = self.connectivity(X)</span>
+            <span class="s1">connectivity = check_array(</span>
+                <span class="s1">connectivity</span><span class="s2">, </span><span class="s1">accept_sparse=[</span><span class="s5">&quot;csr&quot;</span><span class="s2">, </span><span class="s5">&quot;coo&quot;</span><span class="s2">, </span><span class="s5">&quot;lil&quot;</span><span class="s1">]</span>
+            <span class="s1">)</span>
+
+        <span class="s1">n_samples = len(X)</span>
+        <span class="s1">compute_full_tree = self.compute_full_tree</span>
+        <span class="s2">if </span><span class="s1">self.connectivity </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">compute_full_tree = </span><span class="s2">True</span>
+        <span class="s2">if </span><span class="s1">compute_full_tree == </span><span class="s5">&quot;auto&quot;</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">self.distance_threshold </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">compute_full_tree = </span><span class="s2">True</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s3"># Early stopping is likely to give a speed up only for</span>
+                <span class="s3"># a large number of clusters. The actual threshold</span>
+                <span class="s3"># implemented here is heuristic</span>
+                <span class="s1">compute_full_tree = self.n_clusters &lt; max(</span><span class="s4">100</span><span class="s2">, </span><span class="s4">0.02 </span><span class="s1">* n_samples)</span>
+        <span class="s1">n_clusters = self.n_clusters</span>
+        <span class="s2">if </span><span class="s1">compute_full_tree:</span>
+            <span class="s1">n_clusters = </span><span class="s2">None</span>
+
+        <span class="s3"># Construct the tree</span>
+        <span class="s1">kwargs = {}</span>
+        <span class="s2">if </span><span class="s1">self.linkage != </span><span class="s5">&quot;ward&quot;</span><span class="s1">:</span>
+            <span class="s1">kwargs[</span><span class="s5">&quot;linkage&quot;</span><span class="s1">] = self.linkage</span>
+            <span class="s1">kwargs[</span><span class="s5">&quot;affinity&quot;</span><span class="s1">] = self._metric</span>
+
+        <span class="s1">distance_threshold = self.distance_threshold</span>
+
+        <span class="s1">return_distance = (distance_threshold </span><span class="s2">is not None</span><span class="s1">) </span><span class="s2">or </span><span class="s1">self.compute_distances</span>
+
+        <span class="s1">out = memory.cache(tree_builder)(</span>
+            <span class="s1">X</span><span class="s2">,</span>
+            <span class="s1">connectivity=connectivity</span><span class="s2">,</span>
+            <span class="s1">n_clusters=n_clusters</span><span class="s2">,</span>
+            <span class="s1">return_distance=return_distance</span><span class="s2">,</span>
+            <span class="s1">**kwargs</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s1">(self.children_</span><span class="s2">, </span><span class="s1">self.n_connected_components_</span><span class="s2">, </span><span class="s1">self.n_leaves_</span><span class="s2">, </span><span class="s1">parents) = out[</span>
+            <span class="s1">:</span><span class="s4">4</span>
+        <span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">return_distance:</span>
+            <span class="s1">self.distances_ = out[-</span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">self.distance_threshold </span><span class="s2">is not None</span><span class="s1">:  </span><span class="s3"># distance_threshold is used</span>
+            <span class="s1">self.n_clusters_ = (</span>
+                <span class="s1">np.count_nonzero(self.distances_ &gt;= distance_threshold) + </span><span class="s4">1</span>
+            <span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:  </span><span class="s3"># n_clusters is used</span>
+            <span class="s1">self.n_clusters_ = self.n_clusters</span>
+
+        <span class="s3"># Cut the tree</span>
+        <span class="s2">if </span><span class="s1">compute_full_tree:</span>
+            <span class="s1">self.labels_ = _hc_cut(self.n_clusters_</span><span class="s2">, </span><span class="s1">self.children_</span><span class="s2">, </span><span class="s1">self.n_leaves_)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">labels = _hierarchical.hc_get_heads(parents</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">False</span><span class="s1">)</span>
+            <span class="s3"># copy to avoid holding a reference on the original array</span>
+            <span class="s1">labels = np.copy(labels[:n_samples])</span>
+            <span class="s3"># Reassign cluster numbers</span>
+            <span class="s1">self.labels_ = np.searchsorted(np.unique(labels)</span><span class="s2">, </span><span class="s1">labels)</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s2">def </span><span class="s1">fit_predict(self</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit and return the result of each sample's clustering assignment. 
+ 
+        In addition to fitting, this method also return the result of the 
+        clustering assignment for each sample in the training set. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) or \ 
+                (n_samples, n_samples) 
+            Training instances to cluster, or distances between instances if 
+            ``affinity='precomputed'``. 
+ 
+        y : Ignored 
+            Not used, present here for API consistency by convention. 
+ 
+        Returns 
+        ------- 
+        labels : ndarray of shape (n_samples,) 
+            Cluster labels. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">super().fit_predict(X</span><span class="s2">, </span><span class="s1">y)</span>
+
+
+<span class="s2">class </span><span class="s1">FeatureAgglomeration(</span>
+    <span class="s1">ClassNamePrefixFeaturesOutMixin</span><span class="s2">, </span><span class="s1">AgglomerativeClustering</span><span class="s2">, </span><span class="s1">AgglomerationTransform</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Agglomerate features. 
+ 
+    Recursively merges pair of clusters of features. 
+ 
+    Read more in the :ref:`User Guide &lt;hierarchical_clustering&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    n_clusters : int or None, default=2 
+        The number of clusters to find. It must be ``None`` if 
+        ``distance_threshold`` is not ``None``. 
+ 
+    affinity : str or callable, default='euclidean' 
+        The metric to use when calculating distance between instances in a 
+        feature array. If metric is a string or callable, it must be one of 
+        the options allowed by :func:`sklearn.metrics.pairwise_distances` for 
+        its metric parameter. 
+        If linkage is &quot;ward&quot;, only &quot;euclidean&quot; is accepted. 
+        If &quot;precomputed&quot;, a distance matrix (instead of a similarity matrix) 
+        is needed as input for the fit method. 
+ 
+        .. deprecated:: 1.2 
+            `affinity` was deprecated in version 1.2 and will be renamed to 
+            `metric` in 1.4. 
+ 
+    metric : str or callable, default=None 
+        Metric used to compute the linkage. Can be &quot;euclidean&quot;, &quot;l1&quot;, &quot;l2&quot;, 
+        &quot;manhattan&quot;, &quot;cosine&quot;, or &quot;precomputed&quot;. If set to `None` then 
+        &quot;euclidean&quot; is used. If linkage is &quot;ward&quot;, only &quot;euclidean&quot; is 
+        accepted. If &quot;precomputed&quot;, a distance matrix is needed as input for 
+        the fit method. 
+ 
+        .. versionadded:: 1.2 
+ 
+    memory : str or object with the joblib.Memory interface, default=None 
+        Used to cache the output of the computation of the tree. 
+        By default, no caching is done. If a string is given, it is the 
+        path to the caching directory. 
+ 
+    connectivity : array-like or callable, default=None 
+        Connectivity matrix. Defines for each feature the neighboring 
+        features following a given structure of the data. 
+        This can be a connectivity matrix itself or a callable that transforms 
+        the data into a connectivity matrix, such as derived from 
+        `kneighbors_graph`. Default is `None`, i.e, the 
+        hierarchical clustering algorithm is unstructured. 
+ 
+    compute_full_tree : 'auto' or bool, default='auto' 
+        Stop early the construction of the tree at `n_clusters`. This is useful 
+        to decrease computation time if the number of clusters is not small 
+        compared to the number of features. This option is useful only when 
+        specifying a connectivity matrix. Note also that when varying the 
+        number of clusters and using caching, it may be advantageous to compute 
+        the full tree. It must be ``True`` if ``distance_threshold`` is not 
+        ``None``. By default `compute_full_tree` is &quot;auto&quot;, which is equivalent 
+        to `True` when `distance_threshold` is not `None` or that `n_clusters` 
+        is inferior to the maximum between 100 or `0.02 * n_samples`. 
+        Otherwise, &quot;auto&quot; is equivalent to `False`. 
+ 
+    linkage : {&quot;ward&quot;, &quot;complete&quot;, &quot;average&quot;, &quot;single&quot;}, default=&quot;ward&quot; 
+        Which linkage criterion to use. The linkage criterion determines which 
+        distance to use between sets of features. The algorithm will merge 
+        the pairs of cluster that minimize this criterion. 
+ 
+        - &quot;ward&quot; minimizes the variance of the clusters being merged. 
+        - &quot;complete&quot; or maximum linkage uses the maximum distances between 
+          all features of the two sets. 
+        - &quot;average&quot; uses the average of the distances of each feature of 
+          the two sets. 
+        - &quot;single&quot; uses the minimum of the distances between all features 
+          of the two sets. 
+ 
+    pooling_func : callable, default=np.mean 
+        This combines the values of agglomerated features into a single 
+        value, and should accept an array of shape [M, N] and the keyword 
+        argument `axis=1`, and reduce it to an array of size [M]. 
+ 
+    distance_threshold : float, default=None 
+        The linkage distance threshold at or above which clusters will not be 
+        merged. If not ``None``, ``n_clusters`` must be ``None`` and 
+        ``compute_full_tree`` must be ``True``. 
+ 
+        .. versionadded:: 0.21 
+ 
+    compute_distances : bool, default=False 
+        Computes distances between clusters even if `distance_threshold` is not 
+        used. This can be used to make dendrogram visualization, but introduces 
+        a computational and memory overhead. 
+ 
+        .. versionadded:: 0.24 
+ 
+    Attributes 
+    ---------- 
+    n_clusters_ : int 
+        The number of clusters found by the algorithm. If 
+        ``distance_threshold=None``, it will be equal to the given 
+        ``n_clusters``. 
+ 
+    labels_ : array-like of (n_features,) 
+        Cluster labels for each feature. 
+ 
+    n_leaves_ : int 
+        Number of leaves in the hierarchical tree. 
+ 
+    n_connected_components_ : int 
+        The estimated number of connected components in the graph. 
+ 
+        .. versionadded:: 0.21 
+            ``n_connected_components_`` was added to replace ``n_components_``. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    children_ : array-like of shape (n_nodes-1, 2) 
+        The children of each non-leaf node. Values less than `n_features` 
+        correspond to leaves of the tree which are the original samples. 
+        A node `i` greater than or equal to `n_features` is a non-leaf 
+        node and has children `children_[i - n_features]`. Alternatively 
+        at the i-th iteration, children[i][0] and children[i][1] 
+        are merged to form node `n_features + i`. 
+ 
+    distances_ : array-like of shape (n_nodes-1,) 
+        Distances between nodes in the corresponding place in `children_`. 
+        Only computed if `distance_threshold` is used or `compute_distances` 
+        is set to `True`. 
+ 
+    See Also 
+    -------- 
+    AgglomerativeClustering : Agglomerative clustering samples instead of 
+        features. 
+    ward_tree : Hierarchical clustering with ward linkage. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from sklearn import datasets, cluster 
+    &gt;&gt;&gt; digits = datasets.load_digits() 
+    &gt;&gt;&gt; images = digits.images 
+    &gt;&gt;&gt; X = np.reshape(images, (len(images), -1)) 
+    &gt;&gt;&gt; agglo = cluster.FeatureAgglomeration(n_clusters=32) 
+    &gt;&gt;&gt; agglo.fit(X) 
+    FeatureAgglomeration(n_clusters=32) 
+    &gt;&gt;&gt; X_reduced = agglo.transform(X) 
+    &gt;&gt;&gt; X_reduced.shape 
+    (1797, 32) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span>
+        <span class="s5">&quot;n_clusters&quot;</span><span class="s1">: [Interval(Integral</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, None, </span><span class="s1">closed=</span><span class="s5">&quot;left&quot;</span><span class="s1">)</span><span class="s2">, None</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;affinity&quot;</span><span class="s1">: [</span>
+            <span class="s1">Hidden(StrOptions({</span><span class="s5">&quot;deprecated&quot;</span><span class="s1">}))</span><span class="s2">,</span>
+            <span class="s1">StrOptions(set(_VALID_METRICS) | {</span><span class="s5">&quot;precomputed&quot;</span><span class="s1">})</span><span class="s2">,</span>
+            <span class="s1">callable</span><span class="s2">,</span>
+        <span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;metric&quot;</span><span class="s1">: [</span>
+            <span class="s1">StrOptions(set(_VALID_METRICS) | {</span><span class="s5">&quot;precomputed&quot;</span><span class="s1">})</span><span class="s2">,</span>
+            <span class="s1">callable</span><span class="s2">,</span>
+            <span class="s2">None,</span>
+        <span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;memory&quot;</span><span class="s1">: [str</span><span class="s2">, </span><span class="s1">HasMethods(</span><span class="s5">&quot;cache&quot;</span><span class="s1">)</span><span class="s2">, None</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;connectivity&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s2">, </span><span class="s1">callable</span><span class="s2">, None</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;compute_full_tree&quot;</span><span class="s1">: [StrOptions({</span><span class="s5">&quot;auto&quot;</span><span class="s1">})</span><span class="s2">, </span><span class="s5">&quot;boolean&quot;</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;linkage&quot;</span><span class="s1">: [StrOptions(set(_TREE_BUILDERS.keys()))]</span><span class="s2">,</span>
+        <span class="s5">&quot;pooling_func&quot;</span><span class="s1">: [callable]</span><span class="s2">,</span>
+        <span class="s5">&quot;distance_threshold&quot;</span><span class="s1">: [Interval(Real</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, None, </span><span class="s1">closed=</span><span class="s5">&quot;left&quot;</span><span class="s1">)</span><span class="s2">, None</span><span class="s1">]</span><span class="s2">,</span>
+        <span class="s5">&quot;compute_distances&quot;</span><span class="s1">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s1">]</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">n_clusters=</span><span class="s4">2</span><span class="s2">,</span>
+        <span class="s1">*</span><span class="s2">,</span>
+        <span class="s1">affinity=</span><span class="s5">&quot;deprecated&quot;</span><span class="s2">,  </span><span class="s3"># TODO(1.4): Remove</span>
+        <span class="s1">metric=</span><span class="s2">None,  </span><span class="s3"># TODO(1.4): Set to &quot;euclidean&quot;</span>
+        <span class="s1">memory=</span><span class="s2">None,</span>
+        <span class="s1">connectivity=</span><span class="s2">None,</span>
+        <span class="s1">compute_full_tree=</span><span class="s5">&quot;auto&quot;</span><span class="s2">,</span>
+        <span class="s1">linkage=</span><span class="s5">&quot;ward&quot;</span><span class="s2">,</span>
+        <span class="s1">pooling_func=np.mean</span><span class="s2">,</span>
+        <span class="s1">distance_threshold=</span><span class="s2">None,</span>
+        <span class="s1">compute_distances=</span><span class="s2">False,</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__(</span>
+            <span class="s1">n_clusters=n_clusters</span><span class="s2">,</span>
+            <span class="s1">memory=memory</span><span class="s2">,</span>
+            <span class="s1">connectivity=connectivity</span><span class="s2">,</span>
+            <span class="s1">compute_full_tree=compute_full_tree</span><span class="s2">,</span>
+            <span class="s1">linkage=linkage</span><span class="s2">,</span>
+            <span class="s1">affinity=affinity</span><span class="s2">,</span>
+            <span class="s1">metric=metric</span><span class="s2">,</span>
+            <span class="s1">distance_threshold=distance_threshold</span><span class="s2">,</span>
+            <span class="s1">compute_distances=compute_distances</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s1">self.pooling_func = pooling_func</span>
+
+    <span class="s1">@_fit_context(prefer_skip_nested_validation=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">fit(self</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the hierarchical clustering on the data. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            The data. 
+ 
+        y : Ignored 
+            Not used, present here for API consistency by convention. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Returns the transformer. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">X = self._validate_data(X</span><span class="s2">, </span><span class="s1">ensure_min_features=</span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s1">super()._fit(X.T)</span>
+        <span class="s1">self._n_features_out = self.n_clusters_</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">fit_predict(self):</span>
+        <span class="s0">&quot;&quot;&quot;Fit and return the result of each sample's clustering assignment.&quot;&quot;&quot;</span>
+        <span class="s2">raise </span><span class="s1">AttributeError</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,413 @@
+<html>
+<head>
+<title>_milp.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_milp.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">warnings</span>
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">from </span><span class="s1">scipy.sparse </span><span class="s0">import </span><span class="s1">csc_array</span><span class="s0">, </span><span class="s1">vstack</span><span class="s0">, </span><span class="s1">issparse</span>
+<span class="s0">from </span><span class="s1">._highs._highs_wrapper </span><span class="s0">import </span><span class="s1">_highs_wrapper  </span><span class="s2"># type: ignore[import]</span>
+<span class="s0">from </span><span class="s1">._constraints </span><span class="s0">import </span><span class="s1">LinearConstraint</span><span class="s0">, </span><span class="s1">Bounds</span>
+<span class="s0">from </span><span class="s1">._optimize </span><span class="s0">import </span><span class="s1">OptimizeResult</span>
+<span class="s0">from </span><span class="s1">._linprog_highs </span><span class="s0">import </span><span class="s1">_highs_to_scipy_status_message</span>
+
+
+<span class="s0">def </span><span class="s1">_constraints_to_components(constraints):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Convert sequence of constraints to a single set of components A, b_l, b_u. 
+ 
+    `constraints` could be 
+ 
+    1. A LinearConstraint 
+    2. A tuple representing a LinearConstraint 
+    3. An invalid object 
+    4. A sequence of composed entirely of objects of type 1/2 
+    5. A sequence containing at least one object of type 3 
+ 
+    We want to accept 1, 2, and 4 and reject 3 and 5. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">message = (</span><span class="s4">&quot;`constraints` (or each element within `constraints`) must be &quot;</span>
+               <span class="s4">&quot;convertible into an instance of &quot;</span>
+               <span class="s4">&quot;`scipy.optimize.LinearConstraint`.&quot;</span><span class="s1">)</span>
+    <span class="s1">As = []</span>
+    <span class="s1">b_ls = []</span>
+    <span class="s1">b_us = []</span>
+
+    <span class="s2"># Accept case 1 by standardizing as case 4</span>
+    <span class="s0">if </span><span class="s1">isinstance(constraints</span><span class="s0">, </span><span class="s1">LinearConstraint):</span>
+        <span class="s1">constraints = [constraints]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s2"># Reject case 3</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">iter(constraints)</span>
+        <span class="s0">except </span><span class="s1">TypeError </span><span class="s0">as </span><span class="s1">exc:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(message) </span><span class="s0">from </span><span class="s1">exc</span>
+
+        <span class="s2"># Accept case 2 by standardizing as case 4</span>
+        <span class="s0">if </span><span class="s1">len(constraints) == </span><span class="s5">3</span><span class="s1">:</span>
+            <span class="s2"># argument could be a single tuple representing a LinearConstraint</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">constraints = [LinearConstraint(*constraints)]</span>
+            <span class="s0">except </span><span class="s1">(TypeError</span><span class="s0">, </span><span class="s1">ValueError</span><span class="s0">, </span><span class="s1">np.VisibleDeprecationWarning):</span>
+                <span class="s2"># argument was not a tuple representing a LinearConstraint</span>
+                <span class="s0">pass</span>
+
+    <span class="s2"># Address cases 4/5</span>
+    <span class="s0">for </span><span class="s1">constraint </span><span class="s0">in </span><span class="s1">constraints:</span>
+        <span class="s2"># if it's not a LinearConstraint or something that represents a</span>
+        <span class="s2"># LinearConstraint at this point, it's invalid</span>
+        <span class="s0">if not </span><span class="s1">isinstance(constraint</span><span class="s0">, </span><span class="s1">LinearConstraint):</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">constraint = LinearConstraint(*constraint)</span>
+            <span class="s0">except </span><span class="s1">TypeError </span><span class="s0">as </span><span class="s1">exc:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(message) </span><span class="s0">from </span><span class="s1">exc</span>
+        <span class="s1">As.append(csc_array(constraint.A))</span>
+        <span class="s1">b_ls.append(np.atleast_1d(constraint.lb).astype(np.double))</span>
+        <span class="s1">b_us.append(np.atleast_1d(constraint.ub).astype(np.double))</span>
+
+    <span class="s0">if </span><span class="s1">len(As) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s1">A = vstack(As</span><span class="s0">, </span><span class="s1">format=</span><span class="s4">&quot;csc&quot;</span><span class="s1">)</span>
+        <span class="s1">b_l = np.concatenate(b_ls)</span>
+        <span class="s1">b_u = np.concatenate(b_us)</span>
+    <span class="s0">else</span><span class="s1">:  </span><span class="s2"># avoid unnecessary copying</span>
+        <span class="s1">A = As[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">b_l = b_ls[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">b_u = b_us[</span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s0">return </span><span class="s1">A</span><span class="s0">, </span><span class="s1">b_l</span><span class="s0">, </span><span class="s1">b_u</span>
+
+
+<span class="s0">def </span><span class="s1">_milp_iv(c</span><span class="s0">, </span><span class="s1">integrality</span><span class="s0">, </span><span class="s1">bounds</span><span class="s0">, </span><span class="s1">constraints</span><span class="s0">, </span><span class="s1">options):</span>
+    <span class="s2"># objective IV</span>
+    <span class="s0">if </span><span class="s1">issparse(c):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;`c` must be a dense array.&quot;</span><span class="s1">)</span>
+    <span class="s1">c = np.atleast_1d(c).astype(np.double)</span>
+    <span class="s0">if </span><span class="s1">c.ndim != </span><span class="s5">1 </span><span class="s0">or </span><span class="s1">c.size == </span><span class="s5">0 </span><span class="s0">or not </span><span class="s1">np.all(np.isfinite(c)):</span>
+        <span class="s1">message = (</span><span class="s4">&quot;`c` must be a one-dimensional array of finite numbers &quot;</span>
+                   <span class="s4">&quot;with at least one element.&quot;</span><span class="s1">)</span>
+        <span class="s0">raise </span><span class="s1">ValueError(message)</span>
+
+    <span class="s2"># integrality IV</span>
+    <span class="s0">if </span><span class="s1">issparse(integrality):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;`integrality` must be a dense array.&quot;</span><span class="s1">)</span>
+    <span class="s1">message = (</span><span class="s4">&quot;`integrality` must contain integers 0-3 and be broadcastable &quot;</span>
+               <span class="s4">&quot;to `c.shape`.&quot;</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">integrality </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">integrality = </span><span class="s5">0</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">integrality = np.broadcast_to(integrality</span><span class="s0">, </span><span class="s1">c.shape).astype(np.uint8)</span>
+    <span class="s0">except </span><span class="s1">ValueError:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(message)</span>
+    <span class="s0">if </span><span class="s1">integrality.min() &lt; </span><span class="s5">0 </span><span class="s0">or </span><span class="s1">integrality.max() &gt; </span><span class="s5">3</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(message)</span>
+
+    <span class="s2"># bounds IV</span>
+    <span class="s0">if </span><span class="s1">bounds </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">bounds = Bounds(</span><span class="s5">0</span><span class="s0">, </span><span class="s1">np.inf)</span>
+    <span class="s0">elif not </span><span class="s1">isinstance(bounds</span><span class="s0">, </span><span class="s1">Bounds):</span>
+        <span class="s1">message = (</span><span class="s4">&quot;`bounds` must be convertible into an instance of &quot;</span>
+                   <span class="s4">&quot;`scipy.optimize.Bounds`.&quot;</span><span class="s1">)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">bounds = Bounds(*bounds)</span>
+        <span class="s0">except </span><span class="s1">TypeError </span><span class="s0">as </span><span class="s1">exc:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(message) </span><span class="s0">from </span><span class="s1">exc</span>
+
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">lb = np.broadcast_to(bounds.lb</span><span class="s0">, </span><span class="s1">c.shape).astype(np.double)</span>
+        <span class="s1">ub = np.broadcast_to(bounds.ub</span><span class="s0">, </span><span class="s1">c.shape).astype(np.double)</span>
+    <span class="s0">except </span><span class="s1">(ValueError</span><span class="s0">, </span><span class="s1">TypeError) </span><span class="s0">as </span><span class="s1">exc:</span>
+        <span class="s1">message = (</span><span class="s4">&quot;`bounds.lb` and `bounds.ub` must contain reals and &quot;</span>
+                   <span class="s4">&quot;be broadcastable to `c.shape`.&quot;</span><span class="s1">)</span>
+        <span class="s0">raise </span><span class="s1">ValueError(message) </span><span class="s0">from </span><span class="s1">exc</span>
+
+    <span class="s2"># constraints IV</span>
+    <span class="s0">if not </span><span class="s1">constraints:</span>
+        <span class="s1">constraints = [LinearConstraint(np.empty((</span><span class="s5">0</span><span class="s0">, </span><span class="s1">c.size))</span><span class="s0">,</span>
+                                        <span class="s1">np.empty((</span><span class="s5">0</span><span class="s0">,</span><span class="s1">))</span><span class="s0">, </span><span class="s1">np.empty((</span><span class="s5">0</span><span class="s0">,</span><span class="s1">)))]</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">A</span><span class="s0">, </span><span class="s1">b_l</span><span class="s0">, </span><span class="s1">b_u = _constraints_to_components(constraints)</span>
+    <span class="s0">except </span><span class="s1">ValueError </span><span class="s0">as </span><span class="s1">exc:</span>
+        <span class="s1">message = (</span><span class="s4">&quot;`constraints` (or each element within `constraints`) must &quot;</span>
+                   <span class="s4">&quot;be convertible into an instance of &quot;</span>
+                   <span class="s4">&quot;`scipy.optimize.LinearConstraint`.&quot;</span><span class="s1">)</span>
+        <span class="s0">raise </span><span class="s1">ValueError(message) </span><span class="s0">from </span><span class="s1">exc</span>
+
+    <span class="s0">if </span><span class="s1">A.shape != (b_l.size</span><span class="s0">, </span><span class="s1">c.size):</span>
+        <span class="s1">message = </span><span class="s4">&quot;The shape of `A` must be (len(b_l), len(c)).&quot;</span>
+        <span class="s0">raise </span><span class="s1">ValueError(message)</span>
+    <span class="s1">indptr</span><span class="s0">, </span><span class="s1">indices</span><span class="s0">, </span><span class="s1">data = A.indptr</span><span class="s0">, </span><span class="s1">A.indices</span><span class="s0">, </span><span class="s1">A.data.astype(np.double)</span>
+
+    <span class="s2"># options IV</span>
+    <span class="s1">options = options </span><span class="s0">or </span><span class="s1">{}</span>
+    <span class="s1">supported_options = {</span><span class="s4">'disp'</span><span class="s0">, </span><span class="s4">'presolve'</span><span class="s0">, </span><span class="s4">'time_limit'</span><span class="s0">, </span><span class="s4">'node_limit'</span><span class="s0">,</span>
+                         <span class="s4">'mip_rel_gap'</span><span class="s1">}</span>
+    <span class="s1">unsupported_options = set(options).difference(supported_options)</span>
+    <span class="s0">if </span><span class="s1">unsupported_options:</span>
+        <span class="s1">message = (</span><span class="s4">f&quot;Unrecognized options detected: </span><span class="s0">{</span><span class="s1">unsupported_options</span><span class="s0">}</span><span class="s4">. &quot;</span>
+                   <span class="s4">&quot;These will be passed to HiGHS verbatim.&quot;</span><span class="s1">)</span>
+        <span class="s1">warnings.warn(message</span><span class="s0">, </span><span class="s1">RuntimeWarning</span><span class="s0">, </span><span class="s1">stacklevel=</span><span class="s5">3</span><span class="s1">)</span>
+    <span class="s1">options_iv = {</span><span class="s4">'log_to_console'</span><span class="s1">: options.pop(</span><span class="s4">&quot;disp&quot;</span><span class="s0">, False</span><span class="s1">)</span><span class="s0">,</span>
+                  <span class="s4">'mip_max_nodes'</span><span class="s1">: options.pop(</span><span class="s4">&quot;node_limit&quot;</span><span class="s0">, None</span><span class="s1">)}</span>
+    <span class="s1">options_iv.update(options)</span>
+
+    <span class="s0">return </span><span class="s1">c</span><span class="s0">, </span><span class="s1">integrality</span><span class="s0">, </span><span class="s1">lb</span><span class="s0">, </span><span class="s1">ub</span><span class="s0">, </span><span class="s1">indptr</span><span class="s0">, </span><span class="s1">indices</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">b_l</span><span class="s0">, </span><span class="s1">b_u</span><span class="s0">, </span><span class="s1">options_iv</span>
+
+
+<span class="s0">def </span><span class="s1">milp(c</span><span class="s0">, </span><span class="s1">*</span><span class="s0">, </span><span class="s1">integrality=</span><span class="s0">None, </span><span class="s1">bounds=</span><span class="s0">None, </span><span class="s1">constraints=</span><span class="s0">None, </span><span class="s1">options=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s3">r&quot;&quot;&quot; 
+    Mixed-integer linear programming 
+ 
+    Solves problems of the following form: 
+ 
+    .. math:: 
+ 
+        \min_x \ &amp; c^T x \\ 
+        \mbox{such that} \ &amp; b_l \leq A x \leq b_u,\\ 
+        &amp; l \leq x \leq u, \\ 
+        &amp; x_i \in \mathbb{Z}, i \in X_i 
+ 
+    where :math:`x` is a vector of decision variables; 
+    :math:`c`, :math:`b_l`, :math:`b_u`, :math:`l`, and :math:`u` are vectors; 
+    :math:`A` is a matrix, and :math:`X_i` is the set of indices of 
+    decision variables that must be integral. (In this context, a 
+    variable that can assume only integer values is said to be &quot;integral&quot;; 
+    it has an &quot;integrality&quot; constraint.) 
+ 
+    Alternatively, that's: 
+ 
+    minimize:: 
+ 
+        c @ x 
+ 
+    such that:: 
+ 
+        b_l &lt;= A @ x &lt;= b_u 
+        l &lt;= x &lt;= u 
+        Specified elements of x must be integers 
+ 
+    By default, ``l = 0`` and ``u = np.inf`` unless specified with 
+    ``bounds``. 
+ 
+    Parameters 
+    ---------- 
+    c : 1D dense array_like 
+        The coefficients of the linear objective function to be minimized. 
+        `c` is converted to a double precision array before the problem is 
+        solved. 
+    integrality : 1D dense array_like, optional 
+        Indicates the type of integrality constraint on each decision variable. 
+ 
+        ``0`` : Continuous variable; no integrality constraint. 
+ 
+        ``1`` : Integer variable; decision variable must be an integer 
+        within `bounds`. 
+ 
+        ``2`` : Semi-continuous variable; decision variable must be within 
+        `bounds` or take value ``0``. 
+ 
+        ``3`` : Semi-integer variable; decision variable must be an integer 
+        within `bounds` or take value ``0``. 
+ 
+        By default, all variables are continuous. `integrality` is converted 
+        to an array of integers before the problem is solved. 
+ 
+    bounds : scipy.optimize.Bounds, optional 
+        Bounds on the decision variables. Lower and upper bounds are converted 
+        to double precision arrays before the problem is solved. The 
+        ``keep_feasible`` parameter of the `Bounds` object is ignored. If 
+        not specified, all decision variables are constrained to be 
+        non-negative. 
+    constraints : sequence of scipy.optimize.LinearConstraint, optional 
+        Linear constraints of the optimization problem. Arguments may be 
+        one of the following: 
+ 
+        1. A single `LinearConstraint` object 
+        2. A single tuple that can be converted to a `LinearConstraint` object 
+           as ``LinearConstraint(*constraints)`` 
+        3. A sequence composed entirely of objects of type 1. and 2. 
+ 
+        Before the problem is solved, all values are converted to double 
+        precision, and the matrices of constraint coefficients are converted to 
+        instances of `scipy.sparse.csc_array`. The ``keep_feasible`` parameter 
+        of `LinearConstraint` objects is ignored. 
+    options : dict, optional 
+        A dictionary of solver options. The following keys are recognized. 
+ 
+        disp : bool (default: ``False``) 
+            Set to ``True`` if indicators of optimization status are to be 
+            printed to the console during optimization. 
+        node_limit : int, optional 
+            The maximum number of nodes (linear program relaxations) to solve 
+            before stopping. Default is no maximum number of nodes. 
+        presolve : bool (default: ``True``) 
+            Presolve attempts to identify trivial infeasibilities, 
+            identify trivial unboundedness, and simplify the problem before 
+            sending it to the main solver. 
+        time_limit : float, optional 
+            The maximum number of seconds allotted to solve the problem. 
+            Default is no time limit. 
+        mip_rel_gap : float, optional 
+            Termination criterion for MIP solver: solver will terminate when 
+            the gap between the primal objective value and the dual objective 
+            bound, scaled by the primal objective value, is &lt;= mip_rel_gap. 
+ 
+    Returns 
+    ------- 
+    res : OptimizeResult 
+        An instance of :class:`scipy.optimize.OptimizeResult`. The object 
+        is guaranteed to have the following attributes. 
+ 
+        status : int 
+            An integer representing the exit status of the algorithm. 
+ 
+            ``0`` : Optimal solution found. 
+ 
+            ``1`` : Iteration or time limit reached. 
+ 
+            ``2`` : Problem is infeasible. 
+ 
+            ``3`` : Problem is unbounded. 
+ 
+            ``4`` : Other; see message for details. 
+ 
+        success : bool 
+            ``True`` when an optimal solution is found and ``False`` otherwise. 
+ 
+        message : str 
+            A string descriptor of the exit status of the algorithm. 
+ 
+        The following attributes will also be present, but the values may be 
+        ``None``, depending on the solution status. 
+ 
+        x : ndarray 
+            The values of the decision variables that minimize the 
+            objective function while satisfying the constraints. 
+        fun : float 
+            The optimal value of the objective function ``c @ x``. 
+        mip_node_count : int 
+            The number of subproblems or &quot;nodes&quot; solved by the MILP solver. 
+        mip_dual_bound : float 
+            The MILP solver's final estimate of the lower bound on the optimal 
+            solution. 
+        mip_gap : float 
+            The difference between the primal objective value and the dual 
+            objective bound, scaled by the primal objective value. 
+ 
+    Notes 
+    ----- 
+    `milp` is a wrapper of the HiGHS linear optimization software [1]_. The 
+    algorithm is deterministic, and it typically finds the global optimum of 
+    moderately challenging mixed-integer linear programs (when it exists). 
+ 
+    References 
+    ---------- 
+    .. [1] Huangfu, Q., Galabova, I., Feldmeier, M., and Hall, J. A. J. 
+           &quot;HiGHS - high performance software for linear optimization.&quot; 
+           https://highs.dev/ 
+    .. [2] Huangfu, Q. and Hall, J. A. J. &quot;Parallelizing the dual revised 
+           simplex method.&quot; Mathematical Programming Computation, 10 (1), 
+           119-142, 2018. DOI: 10.1007/s12532-017-0130-5 
+ 
+    Examples 
+    -------- 
+    Consider the problem at 
+    https://en.wikipedia.org/wiki/Integer_programming#Example, which is 
+    expressed as a maximization problem of two variables. Since `milp` requires 
+    that the problem be expressed as a minimization problem, the objective 
+    function coefficients on the decision variables are: 
+ 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; c = -np.array([0, 1]) 
+ 
+    Note the negative sign: we maximize the original objective function 
+    by minimizing the negative of the objective function. 
+ 
+    We collect the coefficients of the constraints into arrays like: 
+ 
+    &gt;&gt;&gt; A = np.array([[-1, 1], [3, 2], [2, 3]]) 
+    &gt;&gt;&gt; b_u = np.array([1, 12, 12]) 
+    &gt;&gt;&gt; b_l = np.full_like(b_u, -np.inf) 
+ 
+    Because there is no lower limit on these constraints, we have defined a 
+    variable ``b_l`` full of values representing negative infinity. This may 
+    be unfamiliar to users of `scipy.optimize.linprog`, which only accepts 
+    &quot;less than&quot; (or &quot;upper bound&quot;) inequality constraints of the form 
+    ``A_ub @ x &lt;= b_u``. By accepting both ``b_l`` and ``b_u`` of constraints 
+    ``b_l &lt;= A_ub @ x &lt;= b_u``, `milp` makes it easy to specify &quot;greater than&quot; 
+    inequality constraints, &quot;less than&quot; inequality constraints, and equality 
+    constraints concisely. 
+ 
+    These arrays are collected into a single `LinearConstraint` object like: 
+ 
+    &gt;&gt;&gt; from scipy.optimize import LinearConstraint 
+    &gt;&gt;&gt; constraints = LinearConstraint(A, b_l, b_u) 
+ 
+    The non-negativity bounds on the decision variables are enforced by 
+    default, so we do not need to provide an argument for `bounds`. 
+ 
+    Finally, the problem states that both decision variables must be integers: 
+ 
+    &gt;&gt;&gt; integrality = np.ones_like(c) 
+ 
+    We solve the problem like: 
+ 
+    &gt;&gt;&gt; from scipy.optimize import milp 
+    &gt;&gt;&gt; res = milp(c=c, constraints=constraints, integrality=integrality) 
+    &gt;&gt;&gt; res.x 
+    [1.0, 2.0] 
+ 
+    Note that had we solved the relaxed problem (without integrality 
+    constraints): 
+ 
+    &gt;&gt;&gt; res = milp(c=c, constraints=constraints)  # OR: 
+    &gt;&gt;&gt; # from scipy.optimize import linprog; res = linprog(c, A, b_u) 
+    &gt;&gt;&gt; res.x 
+    [1.8, 2.8] 
+ 
+    we would not have obtained the correct solution by rounding to the nearest 
+    integers. 
+ 
+    Other examples are given :ref:`in the tutorial &lt;tutorial-optimize_milp&gt;`. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">args_iv = _milp_iv(c</span><span class="s0">, </span><span class="s1">integrality</span><span class="s0">, </span><span class="s1">bounds</span><span class="s0">, </span><span class="s1">constraints</span><span class="s0">, </span><span class="s1">options)</span>
+    <span class="s1">c</span><span class="s0">, </span><span class="s1">integrality</span><span class="s0">, </span><span class="s1">lb</span><span class="s0">, </span><span class="s1">ub</span><span class="s0">, </span><span class="s1">indptr</span><span class="s0">, </span><span class="s1">indices</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">b_l</span><span class="s0">, </span><span class="s1">b_u</span><span class="s0">, </span><span class="s1">options = args_iv</span>
+
+    <span class="s1">highs_res = _highs_wrapper(c</span><span class="s0">, </span><span class="s1">indptr</span><span class="s0">, </span><span class="s1">indices</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">b_l</span><span class="s0">, </span><span class="s1">b_u</span><span class="s0">,</span>
+                               <span class="s1">lb</span><span class="s0">, </span><span class="s1">ub</span><span class="s0">, </span><span class="s1">integrality</span><span class="s0">, </span><span class="s1">options)</span>
+
+    <span class="s1">res = {}</span>
+
+    <span class="s2"># Convert to scipy-style status and message</span>
+    <span class="s1">highs_status = highs_res.get(</span><span class="s4">'status'</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s1">highs_message = highs_res.get(</span><span class="s4">'message'</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s1">status</span><span class="s0">, </span><span class="s1">message = _highs_to_scipy_status_message(highs_status</span><span class="s0">,</span>
+                                                     <span class="s1">highs_message)</span>
+    <span class="s1">res[</span><span class="s4">'status'</span><span class="s1">] = status</span>
+    <span class="s1">res[</span><span class="s4">'message'</span><span class="s1">] = message</span>
+    <span class="s1">res[</span><span class="s4">'success'</span><span class="s1">] = (status == </span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">x = highs_res.get(</span><span class="s4">'x'</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s1">res[</span><span class="s4">'x'</span><span class="s1">] = np.array(x) </span><span class="s0">if </span><span class="s1">x </span><span class="s0">is not None else None</span>
+    <span class="s1">res[</span><span class="s4">'fun'</span><span class="s1">] = highs_res.get(</span><span class="s4">'fun'</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s1">res[</span><span class="s4">'mip_node_count'</span><span class="s1">] = highs_res.get(</span><span class="s4">'mip_node_count'</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s1">res[</span><span class="s4">'mip_dual_bound'</span><span class="s1">] = highs_res.get(</span><span class="s4">'mip_dual_bound'</span><span class="s0">, None</span><span class="s1">)</span>
+    <span class="s1">res[</span><span class="s4">'mip_gap'</span><span class="s1">] = highs_res.get(</span><span class="s4">'mip_gap'</span><span class="s0">, None</span><span class="s1">)</span>
+
+    <span class="s0">return </span><span class="s1">OptimizeResult(res)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,1457 @@
+<html>
+<head>
+<title>scanner.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+.s1 { color: #808080;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+scanner.py</font>
+</center></td></tr></table>
+<pre>
+<span class="s1"># Scanner produces tokens of the following types:</span>
+<span class="s1"># STREAM-START</span>
+<span class="s1"># STREAM-END</span>
+<span class="s1"># DIRECTIVE(name, value)</span>
+<span class="s1"># DOCUMENT-START</span>
+<span class="s1"># DOCUMENT-END</span>
+<span class="s1"># BLOCK-SEQUENCE-START</span>
+<span class="s1"># BLOCK-MAPPING-START</span>
+<span class="s1"># BLOCK-END</span>
+<span class="s1"># FLOW-SEQUENCE-START</span>
+<span class="s1"># FLOW-MAPPING-START</span>
+<span class="s1"># FLOW-SEQUENCE-END</span>
+<span class="s1"># FLOW-MAPPING-END</span>
+<span class="s1"># BLOCK-ENTRY</span>
+<span class="s1"># FLOW-ENTRY</span>
+<span class="s1"># KEY</span>
+<span class="s1"># VALUE</span>
+<span class="s1"># ALIAS(value)</span>
+<span class="s1"># ANCHOR(value)</span>
+<span class="s1"># TAG(value)</span>
+<span class="s1"># SCALAR(value, plain, style)</span>
+<span class="s1">#</span>
+<span class="s1"># Read comments in the Scanner code for more details.</span>
+<span class="s1">#</span>
+
+<span class="s0">__all__ = [</span><span class="s2">'Scanner'</span><span class="s3">, </span><span class="s2">'ScannerError'</span><span class="s0">]</span>
+
+<span class="s3">from </span><span class="s0">.error </span><span class="s3">import </span><span class="s0">MarkedYAMLError</span>
+<span class="s3">from </span><span class="s0">.tokens </span><span class="s3">import </span><span class="s0">*</span>
+
+<span class="s3">class </span><span class="s0">ScannerError(MarkedYAMLError):</span>
+    <span class="s3">pass</span>
+
+<span class="s3">class </span><span class="s0">SimpleKey:</span>
+    <span class="s1"># See below simple keys treatment.</span>
+
+    <span class="s3">def </span><span class="s0">__init__(self</span><span class="s3">, </span><span class="s0">token_number</span><span class="s3">, </span><span class="s0">required</span><span class="s3">, </span><span class="s0">index</span><span class="s3">, </span><span class="s0">line</span><span class="s3">, </span><span class="s0">column</span><span class="s3">, </span><span class="s0">mark):</span>
+        <span class="s0">self.token_number = token_number</span>
+        <span class="s0">self.required = required</span>
+        <span class="s0">self.index = index</span>
+        <span class="s0">self.line = line</span>
+        <span class="s0">self.column = column</span>
+        <span class="s0">self.mark = mark</span>
+
+<span class="s3">class </span><span class="s0">Scanner:</span>
+
+    <span class="s3">def </span><span class="s0">__init__(self):</span>
+        <span class="s4">&quot;&quot;&quot;Initialize the scanner.&quot;&quot;&quot;</span>
+        <span class="s1"># It is assumed that Scanner and Reader will have a common descendant.</span>
+        <span class="s1"># Reader do the dirty work of checking for BOM and converting the</span>
+        <span class="s1"># input data to Unicode. It also adds NUL to the end.</span>
+        <span class="s1">#</span>
+        <span class="s1"># Reader supports the following methods</span>
+        <span class="s1">#   self.peek(i=0)       # peek the next i-th character</span>
+        <span class="s1">#   self.prefix(l=1)     # peek the next l characters</span>
+        <span class="s1">#   self.forward(l=1)    # read the next l characters and move the pointer.</span>
+
+        <span class="s1"># Had we reached the end of the stream?</span>
+        <span class="s0">self.done = </span><span class="s3">False</span>
+
+        <span class="s1"># The number of unclosed '{' and '['. `flow_level == 0` means block</span>
+        <span class="s1"># context.</span>
+        <span class="s0">self.flow_level = </span><span class="s5">0</span>
+
+        <span class="s1"># List of processed tokens that are not yet emitted.</span>
+        <span class="s0">self.tokens = []</span>
+
+        <span class="s1"># Add the STREAM-START token.</span>
+        <span class="s0">self.fetch_stream_start()</span>
+
+        <span class="s1"># Number of tokens that were emitted through the `get_token` method.</span>
+        <span class="s0">self.tokens_taken = </span><span class="s5">0</span>
+
+        <span class="s1"># The current indentation level.</span>
+        <span class="s0">self.indent = -</span><span class="s5">1</span>
+
+        <span class="s1"># Past indentation levels.</span>
+        <span class="s0">self.indents = []</span>
+
+        <span class="s1"># Variables related to simple keys treatment.</span>
+
+        <span class="s1"># A simple key is a key that is not denoted by the '?' indicator.</span>
+        <span class="s1"># Example of simple keys:</span>
+        <span class="s1">#   ---</span>
+        <span class="s1">#   block simple key: value</span>
+        <span class="s1">#   ? not a simple key:</span>
+        <span class="s1">#   : { flow simple key: value }</span>
+        <span class="s1"># We emit the KEY token before all keys, so when we find a potential</span>
+        <span class="s1"># simple key, we try to locate the corresponding ':' indicator.</span>
+        <span class="s1"># Simple keys should be limited to a single line and 1024 characters.</span>
+
+        <span class="s1"># Can a simple key start at the current position? A simple key may</span>
+        <span class="s1"># start:</span>
+        <span class="s1"># - at the beginning of the line, not counting indentation spaces</span>
+        <span class="s1">#       (in block context),</span>
+        <span class="s1"># - after '{', '[', ',' (in the flow context),</span>
+        <span class="s1"># - after '?', ':', '-' (in the block context).</span>
+        <span class="s1"># In the block context, this flag also signifies if a block collection</span>
+        <span class="s1"># may start at the current position.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">True</span>
+
+        <span class="s1"># Keep track of possible simple keys. This is a dictionary. The key</span>
+        <span class="s1"># is `flow_level`; there can be no more that one possible simple key</span>
+        <span class="s1"># for each level. The value is a SimpleKey record:</span>
+        <span class="s1">#   (token_number, required, index, line, column, mark)</span>
+        <span class="s1"># A simple key may start with ALIAS, ANCHOR, TAG, SCALAR(flow),</span>
+        <span class="s1"># '[', or '{' tokens.</span>
+        <span class="s0">self.possible_simple_keys = {}</span>
+
+    <span class="s1"># Public methods.</span>
+
+    <span class="s3">def </span><span class="s0">check_token(self</span><span class="s3">, </span><span class="s0">*choices):</span>
+        <span class="s1"># Check if the next token is one of the given types.</span>
+        <span class="s3">while </span><span class="s0">self.need_more_tokens():</span>
+            <span class="s0">self.fetch_more_tokens()</span>
+        <span class="s3">if </span><span class="s0">self.tokens:</span>
+            <span class="s3">if not </span><span class="s0">choices:</span>
+                <span class="s3">return True</span>
+            <span class="s3">for </span><span class="s0">choice </span><span class="s3">in </span><span class="s0">choices:</span>
+                <span class="s3">if </span><span class="s0">isinstance(self.tokens[</span><span class="s5">0</span><span class="s0">]</span><span class="s3">, </span><span class="s0">choice):</span>
+                    <span class="s3">return True</span>
+        <span class="s3">return False</span>
+
+    <span class="s3">def </span><span class="s0">peek_token(self):</span>
+        <span class="s1"># Return the next token, but do not delete if from the queue.</span>
+        <span class="s1"># Return None if no more tokens.</span>
+        <span class="s3">while </span><span class="s0">self.need_more_tokens():</span>
+            <span class="s0">self.fetch_more_tokens()</span>
+        <span class="s3">if </span><span class="s0">self.tokens:</span>
+            <span class="s3">return </span><span class="s0">self.tokens[</span><span class="s5">0</span><span class="s0">]</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">return None</span>
+
+    <span class="s3">def </span><span class="s0">get_token(self):</span>
+        <span class="s1"># Return the next token.</span>
+        <span class="s3">while </span><span class="s0">self.need_more_tokens():</span>
+            <span class="s0">self.fetch_more_tokens()</span>
+        <span class="s3">if </span><span class="s0">self.tokens:</span>
+            <span class="s0">self.tokens_taken += </span><span class="s5">1</span>
+            <span class="s3">return </span><span class="s0">self.tokens.pop(</span><span class="s5">0</span><span class="s0">)</span>
+
+    <span class="s1"># Private methods.</span>
+
+    <span class="s3">def </span><span class="s0">need_more_tokens(self):</span>
+        <span class="s3">if </span><span class="s0">self.done:</span>
+            <span class="s3">return False</span>
+        <span class="s3">if not </span><span class="s0">self.tokens:</span>
+            <span class="s3">return True</span>
+        <span class="s1"># The current token may be a potential simple key, so we</span>
+        <span class="s1"># need to look further.</span>
+        <span class="s0">self.stale_possible_simple_keys()</span>
+        <span class="s3">if </span><span class="s0">self.next_possible_simple_key() == self.tokens_taken:</span>
+            <span class="s3">return True</span>
+
+    <span class="s3">def </span><span class="s0">fetch_more_tokens(self):</span>
+
+        <span class="s1"># Eat whitespaces and comments until we reach the next token.</span>
+        <span class="s0">self.scan_to_next_token()</span>
+
+        <span class="s1"># Remove obsolete possible simple keys.</span>
+        <span class="s0">self.stale_possible_simple_keys()</span>
+
+        <span class="s1"># Compare the current indentation and column. It may add some tokens</span>
+        <span class="s1"># and decrease the current indentation level.</span>
+        <span class="s0">self.unwind_indent(self.column)</span>
+
+        <span class="s1"># Peek the next character.</span>
+        <span class="s0">ch = self.peek()</span>
+
+        <span class="s1"># Is it the end of stream?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'</span><span class="s3">\0</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_stream_end()</span>
+
+        <span class="s1"># Is it a directive?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'%' </span><span class="s3">and </span><span class="s0">self.check_directive():</span>
+            <span class="s3">return </span><span class="s0">self.fetch_directive()</span>
+
+        <span class="s1"># Is it the document start?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'-' </span><span class="s3">and </span><span class="s0">self.check_document_start():</span>
+            <span class="s3">return </span><span class="s0">self.fetch_document_start()</span>
+
+        <span class="s1"># Is it the document end?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'.' </span><span class="s3">and </span><span class="s0">self.check_document_end():</span>
+            <span class="s3">return </span><span class="s0">self.fetch_document_end()</span>
+
+        <span class="s1"># TODO: support for BOM within a stream.</span>
+        <span class="s1">#if ch == '\uFEFF':</span>
+        <span class="s1">#    return self.fetch_bom()    &lt;-- issue BOMToken</span>
+
+        <span class="s1"># Note: the order of the following checks is NOT significant.</span>
+
+        <span class="s1"># Is it the flow sequence start indicator?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'['</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_flow_sequence_start()</span>
+
+        <span class="s1"># Is it the flow mapping start indicator?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'{'</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_flow_mapping_start()</span>
+
+        <span class="s1"># Is it the flow sequence end indicator?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">']'</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_flow_sequence_end()</span>
+
+        <span class="s1"># Is it the flow mapping end indicator?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'}'</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_flow_mapping_end()</span>
+
+        <span class="s1"># Is it the flow entry indicator?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">','</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_flow_entry()</span>
+
+        <span class="s1"># Is it the block entry indicator?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'-' </span><span class="s3">and </span><span class="s0">self.check_block_entry():</span>
+            <span class="s3">return </span><span class="s0">self.fetch_block_entry()</span>
+
+        <span class="s1"># Is it the key indicator?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'?' </span><span class="s3">and </span><span class="s0">self.check_key():</span>
+            <span class="s3">return </span><span class="s0">self.fetch_key()</span>
+
+        <span class="s1"># Is it the value indicator?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">':' </span><span class="s3">and </span><span class="s0">self.check_value():</span>
+            <span class="s3">return </span><span class="s0">self.fetch_value()</span>
+
+        <span class="s1"># Is it an alias?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'*'</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_alias()</span>
+
+        <span class="s1"># Is it an anchor?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'&amp;'</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_anchor()</span>
+
+        <span class="s1"># Is it a tag?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'!'</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_tag()</span>
+
+        <span class="s1"># Is it a literal scalar?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'|' </span><span class="s3">and not </span><span class="s0">self.flow_level:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_literal()</span>
+
+        <span class="s1"># Is it a folded scalar?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'&gt;' </span><span class="s3">and not </span><span class="s0">self.flow_level:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_folded()</span>
+
+        <span class="s1"># Is it a single quoted scalar?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_single()</span>
+
+        <span class="s1"># Is it a double quoted scalar?</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'</span><span class="s3">\&quot;</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.fetch_double()</span>
+
+        <span class="s1"># It must be a plain scalar then.</span>
+        <span class="s3">if </span><span class="s0">self.check_plain():</span>
+            <span class="s3">return </span><span class="s0">self.fetch_plain()</span>
+
+        <span class="s1"># No? It's an error. Let's produce a nice error message.</span>
+        <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning for the next token&quot;</span><span class="s3">, None,</span>
+                <span class="s2">&quot;found character %r that cannot start any token&quot; </span><span class="s0">% ch</span><span class="s3">,</span>
+                <span class="s0">self.get_mark())</span>
+
+    <span class="s1"># Simple keys treatment.</span>
+
+    <span class="s3">def </span><span class="s0">next_possible_simple_key(self):</span>
+        <span class="s1"># Return the number of the nearest possible simple key. Actually we</span>
+        <span class="s1"># don't need to loop through the whole dictionary. We may replace it</span>
+        <span class="s1"># with the following code:</span>
+        <span class="s1">#   if not self.possible_simple_keys:</span>
+        <span class="s1">#       return None</span>
+        <span class="s1">#   return self.possible_simple_keys[</span>
+        <span class="s1">#           min(self.possible_simple_keys.keys())].token_number</span>
+        <span class="s0">min_token_number = </span><span class="s3">None</span>
+        <span class="s3">for </span><span class="s0">level </span><span class="s3">in </span><span class="s0">self.possible_simple_keys:</span>
+            <span class="s0">key = self.possible_simple_keys[level]</span>
+            <span class="s3">if </span><span class="s0">min_token_number </span><span class="s3">is None or </span><span class="s0">key.token_number &lt; min_token_number:</span>
+                <span class="s0">min_token_number = key.token_number</span>
+        <span class="s3">return </span><span class="s0">min_token_number</span>
+
+    <span class="s3">def </span><span class="s0">stale_possible_simple_keys(self):</span>
+        <span class="s1"># Remove entries that are no longer possible simple keys. According to</span>
+        <span class="s1"># the YAML specification, simple keys</span>
+        <span class="s1"># - should be limited to a single line,</span>
+        <span class="s1"># - should be no longer than 1024 characters.</span>
+        <span class="s1"># Disabling this procedure will allow simple keys of any length and</span>
+        <span class="s1"># height (may cause problems if indentation is broken though).</span>
+        <span class="s3">for </span><span class="s0">level </span><span class="s3">in </span><span class="s0">list(self.possible_simple_keys):</span>
+            <span class="s0">key = self.possible_simple_keys[level]</span>
+            <span class="s3">if </span><span class="s0">key.line != self.line  \</span>
+                    <span class="s3">or </span><span class="s0">self.index-key.index &gt; </span><span class="s5">1024</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">key.required:</span>
+                    <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a simple key&quot;</span><span class="s3">, </span><span class="s0">key.mark</span><span class="s3">,</span>
+                            <span class="s2">&quot;could not find expected ':'&quot;</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+                <span class="s3">del </span><span class="s0">self.possible_simple_keys[level]</span>
+
+    <span class="s3">def </span><span class="s0">save_possible_simple_key(self):</span>
+        <span class="s1"># The next token may start a simple key. We check if it's possible</span>
+        <span class="s1"># and save its position. This function is called for</span>
+        <span class="s1">#   ALIAS, ANCHOR, TAG, SCALAR(flow), '[', and '{'.</span>
+
+        <span class="s1"># Check if a simple key is required at the current position.</span>
+        <span class="s0">required = </span><span class="s3">not </span><span class="s0">self.flow_level </span><span class="s3">and </span><span class="s0">self.indent == self.column</span>
+
+        <span class="s1"># The next token might be a simple key. Let's save it's number and</span>
+        <span class="s1"># position.</span>
+        <span class="s3">if </span><span class="s0">self.allow_simple_key:</span>
+            <span class="s0">self.remove_possible_simple_key()</span>
+            <span class="s0">token_number = self.tokens_taken+len(self.tokens)</span>
+            <span class="s0">key = SimpleKey(token_number</span><span class="s3">, </span><span class="s0">required</span><span class="s3">,</span>
+                    <span class="s0">self.index</span><span class="s3">, </span><span class="s0">self.line</span><span class="s3">, </span><span class="s0">self.column</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+            <span class="s0">self.possible_simple_keys[self.flow_level] = key</span>
+
+    <span class="s3">def </span><span class="s0">remove_possible_simple_key(self):</span>
+        <span class="s1"># Remove the saved possible key position at the current flow level.</span>
+        <span class="s3">if </span><span class="s0">self.flow_level </span><span class="s3">in </span><span class="s0">self.possible_simple_keys:</span>
+            <span class="s0">key = self.possible_simple_keys[self.flow_level]</span>
+            
+            <span class="s3">if </span><span class="s0">key.required:</span>
+                <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a simple key&quot;</span><span class="s3">, </span><span class="s0">key.mark</span><span class="s3">,</span>
+                        <span class="s2">&quot;could not find expected ':'&quot;</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+
+            <span class="s3">del </span><span class="s0">self.possible_simple_keys[self.flow_level]</span>
+
+    <span class="s1"># Indentation functions.</span>
+
+    <span class="s3">def </span><span class="s0">unwind_indent(self</span><span class="s3">, </span><span class="s0">column):</span>
+
+        <span class="s1">## In flow context, tokens should respect indentation.</span>
+        <span class="s1">## Actually the condition should be `self.indent &gt;= column` according to</span>
+        <span class="s1">## the spec. But this condition will prohibit intuitively correct</span>
+        <span class="s1">## constructions such as</span>
+        <span class="s1">## key : {</span>
+        <span class="s1">## }</span>
+        <span class="s1">#if self.flow_level and self.indent &gt; column:</span>
+        <span class="s1">#    raise ScannerError(None, None,</span>
+        <span class="s1">#            &quot;invalid indentation or unclosed '[' or '{'&quot;,</span>
+        <span class="s1">#            self.get_mark())</span>
+
+        <span class="s1"># In the flow context, indentation is ignored. We make the scanner less</span>
+        <span class="s1"># restrictive then specification requires.</span>
+        <span class="s3">if </span><span class="s0">self.flow_level:</span>
+            <span class="s3">return</span>
+
+        <span class="s1"># In block context, we may need to issue the BLOCK-END tokens.</span>
+        <span class="s3">while </span><span class="s0">self.indent &gt; column:</span>
+            <span class="s0">mark = self.get_mark()</span>
+            <span class="s0">self.indent = self.indents.pop()</span>
+            <span class="s0">self.tokens.append(BlockEndToken(mark</span><span class="s3">, </span><span class="s0">mark))</span>
+
+    <span class="s3">def </span><span class="s0">add_indent(self</span><span class="s3">, </span><span class="s0">column):</span>
+        <span class="s1"># Check if we need to increase indentation.</span>
+        <span class="s3">if </span><span class="s0">self.indent &lt; column:</span>
+            <span class="s0">self.indents.append(self.indent)</span>
+            <span class="s0">self.indent = column</span>
+            <span class="s3">return True</span>
+        <span class="s3">return False</span>
+
+    <span class="s1"># Fetchers.</span>
+
+    <span class="s3">def </span><span class="s0">fetch_stream_start(self):</span>
+        <span class="s1"># We always add STREAM-START as the first token and STREAM-END as the</span>
+        <span class="s1"># last token.</span>
+
+        <span class="s1"># Read the token.</span>
+        <span class="s0">mark = self.get_mark()</span>
+        
+        <span class="s1"># Add STREAM-START.</span>
+        <span class="s0">self.tokens.append(StreamStartToken(mark</span><span class="s3">, </span><span class="s0">mark</span><span class="s3">,</span>
+            <span class="s0">encoding=self.encoding))</span>
+        
+
+    <span class="s3">def </span><span class="s0">fetch_stream_end(self):</span>
+
+        <span class="s1"># Set the current indentation to -1.</span>
+        <span class="s0">self.unwind_indent(-</span><span class="s5">1</span><span class="s0">)</span>
+
+        <span class="s1"># Reset simple keys.</span>
+        <span class="s0">self.remove_possible_simple_key()</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">False</span>
+        <span class="s0">self.possible_simple_keys = {}</span>
+
+        <span class="s1"># Read the token.</span>
+        <span class="s0">mark = self.get_mark()</span>
+        
+        <span class="s1"># Add STREAM-END.</span>
+        <span class="s0">self.tokens.append(StreamEndToken(mark</span><span class="s3">, </span><span class="s0">mark))</span>
+
+        <span class="s1"># The steam is finished.</span>
+        <span class="s0">self.done = </span><span class="s3">True</span>
+
+    <span class="s3">def </span><span class="s0">fetch_directive(self):</span>
+        
+        <span class="s1"># Set the current indentation to -1.</span>
+        <span class="s0">self.unwind_indent(-</span><span class="s5">1</span><span class="s0">)</span>
+
+        <span class="s1"># Reset simple keys.</span>
+        <span class="s0">self.remove_possible_simple_key()</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">False</span>
+
+        <span class="s1"># Scan and add DIRECTIVE.</span>
+        <span class="s0">self.tokens.append(self.scan_directive())</span>
+
+    <span class="s3">def </span><span class="s0">fetch_document_start(self):</span>
+        <span class="s0">self.fetch_document_indicator(DocumentStartToken)</span>
+
+    <span class="s3">def </span><span class="s0">fetch_document_end(self):</span>
+        <span class="s0">self.fetch_document_indicator(DocumentEndToken)</span>
+
+    <span class="s3">def </span><span class="s0">fetch_document_indicator(self</span><span class="s3">, </span><span class="s0">TokenClass):</span>
+
+        <span class="s1"># Set the current indentation to -1.</span>
+        <span class="s0">self.unwind_indent(-</span><span class="s5">1</span><span class="s0">)</span>
+
+        <span class="s1"># Reset simple keys. Note that there could not be a block collection</span>
+        <span class="s1"># after '---'.</span>
+        <span class="s0">self.remove_possible_simple_key()</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">False</span>
+
+        <span class="s1"># Add DOCUMENT-START or DOCUMENT-END.</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">self.forward(</span><span class="s5">3</span><span class="s0">)</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s0">self.tokens.append(TokenClass(start_mark</span><span class="s3">, </span><span class="s0">end_mark))</span>
+
+    <span class="s3">def </span><span class="s0">fetch_flow_sequence_start(self):</span>
+        <span class="s0">self.fetch_flow_collection_start(FlowSequenceStartToken)</span>
+
+    <span class="s3">def </span><span class="s0">fetch_flow_mapping_start(self):</span>
+        <span class="s0">self.fetch_flow_collection_start(FlowMappingStartToken)</span>
+
+    <span class="s3">def </span><span class="s0">fetch_flow_collection_start(self</span><span class="s3">, </span><span class="s0">TokenClass):</span>
+
+        <span class="s1"># '[' and '{' may start a simple key.</span>
+        <span class="s0">self.save_possible_simple_key()</span>
+
+        <span class="s1"># Increase the flow level.</span>
+        <span class="s0">self.flow_level += </span><span class="s5">1</span>
+
+        <span class="s1"># Simple keys are allowed after '[' and '{'.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">True</span>
+
+        <span class="s1"># Add FLOW-SEQUENCE-START or FLOW-MAPPING-START.</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s0">self.tokens.append(TokenClass(start_mark</span><span class="s3">, </span><span class="s0">end_mark))</span>
+
+    <span class="s3">def </span><span class="s0">fetch_flow_sequence_end(self):</span>
+        <span class="s0">self.fetch_flow_collection_end(FlowSequenceEndToken)</span>
+
+    <span class="s3">def </span><span class="s0">fetch_flow_mapping_end(self):</span>
+        <span class="s0">self.fetch_flow_collection_end(FlowMappingEndToken)</span>
+
+    <span class="s3">def </span><span class="s0">fetch_flow_collection_end(self</span><span class="s3">, </span><span class="s0">TokenClass):</span>
+
+        <span class="s1"># Reset possible simple key on the current level.</span>
+        <span class="s0">self.remove_possible_simple_key()</span>
+
+        <span class="s1"># Decrease the flow level.</span>
+        <span class="s0">self.flow_level -= </span><span class="s5">1</span>
+
+        <span class="s1"># No simple keys after ']' or '}'.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">False</span>
+
+        <span class="s1"># Add FLOW-SEQUENCE-END or FLOW-MAPPING-END.</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s0">self.tokens.append(TokenClass(start_mark</span><span class="s3">, </span><span class="s0">end_mark))</span>
+
+    <span class="s3">def </span><span class="s0">fetch_flow_entry(self):</span>
+
+        <span class="s1"># Simple keys are allowed after ','.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">True</span>
+
+        <span class="s1"># Reset possible simple key on the current level.</span>
+        <span class="s0">self.remove_possible_simple_key()</span>
+
+        <span class="s1"># Add FLOW-ENTRY.</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s0">self.tokens.append(FlowEntryToken(start_mark</span><span class="s3">, </span><span class="s0">end_mark))</span>
+
+    <span class="s3">def </span><span class="s0">fetch_block_entry(self):</span>
+
+        <span class="s1"># Block context needs additional checks.</span>
+        <span class="s3">if not </span><span class="s0">self.flow_level:</span>
+
+            <span class="s1"># Are we allowed to start a new entry?</span>
+            <span class="s3">if not </span><span class="s0">self.allow_simple_key:</span>
+                <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s3">None, None,</span>
+                        <span class="s2">&quot;sequence entries are not allowed here&quot;</span><span class="s3">,</span>
+                        <span class="s0">self.get_mark())</span>
+
+            <span class="s1"># We may need to add BLOCK-SEQUENCE-START.</span>
+            <span class="s3">if </span><span class="s0">self.add_indent(self.column):</span>
+                <span class="s0">mark = self.get_mark()</span>
+                <span class="s0">self.tokens.append(BlockSequenceStartToken(mark</span><span class="s3">, </span><span class="s0">mark))</span>
+
+        <span class="s1"># It's an error for the block entry to occur in the flow context,</span>
+        <span class="s1"># but we let the parser detect this.</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">pass</span>
+
+        <span class="s1"># Simple keys are allowed after '-'.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">True</span>
+
+        <span class="s1"># Reset possible simple key on the current level.</span>
+        <span class="s0">self.remove_possible_simple_key()</span>
+
+        <span class="s1"># Add BLOCK-ENTRY.</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s0">self.tokens.append(BlockEntryToken(start_mark</span><span class="s3">, </span><span class="s0">end_mark))</span>
+
+    <span class="s3">def </span><span class="s0">fetch_key(self):</span>
+        
+        <span class="s1"># Block context needs additional checks.</span>
+        <span class="s3">if not </span><span class="s0">self.flow_level:</span>
+
+            <span class="s1"># Are we allowed to start a key (not necessary a simple)?</span>
+            <span class="s3">if not </span><span class="s0">self.allow_simple_key:</span>
+                <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s3">None, None,</span>
+                        <span class="s2">&quot;mapping keys are not allowed here&quot;</span><span class="s3">,</span>
+                        <span class="s0">self.get_mark())</span>
+
+            <span class="s1"># We may need to add BLOCK-MAPPING-START.</span>
+            <span class="s3">if </span><span class="s0">self.add_indent(self.column):</span>
+                <span class="s0">mark = self.get_mark()</span>
+                <span class="s0">self.tokens.append(BlockMappingStartToken(mark</span><span class="s3">, </span><span class="s0">mark))</span>
+
+        <span class="s1"># Simple keys are allowed after '?' in the block context.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">not </span><span class="s0">self.flow_level</span>
+
+        <span class="s1"># Reset possible simple key on the current level.</span>
+        <span class="s0">self.remove_possible_simple_key()</span>
+
+        <span class="s1"># Add KEY.</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s0">self.tokens.append(KeyToken(start_mark</span><span class="s3">, </span><span class="s0">end_mark))</span>
+
+    <span class="s3">def </span><span class="s0">fetch_value(self):</span>
+
+        <span class="s1"># Do we determine a simple key?</span>
+        <span class="s3">if </span><span class="s0">self.flow_level </span><span class="s3">in </span><span class="s0">self.possible_simple_keys:</span>
+
+            <span class="s1"># Add KEY.</span>
+            <span class="s0">key = self.possible_simple_keys[self.flow_level]</span>
+            <span class="s3">del </span><span class="s0">self.possible_simple_keys[self.flow_level]</span>
+            <span class="s0">self.tokens.insert(key.token_number-self.tokens_taken</span><span class="s3">,</span>
+                    <span class="s0">KeyToken(key.mark</span><span class="s3">, </span><span class="s0">key.mark))</span>
+
+            <span class="s1"># If this key starts a new block mapping, we need to add</span>
+            <span class="s1"># BLOCK-MAPPING-START.</span>
+            <span class="s3">if not </span><span class="s0">self.flow_level:</span>
+                <span class="s3">if </span><span class="s0">self.add_indent(key.column):</span>
+                    <span class="s0">self.tokens.insert(key.token_number-self.tokens_taken</span><span class="s3">,</span>
+                            <span class="s0">BlockMappingStartToken(key.mark</span><span class="s3">, </span><span class="s0">key.mark))</span>
+
+            <span class="s1"># There cannot be two simple keys one after another.</span>
+            <span class="s0">self.allow_simple_key = </span><span class="s3">False</span>
+
+        <span class="s1"># It must be a part of a complex key.</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            
+            <span class="s1"># Block context needs additional checks.</span>
+            <span class="s1"># (Do we really need them? They will be caught by the parser</span>
+            <span class="s1"># anyway.)</span>
+            <span class="s3">if not </span><span class="s0">self.flow_level:</span>
+
+                <span class="s1"># We are allowed to start a complex value if and only if</span>
+                <span class="s1"># we can start a simple key.</span>
+                <span class="s3">if not </span><span class="s0">self.allow_simple_key:</span>
+                    <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s3">None, None,</span>
+                            <span class="s2">&quot;mapping values are not allowed here&quot;</span><span class="s3">,</span>
+                            <span class="s0">self.get_mark())</span>
+
+            <span class="s1"># If this value starts a new block mapping, we need to add</span>
+            <span class="s1"># BLOCK-MAPPING-START.  It will be detected as an error later by</span>
+            <span class="s1"># the parser.</span>
+            <span class="s3">if not </span><span class="s0">self.flow_level:</span>
+                <span class="s3">if </span><span class="s0">self.add_indent(self.column):</span>
+                    <span class="s0">mark = self.get_mark()</span>
+                    <span class="s0">self.tokens.append(BlockMappingStartToken(mark</span><span class="s3">, </span><span class="s0">mark))</span>
+
+            <span class="s1"># Simple keys are allowed after ':' in the block context.</span>
+            <span class="s0">self.allow_simple_key = </span><span class="s3">not </span><span class="s0">self.flow_level</span>
+
+            <span class="s1"># Reset possible simple key on the current level.</span>
+            <span class="s0">self.remove_possible_simple_key()</span>
+
+        <span class="s1"># Add VALUE.</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s0">self.tokens.append(ValueToken(start_mark</span><span class="s3">, </span><span class="s0">end_mark))</span>
+
+    <span class="s3">def </span><span class="s0">fetch_alias(self):</span>
+
+        <span class="s1"># ALIAS could be a simple key.</span>
+        <span class="s0">self.save_possible_simple_key()</span>
+
+        <span class="s1"># No simple keys after ALIAS.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">False</span>
+
+        <span class="s1"># Scan and add ALIAS.</span>
+        <span class="s0">self.tokens.append(self.scan_anchor(AliasToken))</span>
+
+    <span class="s3">def </span><span class="s0">fetch_anchor(self):</span>
+
+        <span class="s1"># ANCHOR could start a simple key.</span>
+        <span class="s0">self.save_possible_simple_key()</span>
+
+        <span class="s1"># No simple keys after ANCHOR.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">False</span>
+
+        <span class="s1"># Scan and add ANCHOR.</span>
+        <span class="s0">self.tokens.append(self.scan_anchor(AnchorToken))</span>
+
+    <span class="s3">def </span><span class="s0">fetch_tag(self):</span>
+
+        <span class="s1"># TAG could start a simple key.</span>
+        <span class="s0">self.save_possible_simple_key()</span>
+
+        <span class="s1"># No simple keys after TAG.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">False</span>
+
+        <span class="s1"># Scan and add TAG.</span>
+        <span class="s0">self.tokens.append(self.scan_tag())</span>
+
+    <span class="s3">def </span><span class="s0">fetch_literal(self):</span>
+        <span class="s0">self.fetch_block_scalar(style=</span><span class="s2">'|'</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">fetch_folded(self):</span>
+        <span class="s0">self.fetch_block_scalar(style=</span><span class="s2">'&gt;'</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">fetch_block_scalar(self</span><span class="s3">, </span><span class="s0">style):</span>
+
+        <span class="s1"># A simple key may follow a block scalar.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">True</span>
+
+        <span class="s1"># Reset possible simple key on the current level.</span>
+        <span class="s0">self.remove_possible_simple_key()</span>
+
+        <span class="s1"># Scan and add SCALAR.</span>
+        <span class="s0">self.tokens.append(self.scan_block_scalar(style))</span>
+
+    <span class="s3">def </span><span class="s0">fetch_single(self):</span>
+        <span class="s0">self.fetch_flow_scalar(style=</span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">fetch_double(self):</span>
+        <span class="s0">self.fetch_flow_scalar(style=</span><span class="s2">'&quot;'</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">fetch_flow_scalar(self</span><span class="s3">, </span><span class="s0">style):</span>
+
+        <span class="s1"># A flow scalar could be a simple key.</span>
+        <span class="s0">self.save_possible_simple_key()</span>
+
+        <span class="s1"># No simple keys after flow scalars.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">False</span>
+
+        <span class="s1"># Scan and add SCALAR.</span>
+        <span class="s0">self.tokens.append(self.scan_flow_scalar(style))</span>
+
+    <span class="s3">def </span><span class="s0">fetch_plain(self):</span>
+
+        <span class="s1"># A plain scalar could be a simple key.</span>
+        <span class="s0">self.save_possible_simple_key()</span>
+
+        <span class="s1"># No simple keys after plain scalars. But note that `scan_plain` will</span>
+        <span class="s1"># change this flag if the scan is finished at the beginning of the</span>
+        <span class="s1"># line.</span>
+        <span class="s0">self.allow_simple_key = </span><span class="s3">False</span>
+
+        <span class="s1"># Scan and add SCALAR. May change `allow_simple_key`.</span>
+        <span class="s0">self.tokens.append(self.scan_plain())</span>
+
+    <span class="s1"># Checkers.</span>
+
+    <span class="s3">def </span><span class="s0">check_directive(self):</span>
+
+        <span class="s1"># DIRECTIVE:        ^ '%' ...</span>
+        <span class="s1"># The '%' indicator is already checked.</span>
+        <span class="s3">if </span><span class="s0">self.column == </span><span class="s5">0</span><span class="s0">:</span>
+            <span class="s3">return True</span>
+
+    <span class="s3">def </span><span class="s0">check_document_start(self):</span>
+
+        <span class="s1"># DOCUMENT-START:   ^ '---' (' '|'\n')</span>
+        <span class="s3">if </span><span class="s0">self.column == </span><span class="s5">0</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">self.prefix(</span><span class="s5">3</span><span class="s0">) == </span><span class="s2">'---'  </span><span class="s0">\</span>
+                    <span class="s3">and </span><span class="s0">self.peek(</span><span class="s5">3</span><span class="s0">) </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s3">return True</span>
+
+    <span class="s3">def </span><span class="s0">check_document_end(self):</span>
+
+        <span class="s1"># DOCUMENT-END:     ^ '...' (' '|'\n')</span>
+        <span class="s3">if </span><span class="s0">self.column == </span><span class="s5">0</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">self.prefix(</span><span class="s5">3</span><span class="s0">) == </span><span class="s2">'...'  </span><span class="s0">\</span>
+                    <span class="s3">and </span><span class="s0">self.peek(</span><span class="s5">3</span><span class="s0">) </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s3">return True</span>
+
+    <span class="s3">def </span><span class="s0">check_block_entry(self):</span>
+
+        <span class="s1"># BLOCK-ENTRY:      '-' (' '|'\n')</span>
+        <span class="s3">return </span><span class="s0">self.peek(</span><span class="s5">1</span><span class="s0">) </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span>
+
+    <span class="s3">def </span><span class="s0">check_key(self):</span>
+
+        <span class="s1"># KEY(flow context):    '?'</span>
+        <span class="s3">if </span><span class="s0">self.flow_level:</span>
+            <span class="s3">return True</span>
+
+        <span class="s1"># KEY(block context):   '?' (' '|'\n')</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.peek(</span><span class="s5">1</span><span class="s0">) </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span>
+
+    <span class="s3">def </span><span class="s0">check_value(self):</span>
+
+        <span class="s1"># VALUE(flow context):  ':'</span>
+        <span class="s3">if </span><span class="s0">self.flow_level:</span>
+            <span class="s3">return True</span>
+
+        <span class="s1"># VALUE(block context): ':' (' '|'\n')</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">self.peek(</span><span class="s5">1</span><span class="s0">) </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span>
+
+    <span class="s3">def </span><span class="s0">check_plain(self):</span>
+
+        <span class="s1"># A plain scalar may start with any non-space character except:</span>
+        <span class="s1">#   '-', '?', ':', ',', '[', ']', '{', '}',</span>
+        <span class="s1">#   '#', '&amp;', '*', '!', '|', '&gt;', '\'', '\&quot;',</span>
+        <span class="s1">#   '%', '@', '`'.</span>
+        <span class="s1">#</span>
+        <span class="s1"># It may also start with</span>
+        <span class="s1">#   '-', '?', ':'</span>
+        <span class="s1"># if it is followed by a non-space character.</span>
+        <span class="s1">#</span>
+        <span class="s1"># Note that we limit the last rule to the block context (except the</span>
+        <span class="s1"># '-' character) because we want the flow context to be space</span>
+        <span class="s1"># independent.</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">return </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">-?:,[]{}#&amp;*!|&gt;</span><span class="s3">\'\&quot;</span><span class="s2">%@`'  </span><span class="s0">\</span>
+                <span class="s3">or </span><span class="s0">(self.peek(</span><span class="s5">1</span><span class="s0">) </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span>
+                        <span class="s3">and </span><span class="s0">(ch == </span><span class="s2">'-' </span><span class="s3">or </span><span class="s0">(</span><span class="s3">not </span><span class="s0">self.flow_level </span><span class="s3">and </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'?:'</span><span class="s0">)))</span>
+
+    <span class="s1"># Scanners.</span>
+
+    <span class="s3">def </span><span class="s0">scan_to_next_token(self):</span>
+        <span class="s1"># We ignore spaces, line breaks and comments.</span>
+        <span class="s1"># If we find a line break in the block context, we set the flag</span>
+        <span class="s1"># `allow_simple_key` on.</span>
+        <span class="s1"># The byte order mark is stripped if it's the first character in the</span>
+        <span class="s1"># stream. We do not yet support BOM inside the stream as the</span>
+        <span class="s1"># specification requires. Any such mark will be considered as a part</span>
+        <span class="s1"># of the document.</span>
+        <span class="s1">#</span>
+        <span class="s1"># TODO: We need to make tab handling rules more sane. A good rule is</span>
+        <span class="s1">#   Tabs cannot precede tokens</span>
+        <span class="s1">#   BLOCK-SEQUENCE-START, BLOCK-MAPPING-START, BLOCK-END,</span>
+        <span class="s1">#   KEY(block), VALUE(block), BLOCK-ENTRY</span>
+        <span class="s1"># So the checking code is</span>
+        <span class="s1">#   if &lt;TAB&gt;:</span>
+        <span class="s1">#       self.allow_simple_keys = False</span>
+        <span class="s1"># We also need to add the check for `allow_simple_keys == True` to</span>
+        <span class="s1"># `unwind_indent` before issuing BLOCK-END.</span>
+        <span class="s1"># Scanners for block, flow, and plain scalars need to be modified.</span>
+
+        <span class="s3">if </span><span class="s0">self.index == </span><span class="s5">0 </span><span class="s3">and </span><span class="s0">self.peek() == </span><span class="s2">'</span><span class="s3">\uFEFF</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s0">self.forward()</span>
+        <span class="s0">found = </span><span class="s3">False</span>
+        <span class="s3">while not </span><span class="s0">found:</span>
+            <span class="s3">while </span><span class="s0">self.peek() == </span><span class="s2">' '</span><span class="s0">:</span>
+                <span class="s0">self.forward()</span>
+            <span class="s3">if </span><span class="s0">self.peek() == </span><span class="s2">'#'</span><span class="s0">:</span>
+                <span class="s3">while </span><span class="s0">self.peek() </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s0">self.forward()</span>
+            <span class="s3">if </span><span class="s0">self.scan_line_break():</span>
+                <span class="s3">if not </span><span class="s0">self.flow_level:</span>
+                    <span class="s0">self.allow_simple_key = </span><span class="s3">True</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s0">found = </span><span class="s3">True</span>
+
+    <span class="s3">def </span><span class="s0">scan_directive(self):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">name = self.scan_directive_name(start_mark)</span>
+        <span class="s0">value = </span><span class="s3">None</span>
+        <span class="s3">if </span><span class="s0">name == </span><span class="s2">'YAML'</span><span class="s0">:</span>
+            <span class="s0">value = self.scan_yaml_directive_value(start_mark)</span>
+            <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s3">elif </span><span class="s0">name == </span><span class="s2">'TAG'</span><span class="s0">:</span>
+            <span class="s0">value = self.scan_tag_directive_value(start_mark)</span>
+            <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">end_mark = self.get_mark()</span>
+            <span class="s3">while </span><span class="s0">self.peek() </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">self.forward()</span>
+        <span class="s0">self.scan_directive_ignored_line(start_mark)</span>
+        <span class="s3">return </span><span class="s0">DirectiveToken(name</span><span class="s3">, </span><span class="s0">value</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">, </span><span class="s0">end_mark)</span>
+
+    <span class="s3">def </span><span class="s0">scan_directive_name(self</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">length = </span><span class="s5">0</span>
+        <span class="s0">ch = self.peek(length)</span>
+        <span class="s3">while </span><span class="s2">'0' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'9' </span><span class="s3">or </span><span class="s2">'A' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'Z' </span><span class="s3">or </span><span class="s2">'a' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'z'  </span><span class="s0">\</span>
+                <span class="s3">or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'-_'</span><span class="s0">:</span>
+            <span class="s0">length += </span><span class="s5">1</span>
+            <span class="s0">ch = self.peek(length)</span>
+        <span class="s3">if not </span><span class="s0">length:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a directive&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected alphabetic or numeric character, but found %r&quot;</span>
+                    <span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s0">value = self.prefix(length)</span>
+        <span class="s0">self.forward(length)</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0 \r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a directive&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected alphabetic or numeric character, but found %r&quot;</span>
+                    <span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s3">return </span><span class="s0">value</span>
+
+    <span class="s3">def </span><span class="s0">scan_yaml_directive_value(self</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s3">while </span><span class="s0">self.peek() == </span><span class="s2">' '</span><span class="s0">:</span>
+            <span class="s0">self.forward()</span>
+        <span class="s0">major = self.scan_yaml_directive_number(start_mark)</span>
+        <span class="s3">if </span><span class="s0">self.peek() != </span><span class="s2">'.'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a directive&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected a digit or '.', but found %r&quot; </span><span class="s0">% self.peek()</span><span class="s3">,</span>
+                    <span class="s0">self.get_mark())</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">minor = self.scan_yaml_directive_number(start_mark)</span>
+        <span class="s3">if </span><span class="s0">self.peek() </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0 \r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a directive&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected a digit or ' ', but found %r&quot; </span><span class="s0">% self.peek()</span><span class="s3">,</span>
+                    <span class="s0">self.get_mark())</span>
+        <span class="s3">return </span><span class="s0">(major</span><span class="s3">, </span><span class="s0">minor)</span>
+
+    <span class="s3">def </span><span class="s0">scan_yaml_directive_number(self</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if not </span><span class="s0">(</span><span class="s2">'0' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'9'</span><span class="s0">):</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a directive&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected a digit, but found %r&quot; </span><span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s0">length = </span><span class="s5">0</span>
+        <span class="s3">while </span><span class="s2">'0' </span><span class="s0">&lt;= self.peek(length) &lt;= </span><span class="s2">'9'</span><span class="s0">:</span>
+            <span class="s0">length += </span><span class="s5">1</span>
+        <span class="s0">value = int(self.prefix(length))</span>
+        <span class="s0">self.forward(length)</span>
+        <span class="s3">return </span><span class="s0">value</span>
+
+    <span class="s3">def </span><span class="s0">scan_tag_directive_value(self</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s3">while </span><span class="s0">self.peek() == </span><span class="s2">' '</span><span class="s0">:</span>
+            <span class="s0">self.forward()</span>
+        <span class="s0">handle = self.scan_tag_directive_handle(start_mark)</span>
+        <span class="s3">while </span><span class="s0">self.peek() == </span><span class="s2">' '</span><span class="s0">:</span>
+            <span class="s0">self.forward()</span>
+        <span class="s0">prefix = self.scan_tag_directive_prefix(start_mark)</span>
+        <span class="s3">return </span><span class="s0">(handle</span><span class="s3">, </span><span class="s0">prefix)</span>
+
+    <span class="s3">def </span><span class="s0">scan_tag_directive_handle(self</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">value = self.scan_tag_handle(</span><span class="s2">'directive'</span><span class="s3">, </span><span class="s0">start_mark)</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch != </span><span class="s2">' '</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a directive&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected ' ', but found %r&quot; </span><span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s3">return </span><span class="s0">value</span>
+
+    <span class="s3">def </span><span class="s0">scan_tag_directive_prefix(self</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">value = self.scan_tag_uri(</span><span class="s2">'directive'</span><span class="s3">, </span><span class="s0">start_mark)</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0 \r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a directive&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected ' ', but found %r&quot; </span><span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s3">return </span><span class="s0">value</span>
+
+    <span class="s3">def </span><span class="s0">scan_directive_ignored_line(self</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s3">while </span><span class="s0">self.peek() == </span><span class="s2">' '</span><span class="s0">:</span>
+            <span class="s0">self.forward()</span>
+        <span class="s3">if </span><span class="s0">self.peek() == </span><span class="s2">'#'</span><span class="s0">:</span>
+            <span class="s3">while </span><span class="s0">self.peek() </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">self.forward()</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a directive&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected a comment or a line break, but found %r&quot;</span>
+                        <span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s0">self.scan_line_break()</span>
+
+    <span class="s3">def </span><span class="s0">scan_anchor(self</span><span class="s3">, </span><span class="s0">TokenClass):</span>
+        <span class="s1"># The specification does not restrict characters for anchors and</span>
+        <span class="s1"># aliases. This may lead to problems, for instance, the document:</span>
+        <span class="s1">#   [ *alias, value ]</span>
+        <span class="s1"># can be interpreted in two ways, as</span>
+        <span class="s1">#   [ &quot;value&quot; ]</span>
+        <span class="s1"># and</span>
+        <span class="s1">#   [ *alias , &quot;value&quot; ]</span>
+        <span class="s1"># Therefore we restrict aliases to numbers and ASCII letters.</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">indicator = self.peek()</span>
+        <span class="s3">if </span><span class="s0">indicator == </span><span class="s2">'*'</span><span class="s0">:</span>
+            <span class="s0">name = </span><span class="s2">'alias'</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">name = </span><span class="s2">'anchor'</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">length = </span><span class="s5">0</span>
+        <span class="s0">ch = self.peek(length)</span>
+        <span class="s3">while </span><span class="s2">'0' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'9' </span><span class="s3">or </span><span class="s2">'A' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'Z' </span><span class="s3">or </span><span class="s2">'a' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'z'  </span><span class="s0">\</span>
+                <span class="s3">or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'-_'</span><span class="s0">:</span>
+            <span class="s0">length += </span><span class="s5">1</span>
+            <span class="s0">ch = self.peek(length)</span>
+        <span class="s3">if not </span><span class="s0">length:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning an %s&quot; </span><span class="s0">% name</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected alphabetic or numeric character, but found %r&quot;</span>
+                    <span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s0">value = self.prefix(length)</span>
+        <span class="s0">self.forward(length)</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">?:,]}%@`'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning an %s&quot; </span><span class="s0">% name</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected alphabetic or numeric character, but found %r&quot;</span>
+                    <span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s3">return </span><span class="s0">TokenClass(value</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">, </span><span class="s0">end_mark)</span>
+
+    <span class="s3">def </span><span class="s0">scan_tag(self):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">ch = self.peek(</span><span class="s5">1</span><span class="s0">)</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'&lt;'</span><span class="s0">:</span>
+            <span class="s0">handle = </span><span class="s3">None</span>
+            <span class="s0">self.forward(</span><span class="s5">2</span><span class="s0">)</span>
+            <span class="s0">suffix = self.scan_tag_uri(</span><span class="s2">'tag'</span><span class="s3">, </span><span class="s0">start_mark)</span>
+            <span class="s3">if </span><span class="s0">self.peek() != </span><span class="s2">'&gt;'</span><span class="s0">:</span>
+                <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while parsing a tag&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                        <span class="s2">&quot;expected '&gt;', but found %r&quot; </span><span class="s0">% self.peek()</span><span class="s3">,</span>
+                        <span class="s0">self.get_mark())</span>
+            <span class="s0">self.forward()</span>
+        <span class="s3">elif </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s0">handle = </span><span class="s3">None</span>
+            <span class="s0">suffix = </span><span class="s2">'!'</span>
+            <span class="s0">self.forward()</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">length = </span><span class="s5">1</span>
+            <span class="s0">use_handle = </span><span class="s3">False</span>
+            <span class="s3">while </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0 \r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'!'</span><span class="s0">:</span>
+                    <span class="s0">use_handle = </span><span class="s3">True</span>
+                    <span class="s3">break</span>
+                <span class="s0">length += </span><span class="s5">1</span>
+                <span class="s0">ch = self.peek(length)</span>
+            <span class="s0">handle = </span><span class="s2">'!'</span>
+            <span class="s3">if </span><span class="s0">use_handle:</span>
+                <span class="s0">handle = self.scan_tag_handle(</span><span class="s2">'tag'</span><span class="s3">, </span><span class="s0">start_mark)</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s0">handle = </span><span class="s2">'!'</span>
+                <span class="s0">self.forward()</span>
+            <span class="s0">suffix = self.scan_tag_uri(</span><span class="s2">'tag'</span><span class="s3">, </span><span class="s0">start_mark)</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0 \r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a tag&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected ' ', but found %r&quot; </span><span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s0">value = (handle</span><span class="s3">, </span><span class="s0">suffix)</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s3">return </span><span class="s0">TagToken(value</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">, </span><span class="s0">end_mark)</span>
+
+    <span class="s3">def </span><span class="s0">scan_block_scalar(self</span><span class="s3">, </span><span class="s0">style):</span>
+        <span class="s1"># See the specification for details.</span>
+
+        <span class="s3">if </span><span class="s0">style == </span><span class="s2">'&gt;'</span><span class="s0">:</span>
+            <span class="s0">folded = </span><span class="s3">True</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">folded = </span><span class="s3">False</span>
+
+        <span class="s0">chunks = []</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+
+        <span class="s1"># Scan the header.</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">chomping</span><span class="s3">, </span><span class="s0">increment = self.scan_block_scalar_indicators(start_mark)</span>
+        <span class="s0">self.scan_block_scalar_ignored_line(start_mark)</span>
+
+        <span class="s1"># Determine the indentation level and go to the first non-empty line.</span>
+        <span class="s0">min_indent = self.indent+</span><span class="s5">1</span>
+        <span class="s3">if </span><span class="s0">min_indent &lt; </span><span class="s5">1</span><span class="s0">:</span>
+            <span class="s0">min_indent = </span><span class="s5">1</span>
+        <span class="s3">if </span><span class="s0">increment </span><span class="s3">is None</span><span class="s0">:</span>
+            <span class="s0">breaks</span><span class="s3">, </span><span class="s0">max_indent</span><span class="s3">, </span><span class="s0">end_mark = self.scan_block_scalar_indentation()</span>
+            <span class="s0">indent = max(min_indent</span><span class="s3">, </span><span class="s0">max_indent)</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">indent = min_indent+increment-</span><span class="s5">1</span>
+            <span class="s0">breaks</span><span class="s3">, </span><span class="s0">end_mark = self.scan_block_scalar_breaks(indent)</span>
+        <span class="s0">line_break = </span><span class="s2">''</span>
+
+        <span class="s1"># Scan the inner part of the block scalar.</span>
+        <span class="s3">while </span><span class="s0">self.column == indent </span><span class="s3">and </span><span class="s0">self.peek() != </span><span class="s2">'</span><span class="s3">\0</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s0">chunks.extend(breaks)</span>
+            <span class="s0">leading_non_space = self.peek() </span><span class="s3">not in </span><span class="s2">' </span><span class="s3">\t</span><span class="s2">'</span>
+            <span class="s0">length = </span><span class="s5">0</span>
+            <span class="s3">while </span><span class="s0">self.peek(length) </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">length += </span><span class="s5">1</span>
+            <span class="s0">chunks.append(self.prefix(length))</span>
+            <span class="s0">self.forward(length)</span>
+            <span class="s0">line_break = self.scan_line_break()</span>
+            <span class="s0">breaks</span><span class="s3">, </span><span class="s0">end_mark = self.scan_block_scalar_breaks(indent)</span>
+            <span class="s3">if </span><span class="s0">self.column == indent </span><span class="s3">and </span><span class="s0">self.peek() != </span><span class="s2">'</span><span class="s3">\0</span><span class="s2">'</span><span class="s0">:</span>
+
+                <span class="s1"># Unfortunately, folding rules are ambiguous.</span>
+                <span class="s1">#</span>
+                <span class="s1"># This is the folding according to the specification:</span>
+                
+                <span class="s3">if </span><span class="s0">folded </span><span class="s3">and </span><span class="s0">line_break == </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'    </span><span class="s0">\</span>
+                        <span class="s3">and </span><span class="s0">leading_non_space </span><span class="s3">and </span><span class="s0">self.peek() </span><span class="s3">not in </span><span class="s2">' </span><span class="s3">\t</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s3">if not </span><span class="s0">breaks:</span>
+                        <span class="s0">chunks.append(</span><span class="s2">' '</span><span class="s0">)</span>
+                <span class="s3">else</span><span class="s0">:</span>
+                    <span class="s0">chunks.append(line_break)</span>
+                
+                <span class="s1"># This is Clark Evans's interpretation (also in the spec</span>
+                <span class="s1"># examples):</span>
+                <span class="s1">#</span>
+                <span class="s1">#if folded and line_break == '\n':</span>
+                <span class="s1">#    if not breaks:</span>
+                <span class="s1">#        if self.peek() not in ' \t':</span>
+                <span class="s1">#            chunks.append(' ')</span>
+                <span class="s1">#        else:</span>
+                <span class="s1">#            chunks.append(line_break)</span>
+                <span class="s1">#else:</span>
+                <span class="s1">#    chunks.append(line_break)</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s3">break</span>
+
+        <span class="s1"># Chomp the tail.</span>
+        <span class="s3">if </span><span class="s0">chomping </span><span class="s3">is not False</span><span class="s0">:</span>
+            <span class="s0">chunks.append(line_break)</span>
+        <span class="s3">if </span><span class="s0">chomping </span><span class="s3">is True</span><span class="s0">:</span>
+            <span class="s0">chunks.extend(breaks)</span>
+
+        <span class="s1"># We are done.</span>
+        <span class="s3">return </span><span class="s0">ScalarToken(</span><span class="s2">''</span><span class="s0">.join(chunks)</span><span class="s3">, False, </span><span class="s0">start_mark</span><span class="s3">, </span><span class="s0">end_mark</span><span class="s3">,</span>
+                <span class="s0">style)</span>
+
+    <span class="s3">def </span><span class="s0">scan_block_scalar_indicators(self</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">chomping = </span><span class="s3">None</span>
+        <span class="s0">increment = </span><span class="s3">None</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'+-'</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'+'</span><span class="s0">:</span>
+                <span class="s0">chomping = </span><span class="s3">True</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s0">chomping = </span><span class="s3">False</span>
+            <span class="s0">self.forward()</span>
+            <span class="s0">ch = self.peek()</span>
+            <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'0123456789'</span><span class="s0">:</span>
+                <span class="s0">increment = int(ch)</span>
+                <span class="s3">if </span><span class="s0">increment == </span><span class="s5">0</span><span class="s0">:</span>
+                    <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a block scalar&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                            <span class="s2">&quot;expected indentation indicator in the range 1-9, but found 0&quot;</span><span class="s3">,</span>
+                            <span class="s0">self.get_mark())</span>
+                <span class="s0">self.forward()</span>
+        <span class="s3">elif </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'0123456789'</span><span class="s0">:</span>
+            <span class="s0">increment = int(ch)</span>
+            <span class="s3">if </span><span class="s0">increment == </span><span class="s5">0</span><span class="s0">:</span>
+                <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a block scalar&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                        <span class="s2">&quot;expected indentation indicator in the range 1-9, but found 0&quot;</span><span class="s3">,</span>
+                        <span class="s0">self.get_mark())</span>
+            <span class="s0">self.forward()</span>
+            <span class="s0">ch = self.peek()</span>
+            <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'+-'</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'+'</span><span class="s0">:</span>
+                    <span class="s0">chomping = </span><span class="s3">True</span>
+                <span class="s3">else</span><span class="s0">:</span>
+                    <span class="s0">chomping = </span><span class="s3">False</span>
+                <span class="s0">self.forward()</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0 \r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a block scalar&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected chomping or indentation indicators, but found %r&quot;</span>
+                    <span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s3">return </span><span class="s0">chomping</span><span class="s3">, </span><span class="s0">increment</span>
+
+    <span class="s3">def </span><span class="s0">scan_block_scalar_ignored_line(self</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s3">while </span><span class="s0">self.peek() == </span><span class="s2">' '</span><span class="s0">:</span>
+            <span class="s0">self.forward()</span>
+        <span class="s3">if </span><span class="s0">self.peek() == </span><span class="s2">'#'</span><span class="s0">:</span>
+            <span class="s3">while </span><span class="s0">self.peek() </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">self.forward()</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\0\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a block scalar&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected a comment or a line break, but found %r&quot; </span><span class="s0">% ch</span><span class="s3">,</span>
+                    <span class="s0">self.get_mark())</span>
+        <span class="s0">self.scan_line_break()</span>
+
+    <span class="s3">def </span><span class="s0">scan_block_scalar_indentation(self):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">chunks = []</span>
+        <span class="s0">max_indent = </span><span class="s5">0</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s3">while </span><span class="s0">self.peek() </span><span class="s3">in </span><span class="s2">' </span><span class="s3">\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">self.peek() != </span><span class="s2">' '</span><span class="s0">:</span>
+                <span class="s0">chunks.append(self.scan_line_break())</span>
+                <span class="s0">end_mark = self.get_mark()</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s0">self.forward()</span>
+                <span class="s3">if </span><span class="s0">self.column &gt; max_indent:</span>
+                    <span class="s0">max_indent = self.column</span>
+        <span class="s3">return </span><span class="s0">chunks</span><span class="s3">, </span><span class="s0">max_indent</span><span class="s3">, </span><span class="s0">end_mark</span>
+
+    <span class="s3">def </span><span class="s0">scan_block_scalar_breaks(self</span><span class="s3">, </span><span class="s0">indent):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">chunks = []</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s3">while </span><span class="s0">self.column &lt; indent </span><span class="s3">and </span><span class="s0">self.peek() == </span><span class="s2">' '</span><span class="s0">:</span>
+            <span class="s0">self.forward()</span>
+        <span class="s3">while </span><span class="s0">self.peek() </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s0">chunks.append(self.scan_line_break())</span>
+            <span class="s0">end_mark = self.get_mark()</span>
+            <span class="s3">while </span><span class="s0">self.column &lt; indent </span><span class="s3">and </span><span class="s0">self.peek() == </span><span class="s2">' '</span><span class="s0">:</span>
+                <span class="s0">self.forward()</span>
+        <span class="s3">return </span><span class="s0">chunks</span><span class="s3">, </span><span class="s0">end_mark</span>
+
+    <span class="s3">def </span><span class="s0">scan_flow_scalar(self</span><span class="s3">, </span><span class="s0">style):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s1"># Note that we loose indentation rules for quoted scalars. Quoted</span>
+        <span class="s1"># scalars don't need to adhere indentation because &quot; and ' clearly</span>
+        <span class="s1"># mark the beginning and the end of them. Therefore we are less</span>
+        <span class="s1"># restrictive then the specification requires. We only need to check</span>
+        <span class="s1"># that document separators are not included in scalars.</span>
+        <span class="s3">if </span><span class="s0">style == </span><span class="s2">'&quot;'</span><span class="s0">:</span>
+            <span class="s0">double = </span><span class="s3">True</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">double = </span><span class="s3">False</span>
+        <span class="s0">chunks = []</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">quote = self.peek()</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">chunks.extend(self.scan_flow_scalar_non_spaces(double</span><span class="s3">, </span><span class="s0">start_mark))</span>
+        <span class="s3">while </span><span class="s0">self.peek() != quote:</span>
+            <span class="s0">chunks.extend(self.scan_flow_scalar_spaces(double</span><span class="s3">, </span><span class="s0">start_mark))</span>
+            <span class="s0">chunks.extend(self.scan_flow_scalar_non_spaces(double</span><span class="s3">, </span><span class="s0">start_mark))</span>
+        <span class="s0">self.forward()</span>
+        <span class="s0">end_mark = self.get_mark()</span>
+        <span class="s3">return </span><span class="s0">ScalarToken(</span><span class="s2">''</span><span class="s0">.join(chunks)</span><span class="s3">, False, </span><span class="s0">start_mark</span><span class="s3">, </span><span class="s0">end_mark</span><span class="s3">,</span>
+                <span class="s0">style)</span>
+
+    <span class="s0">ESCAPE_REPLACEMENTS = {</span>
+        <span class="s2">'0'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\0</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'a'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\x07</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'b'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\x08</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'t'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\x09</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\t</span><span class="s2">'</span><span class="s0">:   </span><span class="s2">'</span><span class="s3">\x09</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'n'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\x0A</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'v'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\x0B</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'f'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\x0C</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'r'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\x0D</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'e'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\x1B</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">' '</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\x20</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\&quot;</span><span class="s2">'</span><span class="s0">:   </span><span class="s2">'</span><span class="s3">\&quot;</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\\</span><span class="s2">'</span><span class="s0">:   </span><span class="s2">'</span><span class="s3">\\</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'/'</span><span class="s0">:    </span><span class="s2">'/'</span><span class="s3">,</span>
+        <span class="s2">'N'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\x85</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'_'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\xA0</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'L'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\u2028</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'P'</span><span class="s0">:    </span><span class="s2">'</span><span class="s3">\u2029</span><span class="s2">'</span><span class="s3">,</span>
+    <span class="s0">}</span>
+
+    <span class="s0">ESCAPE_CODES = {</span>
+        <span class="s2">'x'</span><span class="s0">:    </span><span class="s5">2</span><span class="s3">,</span>
+        <span class="s2">'u'</span><span class="s0">:    </span><span class="s5">4</span><span class="s3">,</span>
+        <span class="s2">'U'</span><span class="s0">:    </span><span class="s5">8</span><span class="s3">,</span>
+    <span class="s0">}</span>
+
+    <span class="s3">def </span><span class="s0">scan_flow_scalar_non_spaces(self</span><span class="s3">, </span><span class="s0">double</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">chunks = []</span>
+        <span class="s3">while True</span><span class="s0">:</span>
+            <span class="s0">length = </span><span class="s5">0</span>
+            <span class="s3">while </span><span class="s0">self.peek(length) </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\'\&quot;\\\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">length += </span><span class="s5">1</span>
+            <span class="s3">if </span><span class="s0">length:</span>
+                <span class="s0">chunks.append(self.prefix(length))</span>
+                <span class="s0">self.forward(length)</span>
+            <span class="s0">ch = self.peek()</span>
+            <span class="s3">if not </span><span class="s0">double </span><span class="s3">and </span><span class="s0">ch == </span><span class="s2">'</span><span class="s3">\'</span><span class="s2">' </span><span class="s3">and </span><span class="s0">self.peek(</span><span class="s5">1</span><span class="s0">) == </span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">chunks.append(</span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span><span class="s0">)</span>
+                <span class="s0">self.forward(</span><span class="s5">2</span><span class="s0">)</span>
+            <span class="s3">elif </span><span class="s0">(double </span><span class="s3">and </span><span class="s0">ch == </span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span><span class="s0">) </span><span class="s3">or </span><span class="s0">(</span><span class="s3">not </span><span class="s0">double </span><span class="s3">and </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\&quot;\\</span><span class="s2">'</span><span class="s0">):</span>
+                <span class="s0">chunks.append(ch)</span>
+                <span class="s0">self.forward()</span>
+            <span class="s3">elif </span><span class="s0">double </span><span class="s3">and </span><span class="s0">ch == </span><span class="s2">'</span><span class="s3">\\</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">self.forward()</span>
+                <span class="s0">ch = self.peek()</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s0">self.ESCAPE_REPLACEMENTS:</span>
+                    <span class="s0">chunks.append(self.ESCAPE_REPLACEMENTS[ch])</span>
+                    <span class="s0">self.forward()</span>
+                <span class="s3">elif </span><span class="s0">ch </span><span class="s3">in </span><span class="s0">self.ESCAPE_CODES:</span>
+                    <span class="s0">length = self.ESCAPE_CODES[ch]</span>
+                    <span class="s0">self.forward()</span>
+                    <span class="s3">for </span><span class="s0">k </span><span class="s3">in </span><span class="s0">range(length):</span>
+                        <span class="s3">if </span><span class="s0">self.peek(k) </span><span class="s3">not in </span><span class="s2">'0123456789ABCDEFabcdef'</span><span class="s0">:</span>
+                            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a double-quoted scalar&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                                    <span class="s2">&quot;expected escape sequence of %d hexadecimal numbers, but found %r&quot; </span><span class="s0">%</span>
+                                        <span class="s0">(length</span><span class="s3">, </span><span class="s0">self.peek(k))</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+                    <span class="s0">code = int(self.prefix(length)</span><span class="s3">, </span><span class="s5">16</span><span class="s0">)</span>
+                    <span class="s0">chunks.append(chr(code))</span>
+                    <span class="s0">self.forward(length)</span>
+                <span class="s3">elif </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s0">self.scan_line_break()</span>
+                    <span class="s0">chunks.extend(self.scan_flow_scalar_breaks(double</span><span class="s3">, </span><span class="s0">start_mark))</span>
+                <span class="s3">else</span><span class="s0">:</span>
+                    <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a double-quoted scalar&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                            <span class="s2">&quot;found unknown escape character %r&quot; </span><span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s3">return </span><span class="s0">chunks</span>
+
+    <span class="s3">def </span><span class="s0">scan_flow_scalar_spaces(self</span><span class="s3">, </span><span class="s0">double</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">chunks = []</span>
+        <span class="s0">length = </span><span class="s5">0</span>
+        <span class="s3">while </span><span class="s0">self.peek(length) </span><span class="s3">in </span><span class="s2">' </span><span class="s3">\t</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s0">length += </span><span class="s5">1</span>
+        <span class="s0">whitespaces = self.prefix(length)</span>
+        <span class="s0">self.forward(length)</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'</span><span class="s3">\0</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a quoted scalar&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;found unexpected end of stream&quot;</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s3">elif </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s0">line_break = self.scan_line_break()</span>
+            <span class="s0">breaks = self.scan_flow_scalar_breaks(double</span><span class="s3">, </span><span class="s0">start_mark)</span>
+            <span class="s3">if </span><span class="s0">line_break != </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">chunks.append(line_break)</span>
+            <span class="s3">elif not </span><span class="s0">breaks:</span>
+                <span class="s0">chunks.append(</span><span class="s2">' '</span><span class="s0">)</span>
+            <span class="s0">chunks.extend(breaks)</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">chunks.append(whitespaces)</span>
+        <span class="s3">return </span><span class="s0">chunks</span>
+
+    <span class="s3">def </span><span class="s0">scan_flow_scalar_breaks(self</span><span class="s3">, </span><span class="s0">double</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">chunks = []</span>
+        <span class="s3">while True</span><span class="s0">:</span>
+            <span class="s1"># Instead of checking indentation, we check for document</span>
+            <span class="s1"># separators.</span>
+            <span class="s0">prefix = self.prefix(</span><span class="s5">3</span><span class="s0">)</span>
+            <span class="s3">if </span><span class="s0">(prefix == </span><span class="s2">'---' </span><span class="s3">or </span><span class="s0">prefix == </span><span class="s2">'...'</span><span class="s0">)   \</span>
+                    <span class="s3">and </span><span class="s0">self.peek(</span><span class="s5">3</span><span class="s0">) </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a quoted scalar&quot;</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                        <span class="s2">&quot;found unexpected document separator&quot;</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+            <span class="s3">while </span><span class="s0">self.peek() </span><span class="s3">in </span><span class="s2">' </span><span class="s3">\t</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">self.forward()</span>
+            <span class="s3">if </span><span class="s0">self.peek() </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">chunks.append(self.scan_line_break())</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s3">return </span><span class="s0">chunks</span>
+
+    <span class="s3">def </span><span class="s0">scan_plain(self):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s1"># We add an additional restriction for the flow context:</span>
+        <span class="s1">#   plain scalars in the flow context cannot contain ',' or '?'.</span>
+        <span class="s1"># We also keep track of the `allow_simple_key` flag here.</span>
+        <span class="s1"># Indentation rules are loosed for the flow context.</span>
+        <span class="s0">chunks = []</span>
+        <span class="s0">start_mark = self.get_mark()</span>
+        <span class="s0">end_mark = start_mark</span>
+        <span class="s0">indent = self.indent+</span><span class="s5">1</span>
+        <span class="s1"># We allow zero indentation for scalars, but then we need to check for</span>
+        <span class="s1"># document separators at the beginning of the line.</span>
+        <span class="s1">#if indent == 0:</span>
+        <span class="s1">#    indent = 1</span>
+        <span class="s0">spaces = []</span>
+        <span class="s3">while True</span><span class="s0">:</span>
+            <span class="s0">length = </span><span class="s5">0</span>
+            <span class="s3">if </span><span class="s0">self.peek() == </span><span class="s2">'#'</span><span class="s0">:</span>
+                <span class="s3">break</span>
+            <span class="s3">while True</span><span class="s0">:</span>
+                <span class="s0">ch = self.peek(length)</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'    </span><span class="s0">\</span>
+                        <span class="s3">or </span><span class="s0">(ch == </span><span class="s2">':' </span><span class="s3">and</span>
+                                <span class="s0">self.peek(length+</span><span class="s5">1</span><span class="s0">) </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span>
+                                      <span class="s0">+ (</span><span class="s2">u',[]{}' </span><span class="s3">if </span><span class="s0">self.flow_level </span><span class="s3">else </span><span class="s2">u''</span><span class="s0">))\</span>
+                        <span class="s3">or </span><span class="s0">(self.flow_level </span><span class="s3">and </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">',?[]{}'</span><span class="s0">):</span>
+                    <span class="s3">break</span>
+                <span class="s0">length += </span><span class="s5">1</span>
+            <span class="s3">if </span><span class="s0">length == </span><span class="s5">0</span><span class="s0">:</span>
+                <span class="s3">break</span>
+            <span class="s0">self.allow_simple_key = </span><span class="s3">False</span>
+            <span class="s0">chunks.extend(spaces)</span>
+            <span class="s0">chunks.append(self.prefix(length))</span>
+            <span class="s0">self.forward(length)</span>
+            <span class="s0">end_mark = self.get_mark()</span>
+            <span class="s0">spaces = self.scan_plain_spaces(indent</span><span class="s3">, </span><span class="s0">start_mark)</span>
+            <span class="s3">if not </span><span class="s0">spaces </span><span class="s3">or </span><span class="s0">self.peek() == </span><span class="s2">'#' </span><span class="s0">\</span>
+                    <span class="s3">or </span><span class="s0">(</span><span class="s3">not </span><span class="s0">self.flow_level </span><span class="s3">and </span><span class="s0">self.column &lt; indent):</span>
+                <span class="s3">break</span>
+        <span class="s3">return </span><span class="s0">ScalarToken(</span><span class="s2">''</span><span class="s0">.join(chunks)</span><span class="s3">, True, </span><span class="s0">start_mark</span><span class="s3">, </span><span class="s0">end_mark)</span>
+
+    <span class="s3">def </span><span class="s0">scan_plain_spaces(self</span><span class="s3">, </span><span class="s0">indent</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s1"># The specification is really confusing about tabs in plain scalars.</span>
+        <span class="s1"># We just forbid them completely. Do not use tabs in YAML!</span>
+        <span class="s0">chunks = []</span>
+        <span class="s0">length = </span><span class="s5">0</span>
+        <span class="s3">while </span><span class="s0">self.peek(length) </span><span class="s3">in </span><span class="s2">' '</span><span class="s0">:</span>
+            <span class="s0">length += </span><span class="s5">1</span>
+        <span class="s0">whitespaces = self.prefix(length)</span>
+        <span class="s0">self.forward(length)</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s0">line_break = self.scan_line_break()</span>
+            <span class="s0">self.allow_simple_key = </span><span class="s3">True</span>
+            <span class="s0">prefix = self.prefix(</span><span class="s5">3</span><span class="s0">)</span>
+            <span class="s3">if </span><span class="s0">(prefix == </span><span class="s2">'---' </span><span class="s3">or </span><span class="s0">prefix == </span><span class="s2">'...'</span><span class="s0">)   \</span>
+                    <span class="s3">and </span><span class="s0">self.peek(</span><span class="s5">3</span><span class="s0">) </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s3">return</span>
+            <span class="s0">breaks = []</span>
+            <span class="s3">while </span><span class="s0">self.peek() </span><span class="s3">in </span><span class="s2">' </span><span class="s3">\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">self.peek() == </span><span class="s2">' '</span><span class="s0">:</span>
+                    <span class="s0">self.forward()</span>
+                <span class="s3">else</span><span class="s0">:</span>
+                    <span class="s0">breaks.append(self.scan_line_break())</span>
+                    <span class="s0">prefix = self.prefix(</span><span class="s5">3</span><span class="s0">)</span>
+                    <span class="s3">if </span><span class="s0">(prefix == </span><span class="s2">'---' </span><span class="s3">or </span><span class="s0">prefix == </span><span class="s2">'...'</span><span class="s0">)   \</span>
+                            <span class="s3">and </span><span class="s0">self.peek(</span><span class="s5">3</span><span class="s0">) </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                        <span class="s3">return</span>
+            <span class="s3">if </span><span class="s0">line_break != </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">chunks.append(line_break)</span>
+            <span class="s3">elif not </span><span class="s0">breaks:</span>
+                <span class="s0">chunks.append(</span><span class="s2">' '</span><span class="s0">)</span>
+            <span class="s0">chunks.extend(breaks)</span>
+        <span class="s3">elif </span><span class="s0">whitespaces:</span>
+            <span class="s0">chunks.append(whitespaces)</span>
+        <span class="s3">return </span><span class="s0">chunks</span>
+
+    <span class="s3">def </span><span class="s0">scan_tag_handle(self</span><span class="s3">, </span><span class="s0">name</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s1"># For some strange reasons, the specification does not allow '_' in</span>
+        <span class="s1"># tag handles. I have allowed it anyway.</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch != </span><span class="s2">'!'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a %s&quot; </span><span class="s0">% name</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected '!', but found %r&quot; </span><span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s0">length = </span><span class="s5">1</span>
+        <span class="s0">ch = self.peek(length)</span>
+        <span class="s3">if </span><span class="s0">ch != </span><span class="s2">' '</span><span class="s0">:</span>
+            <span class="s3">while </span><span class="s2">'0' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'9' </span><span class="s3">or </span><span class="s2">'A' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'Z' </span><span class="s3">or </span><span class="s2">'a' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'z'  </span><span class="s0">\</span>
+                    <span class="s3">or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'-_'</span><span class="s0">:</span>
+                <span class="s0">length += </span><span class="s5">1</span>
+                <span class="s0">ch = self.peek(length)</span>
+            <span class="s3">if </span><span class="s0">ch != </span><span class="s2">'!'</span><span class="s0">:</span>
+                <span class="s0">self.forward(length)</span>
+                <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a %s&quot; </span><span class="s0">% name</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                        <span class="s2">&quot;expected '!', but found %r&quot; </span><span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+            <span class="s0">length += </span><span class="s5">1</span>
+        <span class="s0">value = self.prefix(length)</span>
+        <span class="s0">self.forward(length)</span>
+        <span class="s3">return </span><span class="s0">value</span>
+
+    <span class="s3">def </span><span class="s0">scan_tag_uri(self</span><span class="s3">, </span><span class="s0">name</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s1"># Note: we do not check if URI is well-formed.</span>
+        <span class="s0">chunks = []</span>
+        <span class="s0">length = </span><span class="s5">0</span>
+        <span class="s0">ch = self.peek(length)</span>
+        <span class="s3">while </span><span class="s2">'0' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'9' </span><span class="s3">or </span><span class="s2">'A' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'Z' </span><span class="s3">or </span><span class="s2">'a' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'z'  </span><span class="s0">\</span>
+                <span class="s3">or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'-;/?:@&amp;=+$,_.!~*</span><span class="s3">\'</span><span class="s2">()[]%'</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'%'</span><span class="s0">:</span>
+                <span class="s0">chunks.append(self.prefix(length))</span>
+                <span class="s0">self.forward(length)</span>
+                <span class="s0">length = </span><span class="s5">0</span>
+                <span class="s0">chunks.append(self.scan_uri_escapes(name</span><span class="s3">, </span><span class="s0">start_mark))</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s0">length += </span><span class="s5">1</span>
+            <span class="s0">ch = self.peek(length)</span>
+        <span class="s3">if </span><span class="s0">length:</span>
+            <span class="s0">chunks.append(self.prefix(length))</span>
+            <span class="s0">self.forward(length)</span>
+            <span class="s0">length = </span><span class="s5">0</span>
+        <span class="s3">if not </span><span class="s0">chunks:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while parsing a %s&quot; </span><span class="s0">% name</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                    <span class="s2">&quot;expected URI, but found %r&quot; </span><span class="s0">% ch</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+        <span class="s3">return </span><span class="s2">''</span><span class="s0">.join(chunks)</span>
+
+    <span class="s3">def </span><span class="s0">scan_uri_escapes(self</span><span class="s3">, </span><span class="s0">name</span><span class="s3">, </span><span class="s0">start_mark):</span>
+        <span class="s1"># See the specification for details.</span>
+        <span class="s0">codes = []</span>
+        <span class="s0">mark = self.get_mark()</span>
+        <span class="s3">while </span><span class="s0">self.peek() == </span><span class="s2">'%'</span><span class="s0">:</span>
+            <span class="s0">self.forward()</span>
+            <span class="s3">for </span><span class="s0">k </span><span class="s3">in </span><span class="s0">range(</span><span class="s5">2</span><span class="s0">):</span>
+                <span class="s3">if </span><span class="s0">self.peek(k) </span><span class="s3">not in </span><span class="s2">'0123456789ABCDEFabcdef'</span><span class="s0">:</span>
+                    <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a %s&quot; </span><span class="s0">% name</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">,</span>
+                            <span class="s2">&quot;expected URI escape sequence of 2 hexadecimal numbers, but found %r&quot;</span>
+                            <span class="s0">% self.peek(k)</span><span class="s3">, </span><span class="s0">self.get_mark())</span>
+            <span class="s0">codes.append(int(self.prefix(</span><span class="s5">2</span><span class="s0">)</span><span class="s3">, </span><span class="s5">16</span><span class="s0">))</span>
+            <span class="s0">self.forward(</span><span class="s5">2</span><span class="s0">)</span>
+        <span class="s3">try</span><span class="s0">:</span>
+            <span class="s0">value = bytes(codes).decode(</span><span class="s2">'utf-8'</span><span class="s0">)</span>
+        <span class="s3">except </span><span class="s0">UnicodeDecodeError </span><span class="s3">as </span><span class="s0">exc:</span>
+            <span class="s3">raise </span><span class="s0">ScannerError(</span><span class="s2">&quot;while scanning a %s&quot; </span><span class="s0">% name</span><span class="s3">, </span><span class="s0">start_mark</span><span class="s3">, </span><span class="s0">str(exc)</span><span class="s3">, </span><span class="s0">mark)</span>
+        <span class="s3">return </span><span class="s0">value</span>
+
+    <span class="s3">def </span><span class="s0">scan_line_break(self):</span>
+        <span class="s1"># Transforms:</span>
+        <span class="s1">#   '\r\n'      :   '\n'</span>
+        <span class="s1">#   '\r'        :   '\n'</span>
+        <span class="s1">#   '\n'        :   '\n'</span>
+        <span class="s1">#   '\x85'      :   '\n'</span>
+        <span class="s1">#   '\u2028'    :   '\u2028'</span>
+        <span class="s1">#   '\u2029     :   '\u2029'</span>
+        <span class="s1">#   default     :   ''</span>
+        <span class="s0">ch = self.peek()</span>
+        <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\r\n\x85</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">self.prefix(</span><span class="s5">2</span><span class="s0">) == </span><span class="s2">'</span><span class="s3">\r\n</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">self.forward(</span><span class="s5">2</span><span class="s0">)</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s0">self.forward()</span>
+            <span class="s3">return </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span>
+        <span class="s3">elif </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s0">self.forward()</span>
+            <span class="s3">return </span><span class="s0">ch</span>
+        <span class="s3">return </span><span class="s2">''</span>
+</pre>
+</body>
+</html>

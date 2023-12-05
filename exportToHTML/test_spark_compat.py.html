@@ -1,0 +1,223 @@
+<html>
+<head>
+<title>test_spark_compat.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_spark_compat.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">decimal</span>
+<span class="s0">import </span><span class="s1">signal</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">threading</span>
+
+<span class="s0">import </span><span class="s1">pytest</span>
+
+<span class="s0">from </span><span class="s1">dask.datasets </span><span class="s0">import </span><span class="s1">timeseries</span>
+
+<span class="s1">dd = pytest.importorskip(</span><span class="s2">&quot;dask.dataframe&quot;</span><span class="s1">)</span>
+<span class="s1">pyspark = pytest.importorskip(</span><span class="s2">&quot;pyspark&quot;</span><span class="s1">)</span>
+<span class="s1">pa = pytest.importorskip(</span><span class="s2">&quot;pyarrow&quot;</span><span class="s1">)</span>
+<span class="s1">pytest.importorskip(</span><span class="s2">&quot;fastparquet&quot;</span><span class="s1">)</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">pandas </span><span class="s0">as </span><span class="s1">pd</span>
+
+<span class="s0">from </span><span class="s1">dask.dataframe._compat </span><span class="s0">import </span><span class="s1">PANDAS_GE_150</span><span class="s0">, </span><span class="s1">PANDAS_GE_200</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.utils </span><span class="s0">import </span><span class="s1">assert_eq</span>
+
+<span class="s1">pytestmark = [</span>
+    <span class="s1">pytest.mark.skipif(</span>
+        <span class="s1">sys.platform != </span><span class="s2">&quot;linux&quot;</span><span class="s0">,</span>
+        <span class="s1">reason=</span><span class="s2">&quot;Unnecessary, and hard to get spark working on non-linux platforms&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span><span class="s0">,</span>
+    <span class="s1">pytest.mark.skipif(</span>
+        <span class="s1">PANDAS_GE_200</span><span class="s0">,</span>
+        <span class="s1">reason=</span><span class="s2">&quot;pyspark doesn't yet have support for pandas 2.0&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span><span class="s0">,</span>
+    <span class="s3"># we only test with pyarrow strings and pandas 2.0</span>
+    <span class="s1">pytest.mark.skip_with_pyarrow_strings</span><span class="s0">,  </span><span class="s3"># pyspark doesn't support pandas 2.0</span>
+<span class="s1">]</span>
+
+<span class="s3"># pyspark auto-converts timezones -- round-tripping timestamps is easier if</span>
+<span class="s3"># we set everything to UTC.</span>
+<span class="s1">pdf = timeseries(freq=</span><span class="s2">&quot;1h&quot;</span><span class="s1">).compute()</span>
+<span class="s1">pdf.index = pdf.index.tz_localize(</span><span class="s2">&quot;UTC&quot;</span><span class="s1">)</span>
+<span class="s1">pdf = pdf.reset_index()</span>
+
+
+<span class="s1">@pytest.fixture(scope=</span><span class="s2">&quot;module&quot;</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">spark_session():</span>
+    <span class="s3"># Spark registers a global signal handler that can cause problems elsewhere</span>
+    <span class="s3"># in the test suite. In particular, the handler fails if the spark session</span>
+    <span class="s3"># is stopped (a bug in pyspark).</span>
+    <span class="s1">prev = signal.getsignal(signal.SIGINT)</span>
+    <span class="s3"># Create a spark session. Note that we set the timezone to UTC to avoid</span>
+    <span class="s3"># conversion to local time when reading parquet files.</span>
+    <span class="s1">spark = (</span>
+        <span class="s1">pyspark.sql.SparkSession.builder.master(</span><span class="s2">&quot;local&quot;</span><span class="s1">)</span>
+        <span class="s1">.appName(</span><span class="s2">&quot;Dask Testing&quot;</span><span class="s1">)</span>
+        <span class="s1">.config(</span><span class="s2">&quot;spark.sql.session.timeZone&quot;</span><span class="s0">, </span><span class="s2">&quot;UTC&quot;</span><span class="s1">)</span>
+        <span class="s1">.getOrCreate()</span>
+    <span class="s1">)</span>
+    <span class="s0">yield </span><span class="s1">spark</span>
+
+    <span class="s1">spark.stop()</span>
+    <span class="s3"># Make sure we get rid of the signal once we leave stop the session.</span>
+    <span class="s0">if </span><span class="s1">threading.current_thread() </span><span class="s0">is </span><span class="s1">threading.main_thread():</span>
+        <span class="s1">signal.signal(signal.SIGINT</span><span class="s0">, </span><span class="s1">prev)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s2">&quot;npartitions&quot;</span><span class="s0">, </span><span class="s1">(</span><span class="s4">1</span><span class="s0">, </span><span class="s4">5</span><span class="s0">, </span><span class="s4">10</span><span class="s1">))</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s2">&quot;engine&quot;</span><span class="s0">, </span><span class="s1">(</span><span class="s2">&quot;pyarrow&quot;</span><span class="s0">, </span><span class="s2">&quot;fastparquet&quot;</span><span class="s1">))</span>
+<span class="s0">def </span><span class="s1">test_roundtrip_parquet_spark_to_dask(spark_session</span><span class="s0">, </span><span class="s1">npartitions</span><span class="s0">, </span><span class="s1">tmpdir</span><span class="s0">, </span><span class="s1">engine):</span>
+    <span class="s1">tmpdir = str(tmpdir)</span>
+
+    <span class="s1">sdf = spark_session.createDataFrame(pdf)</span>
+    <span class="s3"># We are not overwriting any data, but spark complains if the directory</span>
+    <span class="s3"># already exists (as tmpdir does) and we don't set overwrite</span>
+    <span class="s1">sdf.repartition(npartitions).write.parquet(tmpdir</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;overwrite&quot;</span><span class="s1">)</span>
+
+    <span class="s1">ddf = dd.read_parquet(tmpdir</span><span class="s0">, </span><span class="s1">engine=engine)</span>
+    <span class="s3"># Papercut: pandas TZ localization doesn't survive roundtrip</span>
+    <span class="s1">ddf = ddf.assign(timestamp=ddf.timestamp.dt.tz_localize(</span><span class="s2">&quot;UTC&quot;</span><span class="s1">))</span>
+    <span class="s0">assert </span><span class="s1">ddf.npartitions == npartitions</span>
+
+    <span class="s1">assert_eq(ddf</span><span class="s0">, </span><span class="s1">pdf</span><span class="s0">, </span><span class="s1">check_index=</span><span class="s0">False</span><span class="s1">)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s2">&quot;engine&quot;</span><span class="s0">, </span><span class="s1">(</span><span class="s2">&quot;pyarrow&quot;</span><span class="s0">, </span><span class="s2">&quot;fastparquet&quot;</span><span class="s1">))</span>
+<span class="s0">def </span><span class="s1">test_roundtrip_hive_parquet_spark_to_dask(spark_session</span><span class="s0">, </span><span class="s1">tmpdir</span><span class="s0">, </span><span class="s1">engine):</span>
+    <span class="s1">tmpdir = str(tmpdir)</span>
+
+    <span class="s1">sdf = spark_session.createDataFrame(pdf)</span>
+    <span class="s3"># not overwriting any data, but spark complains if the directory</span>
+    <span class="s3"># already exists and we don't set overwrite</span>
+    <span class="s1">sdf.write.parquet(tmpdir</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;overwrite&quot;</span><span class="s0">, </span><span class="s1">partitionBy=</span><span class="s2">&quot;name&quot;</span><span class="s1">)</span>
+
+    <span class="s1">ddf = dd.read_parquet(tmpdir</span><span class="s0">, </span><span class="s1">engine=engine)</span>
+    <span class="s3"># Papercut: pandas TZ localization doesn't survive roundtrip</span>
+    <span class="s1">ddf = ddf.assign(timestamp=ddf.timestamp.dt.tz_localize(</span><span class="s2">&quot;UTC&quot;</span><span class="s1">))</span>
+
+    <span class="s3"># Partitioning can change the column order. This is mostly okay,</span>
+    <span class="s3"># but we sort them here to ease comparison</span>
+    <span class="s1">ddf = ddf.compute().sort_index(axis=</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s3"># Dask automatically converts hive-partitioned columns to categories.</span>
+    <span class="s3"># This is fine, but convert back to strings for comparison.</span>
+    <span class="s1">ddf = ddf.assign(name=ddf.name.astype(</span><span class="s2">&quot;str&quot;</span><span class="s1">))</span>
+
+    <span class="s1">assert_eq(ddf</span><span class="s0">, </span><span class="s1">pdf.sort_index(axis=</span><span class="s4">1</span><span class="s1">)</span><span class="s0">, </span><span class="s1">check_index=</span><span class="s0">False</span><span class="s1">)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s2">&quot;npartitions&quot;</span><span class="s0">, </span><span class="s1">(</span><span class="s4">1</span><span class="s0">, </span><span class="s4">5</span><span class="s0">, </span><span class="s4">10</span><span class="s1">))</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s2">&quot;engine&quot;</span><span class="s0">, </span><span class="s1">(</span><span class="s2">&quot;pyarrow&quot;</span><span class="s0">, </span><span class="s2">&quot;fastparquet&quot;</span><span class="s1">))</span>
+<span class="s0">def </span><span class="s1">test_roundtrip_parquet_dask_to_spark(spark_session</span><span class="s0">, </span><span class="s1">npartitions</span><span class="s0">, </span><span class="s1">tmpdir</span><span class="s0">, </span><span class="s1">engine):</span>
+    <span class="s1">tmpdir = str(tmpdir)</span>
+    <span class="s1">ddf = dd.from_pandas(pdf</span><span class="s0">, </span><span class="s1">npartitions=npartitions)</span>
+
+    <span class="s3"># Papercut: https://github.com/dask/fastparquet/issues/646#issuecomment-885614324</span>
+    <span class="s1">kwargs = {</span><span class="s2">&quot;times&quot;</span><span class="s1">: </span><span class="s2">&quot;int96&quot;</span><span class="s1">} </span><span class="s0">if </span><span class="s1">engine == </span><span class="s2">&quot;fastparquet&quot; </span><span class="s0">else </span><span class="s1">{}</span>
+
+    <span class="s1">ddf.to_parquet(tmpdir</span><span class="s0">, </span><span class="s1">engine=engine</span><span class="s0">, </span><span class="s1">write_index=</span><span class="s0">False, </span><span class="s1">**kwargs)</span>
+
+    <span class="s1">sdf = spark_session.read.parquet(tmpdir)</span>
+    <span class="s1">sdf = sdf.toPandas()</span>
+
+    <span class="s3"># Papercut: pandas TZ localization doesn't survive roundtrip</span>
+    <span class="s1">sdf = sdf.assign(timestamp=sdf.timestamp.dt.tz_localize(</span><span class="s2">&quot;UTC&quot;</span><span class="s1">))</span>
+
+    <span class="s1">assert_eq(sdf</span><span class="s0">, </span><span class="s1">ddf</span><span class="s0">, </span><span class="s1">check_index=</span><span class="s0">False</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">test_roundtrip_parquet_spark_to_dask_extension_dtypes(spark_session</span><span class="s0">, </span><span class="s1">tmpdir):</span>
+    <span class="s1">tmpdir = str(tmpdir)</span>
+    <span class="s1">npartitions = </span><span class="s4">5</span>
+
+    <span class="s1">size = </span><span class="s4">20</span>
+    <span class="s1">pdf = pd.DataFrame(</span>
+        <span class="s1">{</span>
+            <span class="s2">&quot;a&quot;</span><span class="s1">: range(size)</span><span class="s0">,</span>
+            <span class="s2">&quot;b&quot;</span><span class="s1">: np.random.random(size=size)</span><span class="s0">,</span>
+            <span class="s2">&quot;c&quot;</span><span class="s1">: [</span><span class="s0">True, False</span><span class="s1">] * (size // </span><span class="s4">2</span><span class="s1">)</span><span class="s0">,</span>
+            <span class="s2">&quot;d&quot;</span><span class="s1">: [</span><span class="s2">&quot;alice&quot;</span><span class="s0">, </span><span class="s2">&quot;bob&quot;</span><span class="s1">] * (size // </span><span class="s4">2</span><span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">}</span>
+    <span class="s1">)</span>
+    <span class="s3"># Note: since we set dtype_backend=&quot;numpy_nullable&quot; below, we are expecting *all*</span>
+    <span class="s3"># of the resulting series to use those dtypes. If there is a mix of nullable</span>
+    <span class="s3"># and non-nullable dtypes here, then that will result in dtype mismatches</span>
+    <span class="s3"># in the finale frame.</span>
+    <span class="s1">pdf = pdf.astype(</span>
+        <span class="s1">{</span>
+            <span class="s2">&quot;a&quot;</span><span class="s1">: </span><span class="s2">&quot;Int64&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;b&quot;</span><span class="s1">: </span><span class="s2">&quot;Float64&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;c&quot;</span><span class="s1">: </span><span class="s2">&quot;boolean&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;d&quot;</span><span class="s1">: </span><span class="s2">&quot;string&quot;</span><span class="s0">,</span>
+        <span class="s1">}</span>
+    <span class="s1">)</span>
+    <span class="s3"># # Ensure all columns are extension dtypes</span>
+    <span class="s0">assert </span><span class="s1">all([pd.api.types.is_extension_array_dtype(dtype) </span><span class="s0">for </span><span class="s1">dtype </span><span class="s0">in </span><span class="s1">pdf.dtypes])</span>
+
+    <span class="s1">sdf = spark_session.createDataFrame(pdf)</span>
+    <span class="s3"># We are not overwriting any data, but spark complains if the directory</span>
+    <span class="s3"># already exists (as tmpdir does) and we don't set overwrite</span>
+    <span class="s1">sdf.repartition(npartitions).write.parquet(tmpdir</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;overwrite&quot;</span><span class="s1">)</span>
+
+    <span class="s1">ddf = dd.read_parquet(tmpdir</span><span class="s0">, </span><span class="s1">engine=</span><span class="s2">&quot;pyarrow&quot;</span><span class="s0">, </span><span class="s1">dtype_backend=</span><span class="s2">&quot;numpy_nullable&quot;</span><span class="s1">)</span>
+    <span class="s0">assert </span><span class="s1">all(</span>
+        <span class="s1">[pd.api.types.is_extension_array_dtype(dtype) </span><span class="s0">for </span><span class="s1">dtype </span><span class="s0">in </span><span class="s1">ddf.dtypes]</span>
+    <span class="s1">)</span><span class="s0">, </span><span class="s1">ddf.dtypes</span>
+    <span class="s1">assert_eq(ddf</span><span class="s0">, </span><span class="s1">pdf</span><span class="s0">, </span><span class="s1">check_index=</span><span class="s0">False</span><span class="s1">)</span>
+
+
+<span class="s1">@pytest.mark.skipif(</span><span class="s0">not </span><span class="s1">PANDAS_GE_150</span><span class="s0">, </span><span class="s1">reason=</span><span class="s2">&quot;Requires pyarrow-backed nullable dtypes&quot;</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">test_read_decimal_dtype_pyarrow(spark_session</span><span class="s0">, </span><span class="s1">tmpdir):</span>
+    <span class="s1">tmpdir = str(tmpdir)</span>
+    <span class="s1">npartitions = </span><span class="s4">3</span>
+    <span class="s1">size = </span><span class="s4">6</span>
+
+    <span class="s1">decimal_data = [</span>
+        <span class="s1">decimal.Decimal(</span><span class="s2">&quot;8093.234&quot;</span><span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">decimal.Decimal(</span><span class="s2">&quot;8094.234&quot;</span><span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">decimal.Decimal(</span><span class="s2">&quot;8095.234&quot;</span><span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">decimal.Decimal(</span><span class="s2">&quot;8096.234&quot;</span><span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">decimal.Decimal(</span><span class="s2">&quot;8097.234&quot;</span><span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">decimal.Decimal(</span><span class="s2">&quot;8098.234&quot;</span><span class="s1">)</span><span class="s0">,</span>
+    <span class="s1">]</span>
+    <span class="s1">pdf = pd.DataFrame(</span>
+        <span class="s1">{</span>
+            <span class="s2">&quot;a&quot;</span><span class="s1">: range(size)</span><span class="s0">,</span>
+            <span class="s2">&quot;b&quot;</span><span class="s1">: decimal_data</span><span class="s0">,</span>
+        <span class="s1">}</span>
+    <span class="s1">)</span>
+    <span class="s1">sdf = spark_session.createDataFrame(pdf)</span>
+    <span class="s1">sdf = sdf.withColumn(</span><span class="s2">&quot;b&quot;</span><span class="s0">, </span><span class="s1">sdf[</span><span class="s2">&quot;b&quot;</span><span class="s1">].cast(pyspark.sql.types.DecimalType(</span><span class="s4">7</span><span class="s0">, </span><span class="s4">3</span><span class="s1">)))</span>
+    <span class="s3"># We are not overwriting any data, but spark complains if the directory</span>
+    <span class="s3"># already exists (as tmpdir does) and we don't set overwrite</span>
+    <span class="s1">sdf.repartition(npartitions).write.parquet(tmpdir</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;overwrite&quot;</span><span class="s1">)</span>
+
+    <span class="s1">ddf = dd.read_parquet(tmpdir</span><span class="s0">, </span><span class="s1">engine=</span><span class="s2">&quot;pyarrow&quot;</span><span class="s0">, </span><span class="s1">dtype_backend=</span><span class="s2">&quot;pyarrow&quot;</span><span class="s1">)</span>
+    <span class="s0">assert </span><span class="s1">ddf.b.dtype.pyarrow_dtype == pa.decimal128(</span><span class="s4">7</span><span class="s0">, </span><span class="s4">3</span><span class="s1">)</span>
+    <span class="s0">assert </span><span class="s1">ddf.b.compute().dtype.pyarrow_dtype == pa.decimal128(</span><span class="s4">7</span><span class="s0">, </span><span class="s4">3</span><span class="s1">)</span>
+    <span class="s1">expected = pdf.astype(</span>
+        <span class="s1">{</span>
+            <span class="s2">&quot;a&quot;</span><span class="s1">: </span><span class="s2">&quot;int64[pyarrow]&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;b&quot;</span><span class="s1">: pd.ArrowDtype(pa.decimal128(</span><span class="s4">7</span><span class="s0">, </span><span class="s4">3</span><span class="s1">))</span><span class="s0">,</span>
+        <span class="s1">}</span>
+    <span class="s1">)</span>
+
+    <span class="s1">assert_eq(ddf</span><span class="s0">, </span><span class="s1">expected</span><span class="s0">, </span><span class="s1">check_index=</span><span class="s0">False</span><span class="s1">)</span>
+</pre>
+</body>
+</html>

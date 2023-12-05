@@ -1,0 +1,1402 @@
+<html>
+<head>
+<title>fastparquet.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+fastparquet.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">copy</span>
+<span class="s0">import </span><span class="s1">pickle</span>
+<span class="s0">import </span><span class="s1">threading</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">OrderedDict</span><span class="s0">, </span><span class="s1">defaultdict</span>
+<span class="s0">from </span><span class="s1">contextlib </span><span class="s0">import </span><span class="s1">ExitStack</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">pandas </span><span class="s0">as </span><span class="s1">pd</span>
+<span class="s0">import </span><span class="s1">tlz </span><span class="s0">as </span><span class="s1">toolz</span>
+<span class="s0">from </span><span class="s1">packaging.version </span><span class="s0">import </span><span class="s1">parse </span><span class="s0">as </span><span class="s1">parse_version</span>
+
+<span class="s0">from </span><span class="s1">dask.core </span><span class="s0">import </span><span class="s1">flatten</span>
+<span class="s0">from </span><span class="s1">dask.dataframe._compat </span><span class="s0">import </span><span class="s1">PANDAS_GE_201</span>
+
+<span class="s0">try</span><span class="s1">:</span>
+    <span class="s0">import </span><span class="s1">fastparquet</span>
+    <span class="s0">from </span><span class="s1">fastparquet </span><span class="s0">import </span><span class="s1">ParquetFile</span>
+    <span class="s0">from </span><span class="s1">fastparquet.util </span><span class="s0">import </span><span class="s1">ex_from_sep</span><span class="s0">, </span><span class="s1">get_file_scheme</span><span class="s0">, </span><span class="s1">groupby_types</span><span class="s0">, </span><span class="s1">val_to_num</span>
+    <span class="s0">from </span><span class="s1">fastparquet.writer </span><span class="s0">import </span><span class="s1">make_part_file</span><span class="s0">, </span><span class="s1">partition_on_columns</span>
+<span class="s0">except </span><span class="s1">ImportError:</span>
+    <span class="s0">pass</span>
+
+<span class="s0">from </span><span class="s1">dask.base </span><span class="s0">import </span><span class="s1">tokenize</span>
+
+<span class="s2">#########################</span>
+<span class="s2"># Fastparquet interface #</span>
+<span class="s2">#########################</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.io.parquet.utils </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">Engine</span><span class="s0">,</span>
+    <span class="s1">_get_aggregation_depth</span><span class="s0">,</span>
+    <span class="s1">_infer_split_row_groups</span><span class="s0">,</span>
+    <span class="s1">_normalize_index_columns</span><span class="s0">,</span>
+    <span class="s1">_parse_pandas_metadata</span><span class="s0">,</span>
+    <span class="s1">_process_open_file_options</span><span class="s0">,</span>
+    <span class="s1">_row_groups_to_parts</span><span class="s0">,</span>
+    <span class="s1">_set_gather_statistics</span><span class="s0">,</span>
+    <span class="s1">_set_metadata_task_size</span><span class="s0">,</span>
+    <span class="s1">_sort_and_analyze_paths</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.io.utils </span><span class="s0">import </span><span class="s1">_is_local_fs</span><span class="s0">, </span><span class="s1">_meta_from_dtypes</span><span class="s0">, </span><span class="s1">_open_input_files</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.utils </span><span class="s0">import </span><span class="s1">UNKNOWN_CATEGORIES</span>
+<span class="s0">from </span><span class="s1">dask.delayed </span><span class="s0">import </span><span class="s1">Delayed</span>
+<span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">natural_sort_key</span>
+
+<span class="s2"># Thread lock required to reset row-groups</span>
+<span class="s1">_FP_FILE_LOCK = threading.RLock()</span>
+
+
+<span class="s0">def </span><span class="s1">_paths_to_cats(paths</span><span class="s0">, </span><span class="s1">file_scheme):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Extract categorical fields and labels from hive- or drill-style paths. 
+    FixMe: This has been pasted from https://github.com/dask/fastparquet/pull/471 
+    Use fastparquet.api.paths_to_cats from fastparquet&gt;0.3.2 instead. 
+ 
+    Parameters 
+    ---------- 
+    paths (Iterable[str]): file paths relative to root 
+    file_scheme (str): 
+ 
+    Returns 
+    ------- 
+    cats (OrderedDict[str, List[Any]]): a dict of field names and their values 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">file_scheme </span><span class="s0">in </span><span class="s1">[</span><span class="s4">&quot;simple&quot;</span><span class="s0">, </span><span class="s4">&quot;flat&quot;</span><span class="s0">, </span><span class="s4">&quot;other&quot;</span><span class="s1">]:</span>
+        <span class="s1">cats = {}</span>
+        <span class="s0">return </span><span class="s1">cats</span>
+
+    <span class="s1">cats = OrderedDict()</span>
+    <span class="s1">raw_cats = OrderedDict()</span>
+    <span class="s1">s = ex_from_sep(</span><span class="s4">&quot;/&quot;</span><span class="s1">)</span>
+    <span class="s1">paths = toolz.unique(paths)</span>
+    <span class="s0">if </span><span class="s1">file_scheme == </span><span class="s4">&quot;hive&quot;</span><span class="s1">:</span>
+        <span class="s1">partitions = toolz.unique((k</span><span class="s0">, </span><span class="s1">v) </span><span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">paths </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">s.findall(path))</span>
+        <span class="s0">for </span><span class="s1">key</span><span class="s0">, </span><span class="s1">val </span><span class="s0">in </span><span class="s1">partitions:</span>
+            <span class="s1">cats.setdefault(key</span><span class="s0">, </span><span class="s1">set()).add(val_to_num(val))</span>
+            <span class="s1">raw_cats.setdefault(key</span><span class="s0">, </span><span class="s1">set()).add(val)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">i_val = toolz.unique(</span>
+            <span class="s1">(i</span><span class="s0">, </span><span class="s1">val) </span><span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">paths </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">val </span><span class="s0">in </span><span class="s1">enumerate(path.split(</span><span class="s4">&quot;/&quot;</span><span class="s1">)[:-</span><span class="s5">1</span><span class="s1">])</span>
+        <span class="s1">)</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">val </span><span class="s0">in </span><span class="s1">i_val:</span>
+            <span class="s1">key = </span><span class="s4">&quot;dir%i&quot; </span><span class="s1">% i</span>
+            <span class="s1">cats.setdefault(key</span><span class="s0">, </span><span class="s1">set()).add(val_to_num(val))</span>
+            <span class="s1">raw_cats.setdefault(key</span><span class="s0">, </span><span class="s1">set()).add(val)</span>
+
+    <span class="s0">for </span><span class="s1">key</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">cats.items():</span>
+        <span class="s2"># Check that no partition names map to the same value after transformation by val_to_num</span>
+        <span class="s1">raw = raw_cats[key]</span>
+        <span class="s0">if </span><span class="s1">len(v) != len(raw):</span>
+            <span class="s1">conflicts_by_value = OrderedDict()</span>
+            <span class="s0">for </span><span class="s1">raw_val </span><span class="s0">in </span><span class="s1">raw_cats[key]:</span>
+                <span class="s1">conflicts_by_value.setdefault(val_to_num(raw_val)</span><span class="s0">, </span><span class="s1">set()).add(raw_val)</span>
+            <span class="s1">conflicts = [</span>
+                <span class="s1">c </span><span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">conflicts_by_value.values() </span><span class="s0">if </span><span class="s1">len(k) &gt; </span><span class="s5">1 </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">k</span>
+            <span class="s1">]</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Partition names map to the same value: %s&quot; </span><span class="s1">% conflicts)</span>
+        <span class="s1">vals_by_type = groupby_types(v)</span>
+
+        <span class="s2"># Check that all partition names map to the same type after transformation by val_to_num</span>
+        <span class="s0">if </span><span class="s1">len(vals_by_type) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">examples = [x[</span><span class="s5">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">vals_by_type.values()]</span>
+            <span class="s1">warnings.warn(</span>
+                <span class="s4">&quot;Partition names coerce to values of different types, e.g. %s&quot;</span>
+                <span class="s1">% examples</span>
+            <span class="s1">)</span>
+
+    <span class="s1">cats = OrderedDict([(key</span><span class="s0">, </span><span class="s1">list(v)) </span><span class="s0">for </span><span class="s1">key</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">cats.items()])</span>
+    <span class="s0">return </span><span class="s1">cats</span>
+
+
+<span class="s1">paths_to_cats = (</span>
+    <span class="s1">_paths_to_cats  </span><span class="s2"># FixMe: use fastparquet.api.paths_to_cats for fastparquet&gt;0.3.2</span>
+<span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">FastParquetEngine(Engine):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_organize_row_groups(</span>
+        <span class="s1">cls</span><span class="s0">,</span>
+        <span class="s1">pf</span><span class="s0">,</span>
+        <span class="s1">split_row_groups</span><span class="s0">,</span>
+        <span class="s1">gather_statistics</span><span class="s0">,</span>
+        <span class="s1">stat_col_indices</span><span class="s0">,</span>
+        <span class="s1">filters</span><span class="s0">,</span>
+        <span class="s1">dtypes</span><span class="s0">,</span>
+        <span class="s1">base_path</span><span class="s0">,</span>
+        <span class="s1">has_metadata_file</span><span class="s0">,</span>
+        <span class="s1">blocksize</span><span class="s0">,</span>
+        <span class="s1">aggregation_depth</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Organize row-groups by file.&quot;&quot;&quot;</span>
+
+        <span class="s2"># Get partitioning metadata</span>
+        <span class="s1">pqpartitions = list(pf.cats)</span>
+
+        <span class="s2"># Fastparquet does not use a natural sorting</span>
+        <span class="s2"># order for partitioned data. Re-sort by path</span>
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">pqpartitions</span>
+            <span class="s0">and </span><span class="s1">aggregation_depth</span>
+            <span class="s0">and </span><span class="s1">pf.row_groups</span>
+            <span class="s0">and </span><span class="s1">pf.row_groups[</span><span class="s5">0</span><span class="s1">].columns[</span><span class="s5">0</span><span class="s1">].file_path</span>
+        <span class="s1">):</span>
+            <span class="s1">pf.row_groups = sorted(</span>
+                <span class="s1">pf.row_groups</span><span class="s0">,</span>
+                <span class="s1">key=</span><span class="s0">lambda </span><span class="s1">x: natural_sort_key(x.columns[</span><span class="s5">0</span><span class="s1">].file_path)</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s2"># Store types specified in pandas metadata</span>
+        <span class="s1">pandas_type = {}</span>
+        <span class="s0">if </span><span class="s1">pf.row_groups </span><span class="s0">and </span><span class="s1">pf.pandas_metadata:</span>
+            <span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">pf.pandas_metadata.get(</span><span class="s4">&quot;columns&quot;</span><span class="s0">, </span><span class="s1">[]):</span>
+                <span class="s0">if </span><span class="s4">&quot;field_name&quot; </span><span class="s0">in </span><span class="s1">c:</span>
+                    <span class="s1">pandas_type[c[</span><span class="s4">&quot;field_name&quot;</span><span class="s1">]] = c.get(</span><span class="s4">&quot;pandas_type&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+
+        <span class="s2"># Get the number of row groups per file</span>
+        <span class="s1">single_rg_parts = int(split_row_groups) == </span><span class="s5">1</span>
+        <span class="s1">file_row_groups = defaultdict(list)</span>
+        <span class="s1">file_row_group_stats = defaultdict(list)</span>
+        <span class="s1">file_row_group_column_stats = defaultdict(list)</span>
+        <span class="s1">cmax_last = {}</span>
+        <span class="s0">for </span><span class="s1">rg</span><span class="s0">, </span><span class="s1">row_group </span><span class="s0">in </span><span class="s1">enumerate(pf.row_groups):</span>
+            <span class="s2"># We can filter partition columns here without dealing</span>
+            <span class="s2"># with statistics</span>
+            <span class="s0">if </span><span class="s1">(</span>
+                <span class="s1">pqpartitions</span>
+                <span class="s0">and </span><span class="s1">filters</span>
+                <span class="s0">and </span><span class="s1">fastparquet.api.filter_out_cats(row_group</span><span class="s0">, </span><span class="s1">filters)</span>
+            <span class="s1">):</span>
+                <span class="s0">continue</span>
+
+            <span class="s2"># NOTE: Here we assume that all column chunks are stored</span>
+            <span class="s2"># in the same file. This is not strictly required by the</span>
+            <span class="s2"># parquet spec.</span>
+            <span class="s1">fp = row_group.columns[</span><span class="s5">0</span><span class="s1">].file_path</span>
+            <span class="s1">fpath = fp.decode() </span><span class="s0">if </span><span class="s1">isinstance(fp</span><span class="s0">, </span><span class="s1">bytes) </span><span class="s0">else </span><span class="s1">fp</span>
+            <span class="s0">if </span><span class="s1">fpath </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s0">if not </span><span class="s1">has_metadata_file:</span>
+                    <span class="s2"># There doesn't need to be a file_path if the</span>
+                    <span class="s2"># row group is in the same file as the metadata.</span>
+                    <span class="s2"># Assume this is a single-file dataset.</span>
+                    <span class="s1">fpath = pf.fn</span>
+                    <span class="s1">base_path = base_path </span><span class="s0">or </span><span class="s4">&quot;&quot;</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s0">raise </span><span class="s1">ValueError(</span>
+                        <span class="s4">&quot;Global metadata structure is missing a file_path string. &quot;</span>
+                        <span class="s4">&quot;If the dataset includes a _metadata file, that file may &quot;</span>
+                        <span class="s4">&quot;have one or more missing file_path fields.&quot;</span>
+                    <span class="s1">)</span>
+
+            <span class="s2"># Append a tuple to file_row_groups. This tuple will</span>
+            <span class="s2"># be structured as: `(&lt;local-row-group-id&gt;, &lt;global-row-group-id&gt;)`</span>
+            <span class="s0">if </span><span class="s1">file_row_groups[fpath]:</span>
+                <span class="s1">file_row_groups[fpath].append((file_row_groups[fpath][-</span><span class="s5">1</span><span class="s1">][</span><span class="s5">0</span><span class="s1">] + </span><span class="s5">1</span><span class="s0">, </span><span class="s1">rg))</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">file_row_groups[fpath].append((</span><span class="s5">0</span><span class="s0">, </span><span class="s1">rg))</span>
+
+            <span class="s0">if </span><span class="s1">gather_statistics:</span>
+                <span class="s0">if </span><span class="s1">single_rg_parts:</span>
+                    <span class="s1">s = {</span>
+                        <span class="s4">&quot;file_path_0&quot;</span><span class="s1">: fpath</span><span class="s0">,</span>
+                        <span class="s4">&quot;num-rows&quot;</span><span class="s1">: row_group.num_rows</span><span class="s0">,</span>
+                        <span class="s4">&quot;total_byte_size&quot;</span><span class="s1">: row_group.total_byte_size</span><span class="s0">,</span>
+                        <span class="s4">&quot;columns&quot;</span><span class="s1">: []</span><span class="s0">,</span>
+                    <span class="s1">}</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">s = {</span>
+                        <span class="s4">&quot;num-rows&quot;</span><span class="s1">: row_group.num_rows</span><span class="s0">,</span>
+                        <span class="s4">&quot;total_byte_size&quot;</span><span class="s1">: row_group.total_byte_size</span><span class="s0">,</span>
+                    <span class="s1">}</span>
+                <span class="s1">cstats = []</span>
+                <span class="s0">for </span><span class="s1">name</span><span class="s0">, </span><span class="s1">i </span><span class="s0">in </span><span class="s1">stat_col_indices.items():</span>
+                    <span class="s1">column = row_group.columns[i]</span>
+                    <span class="s0">if </span><span class="s1">column.meta_data.statistics:</span>
+                        <span class="s1">cmin = </span><span class="s0">None</span>
+                        <span class="s1">cmax = </span><span class="s0">None</span>
+                        <span class="s1">null_count = </span><span class="s0">None</span>
+                        <span class="s2"># TODO: Avoid use of `pf.statistics`</span>
+                        <span class="s0">if </span><span class="s1">pf.statistics[</span><span class="s4">&quot;min&quot;</span><span class="s1">][name][</span><span class="s5">0</span><span class="s1">] </span><span class="s0">is not None</span><span class="s1">:</span>
+                            <span class="s1">cmin = pf.statistics[</span><span class="s4">&quot;min&quot;</span><span class="s1">][name][rg]</span>
+                            <span class="s1">cmax = pf.statistics[</span><span class="s4">&quot;max&quot;</span><span class="s1">][name][rg]</span>
+                            <span class="s1">null_count = pf.statistics[</span><span class="s4">&quot;null_count&quot;</span><span class="s1">][name][rg]</span>
+                        <span class="s0">elif </span><span class="s1">dtypes[name] == </span><span class="s4">&quot;object&quot;</span><span class="s1">:</span>
+                            <span class="s1">cmin = column.meta_data.statistics.min_value</span>
+                            <span class="s1">cmax = column.meta_data.statistics.max_value</span>
+                            <span class="s1">null_count = column.meta_data.statistics.null_count</span>
+                            <span class="s2"># Older versions may not have cmin/cmax_value</span>
+                            <span class="s0">if </span><span class="s1">cmin </span><span class="s0">is None</span><span class="s1">:</span>
+                                <span class="s1">cmin = column.meta_data.statistics.min</span>
+                            <span class="s0">if </span><span class="s1">cmax </span><span class="s0">is None</span><span class="s1">:</span>
+                                <span class="s1">cmax = column.meta_data.statistics.max</span>
+                            <span class="s2"># Decode bytes as long as &quot;bytes&quot; is not the</span>
+                            <span class="s2"># expected `pandas_type` for this column</span>
+                            <span class="s0">if </span><span class="s1">(</span>
+                                <span class="s1">isinstance(cmin</span><span class="s0">, </span><span class="s1">(bytes</span><span class="s0">, </span><span class="s1">bytearray))</span>
+                                <span class="s0">and </span><span class="s1">pandas_type.get(name</span><span class="s0">, None</span><span class="s1">) != </span><span class="s4">&quot;bytes&quot;</span>
+                            <span class="s1">):</span>
+                                <span class="s1">cmin = cmin.decode(</span><span class="s4">&quot;utf-8&quot;</span><span class="s1">)</span>
+                                <span class="s1">cmax = cmax.decode(</span><span class="s4">&quot;utf-8&quot;</span><span class="s1">)</span>
+                            <span class="s0">if </span><span class="s1">isinstance(null_count</span><span class="s0">, </span><span class="s1">(bytes</span><span class="s0">, </span><span class="s1">bytearray)):</span>
+                                <span class="s1">null_count = null_count.decode(</span><span class="s4">&quot;utf-8&quot;</span><span class="s1">)</span>
+                        <span class="s0">if </span><span class="s1">isinstance(cmin</span><span class="s0">, </span><span class="s1">np.datetime64):</span>
+                            <span class="s1">tz = getattr(dtypes[name]</span><span class="s0">, </span><span class="s4">&quot;tz&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+                            <span class="s1">cmin = pd.Timestamp(cmin</span><span class="s0">, </span><span class="s1">tz=tz)</span>
+                            <span class="s1">cmax = pd.Timestamp(cmax</span><span class="s0">, </span><span class="s1">tz=tz)</span>
+                        <span class="s1">last = cmax_last.get(name</span><span class="s0">, None</span><span class="s1">)</span>
+
+                        <span class="s0">if not </span><span class="s1">(</span>
+                            <span class="s1">filters</span>
+                            <span class="s0">or </span><span class="s1">(blocksize </span><span class="s0">and </span><span class="s1">split_row_groups </span><span class="s0">is True</span><span class="s1">)</span>
+                            <span class="s0">or </span><span class="s1">aggregation_depth</span>
+                        <span class="s1">):</span>
+                            <span class="s2"># Only think about bailing if we don't need</span>
+                            <span class="s2"># stats for filtering</span>
+                            <span class="s0">if </span><span class="s1">cmin </span><span class="s0">is None or </span><span class="s1">(last </span><span class="s0">and </span><span class="s1">cmin &lt; last):</span>
+                                <span class="s2"># We are collecting statistics for divisions</span>
+                                <span class="s2"># only (no filters) - Column isn't sorted, or</span>
+                                <span class="s2"># we have an all-null partition, so lets bail.</span>
+                                <span class="s2">#</span>
+                                <span class="s2"># Note: This assumes ascending order.</span>
+                                <span class="s2">#</span>
+                                <span class="s1">gather_statistics = </span><span class="s0">False</span>
+                                <span class="s1">file_row_group_stats = {}</span>
+                                <span class="s1">file_row_group_column_stats = {}</span>
+                                <span class="s0">break</span>
+
+                        <span class="s0">if </span><span class="s1">single_rg_parts:</span>
+                            <span class="s1">s[</span><span class="s4">&quot;columns&quot;</span><span class="s1">].append(</span>
+                                <span class="s1">{</span>
+                                    <span class="s4">&quot;name&quot;</span><span class="s1">: name</span><span class="s0">,</span>
+                                    <span class="s4">&quot;min&quot;</span><span class="s1">: cmin</span><span class="s0">,</span>
+                                    <span class="s4">&quot;max&quot;</span><span class="s1">: cmax</span><span class="s0">,</span>
+                                    <span class="s4">&quot;null_count&quot;</span><span class="s1">: null_count</span><span class="s0">,</span>
+                                <span class="s1">}</span>
+                            <span class="s1">)</span>
+                        <span class="s0">else</span><span class="s1">:</span>
+                            <span class="s1">cstats += [cmin</span><span class="s0">, </span><span class="s1">cmax</span><span class="s0">, </span><span class="s1">null_count]</span>
+                        <span class="s1">cmax_last[name] = cmax</span>
+                    <span class="s0">else</span><span class="s1">:</span>
+                        <span class="s0">if </span><span class="s1">(</span>
+                            <span class="s0">not </span><span class="s1">(</span>
+                                <span class="s1">filters</span>
+                                <span class="s0">or </span><span class="s1">(blocksize </span><span class="s0">and </span><span class="s1">split_row_groups </span><span class="s0">is True</span><span class="s1">)</span>
+                                <span class="s0">or </span><span class="s1">aggregation_depth</span>
+                            <span class="s1">)</span>
+                            <span class="s0">and </span><span class="s1">column.meta_data.num_values &gt; </span><span class="s5">0</span>
+                        <span class="s1">):</span>
+                            <span class="s2"># We are collecting statistics for divisions</span>
+                            <span class="s2"># only (no filters) - Lets bail.</span>
+                            <span class="s1">gather_statistics = </span><span class="s0">False</span>
+                            <span class="s1">file_row_group_stats = {}</span>
+                            <span class="s1">file_row_group_column_stats = {}</span>
+                            <span class="s0">break</span>
+
+                        <span class="s0">if </span><span class="s1">single_rg_parts:</span>
+                            <span class="s1">s[</span><span class="s4">&quot;columns&quot;</span><span class="s1">].append({</span><span class="s4">&quot;name&quot;</span><span class="s1">: name})</span>
+                        <span class="s0">else</span><span class="s1">:</span>
+                            <span class="s1">cstats += [</span><span class="s0">None, None, None</span><span class="s1">]</span>
+                <span class="s0">if </span><span class="s1">gather_statistics:</span>
+                    <span class="s1">file_row_group_stats[fpath].append(s)</span>
+                    <span class="s0">if not </span><span class="s1">single_rg_parts:</span>
+                        <span class="s1">file_row_group_column_stats[fpath].append(tuple(cstats))</span>
+
+        <span class="s0">return </span><span class="s1">(</span>
+            <span class="s1">file_row_groups</span><span class="s0">,</span>
+            <span class="s1">file_row_group_stats</span><span class="s0">,</span>
+            <span class="s1">file_row_group_column_stats</span><span class="s0">,</span>
+            <span class="s1">gather_statistics</span><span class="s0">,</span>
+            <span class="s1">base_path</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_get_thrift_row_groups(</span>
+        <span class="s1">cls</span><span class="s0">,</span>
+        <span class="s1">pf</span><span class="s0">,</span>
+        <span class="s1">filename</span><span class="s0">,</span>
+        <span class="s1">row_groups</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Turn a set of row-groups into bytes-serialized form 
+        using thrift via pickle. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">real_row_groups = []</span>
+        <span class="s0">for </span><span class="s1">_</span><span class="s0">, </span><span class="s1">rg_global </span><span class="s0">in </span><span class="s1">row_groups:</span>
+            <span class="s1">row_group = pf.row_groups[rg_global]</span>
+            <span class="s1">columns = row_group.columns</span>
+            <span class="s0">for </span><span class="s1">c</span><span class="s0">, </span><span class="s1">col </span><span class="s0">in </span><span class="s1">enumerate(columns):</span>
+                <span class="s0">if </span><span class="s1">c:</span>
+                    <span class="s1">col.file_path = </span><span class="s0">None</span>
+                <span class="s1">md = col.meta_data</span>
+                <span class="s1">md.key_value_metadata = </span><span class="s0">None</span>
+                <span class="s2"># NOTE: Fastparquet may need the null count in the</span>
+                <span class="s2"># statistics, so we cannot just set statistics</span>
+                <span class="s2"># to none.  Set attributes separately:</span>
+                <span class="s1">st = md.statistics</span>
+                <span class="s0">if </span><span class="s1">st:</span>
+                    <span class="s1">st.distinct_count = </span><span class="s0">None</span>
+                    <span class="s1">st.max = </span><span class="s0">None</span>
+                    <span class="s1">st.min = </span><span class="s0">None</span>
+                    <span class="s1">st.max_value = </span><span class="s0">None</span>
+                    <span class="s1">st.min_value = </span><span class="s0">None</span>
+                <span class="s1">md.encodings = </span><span class="s0">None</span>
+                <span class="s1">md.total_uncompressed_size = </span><span class="s0">None</span>
+                <span class="s1">md.encoding_stats = </span><span class="s0">None</span>
+            <span class="s1">row_group.columns = columns</span>
+            <span class="s1">real_row_groups.append(row_group)</span>
+        <span class="s0">return </span><span class="s1">real_row_groups</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_make_part(</span>
+        <span class="s1">cls</span><span class="s0">,</span>
+        <span class="s1">filename</span><span class="s0">,</span>
+        <span class="s1">rg_list</span><span class="s0">,</span>
+        <span class="s1">fs=</span><span class="s0">None,</span>
+        <span class="s1">pf=</span><span class="s0">None,</span>
+        <span class="s1">base_path=</span><span class="s0">None,</span>
+        <span class="s1">partitions=</span><span class="s0">None,</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Generate a partition-specific element of `parts`.&quot;&quot;&quot;</span>
+
+        <span class="s0">if </span><span class="s1">partitions:</span>
+            <span class="s1">real_row_groups = cls._get_thrift_row_groups(</span>
+                <span class="s1">pf</span><span class="s0">,</span>
+                <span class="s1">filename</span><span class="s0">,</span>
+                <span class="s1">rg_list</span><span class="s0">,</span>
+            <span class="s1">)</span>
+            <span class="s1">part = {</span><span class="s4">&quot;piece&quot;</span><span class="s1">: (real_row_groups</span><span class="s0">,</span><span class="s1">)}</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># Get full path (empty strings should be ignored)</span>
+            <span class="s1">full_path = fs.sep.join([p </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">[base_path</span><span class="s0">, </span><span class="s1">filename] </span><span class="s0">if </span><span class="s1">p != </span><span class="s4">&quot;&quot;</span><span class="s1">])</span>
+            <span class="s1">row_groups = [rg[</span><span class="s5">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">rg </span><span class="s0">in </span><span class="s1">rg_list]  </span><span class="s2"># Don't need global IDs</span>
+            <span class="s1">part = {</span><span class="s4">&quot;piece&quot;</span><span class="s1">: (full_path</span><span class="s0">, </span><span class="s1">row_groups)}</span>
+
+        <span class="s0">return </span><span class="s1">part</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_collect_dataset_info(</span>
+        <span class="s1">cls</span><span class="s0">,</span>
+        <span class="s1">paths</span><span class="s0">,</span>
+        <span class="s1">fs</span><span class="s0">,</span>
+        <span class="s1">categories</span><span class="s0">,</span>
+        <span class="s1">index</span><span class="s0">,</span>
+        <span class="s1">gather_statistics</span><span class="s0">,</span>
+        <span class="s1">filters</span><span class="s0">,</span>
+        <span class="s1">split_row_groups</span><span class="s0">,</span>
+        <span class="s1">blocksize</span><span class="s0">,</span>
+        <span class="s1">aggregate_files</span><span class="s0">,</span>
+        <span class="s1">ignore_metadata_file</span><span class="s0">,</span>
+        <span class="s1">metadata_task_size</span><span class="s0">,</span>
+        <span class="s1">parquet_file_extension</span><span class="s0">,</span>
+        <span class="s1">kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s2"># Define the parquet-file (pf) object to use for metadata,</span>
+        <span class="s2"># Also, initialize `parts`.  If `parts` is populated here,</span>
+        <span class="s2"># then each part will correspond to a file.  Otherwise, each part will</span>
+        <span class="s2"># correspond to a row group (populated later).</span>
+
+        <span class="s2"># Extract dataset-specific options</span>
+        <span class="s1">dataset_kwargs = kwargs.pop(</span><span class="s4">&quot;dataset&quot;</span><span class="s0">, </span><span class="s1">{})</span>
+
+        <span class="s1">parts = []</span>
+        <span class="s1">_metadata_exists = </span><span class="s0">False</span>
+        <span class="s0">if </span><span class="s1">len(paths) == </span><span class="s5">1 </span><span class="s0">and </span><span class="s1">fs.isdir(paths[</span><span class="s5">0</span><span class="s1">]):</span>
+            <span class="s2"># This is a directory.</span>
+            <span class="s2"># Check if _metadata and/or _common_metadata files exists</span>
+            <span class="s1">base = paths[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s1">_metadata_exists = </span><span class="s0">True</span>
+            <span class="s0">if not </span><span class="s1">ignore_metadata_file:</span>
+                <span class="s1">_metadata_exists = fs.isfile(fs.sep.join([base</span><span class="s0">, </span><span class="s4">&quot;_metadata&quot;</span><span class="s1">]))</span>
+
+            <span class="s2"># Find all files if we are not using a _metadata file</span>
+            <span class="s0">if </span><span class="s1">ignore_metadata_file </span><span class="s0">or not </span><span class="s1">_metadata_exists:</span>
+                <span class="s2"># For now, we need to discover every file under paths[0]</span>
+                <span class="s1">paths</span><span class="s0">, </span><span class="s1">base</span><span class="s0">, </span><span class="s1">fns = _sort_and_analyze_paths(fs.find(base)</span><span class="s0">, </span><span class="s1">fs</span><span class="s0">, </span><span class="s1">root=base)</span>
+                <span class="s1">_update_paths = </span><span class="s0">False</span>
+                <span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">[</span><span class="s4">&quot;_metadata&quot;</span><span class="s0">, </span><span class="s4">&quot;_common_metadata&quot;</span><span class="s1">]:</span>
+                    <span class="s0">try</span><span class="s1">:</span>
+                        <span class="s1">fns.remove(fn)</span>
+                        <span class="s1">_update_paths = </span><span class="s0">True</span>
+                    <span class="s0">except </span><span class="s1">ValueError:</span>
+                        <span class="s0">pass</span>
+                <span class="s0">if </span><span class="s1">_update_paths:</span>
+                    <span class="s1">paths = [fs.sep.join([base</span><span class="s0">, </span><span class="s1">fn]) </span><span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">fns]</span>
+                <span class="s1">_metadata_exists = </span><span class="s0">False</span>
+            <span class="s0">if </span><span class="s1">_metadata_exists:</span>
+                <span class="s2"># Using _metadata file (best-case scenario)</span>
+                <span class="s1">pf = ParquetFile(</span>
+                    <span class="s1">fs.sep.join([base</span><span class="s0">, </span><span class="s4">&quot;_metadata&quot;</span><span class="s1">])</span><span class="s0">,</span>
+                    <span class="s1">open_with=fs.open</span><span class="s0">,</span>
+                    <span class="s1">**dataset_kwargs</span><span class="s0">,</span>
+                <span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s2"># Use 0th file</span>
+                <span class="s2"># Note that &quot;_common_metadata&quot; can cause issues for</span>
+                <span class="s2"># partitioned datasets.</span>
+                <span class="s0">if </span><span class="s1">parquet_file_extension:</span>
+                    <span class="s2"># Raise error if all files have been filtered by extension</span>
+                    <span class="s1">len0 = len(paths)</span>
+                    <span class="s1">paths = [</span>
+                        <span class="s1">path </span><span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">paths </span><span class="s0">if </span><span class="s1">path.endswith(parquet_file_extension)</span>
+                    <span class="s1">]</span>
+                    <span class="s1">fns = [fn </span><span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">fns </span><span class="s0">if </span><span class="s1">fn.endswith(parquet_file_extension)]</span>
+                    <span class="s0">if </span><span class="s1">len0 </span><span class="s0">and </span><span class="s1">paths == []:</span>
+                        <span class="s0">raise </span><span class="s1">ValueError(</span>
+                            <span class="s4">&quot;No files satisfy the `parquet_file_extension` criteria &quot;</span>
+                            <span class="s4">f&quot;(files must end with </span><span class="s0">{</span><span class="s1">parquet_file_extension</span><span class="s0">}</span><span class="s4">).&quot;</span>
+                        <span class="s1">)</span>
+                <span class="s1">pf = ParquetFile(</span>
+                    <span class="s1">paths[:</span><span class="s5">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">open_with=fs.open</span><span class="s0">, </span><span class="s1">root=base</span><span class="s0">, </span><span class="s1">**dataset_kwargs</span>
+                <span class="s1">)</span>
+                <span class="s1">scheme = get_file_scheme(fns)</span>
+                <span class="s1">pf.file_scheme = scheme</span>
+                <span class="s1">pf.cats = paths_to_cats(fns</span><span class="s0">, </span><span class="s1">scheme)</span>
+                <span class="s0">if not </span><span class="s1">gather_statistics:</span>
+                    <span class="s1">parts = [fs.sep.join([base</span><span class="s0">, </span><span class="s1">fn]) </span><span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">fns]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># This is a list of files</span>
+            <span class="s1">paths</span><span class="s0">, </span><span class="s1">base</span><span class="s0">, </span><span class="s1">fns = _sort_and_analyze_paths(paths</span><span class="s0">, </span><span class="s1">fs)</span>
+
+            <span class="s2"># Check if _metadata is in paths, and</span>
+            <span class="s2"># remove it if ignore_metadata_file=True</span>
+            <span class="s1">_metadata_exists = </span><span class="s4">&quot;_metadata&quot; </span><span class="s0">in </span><span class="s1">fns</span>
+            <span class="s0">if </span><span class="s1">_metadata_exists </span><span class="s0">and </span><span class="s1">ignore_metadata_file:</span>
+                <span class="s1">fns.remove(</span><span class="s4">&quot;_metadata&quot;</span><span class="s1">)</span>
+                <span class="s1">_metadata_exists = </span><span class="s0">False</span>
+            <span class="s1">paths = [fs.sep.join([base</span><span class="s0">, </span><span class="s1">fn]) </span><span class="s0">for </span><span class="s1">fn </span><span class="s0">in </span><span class="s1">fns]</span>
+
+            <span class="s0">if </span><span class="s1">_metadata_exists:</span>
+                <span class="s2"># We have a _metadata file, lets use it</span>
+                <span class="s1">pf = ParquetFile(</span>
+                    <span class="s1">fs.sep.join([base</span><span class="s0">, </span><span class="s4">&quot;_metadata&quot;</span><span class="s1">])</span><span class="s0">,</span>
+                    <span class="s1">open_with=fs.open</span><span class="s0">,</span>
+                    <span class="s1">**dataset_kwargs</span><span class="s0">,</span>
+                <span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s2"># Rely on metadata for 0th file.</span>
+                <span class="s2"># Will need to pass a list of paths to read_partition</span>
+                <span class="s1">scheme = get_file_scheme(fns)</span>
+                <span class="s1">pf = ParquetFile(</span>
+                    <span class="s1">paths[:</span><span class="s5">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">open_with=fs.open</span><span class="s0">, </span><span class="s1">root=base</span><span class="s0">, </span><span class="s1">**dataset_kwargs</span>
+                <span class="s1">)</span>
+                <span class="s1">pf.file_scheme = scheme</span>
+                <span class="s1">pf.cats = paths_to_cats(fns</span><span class="s0">, </span><span class="s1">scheme)</span>
+                <span class="s0">if not </span><span class="s1">gather_statistics:</span>
+                    <span class="s1">parts = paths.copy()</span>
+
+        <span class="s2"># Check the `aggregate_files` setting</span>
+        <span class="s1">aggregation_depth = _get_aggregation_depth(</span>
+            <span class="s1">aggregate_files</span><span class="s0">,</span>
+            <span class="s1">list(pf.cats)</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+        <span class="s2"># Ensure that there is no overlap between partition columns</span>
+        <span class="s2"># and explicit columns in `pf`</span>
+        <span class="s0">if </span><span class="s1">pf.cats:</span>
+            <span class="s1">_partitions = [p </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">pf.cats </span><span class="s0">if </span><span class="s1">p </span><span class="s0">not in </span><span class="s1">pf.columns]</span>
+            <span class="s0">if not </span><span class="s1">_partitions:</span>
+                <span class="s1">pf.cats = {}</span>
+            <span class="s0">elif </span><span class="s1">len(_partitions) != len(pf.cats):</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s4">&quot;No partition-columns should be written in the </span><span class="s0">\n</span><span class="s4">&quot;</span>
+                    <span class="s4">&quot;file unless they are ALL written in the file.</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                    <span class="s4">&quot;This restriction is removed as of fastparquet 0.8.4</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                    <span class="s4">&quot;columns: {} | partitions: {}&quot;</span><span class="s1">.format(pf.columns</span><span class="s0">, </span><span class="s1">pf.cats.keys())</span>
+                <span class="s1">)</span>
+
+        <span class="s2"># Set split_row_groups for desired partitioning behavior</span>
+        <span class="s2">#</span>
+        <span class="s2"># Expected behavior for split_row_groups + blocksize combinations:</span>
+        <span class="s2"># +======+==================+===========+=============================+</span>
+        <span class="s2"># | Case | split_row_groups | blocksize | Behavior                    |</span>
+        <span class="s2"># +======+==================+===========+=============================+</span>
+        <span class="s2"># |  A   |  &quot;infer&quot;         |  not None | Go to E or G (using md)     |</span>
+        <span class="s2"># +------+------------------+-----------+-----------------------------+</span>
+        <span class="s2"># |  B   |  &quot;infer&quot;         |  None     | Go to H                     |</span>
+        <span class="s2"># +------+------------------+-----------+-----------------------------+</span>
+        <span class="s2"># |  C   |  &quot;adaptive&quot;      |  not None | Go to E                     |</span>
+        <span class="s2"># +------+------------------+-----------+-----------------------------+</span>
+        <span class="s2"># |  D   |  &quot;adaptive&quot;      |  None     | Go to H                     |</span>
+        <span class="s2"># +======+==================+===========+=============================+</span>
+        <span class="s2"># |  E*  |  True            |  not None | Adaptive partitioning       |</span>
+        <span class="s2"># +------+------------------+-----------+-----------------------------+</span>
+        <span class="s2"># |  F   |  True            |  None     | 1 row-group per partition   |</span>
+        <span class="s2"># +------+------------------+-----------+-----------------------------+</span>
+        <span class="s2"># |  G*  |  False           |  not None | 1+ full files per partition |</span>
+        <span class="s2"># +------+------------------+-----------+-----------------------------+</span>
+        <span class="s2"># |  H   |  False           |  None     | 1 full file per partition   |</span>
+        <span class="s2"># +------+------------------+-----------+-----------------------------+</span>
+        <span class="s2"># |  I   |  n               |  N/A      | n row-groups per partition  |</span>
+        <span class="s2"># +======+==================+===========+=============================+</span>
+        <span class="s2"># NOTES:</span>
+        <span class="s2"># - Adaptive partitioning (E) means that the individual size of each</span>
+        <span class="s2">#   row-group will be accounted for when deciding how many row-groups</span>
+        <span class="s2">#   to map to each output partition.</span>
+        <span class="s2"># - E, G and I will only aggregate data from multiple files into the</span>
+        <span class="s2">#   same output partition if `bool(aggregate_files) == True`.</span>
+        <span class="s2"># - Default partitioning will correspond to either E or G. All other</span>
+        <span class="s2">#   behavior requires user input.</span>
+
+        <span class="s0">if </span><span class="s1">split_row_groups == </span><span class="s4">&quot;infer&quot;</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">blocksize:</span>
+                <span class="s2"># Sample row-group sizes in first file</span>
+                <span class="s1">pf_sample = ParquetFile(</span>
+                    <span class="s1">paths[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">,</span>
+                    <span class="s1">open_with=fs.open</span><span class="s0">,</span>
+                    <span class="s1">**dataset_kwargs</span><span class="s0">,</span>
+                <span class="s1">)</span>
+                <span class="s1">split_row_groups = _infer_split_row_groups(</span>
+                    <span class="s1">[rg.total_byte_size </span><span class="s0">for </span><span class="s1">rg </span><span class="s0">in </span><span class="s1">pf_sample.row_groups]</span><span class="s0">,</span>
+                    <span class="s1">blocksize</span><span class="s0">,</span>
+                    <span class="s1">bool(aggregate_files)</span><span class="s0">,</span>
+                <span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">split_row_groups = </span><span class="s0">False</span>
+
+        <span class="s0">if </span><span class="s1">split_row_groups == </span><span class="s4">&quot;adaptive&quot;</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">blocksize:</span>
+                <span class="s1">split_row_groups = </span><span class="s0">True</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">split_row_groups = </span><span class="s0">False</span>
+
+        <span class="s0">return </span><span class="s1">{</span>
+            <span class="s4">&quot;pf&quot;</span><span class="s1">: pf</span><span class="s0">,</span>
+            <span class="s4">&quot;paths&quot;</span><span class="s1">: paths</span><span class="s0">,</span>
+            <span class="s4">&quot;has_metadata_file&quot;</span><span class="s1">: _metadata_exists</span><span class="s0">,</span>
+            <span class="s4">&quot;parts&quot;</span><span class="s1">: parts</span><span class="s0">,</span>
+            <span class="s4">&quot;base&quot;</span><span class="s1">: base</span><span class="s0">,</span>
+            <span class="s4">&quot;fs&quot;</span><span class="s1">: fs</span><span class="s0">,</span>
+            <span class="s4">&quot;gather_statistics&quot;</span><span class="s1">: gather_statistics</span><span class="s0">,</span>
+            <span class="s4">&quot;categories&quot;</span><span class="s1">: categories</span><span class="s0">,</span>
+            <span class="s4">&quot;index&quot;</span><span class="s1">: index</span><span class="s0">,</span>
+            <span class="s4">&quot;filters&quot;</span><span class="s1">: filters</span><span class="s0">,</span>
+            <span class="s4">&quot;split_row_groups&quot;</span><span class="s1">: split_row_groups</span><span class="s0">,</span>
+            <span class="s4">&quot;blocksize&quot;</span><span class="s1">: blocksize</span><span class="s0">,</span>
+            <span class="s4">&quot;aggregate_files&quot;</span><span class="s1">: aggregate_files</span><span class="s0">,</span>
+            <span class="s4">&quot;aggregation_depth&quot;</span><span class="s1">: aggregation_depth</span><span class="s0">,</span>
+            <span class="s4">&quot;metadata_task_size&quot;</span><span class="s1">: metadata_task_size</span><span class="s0">,</span>
+            <span class="s4">&quot;kwargs&quot;</span><span class="s1">: {</span>
+                <span class="s4">&quot;dataset&quot;</span><span class="s1">: dataset_kwargs</span><span class="s0">,</span>
+                <span class="s1">**kwargs</span><span class="s0">,</span>
+            <span class="s1">}</span><span class="s0">,</span>
+        <span class="s1">}</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_create_dd_meta(cls</span><span class="s0">, </span><span class="s1">dataset_info):</span>
+        <span class="s2"># Collect necessary information from dataset_info</span>
+        <span class="s1">pf = dataset_info[</span><span class="s4">&quot;pf&quot;</span><span class="s1">]</span>
+        <span class="s1">index = dataset_info[</span><span class="s4">&quot;index&quot;</span><span class="s1">]</span>
+        <span class="s1">categories = dataset_info[</span><span class="s4">&quot;categories&quot;</span><span class="s1">]</span>
+
+        <span class="s1">columns = </span><span class="s0">None</span>
+        <span class="s1">pandas_md = pf.pandas_metadata</span>
+
+        <span class="s0">if </span><span class="s1">pandas_md:</span>
+            <span class="s1">(</span>
+                <span class="s1">index_names</span><span class="s0">,</span>
+                <span class="s1">column_names</span><span class="s0">,</span>
+                <span class="s1">storage_name_mapping</span><span class="s0">,</span>
+                <span class="s1">column_index_names</span><span class="s0">,</span>
+            <span class="s1">) = _parse_pandas_metadata(pandas_md)</span>
+            <span class="s2">#  auto-ranges should not be created by fastparquet</span>
+            <span class="s1">column_names.extend(pf.cats)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">index_names = []</span>
+            <span class="s1">column_names = pf.columns + list(pf.cats)</span>
+            <span class="s1">storage_name_mapping = {k: k </span><span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">column_names}</span>
+            <span class="s1">column_index_names = [</span><span class="s0">None</span><span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">index </span><span class="s0">is None and </span><span class="s1">len(index_names) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">len(index_names) == </span><span class="s5">1 </span><span class="s0">and </span><span class="s1">index_names[</span><span class="s5">0</span><span class="s1">] </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">index = index_names[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">index = index_names</span>
+
+        <span class="s2"># Normalize user inputs</span>
+        <span class="s1">column_names</span><span class="s0">, </span><span class="s1">index_names = _normalize_index_columns(</span>
+            <span class="s1">columns</span><span class="s0">, </span><span class="s1">column_names</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">index_names</span>
+        <span class="s1">)</span>
+
+        <span class="s1">all_columns = index_names + column_names</span>
+
+        <span class="s1">categories_dict = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">isinstance(categories</span><span class="s0">, </span><span class="s1">dict):</span>
+            <span class="s1">categories_dict = categories</span>
+
+        <span class="s0">if </span><span class="s1">categories </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">categories = pf.categories</span>
+        <span class="s0">elif </span><span class="s1">isinstance(categories</span><span class="s0">, </span><span class="s1">str):</span>
+            <span class="s1">categories = [categories]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">categories = list(categories)</span>
+
+        <span class="s2"># Check that categories are included in columns</span>
+        <span class="s0">if </span><span class="s1">categories </span><span class="s0">and not </span><span class="s1">set(categories).intersection(all_columns):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">&quot;categories not in available columns.</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                <span class="s4">&quot;categories: {} | columns: {}&quot;</span><span class="s1">.format(categories</span><span class="s0">, </span><span class="s1">list(all_columns))</span>
+            <span class="s1">)</span>
+
+        <span class="s1">dtypes = pf._dtypes(categories)</span>
+        <span class="s1">dtypes = {storage_name_mapping.get(k</span><span class="s0">, </span><span class="s1">k): v </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">dtypes.items()}</span>
+
+        <span class="s1">index_cols = index </span><span class="s0">or </span><span class="s1">()</span>
+        <span class="s0">if </span><span class="s1">isinstance(index_cols</span><span class="s0">, </span><span class="s1">str):</span>
+            <span class="s1">index_cols = [index_cols]</span>
+        <span class="s0">for </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">index_cols:</span>
+            <span class="s0">if </span><span class="s1">getattr(dtypes.get(ind)</span><span class="s0">, </span><span class="s4">&quot;numpy_dtype&quot;</span><span class="s0">, None</span><span class="s1">):</span>
+                <span class="s2"># index does not support masked types</span>
+                <span class="s1">dtypes[ind] = dtypes[ind].numpy_dtype</span>
+        <span class="s0">for </span><span class="s1">cat </span><span class="s0">in </span><span class="s1">categories:</span>
+            <span class="s0">if </span><span class="s1">cat </span><span class="s0">in </span><span class="s1">all_columns:</span>
+                <span class="s1">dtypes[cat] = pd.CategoricalDtype(categories=[UNKNOWN_CATEGORIES])</span>
+
+        <span class="s0">for </span><span class="s1">catcol </span><span class="s0">in </span><span class="s1">pf.cats:</span>
+            <span class="s0">if </span><span class="s1">catcol </span><span class="s0">in </span><span class="s1">all_columns:</span>
+                <span class="s1">dtypes[catcol] = pd.CategoricalDtype(categories=pf.cats[catcol])</span>
+
+        <span class="s1">meta = _meta_from_dtypes(all_columns</span><span class="s0">, </span><span class="s1">dtypes</span><span class="s0">, </span><span class="s1">index_cols</span><span class="s0">, </span><span class="s1">column_index_names)</span>
+
+        <span class="s2"># Update `dataset_info` and return `meta`</span>
+        <span class="s1">dataset_info[</span><span class="s4">&quot;dtypes&quot;</span><span class="s1">] = dtypes</span>
+        <span class="s1">dataset_info[</span><span class="s4">&quot;index&quot;</span><span class="s1">] = index</span>
+        <span class="s1">dataset_info[</span><span class="s4">&quot;index_cols&quot;</span><span class="s1">] = index_cols</span>
+        <span class="s1">dataset_info[</span><span class="s4">&quot;categories&quot;</span><span class="s1">] = categories</span>
+        <span class="s1">dataset_info[</span><span class="s4">&quot;categories_dict&quot;</span><span class="s1">] = categories_dict</span>
+
+        <span class="s0">return </span><span class="s1">meta</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_construct_collection_plan(cls</span><span class="s0">, </span><span class="s1">dataset_info):</span>
+        <span class="s2"># Collect necessary information from dataset_info</span>
+        <span class="s1">fs = dataset_info[</span><span class="s4">&quot;fs&quot;</span><span class="s1">]</span>
+        <span class="s1">parts = dataset_info[</span><span class="s4">&quot;parts&quot;</span><span class="s1">]</span>
+        <span class="s1">paths = dataset_info[</span><span class="s4">&quot;paths&quot;</span><span class="s1">]</span>
+        <span class="s1">filters = dataset_info[</span><span class="s4">&quot;filters&quot;</span><span class="s1">]</span>
+        <span class="s1">pf = dataset_info[</span><span class="s4">&quot;pf&quot;</span><span class="s1">]</span>
+        <span class="s1">split_row_groups = dataset_info[</span><span class="s4">&quot;split_row_groups&quot;</span><span class="s1">]</span>
+        <span class="s1">blocksize = dataset_info[</span><span class="s4">&quot;blocksize&quot;</span><span class="s1">]</span>
+        <span class="s1">gather_statistics = dataset_info[</span><span class="s4">&quot;gather_statistics&quot;</span><span class="s1">]</span>
+        <span class="s1">base_path = dataset_info[</span><span class="s4">&quot;base&quot;</span><span class="s1">]</span>
+        <span class="s1">aggregation_depth = dataset_info[</span><span class="s4">&quot;aggregation_depth&quot;</span><span class="s1">]</span>
+        <span class="s1">index_cols = dataset_info[</span><span class="s4">&quot;index_cols&quot;</span><span class="s1">]</span>
+        <span class="s1">categories = dataset_info[</span><span class="s4">&quot;categories&quot;</span><span class="s1">]</span>
+        <span class="s1">dtypes = dataset_info[</span><span class="s4">&quot;dtypes&quot;</span><span class="s1">]</span>
+        <span class="s1">categories_dict = dataset_info[</span><span class="s4">&quot;categories_dict&quot;</span><span class="s1">]</span>
+        <span class="s1">has_metadata_file = dataset_info[</span><span class="s4">&quot;has_metadata_file&quot;</span><span class="s1">]</span>
+        <span class="s1">metadata_task_size = dataset_info[</span><span class="s4">&quot;metadata_task_size&quot;</span><span class="s1">]</span>
+        <span class="s1">kwargs = dataset_info[</span><span class="s4">&quot;kwargs&quot;</span><span class="s1">]</span>
+
+        <span class="s2"># Ensure metadata_task_size is set</span>
+        <span class="s2"># (Using config file or defaults)</span>
+        <span class="s1">metadata_task_size = _set_metadata_task_size(</span>
+            <span class="s1">dataset_info[</span><span class="s4">&quot;metadata_task_size&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s1">fs</span>
+        <span class="s1">)</span>
+
+        <span class="s2"># Determine which columns need statistics.</span>
+        <span class="s2"># At this point, gather_statistics is only True if</span>
+        <span class="s2"># the user specified calculate_divisions=True</span>
+        <span class="s1">filter_columns = {t[</span><span class="s5">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">t </span><span class="s0">in </span><span class="s1">flatten(filters </span><span class="s0">or </span><span class="s1">[]</span><span class="s0">, </span><span class="s1">container=list)}</span>
+        <span class="s1">stat_col_indices = {}</span>
+        <span class="s1">_index_cols = index_cols </span><span class="s0">if </span><span class="s1">(gather_statistics </span><span class="s0">and </span><span class="s1">len(index_cols) == </span><span class="s5">1</span><span class="s1">) </span><span class="s0">else </span><span class="s1">[]</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">name </span><span class="s0">in </span><span class="s1">enumerate(pf.columns):</span>
+            <span class="s0">if </span><span class="s1">name </span><span class="s0">in </span><span class="s1">_index_cols </span><span class="s0">or </span><span class="s1">name </span><span class="s0">in </span><span class="s1">filter_columns:</span>
+                <span class="s1">stat_col_indices[name] = i</span>
+
+        <span class="s2"># Decide final `gather_statistics` setting.</span>
+        <span class="s2"># NOTE: The &quot;fastparquet&quot; engine requires statistics for</span>
+        <span class="s2"># filtering even if the filter is on a paritioned column</span>
+        <span class="s1">gather_statistics = _set_gather_statistics(</span>
+            <span class="s1">gather_statistics</span><span class="s0">,</span>
+            <span class="s1">blocksize</span><span class="s0">,</span>
+            <span class="s1">split_row_groups</span><span class="s0">,</span>
+            <span class="s1">aggregation_depth</span><span class="s0">,</span>
+            <span class="s1">filter_columns</span><span class="s0">,</span>
+            <span class="s1">set(stat_col_indices) | filter_columns</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+        <span class="s2"># Define common_kwargs</span>
+        <span class="s1">common_kwargs = {</span>
+            <span class="s4">&quot;categories&quot;</span><span class="s1">: categories_dict </span><span class="s0">or </span><span class="s1">categories</span><span class="s0">,</span>
+            <span class="s4">&quot;root_cats&quot;</span><span class="s1">: pf.cats</span><span class="s0">,</span>
+            <span class="s4">&quot;root_file_scheme&quot;</span><span class="s1">: pf.file_scheme</span><span class="s0">,</span>
+            <span class="s4">&quot;base_path&quot;</span><span class="s1">: base_path</span><span class="s0">,</span>
+            <span class="s1">**kwargs</span><span class="s0">,</span>
+        <span class="s1">}</span>
+
+        <span class="s2"># Check if this is a very simple case where we can just</span>
+        <span class="s2"># return the path names. This requires that `parts`</span>
+        <span class="s2"># already be a list of paths. Also, we cannot be splitting</span>
+        <span class="s2"># by row-group or collecting statistics.</span>
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">gather_statistics </span><span class="s0">is False</span>
+            <span class="s0">and not </span><span class="s1">split_row_groups</span>
+            <span class="s0">and </span><span class="s1">isinstance(parts</span><span class="s0">, </span><span class="s1">list)</span>
+            <span class="s0">and </span><span class="s1">len(parts)</span>
+            <span class="s0">and </span><span class="s1">isinstance(parts[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">str)</span>
+        <span class="s1">):</span>
+            <span class="s0">return </span><span class="s1">(</span>
+                <span class="s1">[{</span><span class="s4">&quot;piece&quot;</span><span class="s1">: (full_path</span><span class="s0">, None</span><span class="s1">)} </span><span class="s0">for </span><span class="s1">full_path </span><span class="s0">in </span><span class="s1">parts]</span><span class="s0">,</span>
+                <span class="s1">[]</span><span class="s0">,</span>
+                <span class="s1">common_kwargs</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s1">dataset_info_kwargs = {</span>
+            <span class="s4">&quot;fs&quot;</span><span class="s1">: fs</span><span class="s0">,</span>
+            <span class="s4">&quot;split_row_groups&quot;</span><span class="s1">: split_row_groups</span><span class="s0">,</span>
+            <span class="s4">&quot;gather_statistics&quot;</span><span class="s1">: gather_statistics</span><span class="s0">,</span>
+            <span class="s4">&quot;filters&quot;</span><span class="s1">: filters</span><span class="s0">,</span>
+            <span class="s4">&quot;dtypes&quot;</span><span class="s1">: dtypes</span><span class="s0">,</span>
+            <span class="s4">&quot;stat_col_indices&quot;</span><span class="s1">: stat_col_indices</span><span class="s0">,</span>
+            <span class="s4">&quot;aggregation_depth&quot;</span><span class="s1">: aggregation_depth</span><span class="s0">,</span>
+            <span class="s4">&quot;blocksize&quot;</span><span class="s1">: blocksize</span><span class="s0">,</span>
+            <span class="s4">&quot;root_cats&quot;</span><span class="s1">: pf.cats</span><span class="s0">,</span>
+            <span class="s4">&quot;root_file_scheme&quot;</span><span class="s1">: pf.file_scheme</span><span class="s0">,</span>
+            <span class="s4">&quot;base_path&quot;</span><span class="s1">: </span><span class="s4">&quot;&quot; </span><span class="s0">if </span><span class="s1">base_path </span><span class="s0">is None else </span><span class="s1">base_path</span><span class="s0">,</span>
+            <span class="s4">&quot;has_metadata_file&quot;</span><span class="s1">: has_metadata_file</span><span class="s0">,</span>
+        <span class="s1">}</span>
+
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">has_metadata_file</span>
+            <span class="s0">or </span><span class="s1">metadata_task_size == </span><span class="s5">0</span>
+            <span class="s0">or </span><span class="s1">metadata_task_size &gt; len(paths)</span>
+        <span class="s1">):</span>
+            <span class="s2"># Construct the output-partitioning plan on the</span>
+            <span class="s2"># client process (in serial).  This means we have</span>
+            <span class="s2"># a global _metadata file, or that `metadata_task_size`</span>
+            <span class="s2"># is zero or larger than the number of files.</span>
+            <span class="s1">pf_or_paths = pf </span><span class="s0">if </span><span class="s1">has_metadata_file </span><span class="s0">else </span><span class="s1">paths</span>
+            <span class="s1">parts</span><span class="s0">, </span><span class="s1">stats = cls._collect_file_parts(pf_or_paths</span><span class="s0">, </span><span class="s1">dataset_info_kwargs)</span>
+
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># We DON'T have a global _metadata file to work with.</span>
+            <span class="s2"># We should loop over files in parallel</span>
+            <span class="s1">parts</span><span class="s0">, </span><span class="s1">stats = []</span><span class="s0">, </span><span class="s1">[]</span>
+            <span class="s0">if </span><span class="s1">paths:</span>
+                <span class="s2"># Build and compute a task graph to construct stats/parts</span>
+                <span class="s1">gather_parts_dsk = {}</span>
+                <span class="s1">name = </span><span class="s4">&quot;gather-pq-parts-&quot; </span><span class="s1">+ tokenize(paths</span><span class="s0">, </span><span class="s1">dataset_info_kwargs)</span>
+                <span class="s1">finalize_list = []</span>
+                <span class="s0">for </span><span class="s1">task_i</span><span class="s0">, </span><span class="s1">file_i </span><span class="s0">in </span><span class="s1">enumerate(</span>
+                    <span class="s1">range(</span><span class="s5">0</span><span class="s0">, </span><span class="s1">len(paths)</span><span class="s0">, </span><span class="s1">metadata_task_size)</span>
+                <span class="s1">):</span>
+                    <span class="s1">finalize_list.append((name</span><span class="s0">, </span><span class="s1">task_i))</span>
+                    <span class="s1">gather_parts_dsk[finalize_list[-</span><span class="s5">1</span><span class="s1">]] = (</span>
+                        <span class="s1">cls._collect_file_parts</span><span class="s0">,</span>
+                        <span class="s1">paths[file_i : file_i + metadata_task_size]</span><span class="s0">,</span>
+                        <span class="s1">dataset_info_kwargs</span><span class="s0">,</span>
+                    <span class="s1">)</span>
+
+                <span class="s0">def </span><span class="s1">_combine_parts(parts_and_stats):</span>
+                    <span class="s1">parts</span><span class="s0">, </span><span class="s1">stats = []</span><span class="s0">, </span><span class="s1">[]</span>
+                    <span class="s0">for </span><span class="s1">part</span><span class="s0">, </span><span class="s1">stat </span><span class="s0">in </span><span class="s1">parts_and_stats:</span>
+                        <span class="s1">parts += part</span>
+                        <span class="s0">if </span><span class="s1">stat:</span>
+                            <span class="s1">stats += stat</span>
+                    <span class="s0">return </span><span class="s1">parts</span><span class="s0">, </span><span class="s1">stats</span>
+
+                <span class="s1">gather_parts_dsk[</span><span class="s4">&quot;final-&quot; </span><span class="s1">+ name] = (_combine_parts</span><span class="s0">, </span><span class="s1">finalize_list)</span>
+                <span class="s1">parts</span><span class="s0">, </span><span class="s1">stats = Delayed(</span><span class="s4">&quot;final-&quot; </span><span class="s1">+ name</span><span class="s0">, </span><span class="s1">gather_parts_dsk).compute()</span>
+
+        <span class="s0">return </span><span class="s1">parts</span><span class="s0">, </span><span class="s1">stats</span><span class="s0">, </span><span class="s1">common_kwargs</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_collect_file_parts(</span>
+        <span class="s1">cls</span><span class="s0">,</span>
+        <span class="s1">pf_or_files</span><span class="s0">,</span>
+        <span class="s1">dataset_info_kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s2"># Collect necessary information from dataset_info</span>
+        <span class="s1">fs = dataset_info_kwargs[</span><span class="s4">&quot;fs&quot;</span><span class="s1">]</span>
+        <span class="s1">split_row_groups = dataset_info_kwargs[</span><span class="s4">&quot;split_row_groups&quot;</span><span class="s1">]</span>
+        <span class="s1">gather_statistics = dataset_info_kwargs[</span><span class="s4">&quot;gather_statistics&quot;</span><span class="s1">]</span>
+        <span class="s1">stat_col_indices = dataset_info_kwargs[</span><span class="s4">&quot;stat_col_indices&quot;</span><span class="s1">]</span>
+        <span class="s1">filters = dataset_info_kwargs[</span><span class="s4">&quot;filters&quot;</span><span class="s1">]</span>
+        <span class="s1">dtypes = dataset_info_kwargs[</span><span class="s4">&quot;dtypes&quot;</span><span class="s1">]</span>
+        <span class="s1">blocksize = dataset_info_kwargs[</span><span class="s4">&quot;blocksize&quot;</span><span class="s1">]</span>
+        <span class="s1">aggregation_depth = dataset_info_kwargs[</span><span class="s4">&quot;aggregation_depth&quot;</span><span class="s1">]</span>
+        <span class="s1">base_path = dataset_info_kwargs.get(</span><span class="s4">&quot;base_path&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">root_cats = dataset_info_kwargs.get(</span><span class="s4">&quot;root_cats&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">root_file_scheme = dataset_info_kwargs.get(</span><span class="s4">&quot;root_file_scheme&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">has_metadata_file = dataset_info_kwargs[</span><span class="s4">&quot;has_metadata_file&quot;</span><span class="s1">]</span>
+
+        <span class="s2"># Get ParquetFile</span>
+        <span class="s0">if not </span><span class="s1">isinstance(pf_or_files</span><span class="s0">, </span><span class="s1">fastparquet.api.ParquetFile):</span>
+            <span class="s2"># Construct local `ParquetFile` object</span>
+            <span class="s1">pf = ParquetFile(</span>
+                <span class="s1">pf_or_files</span><span class="s0">,</span>
+                <span class="s1">open_with=fs.open</span><span class="s0">,</span>
+                <span class="s1">root=base_path</span><span class="s0">,</span>
+            <span class="s1">)</span>
+            <span class="s2"># Update hive-partitioning to match global cats/scheme</span>
+            <span class="s1">pf.cats = root_cats </span><span class="s0">or </span><span class="s1">{}</span>
+            <span class="s0">if </span><span class="s1">root_cats:</span>
+                <span class="s1">pf.file_scheme = root_file_scheme</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># We already have a ParquetFile object to work with</span>
+            <span class="s1">pf = pf_or_files</span>
+
+        <span class="s2"># Organize row-groups by file</span>
+        <span class="s1">(</span>
+            <span class="s1">file_row_groups</span><span class="s0">,</span>
+            <span class="s1">file_row_group_stats</span><span class="s0">,</span>
+            <span class="s1">file_row_group_column_stats</span><span class="s0">,</span>
+            <span class="s1">gather_statistics</span><span class="s0">,</span>
+            <span class="s1">base_path</span><span class="s0">,</span>
+        <span class="s1">) = cls._organize_row_groups(</span>
+            <span class="s1">pf</span><span class="s0">,</span>
+            <span class="s1">split_row_groups</span><span class="s0">,</span>
+            <span class="s1">gather_statistics</span><span class="s0">,</span>
+            <span class="s1">stat_col_indices</span><span class="s0">,</span>
+            <span class="s1">filters</span><span class="s0">,</span>
+            <span class="s1">dtypes</span><span class="s0">,</span>
+            <span class="s1">base_path</span><span class="s0">,</span>
+            <span class="s1">has_metadata_file</span><span class="s0">,</span>
+            <span class="s1">blocksize</span><span class="s0">,</span>
+            <span class="s1">aggregation_depth</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+        <span class="s2"># Convert organized row-groups to parts</span>
+        <span class="s1">parts</span><span class="s0">, </span><span class="s1">stats = _row_groups_to_parts(</span>
+            <span class="s1">gather_statistics</span><span class="s0">,</span>
+            <span class="s1">split_row_groups</span><span class="s0">,</span>
+            <span class="s1">aggregation_depth</span><span class="s0">,</span>
+            <span class="s1">file_row_groups</span><span class="s0">,</span>
+            <span class="s1">file_row_group_stats</span><span class="s0">,</span>
+            <span class="s1">file_row_group_column_stats</span><span class="s0">,</span>
+            <span class="s1">stat_col_indices</span><span class="s0">,</span>
+            <span class="s1">cls._make_part</span><span class="s0">,</span>
+            <span class="s1">make_part_kwargs={</span>
+                <span class="s4">&quot;fs&quot;</span><span class="s1">: fs</span><span class="s0">,</span>
+                <span class="s4">&quot;pf&quot;</span><span class="s1">: pf</span><span class="s0">,</span>
+                <span class="s4">&quot;base_path&quot;</span><span class="s1">: base_path</span><span class="s0">,</span>
+                <span class="s4">&quot;partitions&quot;</span><span class="s1">: list(pf.cats)</span><span class="s0">,</span>
+            <span class="s1">}</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+        <span class="s0">return </span><span class="s1">parts</span><span class="s0">, </span><span class="s1">stats</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">read_metadata(</span>
+        <span class="s1">cls</span><span class="s0">,</span>
+        <span class="s1">fs</span><span class="s0">,</span>
+        <span class="s1">paths</span><span class="s0">,</span>
+        <span class="s1">categories=</span><span class="s0">None,</span>
+        <span class="s1">index=</span><span class="s0">None,</span>
+        <span class="s1">use_nullable_dtypes=</span><span class="s0">None,</span>
+        <span class="s1">dtype_backend=</span><span class="s0">None,</span>
+        <span class="s1">gather_statistics=</span><span class="s0">None,</span>
+        <span class="s1">filters=</span><span class="s0">None,</span>
+        <span class="s1">split_row_groups=</span><span class="s4">&quot;adaptive&quot;</span><span class="s0">,</span>
+        <span class="s1">blocksize=</span><span class="s0">None,</span>
+        <span class="s1">aggregate_files=</span><span class="s0">None,</span>
+        <span class="s1">ignore_metadata_file=</span><span class="s0">False,</span>
+        <span class="s1">metadata_task_size=</span><span class="s0">None,</span>
+        <span class="s1">parquet_file_extension=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">use_nullable_dtypes </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">&quot;`use_nullable_dtypes` is not supported by the fastparquet engine&quot;</span>
+            <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">dtype_backend </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">&quot;`dtype_backend` is not supported by the fastparquet engine&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s2"># Stage 1: Collect general dataset information</span>
+        <span class="s1">dataset_info = cls._collect_dataset_info(</span>
+            <span class="s1">paths</span><span class="s0">,</span>
+            <span class="s1">fs</span><span class="s0">,</span>
+            <span class="s1">categories</span><span class="s0">,</span>
+            <span class="s1">index</span><span class="s0">,</span>
+            <span class="s1">gather_statistics</span><span class="s0">,</span>
+            <span class="s1">filters</span><span class="s0">,</span>
+            <span class="s1">split_row_groups</span><span class="s0">,</span>
+            <span class="s1">blocksize</span><span class="s0">,</span>
+            <span class="s1">aggregate_files</span><span class="s0">,</span>
+            <span class="s1">ignore_metadata_file</span><span class="s0">,</span>
+            <span class="s1">metadata_task_size</span><span class="s0">,</span>
+            <span class="s1">parquet_file_extension</span><span class="s0">,</span>
+            <span class="s1">kwargs</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+        <span class="s2"># Stage 2: Generate output `meta`</span>
+        <span class="s1">meta = cls._create_dd_meta(dataset_info)</span>
+
+        <span class="s2"># Stage 3: Generate parts and stats</span>
+        <span class="s1">parts</span><span class="s0">, </span><span class="s1">stats</span><span class="s0">, </span><span class="s1">common_kwargs = cls._construct_collection_plan(dataset_info)</span>
+
+        <span class="s2"># Cannot allow `None` in columns if the user has specified index=False</span>
+        <span class="s1">index = dataset_info[</span><span class="s4">&quot;index&quot;</span><span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">index </span><span class="s0">is False and None in </span><span class="s1">meta.columns:</span>
+            <span class="s1">meta.drop(columns=[</span><span class="s0">None</span><span class="s1">]</span><span class="s0">, </span><span class="s1">inplace=</span><span class="s0">True</span><span class="s1">)</span>
+
+        <span class="s2"># Add `common_kwargs` to the first element of `parts`.</span>
+        <span class="s2"># We can return as a separate element in the future, but</span>
+        <span class="s2"># should avoid breaking the API for now.</span>
+        <span class="s0">if </span><span class="s1">len(parts):</span>
+            <span class="s1">parts[</span><span class="s5">0</span><span class="s1">][</span><span class="s4">&quot;common_kwargs&quot;</span><span class="s1">] = common_kwargs</span>
+            <span class="s1">parts[</span><span class="s5">0</span><span class="s1">][</span><span class="s4">&quot;aggregation_depth&quot;</span><span class="s1">] = dataset_info[</span><span class="s4">&quot;aggregation_depth&quot;</span><span class="s1">]</span>
+            <span class="s1">parts[</span><span class="s5">0</span><span class="s1">][</span><span class="s4">&quot;split_row_groups&quot;</span><span class="s1">] = dataset_info[</span><span class="s4">&quot;split_row_groups&quot;</span><span class="s1">]</span>
+
+        <span class="s0">if </span><span class="s1">len(parts) </span><span class="s0">and </span><span class="s1">len(parts[</span><span class="s5">0</span><span class="s1">][</span><span class="s4">&quot;piece&quot;</span><span class="s1">]) == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s2"># Strip all partition-dependent or unnecessary</span>
+            <span class="s2"># data from the `ParquetFile` object</span>
+            <span class="s1">pf = dataset_info[</span><span class="s4">&quot;pf&quot;</span><span class="s1">]</span>
+            <span class="s1">pf.row_groups = </span><span class="s0">None</span>
+            <span class="s1">pf.fmd.row_groups = </span><span class="s0">None</span>
+            <span class="s1">pf._statistics = </span><span class="s0">None</span>
+            <span class="s1">parts[</span><span class="s5">0</span><span class="s1">][</span><span class="s4">&quot;common_kwargs&quot;</span><span class="s1">][</span><span class="s4">&quot;parquet_file&quot;</span><span class="s1">] = pf</span>
+
+        <span class="s0">return </span><span class="s1">(meta</span><span class="s0">, </span><span class="s1">stats</span><span class="s0">, </span><span class="s1">parts</span><span class="s0">, </span><span class="s1">index)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">multi_support(cls):</span>
+        <span class="s0">return </span><span class="s1">cls == FastParquetEngine</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">read_partition(</span>
+        <span class="s1">cls</span><span class="s0">,</span>
+        <span class="s1">fs</span><span class="s0">,</span>
+        <span class="s1">pieces</span><span class="s0">,</span>
+        <span class="s1">columns</span><span class="s0">,</span>
+        <span class="s1">index</span><span class="s0">,</span>
+        <span class="s1">dtype_backend=</span><span class="s0">None,</span>
+        <span class="s1">categories=()</span><span class="s0">,</span>
+        <span class="s1">root_cats=</span><span class="s0">None,</span>
+        <span class="s1">root_file_scheme=</span><span class="s0">None,</span>
+        <span class="s1">base_path=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s1">null_index_name = </span><span class="s0">False</span>
+        <span class="s1">base_path = </span><span class="s0">False if not </span><span class="s1">root_cats </span><span class="s0">else </span><span class="s1">base_path</span>
+        <span class="s0">if </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s0">if </span><span class="s1">index == [</span><span class="s0">None</span><span class="s1">]:</span>
+                <span class="s2"># Handling a None-labeled index...</span>
+                <span class="s2"># The pandas metadata told us to read in an index</span>
+                <span class="s2"># labeled `None`. If this corresponds to a `RangeIndex`,</span>
+                <span class="s2"># fastparquet will need use the pandas metadata to</span>
+                <span class="s2"># construct the index. Otherwise, the index will correspond</span>
+                <span class="s2"># to a column named &quot;__index_level_0__&quot;.  We will need to</span>
+                <span class="s2"># check the `ParquetFile` object for this column below.</span>
+                <span class="s1">index = []</span>
+                <span class="s1">null_index_name = </span><span class="s0">True</span>
+            <span class="s1">columns += index</span>
+
+        <span class="s2"># Use global `parquet_file` object.  Need to reattach</span>
+        <span class="s2"># the desired row_group</span>
+        <span class="s1">parquet_file = kwargs.pop(</span><span class="s4">&quot;parquet_file&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+
+        <span class="s2"># Always convert pieces to list</span>
+        <span class="s0">if not </span><span class="s1">isinstance(pieces</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s1">pieces = [pieces]</span>
+
+        <span class="s1">sample = pieces[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">isinstance(sample</span><span class="s0">, </span><span class="s1">tuple):</span>
+            <span class="s0">if </span><span class="s1">isinstance(sample[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">str):</span>
+                <span class="s2"># We have paths to read from</span>
+                <span class="s0">assert </span><span class="s1">parquet_file </span><span class="s0">is None</span>
+
+                <span class="s1">row_groups = []</span>
+                <span class="s1">rg_offset = </span><span class="s5">0</span>
+                <span class="s1">parquet_file = ParquetFile(</span>
+                    <span class="s1">[p[</span><span class="s5">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">pieces]</span><span class="s0">,</span>
+                    <span class="s1">open_with=fs.open</span><span class="s0">,</span>
+                    <span class="s1">root=base_path </span><span class="s0">or False,</span>
+                    <span class="s1">**kwargs.get(</span><span class="s4">&quot;dataset&quot;</span><span class="s0">, </span><span class="s1">{})</span><span class="s0">,</span>
+                <span class="s1">)</span>
+                <span class="s0">for </span><span class="s1">piece </span><span class="s0">in </span><span class="s1">pieces:</span>
+                    <span class="s1">_pf = (</span>
+                        <span class="s1">parquet_file</span>
+                        <span class="s0">if </span><span class="s1">len(pieces) == </span><span class="s5">1</span>
+                        <span class="s0">else </span><span class="s1">ParquetFile(</span>
+                            <span class="s1">piece[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">,</span>
+                            <span class="s1">open_with=fs.open</span><span class="s0">,</span>
+                            <span class="s1">root=base_path </span><span class="s0">or False,</span>
+                            <span class="s1">**kwargs.get(</span><span class="s4">&quot;dataset&quot;</span><span class="s0">, </span><span class="s1">{})</span><span class="s0">,</span>
+                        <span class="s1">)</span>
+                    <span class="s1">)</span>
+                    <span class="s1">n_local_row_groups = len(_pf.row_groups)</span>
+                    <span class="s1">local_rg_indices = piece[</span><span class="s5">1</span><span class="s1">] </span><span class="s0">or </span><span class="s1">list(range(n_local_row_groups))</span>
+                    <span class="s1">row_groups += [</span>
+                        <span class="s1">parquet_file.row_groups[rg + rg_offset]</span>
+                        <span class="s0">for </span><span class="s1">rg </span><span class="s0">in </span><span class="s1">local_rg_indices</span>
+                    <span class="s1">]</span>
+                    <span class="s1">rg_offset += n_local_row_groups</span>
+                <span class="s1">update_parquet_file = len(row_groups) &lt; len(parquet_file.row_groups)</span>
+
+            <span class="s0">elif </span><span class="s1">parquet_file:</span>
+                <span class="s1">row_groups = []</span>
+                <span class="s0">for </span><span class="s1">piece </span><span class="s0">in </span><span class="s1">pieces:</span>
+                    <span class="s2"># `piece[1]` will contain actual row-group objects,</span>
+                    <span class="s2"># but they may be pickled</span>
+                    <span class="s1">rgs = piece[</span><span class="s5">0</span><span class="s1">]</span>
+                    <span class="s0">if </span><span class="s1">isinstance(rgs</span><span class="s0">, </span><span class="s1">bytes):</span>
+                        <span class="s1">rgs = pickle.loads(rgs)</span>
+                    <span class="s1">row_groups += rgs</span>
+                <span class="s1">update_parquet_file = </span><span class="s0">True</span>
+
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Neither path nor ParquetFile detected!&quot;</span><span class="s1">)</span>
+
+            <span class="s0">if </span><span class="s1">update_parquet_file:</span>
+                <span class="s0">with </span><span class="s1">_FP_FILE_LOCK:</span>
+                    <span class="s0">for </span><span class="s1">rg </span><span class="s0">in </span><span class="s1">row_groups:</span>
+                        <span class="s0">for </span><span class="s1">chunk </span><span class="s0">in </span><span class="s1">rg.columns:</span>
+                            <span class="s1">s = chunk.file_path</span>
+                            <span class="s0">if </span><span class="s1">s </span><span class="s0">and </span><span class="s1">isinstance(s</span><span class="s0">, </span><span class="s1">bytes):</span>
+                                <span class="s1">chunk.file_path = s.decode()</span>
+
+                    <span class="s1">parquet_file.fmd.row_groups = row_groups</span>
+                    <span class="s2"># NOTE: May lose cats after `_set_attrs` call</span>
+                    <span class="s1">save_cats = parquet_file.cats</span>
+                    <span class="s1">parquet_file._set_attrs()</span>
+                    <span class="s1">parquet_file.cats = save_cats</span>
+
+            <span class="s0">if </span><span class="s1">null_index_name:</span>
+                <span class="s0">if </span><span class="s4">&quot;__index_level_0__&quot; </span><span class="s0">in </span><span class="s1">parquet_file.columns:</span>
+                    <span class="s2"># See &quot;Handling a None-labeled index&quot; comment above</span>
+                    <span class="s1">index = [</span><span class="s4">&quot;__index_level_0__&quot;</span><span class="s1">]</span>
+                    <span class="s1">columns += index</span>
+
+            <span class="s2"># Update hive-partitioning information if necessary</span>
+            <span class="s1">parquet_file.cats = root_cats </span><span class="s0">or </span><span class="s1">{}</span>
+            <span class="s0">if </span><span class="s1">root_cats:</span>
+                <span class="s1">parquet_file.file_scheme = root_file_scheme</span>
+
+            <span class="s1">parquet_file._dtypes = (</span>
+                <span class="s0">lambda </span><span class="s1">*args: parquet_file.dtypes</span>
+            <span class="s1">)  </span><span class="s2"># ugly patch, could be fixed</span>
+
+            <span class="s2"># Convert ParquetFile to pandas</span>
+            <span class="s0">return </span><span class="s1">cls.pf_to_pandas(</span>
+                <span class="s1">parquet_file</span><span class="s0">,</span>
+                <span class="s1">fs=fs</span><span class="s0">,</span>
+                <span class="s1">columns=columns</span><span class="s0">,</span>
+                <span class="s1">categories=categories</span><span class="s0">,</span>
+                <span class="s1">index=index</span><span class="s0">,</span>
+                <span class="s1">**kwargs.get(</span><span class="s4">&quot;read&quot;</span><span class="s0">, </span><span class="s1">{})</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># `sample` is NOT a tuple</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s4">f&quot;Expected tuple, got </span><span class="s0">{</span><span class="s1">type(sample)</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">pf_to_pandas(</span>
+        <span class="s1">cls</span><span class="s0">,</span>
+        <span class="s1">pf</span><span class="s0">,</span>
+        <span class="s1">fs=</span><span class="s0">None,</span>
+        <span class="s1">columns=</span><span class="s0">None,</span>
+        <span class="s1">categories=</span><span class="s0">None,</span>
+        <span class="s1">index=</span><span class="s0">None,</span>
+        <span class="s1">open_file_options=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s2"># This method was mostly copied from the fastparquet</span>
+        <span class="s2"># `ParquetFile.to_pandas` definition. We maintain our</span>
+        <span class="s2"># own implmentation in Dask to enable better remote</span>
+        <span class="s2"># file-handling control</span>
+
+        <span class="s2"># Handle selected columns</span>
+        <span class="s0">if </span><span class="s1">columns </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">columns = columns[:]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">columns = pf.columns + list(pf.cats)</span>
+        <span class="s0">if </span><span class="s1">index:</span>
+            <span class="s1">columns += [i </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">index </span><span class="s0">if </span><span class="s1">i </span><span class="s0">not in </span><span class="s1">columns]</span>
+
+        <span class="s2"># Extract row-groups and pre-allocate df</span>
+        <span class="s1">rgs = pf.row_groups</span>
+        <span class="s1">size = sum(rg.num_rows </span><span class="s0">for </span><span class="s1">rg </span><span class="s0">in </span><span class="s1">rgs)</span>
+        <span class="s1">df</span><span class="s0">, </span><span class="s1">views = pf.pre_allocate(size</span><span class="s0">, </span><span class="s1">columns</span><span class="s0">, </span><span class="s1">categories</span><span class="s0">, </span><span class="s1">index)</span>
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">parse_version(fastparquet.__version__) &lt;= parse_version(</span><span class="s4">&quot;2023.02.0&quot;</span><span class="s1">)</span>
+            <span class="s0">and </span><span class="s1">PANDAS_GE_201</span>
+            <span class="s0">and </span><span class="s1">df.columns.empty</span>
+        <span class="s1">):</span>
+            <span class="s1">df.columns = pd.Index([]</span><span class="s0">, </span><span class="s1">dtype=object)</span>
+        <span class="s1">start = </span><span class="s5">0</span>
+
+        <span class="s2"># Get a map of file names -&gt; row-groups</span>
+        <span class="s1">fn_rg_map = defaultdict(list)</span>
+        <span class="s0">for </span><span class="s1">rg </span><span class="s0">in </span><span class="s1">rgs:</span>
+            <span class="s1">fn = pf.row_group_filename(rg)</span>
+            <span class="s1">fn_rg_map[fn].append(rg)</span>
+
+        <span class="s2"># Define file-opening options</span>
+        <span class="s1">precache_options</span><span class="s0">, </span><span class="s1">open_file_options = _process_open_file_options(</span>
+            <span class="s1">open_file_options</span><span class="s0">,</span>
+            <span class="s1">**(</span>
+                <span class="s1">{</span>
+                    <span class="s4">&quot;allow_precache&quot;</span><span class="s1">: </span><span class="s0">False,</span>
+                    <span class="s4">&quot;default_cache&quot;</span><span class="s1">: </span><span class="s4">&quot;readahead&quot;</span><span class="s0">,</span>
+                <span class="s1">}</span>
+                <span class="s0">if </span><span class="s1">_is_local_fs(fs)</span>
+                <span class="s0">else </span><span class="s1">{</span>
+                    <span class="s4">&quot;metadata&quot;</span><span class="s1">: pf</span><span class="s0">,</span>
+                    <span class="s4">&quot;columns&quot;</span><span class="s1">: list(set(columns).intersection(pf.columns))</span><span class="s0">,</span>
+                    <span class="s4">&quot;row_groups&quot;</span><span class="s1">: [rgs </span><span class="s0">for </span><span class="s1">rgs </span><span class="s0">in </span><span class="s1">fn_rg_map.values()]</span><span class="s0">,</span>
+                    <span class="s4">&quot;default_engine&quot;</span><span class="s1">: </span><span class="s4">&quot;fastparquet&quot;</span><span class="s0">,</span>
+                    <span class="s4">&quot;default_cache&quot;</span><span class="s1">: </span><span class="s4">&quot;readahead&quot;</span><span class="s0">,</span>
+                <span class="s1">}</span>
+            <span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+        <span class="s0">with </span><span class="s1">ExitStack() </span><span class="s0">as </span><span class="s1">stack:</span>
+            <span class="s0">for </span><span class="s1">fn</span><span class="s0">, </span><span class="s1">infile </span><span class="s0">in </span><span class="s1">zip(</span>
+                <span class="s1">fn_rg_map.keys()</span><span class="s0">,</span>
+                <span class="s1">_open_input_files(</span>
+                    <span class="s1">list(fn_rg_map.keys())</span><span class="s0">,</span>
+                    <span class="s1">fs=fs</span><span class="s0">,</span>
+                    <span class="s1">context_stack=stack</span><span class="s0">,</span>
+                    <span class="s1">precache_options=precache_options</span><span class="s0">,</span>
+                    <span class="s1">**open_file_options</span><span class="s0">,</span>
+                <span class="s1">)</span><span class="s0">,</span>
+            <span class="s1">):</span>
+                <span class="s0">for </span><span class="s1">rg </span><span class="s0">in </span><span class="s1">fn_rg_map[fn]:</span>
+                    <span class="s1">thislen = rg.num_rows</span>
+                    <span class="s1">parts = {</span>
+                        <span class="s1">name: (</span>
+                            <span class="s1">v</span>
+                            <span class="s0">if </span><span class="s1">name.endswith(</span><span class="s4">&quot;-catdef&quot;</span><span class="s1">)</span>
+                            <span class="s0">else </span><span class="s1">v[start : start + thislen]</span>
+                        <span class="s1">)</span>
+                        <span class="s0">for </span><span class="s1">(name</span><span class="s0">, </span><span class="s1">v) </span><span class="s0">in </span><span class="s1">views.items()</span>
+                    <span class="s1">}</span>
+
+                    <span class="s2"># Add row-group data to df</span>
+                    <span class="s1">pf.read_row_group_file(</span>
+                        <span class="s1">rg</span><span class="s0">,</span>
+                        <span class="s1">columns</span><span class="s0">,</span>
+                        <span class="s1">categories</span><span class="s0">,</span>
+                        <span class="s1">index</span><span class="s0">,</span>
+                        <span class="s1">assign=parts</span><span class="s0">,</span>
+                        <span class="s1">partition_meta=pf.partition_meta</span><span class="s0">,</span>
+                        <span class="s1">infile=infile</span><span class="s0">,</span>
+                        <span class="s1">**kwargs</span><span class="s0">,</span>
+                    <span class="s1">)</span>
+                    <span class="s1">start += thislen</span>
+        <span class="s0">return </span><span class="s1">df</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">initialize_write(</span>
+        <span class="s1">cls</span><span class="s0">,</span>
+        <span class="s1">df</span><span class="s0">,</span>
+        <span class="s1">fs</span><span class="s0">,</span>
+        <span class="s1">path</span><span class="s0">,</span>
+        <span class="s1">append=</span><span class="s0">False,</span>
+        <span class="s1">partition_on=</span><span class="s0">None,</span>
+        <span class="s1">ignore_divisions=</span><span class="s0">False,</span>
+        <span class="s1">division_info=</span><span class="s0">None,</span>
+        <span class="s1">schema=</span><span class="s4">&quot;infer&quot;</span><span class="s0">,</span>
+        <span class="s1">object_encoding=</span><span class="s4">&quot;utf8&quot;</span><span class="s0">,</span>
+        <span class="s1">index_cols=</span><span class="s0">None,</span>
+        <span class="s1">custom_metadata=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">index_cols </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">index_cols = []</span>
+        <span class="s0">if </span><span class="s1">append </span><span class="s0">and </span><span class="s1">division_info </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">ignore_divisions = </span><span class="s0">True</span>
+        <span class="s1">fs.mkdirs(path</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">object_encoding == </span><span class="s4">&quot;infer&quot; </span><span class="s0">or </span><span class="s1">(</span>
+            <span class="s1">isinstance(object_encoding</span><span class="s0">, </span><span class="s1">dict) </span><span class="s0">and </span><span class="s4">&quot;infer&quot; </span><span class="s0">in </span><span class="s1">object_encoding.values()</span>
+        <span class="s1">):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">'&quot;infer&quot; not allowed as object encoding, '</span>
+                <span class="s4">&quot;because this required data in memory.&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">metadata_file_exists = </span><span class="s0">False</span>
+        <span class="s0">if </span><span class="s1">append:</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s2"># to append to a dataset without _metadata, need to load</span>
+                <span class="s2"># _common_metadata or any data file here</span>
+                <span class="s1">pf = fastparquet.api.ParquetFile(path</span><span class="s0">, </span><span class="s1">open_with=fs.open)</span>
+                <span class="s1">metadata_file_exists = fs.exists(fs.sep.join([path</span><span class="s0">, </span><span class="s4">&quot;_metadata&quot;</span><span class="s1">]))</span>
+            <span class="s0">except </span><span class="s1">(OSError</span><span class="s0">, </span><span class="s1">ValueError):</span>
+                <span class="s2"># append for create</span>
+                <span class="s1">append = </span><span class="s0">False</span>
+        <span class="s0">if </span><span class="s1">append:</span>
+            <span class="s0">from </span><span class="s1">dask.dataframe._pyarrow </span><span class="s0">import </span><span class="s1">to_object_string</span>
+
+            <span class="s0">if </span><span class="s1">pf.file_scheme </span><span class="s0">not in </span><span class="s1">[</span><span class="s4">&quot;hive&quot;</span><span class="s0">, </span><span class="s4">&quot;empty&quot;</span><span class="s0">, </span><span class="s4">&quot;flat&quot;</span><span class="s1">]:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s4">&quot;Requested file scheme is hive, but existing file scheme is not.&quot;</span>
+                <span class="s1">)</span>
+            <span class="s0">elif </span><span class="s1">(set(pf.columns) != set(df.columns) - set(partition_on)) </span><span class="s0">or </span><span class="s1">(</span>
+                <span class="s1">set(partition_on) != set(pf.cats)</span>
+            <span class="s1">):</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s4">&quot;Appended columns not the same.</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                    <span class="s4">&quot;Previous: {} | New: {}&quot;</span><span class="s1">.format(pf.columns</span><span class="s0">, </span><span class="s1">list(df.columns))</span>
+                <span class="s1">)</span>
+            <span class="s0">elif </span><span class="s1">(</span>
+                <span class="s1">pd.Series(pf.dtypes).loc[pf.columns]</span>
+                <span class="s1">!= to_object_string(df[pf.columns]._meta).dtypes</span>
+            <span class="s1">).any():</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s4">&quot;Appended dtypes differ.</span><span class="s0">\n</span><span class="s4">{}&quot;</span><span class="s1">.format(</span>
+                        <span class="s1">set(pf.dtypes.items()) ^ set(df.dtypes.items())</span>
+                    <span class="s1">)</span>
+                <span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">df = df[pf.columns + partition_on]</span>
+
+            <span class="s1">fmd = pf.fmd</span>
+            <span class="s1">i_offset = fastparquet.writer.find_max_part(fmd.row_groups)</span>
+            <span class="s0">if not </span><span class="s1">ignore_divisions:</span>
+                <span class="s0">if not </span><span class="s1">set(index_cols).intersection([division_info[</span><span class="s4">&quot;name&quot;</span><span class="s1">]]):</span>
+                    <span class="s1">ignore_divisions = </span><span class="s0">True</span>
+            <span class="s0">if not </span><span class="s1">ignore_divisions:</span>
+                <span class="s1">minmax = fastparquet.api.sorted_partitioned_columns(pf)</span>
+                <span class="s2"># If fastparquet detects that a partitioned column isn't sorted, it won't</span>
+                <span class="s2"># appear in the resulting min/max dictionary</span>
+                <span class="s1">old_end = (</span>
+                    <span class="s1">minmax[index_cols[</span><span class="s5">0</span><span class="s1">]][</span><span class="s4">&quot;max&quot;</span><span class="s1">][-</span><span class="s5">1</span><span class="s1">]</span>
+                    <span class="s0">if </span><span class="s1">index_cols[</span><span class="s5">0</span><span class="s1">] </span><span class="s0">in </span><span class="s1">minmax</span>
+                    <span class="s0">else None</span>
+                <span class="s1">)</span>
+                <span class="s1">divisions = division_info[</span><span class="s4">&quot;divisions&quot;</span><span class="s1">]</span>
+                <span class="s0">if </span><span class="s1">old_end </span><span class="s0">is not None and </span><span class="s1">divisions[</span><span class="s5">0</span><span class="s1">] &lt;= old_end:</span>
+                    <span class="s0">raise </span><span class="s1">ValueError(</span>
+                        <span class="s4">&quot;The divisions of the appended dataframe overlap with &quot;</span>
+                        <span class="s4">&quot;previously written divisions. If this is desired, set &quot;</span>
+                        <span class="s4">&quot;``ignore_divisions=True`` to append anyway.</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                        <span class="s4">&quot;- End of last written partition: {old_end}</span><span class="s0">\n</span><span class="s4">&quot;</span>
+                        <span class="s4">&quot;- Start of first new partition: {divisions[0]}&quot;</span>
+                    <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">fmd = fastparquet.writer.make_metadata(</span>
+                <span class="s1">df._meta</span><span class="s0">,</span>
+                <span class="s1">object_encoding=object_encoding</span><span class="s0">,</span>
+                <span class="s1">index_cols=index_cols</span><span class="s0">,</span>
+                <span class="s1">ignore_columns=partition_on</span><span class="s0">,</span>
+                <span class="s1">**kwargs</span><span class="s0">,</span>
+            <span class="s1">)</span>
+            <span class="s1">i_offset = </span><span class="s5">0</span>
+        <span class="s0">if </span><span class="s1">custom_metadata </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">kvm = fmd.key_value_metadata </span><span class="s0">or </span><span class="s1">[]</span>
+            <span class="s1">kvm.extend(</span>
+                <span class="s1">[</span>
+                    <span class="s1">fastparquet.parquet_thrift.KeyValue(key=key</span><span class="s0">, </span><span class="s1">value=value)</span>
+                    <span class="s0">for </span><span class="s1">key</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">custom_metadata.items()</span>
+                <span class="s1">]</span>
+            <span class="s1">)</span>
+            <span class="s1">fmd.key_value_metadata = kvm</span>
+
+        <span class="s1">extra_write_kwargs = {</span><span class="s4">&quot;fmd&quot;</span><span class="s1">: fmd}</span>
+        <span class="s0">return </span><span class="s1">i_offset</span><span class="s0">, </span><span class="s1">fmd</span><span class="s0">, </span><span class="s1">metadata_file_exists</span><span class="s0">, </span><span class="s1">extra_write_kwargs</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">write_partition(</span>
+        <span class="s1">cls</span><span class="s0">,</span>
+        <span class="s1">df</span><span class="s0">,</span>
+        <span class="s1">path</span><span class="s0">,</span>
+        <span class="s1">fs</span><span class="s0">,</span>
+        <span class="s1">filename</span><span class="s0">,</span>
+        <span class="s1">partition_on</span><span class="s0">,</span>
+        <span class="s1">return_metadata</span><span class="s0">,</span>
+        <span class="s1">fmd=</span><span class="s0">None,</span>
+        <span class="s1">compression=</span><span class="s0">None,</span>
+        <span class="s1">custom_metadata=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s2"># Update key/value metadata if necessary</span>
+        <span class="s1">fmd = copy.copy(fmd)</span>
+        <span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">fmd.schema:</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s2"># can be coerced to bytes on copy</span>
+                <span class="s1">s.name = s.name.decode()</span>
+            <span class="s0">except </span><span class="s1">AttributeError:</span>
+                <span class="s0">pass</span>
+        <span class="s0">if </span><span class="s1">custom_metadata </span><span class="s0">and </span><span class="s1">fmd </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">fmd.key_value_metadata = fmd.key_value_metadata + (</span>
+                <span class="s1">[</span>
+                    <span class="s1">fastparquet.parquet_thrift.KeyValue(key=key</span><span class="s0">, </span><span class="s1">value=value)</span>
+                    <span class="s0">for </span><span class="s1">key</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">custom_metadata.items()</span>
+                <span class="s1">]</span>
+            <span class="s1">)</span>
+
+        <span class="s0">if not </span><span class="s1">len(df):</span>
+            <span class="s2"># Write nothing for empty partitions</span>
+            <span class="s1">rgs = []</span>
+        <span class="s0">elif </span><span class="s1">partition_on:</span>
+            <span class="s1">mkdirs = </span><span class="s0">lambda </span><span class="s1">x: fs.mkdirs(x</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">parse_version(fastparquet.__version__) &gt;= parse_version(</span><span class="s4">&quot;0.1.4&quot;</span><span class="s1">):</span>
+                <span class="s1">rgs = partition_on_columns(</span>
+                    <span class="s1">df</span><span class="s0">, </span><span class="s1">partition_on</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">filename</span><span class="s0">, </span><span class="s1">fmd</span><span class="s0">, </span><span class="s1">compression</span><span class="s0">, </span><span class="s1">fs.open</span><span class="s0">, </span><span class="s1">mkdirs</span>
+                <span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">rgs = partition_on_columns(</span>
+                    <span class="s1">df</span><span class="s0">,</span>
+                    <span class="s1">partition_on</span><span class="s0">,</span>
+                    <span class="s1">path</span><span class="s0">,</span>
+                    <span class="s1">filename</span><span class="s0">,</span>
+                    <span class="s1">fmd</span><span class="s0">,</span>
+                    <span class="s1">fs.sep</span><span class="s0">,</span>
+                    <span class="s1">compression</span><span class="s0">,</span>
+                    <span class="s1">fs.open</span><span class="s0">,</span>
+                    <span class="s1">mkdirs</span><span class="s0">,</span>
+                <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">with </span><span class="s1">fs.open(fs.sep.join([path</span><span class="s0">, </span><span class="s1">filename])</span><span class="s0">, </span><span class="s4">&quot;wb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">fil:</span>
+                <span class="s1">fmd.num_rows = len(df)</span>
+                <span class="s1">rg = make_part_file(</span>
+                    <span class="s1">fil</span><span class="s0">, </span><span class="s1">df</span><span class="s0">, </span><span class="s1">fmd.schema</span><span class="s0">, </span><span class="s1">compression=compression</span><span class="s0">, </span><span class="s1">fmd=fmd</span>
+                <span class="s1">)</span>
+            <span class="s0">for </span><span class="s1">chunk </span><span class="s0">in </span><span class="s1">rg.columns:</span>
+                <span class="s1">chunk.file_path = filename</span>
+            <span class="s1">rgs = [rg]</span>
+        <span class="s0">if </span><span class="s1">return_metadata:</span>
+            <span class="s0">return </span><span class="s1">rgs</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">[]</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">write_metadata(cls</span><span class="s0">, </span><span class="s1">parts</span><span class="s0">, </span><span class="s1">meta</span><span class="s0">, </span><span class="s1">fs</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">append=</span><span class="s0">False, </span><span class="s1">**kwargs):</span>
+        <span class="s1">_meta = copy.copy(meta)</span>
+        <span class="s1">rgs = meta.row_groups</span>
+        <span class="s0">if </span><span class="s1">parts:</span>
+            <span class="s0">for </span><span class="s1">rg </span><span class="s0">in </span><span class="s1">parts:</span>
+                <span class="s0">if </span><span class="s1">rg </span><span class="s0">is not None</span><span class="s1">:</span>
+                    <span class="s0">if </span><span class="s1">isinstance(rg</span><span class="s0">, </span><span class="s1">list):</span>
+                        <span class="s0">for </span><span class="s1">r </span><span class="s0">in </span><span class="s1">rg:</span>
+                            <span class="s1">rgs.append(r)</span>
+                    <span class="s0">else</span><span class="s1">:</span>
+                        <span class="s1">rgs.append(rg)</span>
+            <span class="s1">_meta.row_groups = rgs</span>
+            <span class="s1">fn = fs.sep.join([path</span><span class="s0">, </span><span class="s4">&quot;_metadata&quot;</span><span class="s1">])</span>
+            <span class="s1">fastparquet.writer.write_common_metadata(</span>
+                <span class="s1">fn</span><span class="s0">, </span><span class="s1">_meta</span><span class="s0">, </span><span class="s1">open_with=fs.open</span><span class="s0">, </span><span class="s1">no_row_groups=</span><span class="s0">False</span>
+            <span class="s1">)</span>
+
+        <span class="s2"># if appending, could skip this, but would need to check existence</span>
+        <span class="s1">fn = fs.sep.join([path</span><span class="s0">, </span><span class="s4">&quot;_common_metadata&quot;</span><span class="s1">])</span>
+        <span class="s1">fastparquet.writer.write_common_metadata(fn</span><span class="s0">, </span><span class="s1">_meta</span><span class="s0">, </span><span class="s1">open_with=fs.open)</span>
+</pre>
+</body>
+</html>

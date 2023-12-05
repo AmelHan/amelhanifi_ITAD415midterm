@@ -1,0 +1,628 @@
+<html>
+<head>
+<title>_diagnostics_count.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_diagnostics_count.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+<span class="s2">&quot;&quot;&quot; 
+Created on Fri Sep 15 12:53:45 2017 
+ 
+Author: Josef Perktold 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">stats</span>
+
+<span class="s3">import </span><span class="s1">pandas </span><span class="s3">as </span><span class="s1">pd</span>
+
+<span class="s3">from </span><span class="s1">statsmodels.stats.base </span><span class="s3">import </span><span class="s1">HolderTuple</span>
+<span class="s3">from </span><span class="s1">statsmodels.discrete.discrete_model </span><span class="s3">import </span><span class="s1">Poisson</span>
+<span class="s3">from </span><span class="s1">statsmodels.regression.linear_model </span><span class="s3">import </span><span class="s1">OLS</span>
+
+
+<span class="s3">def </span><span class="s1">_combine_bins(edge_index</span><span class="s3">, </span><span class="s1">x):</span>
+    <span class="s2">&quot;&quot;&quot;group columns into bins using sum 
+ 
+    This is mainly a helper function for combining probabilities into cells. 
+    It similar to `np.add.reduceat(x, edge_index, axis=-1)` except for the 
+    treatment of the last index and last cell. 
+ 
+    Parameters 
+    ---------- 
+    edge_index : array_like 
+         This defines the (zero-based) indices for the columns that are be 
+         combined. Each index in `edge_index` except the last is the starting 
+         index for a bin. The largest index in a bin is the next edge_index-1. 
+    x : 1d or 2d array 
+        array for which columns are combined. If x is 1-dimensional that it 
+        will be treated as a 2-d row vector. 
+ 
+    Returns 
+    ------- 
+    x_new : ndarray 
+    k_li : ndarray 
+        Count of columns combined in bin. 
+ 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; dia.combine_bins([0,1,5], np.arange(4)) 
+    (array([0, 6]), array([1, 4])) 
+ 
+    this aggregates to two bins with the sum of 1 and 4 elements 
+    &gt;&gt;&gt; np.arange(4)[0].sum() 
+    0 
+    &gt;&gt;&gt; np.arange(4)[1:5].sum() 
+    6 
+ 
+    If the rightmost index is smaller than len(x)+1, then the remaining 
+    columns will not be included. 
+ 
+    &gt;&gt;&gt; dia.combine_bins([0,1,3], np.arange(4)) 
+    (array([0, 3]), array([1, 2])) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">x = np.asarray(x)</span>
+    <span class="s3">if </span><span class="s1">x.ndim == </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">is_1d = </span><span class="s3">True</span>
+        <span class="s1">x = x[</span><span class="s3">None, </span><span class="s1">:]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">is_1d = </span><span class="s3">False</span>
+    <span class="s1">xli = []</span>
+    <span class="s1">kli = []</span>
+    <span class="s3">for </span><span class="s1">bin_idx </span><span class="s3">in </span><span class="s1">range(len(edge_index) - </span><span class="s4">1</span><span class="s1">):</span>
+        <span class="s1">i</span><span class="s3">, </span><span class="s1">j = edge_index[bin_idx : bin_idx + </span><span class="s4">2</span><span class="s1">]</span>
+        <span class="s1">xli.append(x[:</span><span class="s3">, </span><span class="s1">i:j].sum(</span><span class="s4">1</span><span class="s1">))</span>
+        <span class="s1">kli.append(j - i)</span>
+
+    <span class="s1">x_new = np.column_stack(xli)</span>
+    <span class="s3">if </span><span class="s1">is_1d:</span>
+        <span class="s1">x_new = x_new.squeeze()</span>
+    <span class="s3">return </span><span class="s1">x_new</span><span class="s3">, </span><span class="s1">np.asarray(kli)</span>
+
+
+<span class="s3">def </span><span class="s1">plot_probs(freq</span><span class="s3">, </span><span class="s1">probs_predicted</span><span class="s3">, </span><span class="s1">label=</span><span class="s5">'predicted'</span><span class="s3">, </span><span class="s1">upp_xlim=</span><span class="s3">None,</span>
+               <span class="s1">fig=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;diagnostic plots for comparing two lists of discrete probabilities 
+ 
+    Parameters 
+    ---------- 
+    freq, probs_predicted : nd_arrays 
+        two arrays of probabilities, this can be any probabilities for 
+        the same events, default is designed for comparing predicted 
+        and observed probabilities 
+    label : str or tuple 
+        If string, then it will be used as the label for probs_predicted and 
+        &quot;freq&quot; is used for the other probabilities. 
+        If label is a tuple of strings, then the first is they are used as 
+        label for both probabilities 
+ 
+    upp_xlim : None or int 
+        If it is not None, then the xlim of the first two plots are set to 
+        (0, upp_xlim), otherwise the matplotlib default is used 
+    fig : None or matplotlib figure instance 
+        If fig is provided, then the axes will be added to it in a (3,1) 
+        subplots, otherwise a matplotlib figure instance is created 
+ 
+    Returns 
+    ------- 
+    Figure 
+        The figure contains 3 subplot with probabilities, cumulative 
+        probabilities and a PP-plot 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">isinstance(label</span><span class="s3">, </span><span class="s1">list):</span>
+        <span class="s1">label0</span><span class="s3">, </span><span class="s1">label1 = label</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">label0</span><span class="s3">, </span><span class="s1">label1 = </span><span class="s5">'freq'</span><span class="s3">, </span><span class="s1">label</span>
+
+    <span class="s3">if </span><span class="s1">fig </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s3">import </span><span class="s1">matplotlib.pyplot </span><span class="s3">as </span><span class="s1">plt</span>
+        <span class="s1">fig = plt.figure(figsize=(</span><span class="s4">8</span><span class="s3">,</span><span class="s4">12</span><span class="s1">))</span>
+    <span class="s1">ax1 = fig.add_subplot(</span><span class="s4">311</span><span class="s1">)</span>
+    <span class="s1">ax1.plot(freq</span><span class="s3">, </span><span class="s5">'-o'</span><span class="s3">, </span><span class="s1">label=label0)</span>
+    <span class="s1">ax1.plot(probs_predicted</span><span class="s3">, </span><span class="s5">'-d'</span><span class="s3">, </span><span class="s1">label=label1)</span>
+    <span class="s3">if </span><span class="s1">upp_xlim </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s1">ax1.set_xlim(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">upp_xlim)</span>
+    <span class="s1">ax1.legend()</span>
+    <span class="s1">ax1.set_title(</span><span class="s5">'probabilities'</span><span class="s1">)</span>
+
+    <span class="s1">ax2 = fig.add_subplot(</span><span class="s4">312</span><span class="s1">)</span>
+    <span class="s1">ax2.plot(np.cumsum(freq)</span><span class="s3">, </span><span class="s5">'-o'</span><span class="s3">, </span><span class="s1">label=label0)</span>
+    <span class="s1">ax2.plot(np.cumsum(probs_predicted)</span><span class="s3">, </span><span class="s5">'-d'</span><span class="s3">, </span><span class="s1">label=label1)</span>
+    <span class="s3">if </span><span class="s1">upp_xlim </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s1">ax2.set_xlim(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">upp_xlim)</span>
+    <span class="s1">ax2.legend()</span>
+    <span class="s1">ax2.set_title(</span><span class="s5">'cumulative probabilities'</span><span class="s1">)</span>
+
+    <span class="s1">ax3 = fig.add_subplot(</span><span class="s4">313</span><span class="s1">)</span>
+    <span class="s1">ax3.plot(np.cumsum(probs_predicted)</span><span class="s3">, </span><span class="s1">np.cumsum(freq)</span><span class="s3">, </span><span class="s5">'o'</span><span class="s1">)</span>
+    <span class="s1">ax3.plot(np.arange(len(freq)) / len(freq)</span><span class="s3">, </span><span class="s1">np.arange(len(freq)) / len(freq))</span>
+    <span class="s1">ax3.set_title(</span><span class="s5">'PP-plot'</span><span class="s1">)</span>
+    <span class="s1">ax3.set_xlabel(label1)</span>
+    <span class="s1">ax3.set_ylabel(label0)</span>
+    <span class="s3">return </span><span class="s1">fig</span>
+
+
+<span class="s3">def </span><span class="s1">test_chisquare_prob(results</span><span class="s3">, </span><span class="s1">probs</span><span class="s3">, </span><span class="s1">bin_edges=</span><span class="s3">None, </span><span class="s1">method=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    chisquare test for predicted probabilities using cmt-opg 
+ 
+    Parameters 
+    ---------- 
+    results : results instance 
+        Instance of a count regression results 
+    probs : ndarray 
+        Array of predicted probabilities with observations 
+        in rows and event counts in columns 
+    bin_edges : None or array 
+        intervals to combine several counts into cells 
+        see combine_bins 
+ 
+    Returns 
+    ------- 
+    (api not stable, replace by test-results class) 
+    statistic : float 
+        chisquare statistic for tes 
+    p-value : float 
+        p-value of test 
+    df : int 
+        degrees of freedom for chisquare distribution 
+    extras : ??? 
+        currently returns a tuple with some intermediate results 
+        (diff, res_aux) 
+ 
+    Notes 
+    ----- 
+ 
+    Status : experimental, no verified unit tests, needs to be generalized 
+    currently only OPG version with auxiliary regression is implemented 
+ 
+    Assumes counts are np.arange(probs.shape[1]), i.e. consecutive 
+    integers starting at zero. 
+ 
+    Auxiliary regression drops the last column of binned probs to avoid 
+    that probabilities sum to 1. 
+ 
+    References 
+    ---------- 
+    .. [1] Andrews, Donald W. K. 1988a. “Chi-Square Diagnostic Tests for 
+           Econometric Models: Theory.” Econometrica 56 (6): 1419–53. 
+           https://doi.org/10.2307/1913105. 
+ 
+    .. [2] Andrews, Donald W. K. 1988b. “Chi-Square Diagnostic Tests for 
+           Econometric Models.” Journal of Econometrics 37 (1): 135–56. 
+           https://doi.org/10.1016/0304-4076(88)90079-6. 
+ 
+    .. [3] Manjón, M., and O. Martínez. 2014. “The Chi-Squared Goodness-of-Fit 
+           Test for Count-Data Models.” Stata Journal 14 (4): 798–816. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">res = results</span>
+    <span class="s1">score_obs = results.model.score_obs(results.params)</span>
+    <span class="s1">d_ind = (res.model.endog[:</span><span class="s3">, None</span><span class="s1">] == np.arange(probs.shape[</span><span class="s4">1</span><span class="s1">])).astype(int)</span>
+    <span class="s3">if </span><span class="s1">bin_edges </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s1">d_ind_bins</span><span class="s3">, </span><span class="s1">k_bins = _combine_bins(bin_edges</span><span class="s3">, </span><span class="s1">d_ind)</span>
+        <span class="s1">probs_bins</span><span class="s3">, </span><span class="s1">k_bins = _combine_bins(bin_edges</span><span class="s3">, </span><span class="s1">probs)</span>
+        <span class="s1">k_bins = probs_bins.shape[-</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">d_ind_bins</span><span class="s3">, </span><span class="s1">k_bins = d_ind</span><span class="s3">, </span><span class="s1">d_ind.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">probs_bins = probs</span>
+    <span class="s1">diff1 = d_ind_bins - probs_bins</span>
+    <span class="s0"># diff2 = (1 - d_ind.sum(1)) - (1 - probs_bins.sum(1))</span>
+    <span class="s1">x_aux = np.column_stack((score_obs</span><span class="s3">, </span><span class="s1">diff1[:</span><span class="s3">, </span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]))  </span><span class="s0"># diff2))</span>
+    <span class="s1">nobs = x_aux.shape[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">res_aux = OLS(np.ones(nobs)</span><span class="s3">, </span><span class="s1">x_aux).fit()</span>
+
+    <span class="s1">chi2_stat = nobs * (</span><span class="s4">1 </span><span class="s1">- res_aux.ssr / res_aux.uncentered_tss)</span>
+    <span class="s1">df = res_aux.model.rank - score_obs.shape[</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s3">if </span><span class="s1">df &lt; k_bins - </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s0"># not a problem in general, but it can be for OPG version</span>
+        <span class="s3">import </span><span class="s1">warnings</span>
+        <span class="s0"># TODO: Warning shows up in Monte Carlo loop, skip for now</span>
+        <span class="s1">warnings.warn(</span><span class="s5">'auxiliary model is rank deficient'</span><span class="s1">)</span>
+
+    <span class="s1">statistic = chi2_stat</span>
+    <span class="s1">pvalue = stats.chi2.sf(chi2_stat</span><span class="s3">, </span><span class="s1">df)</span>
+
+    <span class="s1">res = HolderTuple(</span>
+        <span class="s1">statistic=statistic</span><span class="s3">,</span>
+        <span class="s1">pvalue=pvalue</span><span class="s3">,</span>
+        <span class="s1">df=df</span><span class="s3">,</span>
+        <span class="s1">diff1=diff1</span><span class="s3">,</span>
+        <span class="s1">res_aux=res_aux</span><span class="s3">,</span>
+        <span class="s1">distribution=</span><span class="s5">&quot;chi2&quot;</span><span class="s3">,</span>
+        <span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">res</span>
+
+
+<span class="s3">class </span><span class="s1">DispersionResults(HolderTuple):</span>
+
+    <span class="s3">def </span><span class="s1">summary_frame(self):</span>
+        <span class="s1">frame = pd.DataFrame({</span>
+            <span class="s5">&quot;statistic&quot;</span><span class="s1">: self.statistic</span><span class="s3">,</span>
+            <span class="s5">&quot;pvalue&quot;</span><span class="s1">: self.pvalue</span><span class="s3">,</span>
+            <span class="s5">&quot;method&quot;</span><span class="s1">: self.method</span><span class="s3">,</span>
+            <span class="s5">&quot;alternative&quot;</span><span class="s1">: self.alternative</span>
+            <span class="s1">})</span>
+
+        <span class="s3">return </span><span class="s1">frame</span>
+
+
+<span class="s3">def </span><span class="s1">test_poisson_dispersion(results</span><span class="s3">, </span><span class="s1">method=</span><span class="s5">&quot;all&quot;</span><span class="s3">, </span><span class="s1">_old=</span><span class="s3">False</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Score/LM type tests for Poisson variance assumptions 
+ 
+    Null Hypothesis is 
+ 
+    H0: var(y) = E(y) and assuming E(y) is correctly specified 
+    H1: var(y) ~= E(y) 
+ 
+    The tests are based on the constrained model, i.e. the Poisson model. 
+    The tests differ in their assumed alternatives, and in their maintained 
+    assumptions. 
+ 
+    Parameters 
+    ---------- 
+    results : Poisson results instance 
+        This can be a results instance for either a discrete Poisson or a GLM 
+        with family Poisson. 
+    method : str 
+        Not used yet. Currently results for all methods are returned. 
+    _old : bool 
+        Temporary keyword for backwards compatibility, will be removed 
+        in future version of statsmodels. 
+ 
+    Returns 
+    ------- 
+    res : instance 
+        The instance of DispersionResults has the hypothesis test results, 
+        statistic, pvalue, method, alternative, as main attributes and a 
+        summary_frame method that returns the results as pandas DataFrame. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">method </span><span class="s3">not in </span><span class="s1">[</span><span class="s5">&quot;all&quot;</span><span class="s1">]:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">f'unknown method &quot;</span><span class="s3">{</span><span class="s1">method</span><span class="s3">}</span><span class="s5">&quot;'</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s1">hasattr(results</span><span class="s3">, </span><span class="s5">'_results'</span><span class="s1">):</span>
+        <span class="s1">results = results._results</span>
+
+    <span class="s1">endog = results.model.endog</span>
+    <span class="s1">nobs = endog.shape[</span><span class="s4">0</span><span class="s1">]  </span><span class="s0"># TODO: use attribute, may need to be added</span>
+    <span class="s1">fitted = results.predict()</span>
+    <span class="s0"># fitted = results.fittedvalues  # discrete has linear prediction</span>
+    <span class="s0"># this assumes Poisson</span>
+    <span class="s1">resid2 = results.resid_response**</span><span class="s4">2</span>
+    <span class="s1">var_resid_endog = (resid2 - endog)</span>
+    <span class="s1">var_resid_fitted = (resid2 - fitted)</span>
+    <span class="s1">std1 = np.sqrt(</span><span class="s4">2 </span><span class="s1">* (fitted**</span><span class="s4">2</span><span class="s1">).sum())</span>
+
+    <span class="s1">var_resid_endog_sum = var_resid_endog.sum()</span>
+    <span class="s1">dean_a = var_resid_fitted.sum() / std1</span>
+    <span class="s1">dean_b = var_resid_endog_sum / std1</span>
+    <span class="s1">dean_c = (var_resid_endog / fitted).sum() / np.sqrt(</span><span class="s4">2 </span><span class="s1">* nobs)</span>
+
+    <span class="s1">pval_dean_a = </span><span class="s4">2 </span><span class="s1">* stats.norm.sf(np.abs(dean_a))</span>
+    <span class="s1">pval_dean_b = </span><span class="s4">2 </span><span class="s1">* stats.norm.sf(np.abs(dean_b))</span>
+    <span class="s1">pval_dean_c = </span><span class="s4">2 </span><span class="s1">* stats.norm.sf(np.abs(dean_c))</span>
+
+    <span class="s1">results_all = [[dean_a</span><span class="s3">, </span><span class="s1">pval_dean_a]</span><span class="s3">,</span>
+                   <span class="s1">[dean_b</span><span class="s3">, </span><span class="s1">pval_dean_b]</span><span class="s3">,</span>
+                   <span class="s1">[dean_c</span><span class="s3">, </span><span class="s1">pval_dean_c]]</span>
+    <span class="s1">description = [[</span><span class="s5">'Dean A'</span><span class="s3">, </span><span class="s5">'mu (1 + a mu)'</span><span class="s1">]</span><span class="s3">,</span>
+                   <span class="s1">[</span><span class="s5">'Dean B'</span><span class="s3">, </span><span class="s5">'mu (1 + a mu)'</span><span class="s1">]</span><span class="s3">,</span>
+                   <span class="s1">[</span><span class="s5">'Dean C'</span><span class="s3">, </span><span class="s5">'mu (1 + a)'</span><span class="s1">]]</span>
+
+    <span class="s0"># Cameron Trived auxiliary regression page 78 count book 1989</span>
+    <span class="s1">endog_v = var_resid_endog / fitted</span>
+    <span class="s1">res_ols_nb2 = OLS(endog_v</span><span class="s3">, </span><span class="s1">fitted).fit(use_t=</span><span class="s3">False</span><span class="s1">)</span>
+    <span class="s1">stat_ols_nb2 = res_ols_nb2.tvalues[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">pval_ols_nb2 = res_ols_nb2.pvalues[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">results_all.append([stat_ols_nb2</span><span class="s3">, </span><span class="s1">pval_ols_nb2])</span>
+    <span class="s1">description.append([</span><span class="s5">'CT nb2'</span><span class="s3">, </span><span class="s5">'mu (1 + a mu)'</span><span class="s1">])</span>
+
+    <span class="s1">res_ols_nb1 = OLS(endog_v</span><span class="s3">, </span><span class="s1">fitted).fit(use_t=</span><span class="s3">False</span><span class="s1">)</span>
+    <span class="s1">stat_ols_nb1 = res_ols_nb1.tvalues[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">pval_ols_nb1 = res_ols_nb1.pvalues[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">results_all.append([stat_ols_nb1</span><span class="s3">, </span><span class="s1">pval_ols_nb1])</span>
+    <span class="s1">description.append([</span><span class="s5">'CT nb1'</span><span class="s3">, </span><span class="s5">'mu (1 + a)'</span><span class="s1">])</span>
+
+    <span class="s1">endog_v = var_resid_endog / fitted</span>
+    <span class="s1">res_ols_nb2 = OLS(endog_v</span><span class="s3">, </span><span class="s1">fitted).fit(cov_type=</span><span class="s5">'HC3'</span><span class="s3">, </span><span class="s1">use_t=</span><span class="s3">False</span><span class="s1">)</span>
+    <span class="s1">stat_ols_hc1_nb2 = res_ols_nb2.tvalues[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">pval_ols_hc1_nb2 = res_ols_nb2.pvalues[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">results_all.append([stat_ols_hc1_nb2</span><span class="s3">, </span><span class="s1">pval_ols_hc1_nb2])</span>
+    <span class="s1">description.append([</span><span class="s5">'CT nb2 HC3'</span><span class="s3">, </span><span class="s5">'mu (1 + a mu)'</span><span class="s1">])</span>
+
+    <span class="s1">res_ols_nb1 = OLS(endog_v</span><span class="s3">, </span><span class="s1">np.ones(len(endog_v))).fit(cov_type=</span><span class="s5">'HC3'</span><span class="s3">,</span>
+                                                          <span class="s1">use_t=</span><span class="s3">False</span><span class="s1">)</span>
+    <span class="s1">stat_ols_hc1_nb1 = res_ols_nb1.tvalues[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">pval_ols_hc1_nb1 = res_ols_nb1.pvalues[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">results_all.append([stat_ols_hc1_nb1</span><span class="s3">, </span><span class="s1">pval_ols_hc1_nb1])</span>
+    <span class="s1">description.append([</span><span class="s5">'CT nb1 HC3'</span><span class="s3">, </span><span class="s5">'mu (1 + a)'</span><span class="s1">])</span>
+
+    <span class="s1">results_all = np.array(results_all)</span>
+    <span class="s3">if </span><span class="s1">_old:</span>
+        <span class="s0"># for backwards compatibility in 0.14, remove in later versions</span>
+        <span class="s3">return </span><span class="s1">results_all</span><span class="s3">, </span><span class="s1">description</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">res = DispersionResults(</span>
+            <span class="s1">statistic=results_all[:</span><span class="s3">, </span><span class="s4">0</span><span class="s1">]</span><span class="s3">,</span>
+            <span class="s1">pvalue=results_all[:</span><span class="s3">, </span><span class="s4">1</span><span class="s1">]</span><span class="s3">,</span>
+            <span class="s1">method=[i[</span><span class="s4">0</span><span class="s1">] </span><span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">description]</span><span class="s3">,</span>
+            <span class="s1">alternative=[i[</span><span class="s4">1</span><span class="s1">] </span><span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">description]</span><span class="s3">,</span>
+            <span class="s1">name=</span><span class="s5">&quot;Poisson Dispersion Test&quot;</span>
+            <span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+
+<span class="s3">def </span><span class="s1">_test_poisson_dispersion_generic(</span>
+        <span class="s1">results</span><span class="s3">,</span>
+        <span class="s1">exog_new_test</span><span class="s3">,</span>
+        <span class="s1">exog_new_control=</span><span class="s3">None,</span>
+        <span class="s1">include_score=</span><span class="s3">False,</span>
+        <span class="s1">use_endog=</span><span class="s3">True,</span>
+        <span class="s1">cov_type=</span><span class="s5">'HC3'</span><span class="s3">,</span>
+        <span class="s1">cov_kwds=</span><span class="s3">None,</span>
+        <span class="s1">use_t=</span><span class="s3">False</span>
+        <span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;A variable addition test for the variance function 
+ 
+    This uses an artificial regression to calculate a variant of an LM or 
+    generalized score test for the specification of the variance assumption 
+    in a Poisson model. The performed test is a Wald test on the coefficients 
+    of the `exog_new_test`. 
+ 
+    Warning: insufficiently tested, especially for options 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">hasattr(results</span><span class="s3">, </span><span class="s5">'_results'</span><span class="s1">):</span>
+        <span class="s1">results = results._results</span>
+
+    <span class="s1">endog = results.model.endog</span>
+    <span class="s1">nobs = endog.shape[</span><span class="s4">0</span><span class="s1">]   </span><span class="s0"># TODO: use attribute, may need to be added</span>
+    <span class="s0"># fitted = results.fittedvalues  # generic has linpred as fittedvalues</span>
+    <span class="s1">fitted = results.predict()</span>
+    <span class="s1">resid2 = results.resid_response**</span><span class="s4">2</span>
+    <span class="s0"># the following assumes Poisson</span>
+    <span class="s3">if </span><span class="s1">use_endog:</span>
+        <span class="s1">var_resid = (resid2 - endog)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">var_resid = (resid2 - fitted)</span>
+
+    <span class="s1">endog_v = var_resid / fitted</span>
+
+    <span class="s1">k_constraints = exog_new_test.shape[</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s1">ex_list = [exog_new_test]</span>
+    <span class="s3">if </span><span class="s1">include_score:</span>
+        <span class="s1">score_obs = results.model.score_obs(results.params)</span>
+        <span class="s1">ex_list.append(score_obs)</span>
+
+    <span class="s3">if </span><span class="s1">exog_new_control </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s1">ex_list.append(score_obs)</span>
+
+    <span class="s3">if </span><span class="s1">len(ex_list) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">ex = np.column_stack(ex_list)</span>
+        <span class="s1">use_wald = </span><span class="s3">True</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">ex = ex_list[</span><span class="s4">0</span><span class="s1">]  </span><span class="s0"># no control variables in exog</span>
+        <span class="s1">use_wald = </span><span class="s3">False</span>
+
+    <span class="s1">res_ols = OLS(endog_v</span><span class="s3">, </span><span class="s1">ex).fit(cov_type=cov_type</span><span class="s3">, </span><span class="s1">cov_kwds=cov_kwds</span><span class="s3">,</span>
+                                   <span class="s1">use_t=use_t)</span>
+
+    <span class="s3">if </span><span class="s1">use_wald:</span>
+        <span class="s0"># we have controls and need to test coefficients</span>
+        <span class="s1">k_vars = ex.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">constraints = np.eye(k_constraints</span><span class="s3">, </span><span class="s1">k_vars)</span>
+        <span class="s1">ht = res_ols.wald_test(constraints)</span>
+        <span class="s1">stat_ols = ht.statistic</span>
+        <span class="s1">pval_ols = ht.pvalue</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s0"># we do not have controls and can use overall fit</span>
+        <span class="s1">nobs = endog_v.shape[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">rsquared_noncentered = </span><span class="s4">1 </span><span class="s1">- res_ols.ssr/res_ols.uncentered_tss</span>
+        <span class="s1">stat_ols = nobs * rsquared_noncentered</span>
+        <span class="s1">pval_ols = stats.chi2.sf(stat_ols</span><span class="s3">, </span><span class="s1">k_constraints)</span>
+
+    <span class="s3">return </span><span class="s1">stat_ols</span><span class="s3">, </span><span class="s1">pval_ols</span>
+
+
+<span class="s3">def </span><span class="s1">test_poisson_zeroinflation_jh(results_poisson</span><span class="s3">, </span><span class="s1">exog_infl=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;score test for zero inflation or deflation in Poisson 
+ 
+    This implements Jansakul and Hinde 2009 score test 
+    for excess zeros against a zero modified Poisson 
+    alternative. They use a linear link function for the 
+    inflation model to allow for zero deflation. 
+ 
+    Parameters 
+    ---------- 
+    results_poisson: results instance 
+        The test is only valid if the results instance is a Poisson 
+        model. 
+    exog_infl : ndarray 
+        Explanatory variables for the zero inflated or zero modified 
+        alternative. I exog_infl is None, then the inflation 
+        probability is assumed to be constant. 
+ 
+    Returns 
+    ------- 
+    score test results based on chisquare distribution 
+ 
+    Notes 
+    ----- 
+    This is a score test based on the null hypothesis that 
+    the true model is Poisson. It will also reject for 
+    other deviations from a Poisson model if those affect 
+    the zero probabilities, e.g. in the direction of 
+    excess dispersion as in the Negative Binomial 
+    or Generalized Poisson model. 
+    Therefore, rejection in this test does not imply that 
+    zero-inflated Poisson is the appropriate model. 
+ 
+    Status: experimental, no verified unit tests, 
+ 
+    TODO: If the zero modification probability is assumed 
+    to be constant under the alternative, then we only have 
+    a scalar test score and we can use one-sided tests to 
+    distinguish zero inflation and deflation from the 
+    two-sided deviations. (The general one-sided case is 
+    difficult.) 
+    In this case the test specializes to the test by Broek 
+ 
+    References 
+    ---------- 
+    .. [1] Jansakul, N., and J. P. Hinde. 2002. “Score Tests for Zero-Inflated 
+           Poisson Models.” Computational Statistics &amp; Data Analysis 40 (1): 
+           75–96. https://doi.org/10.1016/S0167-9473(01)00104-9. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">isinstance(results_poisson.model</span><span class="s3">, </span><span class="s1">Poisson):</span>
+        <span class="s0"># GLM Poisson would be also valid, not tried</span>
+        <span class="s3">import </span><span class="s1">warnings</span>
+        <span class="s1">warnings.warn(</span><span class="s5">'Test is only valid if model is Poisson'</span><span class="s1">)</span>
+
+    <span class="s1">nobs = results_poisson.model.endog.shape[</span><span class="s4">0</span><span class="s1">]</span>
+
+    <span class="s3">if </span><span class="s1">exog_infl </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">exog_infl = np.ones((nobs</span><span class="s3">, </span><span class="s4">1</span><span class="s1">))</span>
+
+
+    <span class="s1">endog = results_poisson.model.endog</span>
+    <span class="s1">exog = results_poisson.model.exog</span>
+
+    <span class="s1">mu = results_poisson.predict()</span>
+    <span class="s1">prob_zero = np.exp(-mu)</span>
+
+    <span class="s1">cov_poi = results_poisson.cov_params()</span>
+    <span class="s1">cross_derivative = (exog_infl.T * (-mu)).dot(exog).T</span>
+    <span class="s1">cov_infl = (exog_infl.T * ((</span><span class="s4">1 </span><span class="s1">- prob_zero) / prob_zero)).dot(exog_infl)</span>
+    <span class="s1">score_obs_infl = exog_infl * (((endog == </span><span class="s4">0</span><span class="s1">) - prob_zero) / prob_zero)[:</span><span class="s3">,None</span><span class="s1">]</span>
+    <span class="s0">#score_obs_infl = exog_infl * ((endog == 0) * (1 - prob_zero) / prob_zero - (endog&gt;0))[:,None] #same</span>
+    <span class="s1">score_infl = score_obs_infl.sum(</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">cov_score_infl = cov_infl - cross_derivative.T.dot(cov_poi).dot(cross_derivative)</span>
+    <span class="s1">cov_score_infl_inv = np.linalg.pinv(cov_score_infl)</span>
+
+    <span class="s1">statistic = score_infl.dot(cov_score_infl_inv).dot(score_infl)</span>
+    <span class="s1">df2 = np.linalg.matrix_rank(cov_score_infl)  </span><span class="s0"># more general, maybe not needed</span>
+    <span class="s1">df = exog_infl.shape[</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s1">pvalue = stats.chi2.sf(statistic</span><span class="s3">, </span><span class="s1">df)</span>
+
+    <span class="s1">res = HolderTuple(</span>
+        <span class="s1">statistic=statistic</span><span class="s3">,</span>
+        <span class="s1">pvalue=pvalue</span><span class="s3">,</span>
+        <span class="s1">df=df</span><span class="s3">,</span>
+        <span class="s1">rank_score=df2</span><span class="s3">,</span>
+        <span class="s1">distribution=</span><span class="s5">&quot;chi2&quot;</span><span class="s3">,</span>
+        <span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">res</span>
+
+
+<span class="s3">def </span><span class="s1">test_poisson_zeroinflation_broek(results_poisson):</span>
+    <span class="s2">&quot;&quot;&quot;score test for zero modification in Poisson, special case 
+ 
+    This assumes that the Poisson model has a constant and that 
+    the zero modification probability is constant. 
+ 
+    This is a special case of test_poisson_zeroinflation derived by 
+    van den Broek 1995. 
+ 
+    The test reports two sided and one sided alternatives based on 
+    the normal distribution of the test statistic. 
+ 
+    References 
+    ---------- 
+    .. [1] Broek, Jan van den. 1995. “A Score Test for Zero Inflation in a 
+           Poisson Distribution.” Biometrics 51 (2): 738–43. 
+           https://doi.org/10.2307/2532959. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">mu = results_poisson.predict()</span>
+    <span class="s1">prob_zero = np.exp(-mu)</span>
+    <span class="s1">endog = results_poisson.model.endog</span>
+    <span class="s0"># nobs = len(endog)</span>
+    <span class="s0"># score =  ((endog == 0) / prob_zero).sum() - nobs</span>
+    <span class="s0"># var_score = (1 / prob_zero).sum() - nobs - endog.sum()</span>
+    <span class="s1">score = (((endog == </span><span class="s4">0</span><span class="s1">) - prob_zero) / prob_zero).sum()</span>
+    <span class="s1">var_score = ((</span><span class="s4">1 </span><span class="s1">- prob_zero) / prob_zero).sum() - endog.sum()</span>
+    <span class="s1">statistic = score / np.sqrt(var_score)</span>
+    <span class="s1">pvalue_two = </span><span class="s4">2 </span><span class="s1">* stats.norm.sf(np.abs(statistic))</span>
+    <span class="s1">pvalue_upp = stats.norm.sf(statistic)</span>
+    <span class="s1">pvalue_low = stats.norm.cdf(statistic)</span>
+
+    <span class="s1">res = HolderTuple(</span>
+        <span class="s1">statistic=statistic</span><span class="s3">,</span>
+        <span class="s1">pvalue=pvalue_two</span><span class="s3">,</span>
+        <span class="s1">pvalue_smaller=pvalue_upp</span><span class="s3">,</span>
+        <span class="s1">pvalue_larger=pvalue_low</span><span class="s3">,</span>
+        <span class="s1">chi2=statistic**</span><span class="s4">2</span><span class="s3">,</span>
+        <span class="s1">pvalue_chi2=stats.chi2.sf(statistic**</span><span class="s4">2</span><span class="s3">, </span><span class="s4">1</span><span class="s1">)</span><span class="s3">,</span>
+        <span class="s1">df_chi2=</span><span class="s4">1</span><span class="s3">,</span>
+        <span class="s1">distribution=</span><span class="s5">&quot;normal&quot;</span><span class="s3">,</span>
+        <span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">res</span>
+
+
+<span class="s3">def </span><span class="s1">test_poisson_zeros(results):</span>
+    <span class="s2">&quot;&quot;&quot;Test for excess zeros in Poisson regression model. 
+ 
+    The test is implemented following Tang and Tang [1]_ equ. (12) which is 
+    based on the test derived in He et al 2019 [2]_. 
+ 
+    References 
+    ---------- 
+ 
+    .. [1] Tang, Yi, and Wan Tang. 2018. “Testing Modified Zeros for Poisson 
+           Regression Models:” Statistical Methods in Medical Research, 
+           September. https://doi.org/10.1177/0962280218796253. 
+ 
+    .. [2] He, Hua, Hui Zhang, Peng Ye, and Wan Tang. 2019. “A Test of Inflated 
+           Zeros for Poisson Regression Models.” Statistical Methods in 
+           Medical Research 28 (4): 1157–69. 
+           https://doi.org/10.1177/0962280217749991. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">x = results.model.exog</span>
+    <span class="s1">mean = results.predict()</span>
+    <span class="s1">prob0 = np.exp(-mean)</span>
+    <span class="s1">counts = (results.model.endog == </span><span class="s4">0</span><span class="s1">).astype(int)</span>
+    <span class="s1">diff = counts.sum() - prob0.sum()</span>
+    <span class="s1">var1 = prob0 @ (</span><span class="s4">1 </span><span class="s1">- prob0)</span>
+    <span class="s1">pm = prob0 * mean</span>
+    <span class="s1">c = np.linalg.inv(x.T * mean @ x)</span>
+    <span class="s1">pmx = pm @ x</span>
+    <span class="s1">var2 = pmx @ c @ pmx</span>
+    <span class="s1">var = var1 - var2</span>
+    <span class="s1">statistic = diff / np.sqrt(var)</span>
+
+    <span class="s1">pvalue_two = </span><span class="s4">2 </span><span class="s1">* stats.norm.sf(np.abs(statistic))</span>
+    <span class="s1">pvalue_upp = stats.norm.sf(statistic)</span>
+    <span class="s1">pvalue_low = stats.norm.cdf(statistic)</span>
+
+    <span class="s1">res = HolderTuple(</span>
+        <span class="s1">statistic=statistic</span><span class="s3">,</span>
+        <span class="s1">pvalue=pvalue_two</span><span class="s3">,</span>
+        <span class="s1">pvalue_smaller=pvalue_upp</span><span class="s3">,</span>
+        <span class="s1">pvalue_larger=pvalue_low</span><span class="s3">,</span>
+        <span class="s1">chi2=statistic**</span><span class="s4">2</span><span class="s3">,</span>
+        <span class="s1">pvalue_chi2=stats.chi2.sf(statistic**</span><span class="s4">2</span><span class="s3">, </span><span class="s4">1</span><span class="s1">)</span><span class="s3">,</span>
+        <span class="s1">df_chi2=</span><span class="s4">1</span><span class="s3">,</span>
+        <span class="s1">distribution=</span><span class="s5">&quot;normal&quot;</span><span class="s3">,</span>
+        <span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">res</span>
+</pre>
+</body>
+</html>

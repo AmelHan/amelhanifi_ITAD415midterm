@@ -1,0 +1,900 @@
+<html>
+<head>
+<title>http.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6a8759;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+http.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">asyncio</span>
+<span class="s0">import </span><span class="s1">io</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">import </span><span class="s1">weakref</span>
+<span class="s0">from </span><span class="s1">copy </span><span class="s0">import </span><span class="s1">copy</span>
+<span class="s0">from </span><span class="s1">urllib.parse </span><span class="s0">import </span><span class="s1">urlparse</span>
+
+<span class="s0">import </span><span class="s1">aiohttp</span>
+<span class="s0">import </span><span class="s1">requests</span>
+<span class="s0">import </span><span class="s1">yarl</span>
+
+<span class="s0">from </span><span class="s1">fsspec.asyn </span><span class="s0">import </span><span class="s1">AbstractAsyncStreamedFile</span><span class="s0">, </span><span class="s1">AsyncFileSystem</span><span class="s0">, </span><span class="s1">sync</span><span class="s0">, </span><span class="s1">sync_wrapper</span>
+<span class="s0">from </span><span class="s1">fsspec.callbacks </span><span class="s0">import </span><span class="s1">_DEFAULT_CALLBACK</span>
+<span class="s0">from </span><span class="s1">fsspec.exceptions </span><span class="s0">import </span><span class="s1">FSTimeoutError</span>
+<span class="s0">from </span><span class="s1">fsspec.spec </span><span class="s0">import </span><span class="s1">AbstractBufferedFile</span>
+<span class="s0">from </span><span class="s1">fsspec.utils </span><span class="s0">import </span><span class="s1">DEFAULT_BLOCK_SIZE</span><span class="s0">, </span><span class="s1">isfilelike</span><span class="s0">, </span><span class="s1">nullcontext</span><span class="s0">, </span><span class="s1">tokenize</span>
+
+<span class="s0">from </span><span class="s1">..caching </span><span class="s0">import </span><span class="s1">AllBytes</span>
+
+<span class="s2"># https://stackoverflow.com/a/15926317/3821154</span>
+<span class="s1">ex = re.compile(</span><span class="s3">r&quot;&quot;&quot;&lt;(a|A)\s+(?:[^&gt;]*?\s+)?(href|HREF)=[&quot;'](?P&lt;url&gt;[^&quot;']+)&quot;&quot;&quot;</span><span class="s1">)</span>
+<span class="s1">ex2 = re.compile(</span><span class="s3">r&quot;&quot;&quot;(?P&lt;url&gt;http[s]?://[-a-zA-Z0-9@:%_+.~#?&amp;/=]+)&quot;&quot;&quot;</span><span class="s1">)</span>
+<span class="s1">logger = logging.getLogger(</span><span class="s3">&quot;fsspec.http&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">async def </span><span class="s1">get_client(**kwargs):</span>
+    <span class="s0">return </span><span class="s1">aiohttp.ClientSession(**kwargs)</span>
+
+
+<span class="s0">class </span><span class="s1">HTTPFileSystem(AsyncFileSystem):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Simple File-System for fetching data via HTTP(S) 
+ 
+    ``ls()`` is implemented by loading the parent page and doing a regex 
+    match on the result. If simple_link=True, anything of the form 
+    &quot;http(s)://server.com/stuff?thing=other&quot;; otherwise only links within 
+    HTML href tags will be used. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">sep = </span><span class="s3">&quot;/&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">simple_links=</span><span class="s0">True,</span>
+        <span class="s1">block_size=</span><span class="s0">None,</span>
+        <span class="s1">same_scheme=</span><span class="s0">True,</span>
+        <span class="s1">size_policy=</span><span class="s0">None,</span>
+        <span class="s1">cache_type=</span><span class="s3">&quot;bytes&quot;</span><span class="s0">,</span>
+        <span class="s1">cache_options=</span><span class="s0">None,</span>
+        <span class="s1">asynchronous=</span><span class="s0">False,</span>
+        <span class="s1">loop=</span><span class="s0">None,</span>
+        <span class="s1">client_kwargs=</span><span class="s0">None,</span>
+        <span class="s1">get_client=get_client</span><span class="s0">,</span>
+        <span class="s1">encoded=</span><span class="s0">False,</span>
+        <span class="s1">**storage_options</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        NB: if this is called async, you must await set_client 
+ 
+        Parameters 
+        ---------- 
+        block_size: int 
+            Blocks to read bytes; if 0, will default to raw requests file-like 
+            objects instead of HTTPFile instances 
+        simple_links: bool 
+            If True, will consider both HTML &lt;a&gt; tags and anything that looks 
+            like a URL; if False, will consider only the former. 
+        same_scheme: True 
+            When doing ls/glob, if this is True, only consider paths that have 
+            http/https matching the input URLs. 
+        size_policy: this argument is deprecated 
+        client_kwargs: dict 
+            Passed to aiohttp.ClientSession, see 
+            https://docs.aiohttp.org/en/stable/client_reference.html 
+            For example, ``{'auth': aiohttp.BasicAuth('user', 'pass')}`` 
+        get_client: Callable[..., aiohttp.ClientSession] 
+            A callable which takes keyword arguments and constructs 
+            an aiohttp.ClientSession. It's state will be managed by 
+            the HTTPFileSystem class. 
+        storage_options: key-value 
+            Any other parameters passed on to requests 
+        cache_type, cache_options: defaults used in open 
+        &quot;&quot;&quot;</span>
+        <span class="s1">super().__init__(self</span><span class="s0">, </span><span class="s1">asynchronous=asynchronous</span><span class="s0">, </span><span class="s1">loop=loop</span><span class="s0">, </span><span class="s1">**storage_options)</span>
+        <span class="s1">self.block_size = block_size </span><span class="s0">if </span><span class="s1">block_size </span><span class="s0">is not None else </span><span class="s1">DEFAULT_BLOCK_SIZE</span>
+        <span class="s1">self.simple_links = simple_links</span>
+        <span class="s1">self.same_schema = same_scheme</span>
+        <span class="s1">self.cache_type = cache_type</span>
+        <span class="s1">self.cache_options = cache_options</span>
+        <span class="s1">self.client_kwargs = client_kwargs </span><span class="s0">or </span><span class="s1">{}</span>
+        <span class="s1">self.get_client = get_client</span>
+        <span class="s1">self.encoded = encoded</span>
+        <span class="s1">self.kwargs = storage_options</span>
+        <span class="s1">self._session = </span><span class="s0">None</span>
+
+        <span class="s2"># Clean caching-related parameters from `storage_options`</span>
+        <span class="s2"># before propagating them as `request_options` through `self.kwargs`.</span>
+        <span class="s2"># TODO: Maybe rename `self.kwargs` to `self.request_options` to make</span>
+        <span class="s2">#       it clearer.</span>
+        <span class="s1">request_options = copy(storage_options)</span>
+        <span class="s1">self.use_listings_cache = request_options.pop(</span><span class="s3">&quot;use_listings_cache&quot;</span><span class="s0">, False</span><span class="s1">)</span>
+        <span class="s1">request_options.pop(</span><span class="s3">&quot;listings_expiry_time&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">request_options.pop(</span><span class="s3">&quot;max_paths&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">request_options.pop(</span><span class="s3">&quot;skip_instance_cache&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">self.kwargs = request_options</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">fsid(self):</span>
+        <span class="s0">return </span><span class="s3">&quot;http&quot;</span>
+
+    <span class="s0">def </span><span class="s1">encode_url(self</span><span class="s0">, </span><span class="s1">url):</span>
+        <span class="s0">return </span><span class="s1">yarl.URL(url</span><span class="s0">, </span><span class="s1">encoded=self.encoded)</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s0">def </span><span class="s1">close_session(loop</span><span class="s0">, </span><span class="s1">session):</span>
+        <span class="s0">if </span><span class="s1">loop </span><span class="s0">is not None and </span><span class="s1">loop.is_running():</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">sync(loop</span><span class="s0">, </span><span class="s1">session.close</span><span class="s0">, </span><span class="s1">timeout=</span><span class="s5">0.1</span><span class="s1">)</span>
+                <span class="s0">return</span>
+            <span class="s0">except </span><span class="s1">(TimeoutError</span><span class="s0">, </span><span class="s1">FSTimeoutError):</span>
+                <span class="s0">pass</span>
+        <span class="s1">connector = getattr(session</span><span class="s0">, </span><span class="s3">&quot;_connector&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">connector </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s2"># close after loop is dead</span>
+            <span class="s1">connector._close()</span>
+
+    <span class="s0">async def </span><span class="s1">set_session(self):</span>
+        <span class="s0">if </span><span class="s1">self._session </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self._session = </span><span class="s0">await </span><span class="s1">self.get_client(loop=self.loop</span><span class="s0">, </span><span class="s1">**self.client_kwargs)</span>
+            <span class="s0">if not </span><span class="s1">self.asynchronous:</span>
+                <span class="s1">weakref.finalize(self</span><span class="s0">, </span><span class="s1">self.close_session</span><span class="s0">, </span><span class="s1">self.loop</span><span class="s0">, </span><span class="s1">self._session)</span>
+        <span class="s0">return </span><span class="s1">self._session</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_strip_protocol(cls</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s4">&quot;&quot;&quot;For HTTP, we always want to keep the full URL&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">path</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_parent(cls</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s2"># override, since _strip_protocol is different for URLs</span>
+        <span class="s1">par = super()._parent(path)</span>
+        <span class="s0">if </span><span class="s1">len(par) &gt; </span><span class="s5">7</span><span class="s1">:  </span><span class="s2"># &quot;http://...&quot;</span>
+            <span class="s0">return </span><span class="s1">par</span>
+        <span class="s0">return </span><span class="s3">&quot;&quot;</span>
+
+    <span class="s0">async def </span><span class="s1">_ls_real(self</span><span class="s0">, </span><span class="s1">url</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+        <span class="s2"># ignoring URL-encoded arguments</span>
+        <span class="s1">kw = self.kwargs.copy()</span>
+        <span class="s1">kw.update(kwargs)</span>
+        <span class="s1">logger.debug(url)</span>
+        <span class="s1">session = </span><span class="s0">await </span><span class="s1">self.set_session()</span>
+        <span class="s0">async with </span><span class="s1">session.get(self.encode_url(url)</span><span class="s0">, </span><span class="s1">**self.kwargs) </span><span class="s0">as </span><span class="s1">r:</span>
+            <span class="s1">self._raise_not_found_for_status(r</span><span class="s0">, </span><span class="s1">url)</span>
+            <span class="s1">text = </span><span class="s0">await </span><span class="s1">r.text()</span>
+        <span class="s0">if </span><span class="s1">self.simple_links:</span>
+            <span class="s1">links = ex2.findall(text) + [u[</span><span class="s5">2</span><span class="s1">] </span><span class="s0">for </span><span class="s1">u </span><span class="s0">in </span><span class="s1">ex.findall(text)]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">links = [u[</span><span class="s5">2</span><span class="s1">] </span><span class="s0">for </span><span class="s1">u </span><span class="s0">in </span><span class="s1">ex.findall(text)]</span>
+        <span class="s1">out = set()</span>
+        <span class="s1">parts = urlparse(url)</span>
+        <span class="s0">for </span><span class="s1">l </span><span class="s0">in </span><span class="s1">links:</span>
+            <span class="s0">if </span><span class="s1">isinstance(l</span><span class="s0">, </span><span class="s1">tuple):</span>
+                <span class="s1">l = l[</span><span class="s5">1</span><span class="s1">]</span>
+            <span class="s0">if </span><span class="s1">l.startswith(</span><span class="s3">&quot;/&quot;</span><span class="s1">) </span><span class="s0">and </span><span class="s1">len(l) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s2"># absolute URL on this server</span>
+                <span class="s1">l = </span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">parts.scheme</span><span class="s0">}</span><span class="s3">://</span><span class="s0">{</span><span class="s1">parts.netloc</span><span class="s0">}{</span><span class="s1">l</span><span class="s0">}</span><span class="s3">&quot;</span>
+            <span class="s0">if </span><span class="s1">l.startswith(</span><span class="s3">&quot;http&quot;</span><span class="s1">):</span>
+                <span class="s0">if </span><span class="s1">self.same_schema </span><span class="s0">and </span><span class="s1">l.startswith(url.rstrip(</span><span class="s3">&quot;/&quot;</span><span class="s1">) + </span><span class="s3">&quot;/&quot;</span><span class="s1">):</span>
+                    <span class="s1">out.add(l)</span>
+                <span class="s0">elif </span><span class="s1">l.replace(</span><span class="s3">&quot;https&quot;</span><span class="s0">, </span><span class="s3">&quot;http&quot;</span><span class="s1">).startswith(</span>
+                    <span class="s1">url.replace(</span><span class="s3">&quot;https&quot;</span><span class="s0">, </span><span class="s3">&quot;http&quot;</span><span class="s1">).rstrip(</span><span class="s3">&quot;/&quot;</span><span class="s1">) + </span><span class="s3">&quot;/&quot;</span>
+                <span class="s1">):</span>
+                    <span class="s2"># allowed to cross http &lt;-&gt; https</span>
+                    <span class="s1">out.add(l)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">if </span><span class="s1">l </span><span class="s0">not in </span><span class="s1">[</span><span class="s3">&quot;..&quot;</span><span class="s0">, </span><span class="s3">&quot;../&quot;</span><span class="s1">]:</span>
+                    <span class="s2"># Ignore FTP-like &quot;parent&quot;</span>
+                    <span class="s1">out.add(</span><span class="s3">&quot;/&quot;</span><span class="s1">.join([url.rstrip(</span><span class="s3">&quot;/&quot;</span><span class="s1">)</span><span class="s0">, </span><span class="s1">l.lstrip(</span><span class="s3">&quot;/&quot;</span><span class="s1">)]))</span>
+        <span class="s0">if not </span><span class="s1">out </span><span class="s0">and </span><span class="s1">url.endswith(</span><span class="s3">&quot;/&quot;</span><span class="s1">):</span>
+            <span class="s1">out = </span><span class="s0">await </span><span class="s1">self._ls_real(url.rstrip(</span><span class="s3">&quot;/&quot;</span><span class="s1">)</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">False</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">detail:</span>
+            <span class="s0">return </span><span class="s1">[</span>
+                <span class="s1">{</span>
+                    <span class="s3">&quot;name&quot;</span><span class="s1">: u</span><span class="s0">,</span>
+                    <span class="s3">&quot;size&quot;</span><span class="s1">: </span><span class="s0">None,</span>
+                    <span class="s3">&quot;type&quot;</span><span class="s1">: </span><span class="s3">&quot;directory&quot; </span><span class="s0">if </span><span class="s1">u.endswith(</span><span class="s3">&quot;/&quot;</span><span class="s1">) </span><span class="s0">else </span><span class="s3">&quot;file&quot;</span><span class="s0">,</span>
+                <span class="s1">}</span>
+                <span class="s0">for </span><span class="s1">u </span><span class="s0">in </span><span class="s1">out</span>
+            <span class="s1">]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">sorted(out)</span>
+
+    <span class="s0">async def </span><span class="s1">_ls(self</span><span class="s0">, </span><span class="s1">url</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+        <span class="s0">if </span><span class="s1">self.use_listings_cache </span><span class="s0">and </span><span class="s1">url </span><span class="s0">in </span><span class="s1">self.dircache:</span>
+            <span class="s1">out = self.dircache[url]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">out = </span><span class="s0">await </span><span class="s1">self._ls_real(url</span><span class="s0">, </span><span class="s1">detail=detail</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+            <span class="s1">self.dircache[url] = out</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s1">ls = sync_wrapper(_ls)</span>
+
+    <span class="s0">def </span><span class="s1">_raise_not_found_for_status(self</span><span class="s0">, </span><span class="s1">response</span><span class="s0">, </span><span class="s1">url):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Raises FileNotFoundError for 404s, otherwise uses raise_for_status. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">response.status == </span><span class="s5">404</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">FileNotFoundError(url)</span>
+        <span class="s1">response.raise_for_status()</span>
+
+    <span class="s0">async def </span><span class="s1">_cat_file(self</span><span class="s0">, </span><span class="s1">url</span><span class="s0">, </span><span class="s1">start=</span><span class="s0">None, </span><span class="s1">end=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">kw = self.kwargs.copy()</span>
+        <span class="s1">kw.update(kwargs)</span>
+        <span class="s1">logger.debug(url)</span>
+
+        <span class="s0">if </span><span class="s1">start </span><span class="s0">is not None or </span><span class="s1">end </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">start == end:</span>
+                <span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+            <span class="s1">headers = kw.pop(</span><span class="s3">&quot;headers&quot;</span><span class="s0">, </span><span class="s1">{}).copy()</span>
+
+            <span class="s1">headers[</span><span class="s3">&quot;Range&quot;</span><span class="s1">] = </span><span class="s0">await </span><span class="s1">self._process_limits(url</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">end)</span>
+            <span class="s1">kw[</span><span class="s3">&quot;headers&quot;</span><span class="s1">] = headers</span>
+        <span class="s1">session = </span><span class="s0">await </span><span class="s1">self.set_session()</span>
+        <span class="s0">async with </span><span class="s1">session.get(self.encode_url(url)</span><span class="s0">, </span><span class="s1">**kw) </span><span class="s0">as </span><span class="s1">r:</span>
+            <span class="s1">out = </span><span class="s0">await </span><span class="s1">r.read()</span>
+            <span class="s1">self._raise_not_found_for_status(r</span><span class="s0">, </span><span class="s1">url)</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">async def </span><span class="s1">_get_file(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">chunk_size=</span><span class="s5">5 </span><span class="s1">* </span><span class="s5">2</span><span class="s1">**</span><span class="s5">20</span><span class="s0">, </span><span class="s1">callback=_DEFAULT_CALLBACK</span><span class="s0">, </span><span class="s1">**kwargs</span>
+    <span class="s1">):</span>
+        <span class="s1">kw = self.kwargs.copy()</span>
+        <span class="s1">kw.update(kwargs)</span>
+        <span class="s1">logger.debug(rpath)</span>
+        <span class="s1">session = </span><span class="s0">await </span><span class="s1">self.set_session()</span>
+        <span class="s0">async with </span><span class="s1">session.get(self.encode_url(rpath)</span><span class="s0">, </span><span class="s1">**kw) </span><span class="s0">as </span><span class="s1">r:</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">size = int(r.headers[</span><span class="s3">&quot;content-length&quot;</span><span class="s1">])</span>
+            <span class="s0">except </span><span class="s1">(ValueError</span><span class="s0">, </span><span class="s1">KeyError):</span>
+                <span class="s1">size = </span><span class="s0">None</span>
+
+            <span class="s1">callback.set_size(size)</span>
+            <span class="s1">self._raise_not_found_for_status(r</span><span class="s0">, </span><span class="s1">rpath)</span>
+            <span class="s0">if </span><span class="s1">isfilelike(lpath):</span>
+                <span class="s1">outfile = lpath</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">outfile = open(lpath</span><span class="s0">, </span><span class="s3">&quot;wb&quot;</span><span class="s1">)</span>
+
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">chunk = </span><span class="s0">True</span>
+                <span class="s0">while </span><span class="s1">chunk:</span>
+                    <span class="s1">chunk = </span><span class="s0">await </span><span class="s1">r.content.read(chunk_size)</span>
+                    <span class="s1">outfile.write(chunk)</span>
+                    <span class="s1">callback.relative_update(len(chunk))</span>
+            <span class="s0">finally</span><span class="s1">:</span>
+                <span class="s0">if not </span><span class="s1">isfilelike(lpath):</span>
+                    <span class="s1">outfile.close()</span>
+
+    <span class="s0">async def </span><span class="s1">_put_file(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">lpath</span><span class="s0">,</span>
+        <span class="s1">rpath</span><span class="s0">,</span>
+        <span class="s1">chunk_size=</span><span class="s5">5 </span><span class="s1">* </span><span class="s5">2</span><span class="s1">**</span><span class="s5">20</span><span class="s0">,</span>
+        <span class="s1">callback=_DEFAULT_CALLBACK</span><span class="s0">,</span>
+        <span class="s1">method=</span><span class="s3">&quot;post&quot;</span><span class="s0">,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s0">async def </span><span class="s1">gen_chunks():</span>
+            <span class="s2"># Support passing arbitrary file-like objects</span>
+            <span class="s2"># and use them instead of streams.</span>
+            <span class="s0">if </span><span class="s1">isinstance(lpath</span><span class="s0">, </span><span class="s1">io.IOBase):</span>
+                <span class="s1">context = nullcontext(lpath)</span>
+                <span class="s1">use_seek = </span><span class="s0">False  </span><span class="s2"># might not support seeking</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">context = open(lpath</span><span class="s0">, </span><span class="s3">&quot;rb&quot;</span><span class="s1">)</span>
+                <span class="s1">use_seek = </span><span class="s0">True</span>
+
+            <span class="s0">with </span><span class="s1">context </span><span class="s0">as </span><span class="s1">f:</span>
+                <span class="s0">if </span><span class="s1">use_seek:</span>
+                    <span class="s1">callback.set_size(f.seek(</span><span class="s5">0</span><span class="s0">, </span><span class="s5">2</span><span class="s1">))</span>
+                    <span class="s1">f.seek(</span><span class="s5">0</span><span class="s1">)</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">callback.set_size(getattr(f</span><span class="s0">, </span><span class="s3">&quot;size&quot;</span><span class="s0">, None</span><span class="s1">))</span>
+
+                <span class="s1">chunk = f.read(chunk_size)</span>
+                <span class="s0">while </span><span class="s1">chunk:</span>
+                    <span class="s0">yield </span><span class="s1">chunk</span>
+                    <span class="s1">callback.relative_update(len(chunk))</span>
+                    <span class="s1">chunk = f.read(chunk_size)</span>
+
+        <span class="s1">kw = self.kwargs.copy()</span>
+        <span class="s1">kw.update(kwargs)</span>
+        <span class="s1">session = </span><span class="s0">await </span><span class="s1">self.set_session()</span>
+
+        <span class="s1">method = method.lower()</span>
+        <span class="s0">if </span><span class="s1">method </span><span class="s0">not in </span><span class="s1">(</span><span class="s3">&quot;post&quot;</span><span class="s0">, </span><span class="s3">&quot;put&quot;</span><span class="s1">):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">f&quot;method has to be either 'post' or 'put', not: </span><span class="s0">{</span><span class="s1">method</span><span class="s0">!r}</span><span class="s3">&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">meth = getattr(session</span><span class="s0">, </span><span class="s1">method)</span>
+        <span class="s0">async with </span><span class="s1">meth(rpath</span><span class="s0">, </span><span class="s1">data=gen_chunks()</span><span class="s0">, </span><span class="s1">**kw) </span><span class="s0">as </span><span class="s1">resp:</span>
+            <span class="s1">self._raise_not_found_for_status(resp</span><span class="s0">, </span><span class="s1">rpath)</span>
+
+    <span class="s0">async def </span><span class="s1">_exists(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">kw = self.kwargs.copy()</span>
+        <span class="s1">kw.update(kwargs)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">logger.debug(path)</span>
+            <span class="s1">session = </span><span class="s0">await </span><span class="s1">self.set_session()</span>
+            <span class="s1">r = </span><span class="s0">await </span><span class="s1">session.get(self.encode_url(path)</span><span class="s0">, </span><span class="s1">**kw)</span>
+            <span class="s0">async with </span><span class="s1">r:</span>
+                <span class="s0">return </span><span class="s1">r.status &lt; </span><span class="s5">400</span>
+        <span class="s0">except </span><span class="s1">(requests.HTTPError</span><span class="s0">, </span><span class="s1">aiohttp.ClientError):</span>
+            <span class="s0">return False</span>
+
+    <span class="s0">async def </span><span class="s1">_isfile(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">return await </span><span class="s1">self._exists(path</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">_open(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">path</span><span class="s0">,</span>
+        <span class="s1">mode=</span><span class="s3">&quot;rb&quot;</span><span class="s0">,</span>
+        <span class="s1">block_size=</span><span class="s0">None,</span>
+        <span class="s1">autocommit=</span><span class="s0">None,  </span><span class="s2"># XXX: This differs from the base class.</span>
+        <span class="s1">cache_type=</span><span class="s0">None,</span>
+        <span class="s1">cache_options=</span><span class="s0">None,</span>
+        <span class="s1">size=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot;Make a file-like object 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+            Full URL with protocol 
+        mode: string 
+            must be &quot;rb&quot; 
+        block_size: int or None 
+            Bytes to download in one request; use instance value if None. If 
+            zero, will return a streaming Requests file-like instance. 
+        kwargs: key-value 
+            Any other parameters, passed to requests calls 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">mode != </span><span class="s3">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+        <span class="s1">block_size = block_size </span><span class="s0">if </span><span class="s1">block_size </span><span class="s0">is not None else </span><span class="s1">self.block_size</span>
+        <span class="s1">kw = self.kwargs.copy()</span>
+        <span class="s1">kw[</span><span class="s3">&quot;asynchronous&quot;</span><span class="s1">] = self.asynchronous</span>
+        <span class="s1">kw.update(kwargs)</span>
+        <span class="s1">size = size </span><span class="s0">or </span><span class="s1">self.info(path</span><span class="s0">, </span><span class="s1">**kwargs)[</span><span class="s3">&quot;size&quot;</span><span class="s1">]</span>
+        <span class="s1">session = sync(self.loop</span><span class="s0">, </span><span class="s1">self.set_session)</span>
+        <span class="s0">if </span><span class="s1">block_size </span><span class="s0">and </span><span class="s1">size:</span>
+            <span class="s0">return </span><span class="s1">HTTPFile(</span>
+                <span class="s1">self</span><span class="s0">,</span>
+                <span class="s1">path</span><span class="s0">,</span>
+                <span class="s1">session=session</span><span class="s0">,</span>
+                <span class="s1">block_size=block_size</span><span class="s0">,</span>
+                <span class="s1">mode=mode</span><span class="s0">,</span>
+                <span class="s1">size=size</span><span class="s0">,</span>
+                <span class="s1">cache_type=cache_type </span><span class="s0">or </span><span class="s1">self.cache_type</span><span class="s0">,</span>
+                <span class="s1">cache_options=cache_options </span><span class="s0">or </span><span class="s1">self.cache_options</span><span class="s0">,</span>
+                <span class="s1">loop=self.loop</span><span class="s0">,</span>
+                <span class="s1">**kw</span><span class="s0">,</span>
+            <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">HTTPStreamFile(</span>
+                <span class="s1">self</span><span class="s0">,</span>
+                <span class="s1">path</span><span class="s0">,</span>
+                <span class="s1">mode=mode</span><span class="s0">,</span>
+                <span class="s1">loop=self.loop</span><span class="s0">,</span>
+                <span class="s1">session=session</span><span class="s0">,</span>
+                <span class="s1">**kw</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+    <span class="s0">async def </span><span class="s1">open_async(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode=</span><span class="s3">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">size=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">session = </span><span class="s0">await </span><span class="s1">self.set_session()</span>
+        <span class="s0">if </span><span class="s1">size </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">size = (</span><span class="s0">await </span><span class="s1">self._info(path</span><span class="s0">, </span><span class="s1">**kwargs))[</span><span class="s3">&quot;size&quot;</span><span class="s1">]</span>
+            <span class="s0">except </span><span class="s1">FileNotFoundError:</span>
+                <span class="s0">pass</span>
+        <span class="s0">return </span><span class="s1">AsyncStreamFile(</span>
+            <span class="s1">self</span><span class="s0">,</span>
+            <span class="s1">path</span><span class="s0">,</span>
+            <span class="s1">loop=self.loop</span><span class="s0">,</span>
+            <span class="s1">session=session</span><span class="s0">,</span>
+            <span class="s1">size=size</span><span class="s0">,</span>
+            <span class="s1">**kwargs</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">ukey(self</span><span class="s0">, </span><span class="s1">url):</span>
+        <span class="s4">&quot;&quot;&quot;Unique identifier; assume HTTP files are static, unchanging&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">tokenize(url</span><span class="s0">, </span><span class="s1">self.kwargs</span><span class="s0">, </span><span class="s1">self.protocol)</span>
+
+    <span class="s0">async def </span><span class="s1">_info(self</span><span class="s0">, </span><span class="s1">url</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s4">&quot;&quot;&quot;Get info of URL 
+ 
+        Tries to access location via HEAD, and then GET methods, but does 
+        not fetch the data. 
+ 
+        It is possible that the server does not supply any size information, in 
+        which case size will be given as None (and certain operations on the 
+        corresponding file will not work). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">info = {}</span>
+        <span class="s1">session = </span><span class="s0">await </span><span class="s1">self.set_session()</span>
+
+        <span class="s0">for </span><span class="s1">policy </span><span class="s0">in </span><span class="s1">[</span><span class="s3">&quot;head&quot;</span><span class="s0">, </span><span class="s3">&quot;get&quot;</span><span class="s1">]:</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">info.update(</span>
+                    <span class="s0">await </span><span class="s1">_file_info(</span>
+                        <span class="s1">self.encode_url(url)</span><span class="s0">,</span>
+                        <span class="s1">size_policy=policy</span><span class="s0">,</span>
+                        <span class="s1">session=session</span><span class="s0">,</span>
+                        <span class="s1">**self.kwargs</span><span class="s0">,</span>
+                        <span class="s1">**kwargs</span><span class="s0">,</span>
+                    <span class="s1">)</span>
+                <span class="s1">)</span>
+                <span class="s0">if </span><span class="s1">info.get(</span><span class="s3">&quot;size&quot;</span><span class="s1">) </span><span class="s0">is not None</span><span class="s1">:</span>
+                    <span class="s0">break</span>
+            <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">exc:</span>
+                <span class="s0">if </span><span class="s1">policy == </span><span class="s3">&quot;get&quot;</span><span class="s1">:</span>
+                    <span class="s2"># If get failed, then raise a FileNotFoundError</span>
+                    <span class="s0">raise </span><span class="s1">FileNotFoundError(url) </span><span class="s0">from </span><span class="s1">exc</span>
+                <span class="s1">logger.debug(str(exc))</span>
+
+        <span class="s0">return </span><span class="s1">{</span><span class="s3">&quot;name&quot;</span><span class="s1">: url</span><span class="s0">, </span><span class="s3">&quot;size&quot;</span><span class="s1">: </span><span class="s0">None, </span><span class="s1">**info</span><span class="s0">, </span><span class="s3">&quot;type&quot;</span><span class="s1">: </span><span class="s3">&quot;file&quot;</span><span class="s1">}</span>
+
+    <span class="s0">async def </span><span class="s1">_glob(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Find files by glob-matching. 
+ 
+        This implementation is idntical to the one in AbstractFileSystem, 
+        but &quot;?&quot; is not considered as a character for globbing, because it is 
+        so common in URLs, often identifying the &quot;query&quot; part. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None and </span><span class="s1">maxdepth &lt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;maxdepth must be at least 1&quot;</span><span class="s1">)</span>
+        <span class="s0">import </span><span class="s1">re</span>
+
+        <span class="s1">ends = path.endswith(</span><span class="s3">&quot;/&quot;</span><span class="s1">)</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">idx_star = path.find(</span><span class="s3">&quot;*&quot;</span><span class="s1">) </span><span class="s0">if </span><span class="s1">path.find(</span><span class="s3">&quot;*&quot;</span><span class="s1">) &gt;= </span><span class="s5">0 </span><span class="s0">else </span><span class="s1">len(path)</span>
+        <span class="s1">idx_brace = path.find(</span><span class="s3">&quot;[&quot;</span><span class="s1">) </span><span class="s0">if </span><span class="s1">path.find(</span><span class="s3">&quot;[&quot;</span><span class="s1">) &gt;= </span><span class="s5">0 </span><span class="s0">else </span><span class="s1">len(path)</span>
+
+        <span class="s1">min_idx = min(idx_star</span><span class="s0">, </span><span class="s1">idx_brace)</span>
+
+        <span class="s1">detail = kwargs.pop(</span><span class="s3">&quot;detail&quot;</span><span class="s0">, False</span><span class="s1">)</span>
+
+        <span class="s0">if not </span><span class="s1">has_magic(path):</span>
+            <span class="s0">if await </span><span class="s1">self._exists(path):</span>
+                <span class="s0">if not </span><span class="s1">detail:</span>
+                    <span class="s0">return </span><span class="s1">[path]</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s0">return </span><span class="s1">{path: </span><span class="s0">await </span><span class="s1">self._info(path)}</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">if not </span><span class="s1">detail:</span>
+                    <span class="s0">return </span><span class="s1">[]  </span><span class="s2"># glob of non-existent returns empty</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s0">return </span><span class="s1">{}</span>
+        <span class="s0">elif </span><span class="s3">&quot;/&quot; </span><span class="s0">in </span><span class="s1">path[:min_idx]:</span>
+            <span class="s1">min_idx = path[:min_idx].rindex(</span><span class="s3">&quot;/&quot;</span><span class="s1">)</span>
+            <span class="s1">root = path[: min_idx + </span><span class="s5">1</span><span class="s1">]</span>
+            <span class="s1">depth = path[min_idx + </span><span class="s5">1 </span><span class="s1">:].count(</span><span class="s3">&quot;/&quot;</span><span class="s1">) + </span><span class="s5">1</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">root = </span><span class="s3">&quot;&quot;</span>
+            <span class="s1">depth = path[min_idx + </span><span class="s5">1 </span><span class="s1">:].count(</span><span class="s3">&quot;/&quot;</span><span class="s1">) + </span><span class="s5">1</span>
+
+        <span class="s0">if </span><span class="s3">&quot;**&quot; </span><span class="s0">in </span><span class="s1">path:</span>
+            <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">idx_double_stars = path.find(</span><span class="s3">&quot;**&quot;</span><span class="s1">)</span>
+                <span class="s1">depth_double_stars = path[idx_double_stars:].count(</span><span class="s3">&quot;/&quot;</span><span class="s1">) + </span><span class="s5">1</span>
+                <span class="s1">depth = depth - depth_double_stars + maxdepth</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">depth = </span><span class="s0">None</span>
+
+        <span class="s1">allpaths = </span><span class="s0">await </span><span class="s1">self._find(</span>
+            <span class="s1">root</span><span class="s0">, </span><span class="s1">maxdepth=depth</span><span class="s0">, </span><span class="s1">withdirs=</span><span class="s0">True, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs</span>
+        <span class="s1">)</span>
+        <span class="s2"># Escape characters special to python regex, leaving our supported</span>
+        <span class="s2"># special characters in place.</span>
+        <span class="s2"># See https://www.gnu.org/software/bash/manual/html_node/Pattern-Matching.html</span>
+        <span class="s2"># for shell globbing details.</span>
+        <span class="s1">pattern = (</span>
+            <span class="s3">&quot;^&quot;</span>
+            <span class="s1">+ (</span>
+                <span class="s1">path.replace(</span><span class="s3">&quot;</span><span class="s0">\\</span><span class="s3">&quot;</span><span class="s0">, </span><span class="s3">r&quot;\\&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s3">&quot;.&quot;</span><span class="s0">, </span><span class="s3">r&quot;\.&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s3">&quot;+&quot;</span><span class="s0">, </span><span class="s3">r&quot;\+&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s3">&quot;//&quot;</span><span class="s0">, </span><span class="s3">&quot;/&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s3">&quot;(&quot;</span><span class="s0">, </span><span class="s3">r&quot;\(&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s3">&quot;)&quot;</span><span class="s0">, </span><span class="s3">r&quot;\)&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s3">&quot;|&quot;</span><span class="s0">, </span><span class="s3">r&quot;\|&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s3">&quot;^&quot;</span><span class="s0">, </span><span class="s3">r&quot;\^&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s3">&quot;$&quot;</span><span class="s0">, </span><span class="s3">r&quot;\$&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s3">&quot;{&quot;</span><span class="s0">, </span><span class="s3">r&quot;\{&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s3">&quot;}&quot;</span><span class="s0">, </span><span class="s3">r&quot;\}&quot;</span><span class="s1">)</span>
+                <span class="s1">.rstrip(</span><span class="s3">&quot;/&quot;</span><span class="s1">)</span>
+            <span class="s1">)</span>
+            <span class="s1">+ </span><span class="s3">&quot;$&quot;</span>
+        <span class="s1">)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s3">&quot;/[*]{2}&quot;</span><span class="s0">, </span><span class="s3">&quot;=SLASH_DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s3">&quot;[*]{2}/?&quot;</span><span class="s0">, </span><span class="s3">&quot;=DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s3">&quot;[*]&quot;</span><span class="s0">, </span><span class="s3">&quot;[^/]*&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s3">&quot;=SLASH_DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s3">&quot;(|/.*)&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s3">&quot;=DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s3">&quot;.*&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.compile(pattern)</span>
+        <span class="s1">out = {</span>
+            <span class="s1">p: allpaths[p]</span>
+            <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">sorted(allpaths)</span>
+            <span class="s0">if </span><span class="s1">pattern.match(p.replace(</span><span class="s3">&quot;//&quot;</span><span class="s0">, </span><span class="s3">&quot;/&quot;</span><span class="s1">).rstrip(</span><span class="s3">&quot;/&quot;</span><span class="s1">))</span>
+        <span class="s1">}</span>
+
+        <span class="s2"># Return directories only when the glob end by a slash</span>
+        <span class="s2"># This is needed for posix glob compliance</span>
+        <span class="s0">if </span><span class="s1">ends:</span>
+            <span class="s1">out = {k: v </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">out.items() </span><span class="s0">if </span><span class="s1">v[</span><span class="s3">&quot;type&quot;</span><span class="s1">] == </span><span class="s3">&quot;directory&quot;</span><span class="s1">}</span>
+
+        <span class="s0">if </span><span class="s1">detail:</span>
+            <span class="s0">return </span><span class="s1">out</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">list(out)</span>
+
+    <span class="s0">async def </span><span class="s1">_isdir(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s2"># override, since all URLs are (also) files</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">bool(</span><span class="s0">await </span><span class="s1">self._ls(path))</span>
+        <span class="s0">except </span><span class="s1">(FileNotFoundError</span><span class="s0">, </span><span class="s1">ValueError):</span>
+            <span class="s0">return False</span>
+
+
+<span class="s0">class </span><span class="s1">HTTPFile(AbstractBufferedFile):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    A file-like object pointing to a remove HTTP(S) resource 
+ 
+    Supports only reading, with read-ahead of a predermined block-size. 
+ 
+    In the case that the server does not supply the filesize, only reading of 
+    the complete file in one go is supported. 
+ 
+    Parameters 
+    ---------- 
+    url: str 
+        Full URL of the remote resource, including the protocol 
+    session: requests.Session or None 
+        All calls will be made within this session, to avoid restarting 
+        connections where the server allows this 
+    block_size: int or None 
+        The amount of read-ahead to do, in bytes. Default is 5MB, or the value 
+        configured for the FileSystem creating this file 
+    size: None or int 
+        If given, this is the size of the file in bytes, and we don't attempt 
+        to call the server to find the value. 
+    kwargs: all other key-values are passed to requests calls. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">fs</span><span class="s0">,</span>
+        <span class="s1">url</span><span class="s0">,</span>
+        <span class="s1">session=</span><span class="s0">None,</span>
+        <span class="s1">block_size=</span><span class="s0">None,</span>
+        <span class="s1">mode=</span><span class="s3">&quot;rb&quot;</span><span class="s0">,</span>
+        <span class="s1">cache_type=</span><span class="s3">&quot;bytes&quot;</span><span class="s0">,</span>
+        <span class="s1">cache_options=</span><span class="s0">None,</span>
+        <span class="s1">size=</span><span class="s0">None,</span>
+        <span class="s1">loop=</span><span class="s0">None,</span>
+        <span class="s1">asynchronous=</span><span class="s0">False,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">mode != </span><span class="s3">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError(</span><span class="s3">&quot;File mode not supported&quot;</span><span class="s1">)</span>
+        <span class="s1">self.asynchronous = asynchronous</span>
+        <span class="s1">self.url = url</span>
+        <span class="s1">self.session = session</span>
+        <span class="s1">self.details = {</span><span class="s3">&quot;name&quot;</span><span class="s1">: url</span><span class="s0">, </span><span class="s3">&quot;size&quot;</span><span class="s1">: size</span><span class="s0">, </span><span class="s3">&quot;type&quot;</span><span class="s1">: </span><span class="s3">&quot;file&quot;</span><span class="s1">}</span>
+        <span class="s1">super().__init__(</span>
+            <span class="s1">fs=fs</span><span class="s0">,</span>
+            <span class="s1">path=url</span><span class="s0">,</span>
+            <span class="s1">mode=mode</span><span class="s0">,</span>
+            <span class="s1">block_size=block_size</span><span class="s0">,</span>
+            <span class="s1">cache_type=cache_type</span><span class="s0">,</span>
+            <span class="s1">cache_options=cache_options</span><span class="s0">,</span>
+            <span class="s1">**kwargs</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s1">self.loop = loop</span>
+
+    <span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">length=-</span><span class="s5">1</span><span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot;Read bytes from file 
+ 
+        Parameters 
+        ---------- 
+        length: int 
+            Read up to this many bytes. If negative, read all content to end of 
+            file. If the server has not supplied the filesize, attempting to 
+            read only part of the data will raise a ValueError. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">(length &lt; </span><span class="s5">0 </span><span class="s0">and </span><span class="s1">self.loc == </span><span class="s5">0</span><span class="s1">)  </span><span class="s2"># explicit read all</span>
+            <span class="s2"># but not when the size is known and fits into a block anyways</span>
+            <span class="s0">and not </span><span class="s1">(self.size </span><span class="s0">is not None and </span><span class="s1">self.size &lt;= self.blocksize)</span>
+        <span class="s1">):</span>
+            <span class="s1">self._fetch_all()</span>
+        <span class="s0">if </span><span class="s1">self.size </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">length &lt; </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s1">self._fetch_all()</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">length = min(self.size - self.loc</span><span class="s0">, </span><span class="s1">length)</span>
+        <span class="s0">return </span><span class="s1">super().read(length)</span>
+
+    <span class="s0">async def </span><span class="s1">async_fetch_all(self):</span>
+        <span class="s4">&quot;&quot;&quot;Read whole file in one shot, without caching 
+ 
+        This is only called when position is still at zero, 
+        and read() is called without a byte-count. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">logger.debug(</span><span class="s3">f&quot;Fetch all for </span><span class="s0">{</span><span class="s1">self</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s0">if not </span><span class="s1">isinstance(self.cache</span><span class="s0">, </span><span class="s1">AllBytes):</span>
+            <span class="s1">r = </span><span class="s0">await </span><span class="s1">self.session.get(self.fs.encode_url(self.url)</span><span class="s0">, </span><span class="s1">**self.kwargs)</span>
+            <span class="s0">async with </span><span class="s1">r:</span>
+                <span class="s1">r.raise_for_status()</span>
+                <span class="s1">out = </span><span class="s0">await </span><span class="s1">r.read()</span>
+                <span class="s1">self.cache = AllBytes(</span>
+                    <span class="s1">size=len(out)</span><span class="s0">, </span><span class="s1">fetcher=</span><span class="s0">None, </span><span class="s1">blocksize=</span><span class="s0">None, </span><span class="s1">data=out</span>
+                <span class="s1">)</span>
+                <span class="s1">self.size = len(out)</span>
+
+    <span class="s1">_fetch_all = sync_wrapper(async_fetch_all)</span>
+
+    <span class="s0">def </span><span class="s1">_parse_content_range(self</span><span class="s0">, </span><span class="s1">headers):</span>
+        <span class="s4">&quot;&quot;&quot;Parse the Content-Range header&quot;&quot;&quot;</span>
+        <span class="s1">s = headers.get(</span><span class="s3">&quot;Content-Range&quot;</span><span class="s0">, </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s1">m = re.match(</span><span class="s3">r&quot;bytes (\d+-\d+|\*)/(\d+|\*)&quot;</span><span class="s0">, </span><span class="s1">s)</span>
+        <span class="s0">if not </span><span class="s1">m:</span>
+            <span class="s0">return None, None, None</span>
+
+        <span class="s0">if </span><span class="s1">m[</span><span class="s5">1</span><span class="s1">] == </span><span class="s3">&quot;*&quot;</span><span class="s1">:</span>
+            <span class="s1">start = end = </span><span class="s0">None</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">start</span><span class="s0">, </span><span class="s1">end = [int(x) </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">m[</span><span class="s5">1</span><span class="s1">].split(</span><span class="s3">&quot;-&quot;</span><span class="s1">)]</span>
+        <span class="s1">total = </span><span class="s0">None if </span><span class="s1">m[</span><span class="s5">2</span><span class="s1">] == </span><span class="s3">&quot;*&quot; </span><span class="s0">else </span><span class="s1">int(m[</span><span class="s5">2</span><span class="s1">])</span>
+        <span class="s0">return </span><span class="s1">start</span><span class="s0">, </span><span class="s1">end</span><span class="s0">, </span><span class="s1">total</span>
+
+    <span class="s0">async def </span><span class="s1">async_fetch_range(self</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">end):</span>
+        <span class="s4">&quot;&quot;&quot;Download a block of data 
+ 
+        The expectation is that the server returns only the requested bytes, 
+        with HTTP code 206. If this is not the case, we first check the headers, 
+        and then stream the output - if the data size is bigger than we 
+        requested, an exception is raised. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">logger.debug(</span><span class="s3">f&quot;Fetch range for </span><span class="s0">{</span><span class="s1">self</span><span class="s0">}</span><span class="s3">: </span><span class="s0">{</span><span class="s1">start</span><span class="s0">}</span><span class="s3">-</span><span class="s0">{</span><span class="s1">end</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s1">kwargs = self.kwargs.copy()</span>
+        <span class="s1">headers = kwargs.pop(</span><span class="s3">&quot;headers&quot;</span><span class="s0">, </span><span class="s1">{}).copy()</span>
+        <span class="s1">headers[</span><span class="s3">&quot;Range&quot;</span><span class="s1">] = </span><span class="s3">f&quot;bytes=</span><span class="s0">{</span><span class="s1">start</span><span class="s0">}</span><span class="s3">-</span><span class="s0">{</span><span class="s1">end - </span><span class="s5">1</span><span class="s0">}</span><span class="s3">&quot;</span>
+        <span class="s1">logger.debug(</span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">self.url</span><span class="s0">} </span><span class="s3">: </span><span class="s0">{</span><span class="s1">headers[</span><span class="s3">'Range'</span><span class="s1">]</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s1">r = </span><span class="s0">await </span><span class="s1">self.session.get(</span>
+            <span class="s1">self.fs.encode_url(self.url)</span><span class="s0">, </span><span class="s1">headers=headers</span><span class="s0">, </span><span class="s1">**kwargs</span>
+        <span class="s1">)</span>
+        <span class="s0">async with </span><span class="s1">r:</span>
+            <span class="s0">if </span><span class="s1">r.status == </span><span class="s5">416</span><span class="s1">:</span>
+                <span class="s2"># range request outside file</span>
+                <span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+            <span class="s1">r.raise_for_status()</span>
+
+            <span class="s2"># If the server has handled the range request, it should reply</span>
+            <span class="s2"># with status 206 (partial content). But we'll guess that a suitable</span>
+            <span class="s2"># Content-Range header or a Content-Length no more than the</span>
+            <span class="s2"># requested range also mean we have got the desired range.</span>
+            <span class="s1">response_is_range = (</span>
+                <span class="s1">r.status == </span><span class="s5">206</span>
+                <span class="s0">or </span><span class="s1">self._parse_content_range(r.headers)[</span><span class="s5">0</span><span class="s1">] == start</span>
+                <span class="s0">or </span><span class="s1">int(r.headers.get(</span><span class="s3">&quot;Content-Length&quot;</span><span class="s0">, </span><span class="s1">end + </span><span class="s5">1</span><span class="s1">)) &lt;= end - start</span>
+            <span class="s1">)</span>
+
+            <span class="s0">if </span><span class="s1">response_is_range:</span>
+                <span class="s2"># partial content, as expected</span>
+                <span class="s1">out = </span><span class="s0">await </span><span class="s1">r.read()</span>
+            <span class="s0">elif </span><span class="s1">start &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">&quot;The HTTP server doesn't appear to support range requests. &quot;</span>
+                    <span class="s3">&quot;Only reading this file from the beginning is supported. &quot;</span>
+                    <span class="s3">&quot;Open with block_size=0 for a streaming file interface.&quot;</span>
+                <span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s2"># Response is not a range, but we want the start of the file,</span>
+                <span class="s2"># so we can read the required amount anyway.</span>
+                <span class="s1">cl = </span><span class="s5">0</span>
+                <span class="s1">out = []</span>
+                <span class="s0">while True</span><span class="s1">:</span>
+                    <span class="s1">chunk = </span><span class="s0">await </span><span class="s1">r.content.read(</span><span class="s5">2</span><span class="s1">**</span><span class="s5">20</span><span class="s1">)</span>
+                    <span class="s2"># data size unknown, let's read until we have enough</span>
+                    <span class="s0">if </span><span class="s1">chunk:</span>
+                        <span class="s1">out.append(chunk)</span>
+                        <span class="s1">cl += len(chunk)</span>
+                        <span class="s0">if </span><span class="s1">cl &gt; end - start:</span>
+                            <span class="s0">break</span>
+                    <span class="s0">else</span><span class="s1">:</span>
+                        <span class="s0">break</span>
+                <span class="s1">out = </span><span class="s6">b&quot;&quot;</span><span class="s1">.join(out)[: end - start]</span>
+            <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s1">_fetch_range = sync_wrapper(async_fetch_range)</span>
+
+    <span class="s0">def </span><span class="s1">__reduce__(self):</span>
+        <span class="s0">return </span><span class="s1">(</span>
+            <span class="s1">reopen</span><span class="s0">,</span>
+            <span class="s1">(</span>
+                <span class="s1">self.fs</span><span class="s0">,</span>
+                <span class="s1">self.url</span><span class="s0">,</span>
+                <span class="s1">self.mode</span><span class="s0">,</span>
+                <span class="s1">self.blocksize</span><span class="s0">,</span>
+                <span class="s1">self.cache.name </span><span class="s0">if </span><span class="s1">self.cache </span><span class="s0">else </span><span class="s3">&quot;none&quot;</span><span class="s0">,</span>
+                <span class="s1">self.size</span><span class="s0">,</span>
+            <span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">reopen(fs</span><span class="s0">, </span><span class="s1">url</span><span class="s0">, </span><span class="s1">mode</span><span class="s0">, </span><span class="s1">blocksize</span><span class="s0">, </span><span class="s1">cache_type</span><span class="s0">, </span><span class="s1">size=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s0">return </span><span class="s1">fs.open(</span>
+        <span class="s1">url</span><span class="s0">, </span><span class="s1">mode=mode</span><span class="s0">, </span><span class="s1">block_size=blocksize</span><span class="s0">, </span><span class="s1">cache_type=cache_type</span><span class="s0">, </span><span class="s1">size=size</span>
+    <span class="s1">)</span>
+
+
+<span class="s1">magic_check = re.compile(</span><span class="s3">&quot;([*[])&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">has_magic(s):</span>
+    <span class="s1">match = magic_check.search(s)</span>
+    <span class="s0">return </span><span class="s1">match </span><span class="s0">is not None</span>
+
+
+<span class="s0">class </span><span class="s1">HTTPStreamFile(AbstractBufferedFile):</span>
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">fs</span><span class="s0">, </span><span class="s1">url</span><span class="s0">, </span><span class="s1">mode=</span><span class="s3">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">loop=</span><span class="s0">None, </span><span class="s1">session=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self.asynchronous = kwargs.pop(</span><span class="s3">&quot;asynchronous&quot;</span><span class="s0">, False</span><span class="s1">)</span>
+        <span class="s1">self.url = url</span>
+        <span class="s1">self.loop = loop</span>
+        <span class="s1">self.session = session</span>
+        <span class="s0">if </span><span class="s1">mode != </span><span class="s3">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span>
+        <span class="s1">self.details = {</span><span class="s3">&quot;name&quot;</span><span class="s1">: url</span><span class="s0">, </span><span class="s3">&quot;size&quot;</span><span class="s1">: </span><span class="s0">None</span><span class="s1">}</span>
+        <span class="s1">super().__init__(fs=fs</span><span class="s0">, </span><span class="s1">path=url</span><span class="s0">, </span><span class="s1">mode=mode</span><span class="s0">, </span><span class="s1">cache_type=</span><span class="s3">&quot;none&quot;</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s0">async def </span><span class="s1">cor():</span>
+            <span class="s1">r = </span><span class="s0">await </span><span class="s1">self.session.get(self.fs.encode_url(url)</span><span class="s0">, </span><span class="s1">**kwargs).__aenter__()</span>
+            <span class="s1">self.fs._raise_not_found_for_status(r</span><span class="s0">, </span><span class="s1">url)</span>
+            <span class="s0">return </span><span class="s1">r</span>
+
+        <span class="s1">self.r = sync(self.loop</span><span class="s0">, </span><span class="s1">cor)</span>
+
+    <span class="s0">def </span><span class="s1">seek(self</span><span class="s0">, </span><span class="s1">loc</span><span class="s0">, </span><span class="s1">whence=</span><span class="s5">0</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">loc == </span><span class="s5">0 </span><span class="s0">and </span><span class="s1">whence == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">return</span>
+        <span class="s0">if </span><span class="s1">loc == self.loc </span><span class="s0">and </span><span class="s1">whence == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s0">return</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Cannot seek streaming HTTP file&quot;</span><span class="s1">)</span>
+
+    <span class="s0">async def </span><span class="s1">_read(self</span><span class="s0">, </span><span class="s1">num=-</span><span class="s5">1</span><span class="s1">):</span>
+        <span class="s1">out = </span><span class="s0">await </span><span class="s1">self.r.content.read(num)</span>
+        <span class="s1">self.loc += len(out)</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s1">read = sync_wrapper(_read)</span>
+
+    <span class="s0">async def </span><span class="s1">_close(self):</span>
+        <span class="s1">self.r.close()</span>
+
+    <span class="s0">def </span><span class="s1">close(self):</span>
+        <span class="s1">asyncio.run_coroutine_threadsafe(self._close()</span><span class="s0">, </span><span class="s1">self.loop)</span>
+        <span class="s1">super().close()</span>
+
+    <span class="s0">def </span><span class="s1">__reduce__(self):</span>
+        <span class="s0">return </span><span class="s1">reopen</span><span class="s0">, </span><span class="s1">(self.fs</span><span class="s0">, </span><span class="s1">self.url</span><span class="s0">, </span><span class="s1">self.mode</span><span class="s0">, </span><span class="s1">self.blocksize</span><span class="s0">, </span><span class="s1">self.cache.name)</span>
+
+
+<span class="s0">class </span><span class="s1">AsyncStreamFile(AbstractAsyncStreamedFile):</span>
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">fs</span><span class="s0">, </span><span class="s1">url</span><span class="s0">, </span><span class="s1">mode=</span><span class="s3">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">loop=</span><span class="s0">None, </span><span class="s1">session=</span><span class="s0">None, </span><span class="s1">size=</span><span class="s0">None, </span><span class="s1">**kwargs</span>
+    <span class="s1">):</span>
+        <span class="s1">self.url = url</span>
+        <span class="s1">self.session = session</span>
+        <span class="s1">self.r = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">mode != </span><span class="s3">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span>
+        <span class="s1">self.details = {</span><span class="s3">&quot;name&quot;</span><span class="s1">: url</span><span class="s0">, </span><span class="s3">&quot;size&quot;</span><span class="s1">: </span><span class="s0">None</span><span class="s1">}</span>
+        <span class="s1">self.kwargs = kwargs</span>
+        <span class="s1">super().__init__(fs=fs</span><span class="s0">, </span><span class="s1">path=url</span><span class="s0">, </span><span class="s1">mode=mode</span><span class="s0">, </span><span class="s1">cache_type=</span><span class="s3">&quot;none&quot;</span><span class="s1">)</span>
+        <span class="s1">self.size = size</span>
+
+    <span class="s0">async def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">num=-</span><span class="s5">1</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">self.r </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">r = </span><span class="s0">await </span><span class="s1">self.session.get(</span>
+                <span class="s1">self.fs.encode_url(self.url)</span><span class="s0">, </span><span class="s1">**self.kwargs</span>
+            <span class="s1">).__aenter__()</span>
+            <span class="s1">self.fs._raise_not_found_for_status(r</span><span class="s0">, </span><span class="s1">self.url)</span>
+            <span class="s1">self.r = r</span>
+        <span class="s1">out = </span><span class="s0">await </span><span class="s1">self.r.content.read(num)</span>
+        <span class="s1">self.loc += len(out)</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">async def </span><span class="s1">close(self):</span>
+        <span class="s0">if </span><span class="s1">self.r </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">self.r.close()</span>
+            <span class="s1">self.r = </span><span class="s0">None</span>
+        <span class="s0">await </span><span class="s1">super().close()</span>
+
+
+<span class="s0">async def </span><span class="s1">get_range(session</span><span class="s0">, </span><span class="s1">url</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">end</span><span class="s0">, </span><span class="s1">file=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+    <span class="s2"># explicit get a range when we know it must be safe</span>
+    <span class="s1">kwargs = kwargs.copy()</span>
+    <span class="s1">headers = kwargs.pop(</span><span class="s3">&quot;headers&quot;</span><span class="s0">, </span><span class="s1">{}).copy()</span>
+    <span class="s1">headers[</span><span class="s3">&quot;Range&quot;</span><span class="s1">] = </span><span class="s3">f&quot;bytes=</span><span class="s0">{</span><span class="s1">start</span><span class="s0">}</span><span class="s3">-</span><span class="s0">{</span><span class="s1">end - </span><span class="s5">1</span><span class="s0">}</span><span class="s3">&quot;</span>
+    <span class="s1">r = </span><span class="s0">await </span><span class="s1">session.get(url</span><span class="s0">, </span><span class="s1">headers=headers</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s1">r.raise_for_status()</span>
+    <span class="s0">async with </span><span class="s1">r:</span>
+        <span class="s1">out = </span><span class="s0">await </span><span class="s1">r.read()</span>
+    <span class="s0">if </span><span class="s1">file:</span>
+        <span class="s0">with </span><span class="s1">open(file</span><span class="s0">, </span><span class="s3">&quot;rb+&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">f:</span>
+            <span class="s1">f.seek(start)</span>
+            <span class="s1">f.write(out)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+
+<span class="s0">async def </span><span class="s1">_file_info(url</span><span class="s0">, </span><span class="s1">session</span><span class="s0">, </span><span class="s1">size_policy=</span><span class="s3">&quot;head&quot;</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+    <span class="s4">&quot;&quot;&quot;Call HEAD on the server to get details about the file (size/checksum etc.) 
+ 
+    Default operation is to explicitly allow redirects and use encoding 
+    'identity' (no compression) to get the true size of the target. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">logger.debug(</span><span class="s3">&quot;Retrieve file size for %s&quot;</span><span class="s0">, </span><span class="s1">url)</span>
+    <span class="s1">kwargs = kwargs.copy()</span>
+    <span class="s1">ar = kwargs.pop(</span><span class="s3">&quot;allow_redirects&quot;</span><span class="s0">, True</span><span class="s1">)</span>
+    <span class="s1">head = kwargs.get(</span><span class="s3">&quot;headers&quot;</span><span class="s0">, </span><span class="s1">{}).copy()</span>
+    <span class="s1">head[</span><span class="s3">&quot;Accept-Encoding&quot;</span><span class="s1">] = </span><span class="s3">&quot;identity&quot;</span>
+    <span class="s1">kwargs[</span><span class="s3">&quot;headers&quot;</span><span class="s1">] = head</span>
+
+    <span class="s1">info = {}</span>
+    <span class="s0">if </span><span class="s1">size_policy == </span><span class="s3">&quot;head&quot;</span><span class="s1">:</span>
+        <span class="s1">r = </span><span class="s0">await </span><span class="s1">session.head(url</span><span class="s0">, </span><span class="s1">allow_redirects=ar</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s0">elif </span><span class="s1">size_policy == </span><span class="s3">&quot;get&quot;</span><span class="s1">:</span>
+        <span class="s1">r = </span><span class="s0">await </span><span class="s1">session.get(url</span><span class="s0">, </span><span class="s1">allow_redirects=ar</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">TypeError(</span><span class="s3">f'size_policy must be &quot;head&quot; or &quot;get&quot;, got </span><span class="s0">{</span><span class="s1">size_policy</span><span class="s0">}</span><span class="s3">'</span><span class="s1">)</span>
+    <span class="s0">async with </span><span class="s1">r:</span>
+        <span class="s1">r.raise_for_status()</span>
+
+        <span class="s2"># TODO:</span>
+        <span class="s2">#  recognise lack of 'Accept-Ranges',</span>
+        <span class="s2">#                 or 'Accept-Ranges': 'none' (not 'bytes')</span>
+        <span class="s2">#  to mean streaming only, no random access =&gt; return None</span>
+        <span class="s0">if </span><span class="s3">&quot;Content-Length&quot; </span><span class="s0">in </span><span class="s1">r.headers:</span>
+            <span class="s2"># Some servers may choose to ignore Accept-Encoding and return</span>
+            <span class="s2"># compressed content, in which case the returned size is unreliable.</span>
+            <span class="s0">if </span><span class="s1">r.headers.get(</span><span class="s3">&quot;Content-Encoding&quot;</span><span class="s0">, </span><span class="s3">&quot;identity&quot;</span><span class="s1">) == </span><span class="s3">&quot;identity&quot;</span><span class="s1">:</span>
+                <span class="s1">info[</span><span class="s3">&quot;size&quot;</span><span class="s1">] = int(r.headers[</span><span class="s3">&quot;Content-Length&quot;</span><span class="s1">])</span>
+        <span class="s0">elif </span><span class="s3">&quot;Content-Range&quot; </span><span class="s0">in </span><span class="s1">r.headers:</span>
+            <span class="s1">info[</span><span class="s3">&quot;size&quot;</span><span class="s1">] = int(r.headers[</span><span class="s3">&quot;Content-Range&quot;</span><span class="s1">].split(</span><span class="s3">&quot;/&quot;</span><span class="s1">)[</span><span class="s5">1</span><span class="s1">])</span>
+
+        <span class="s0">for </span><span class="s1">checksum_field </span><span class="s0">in </span><span class="s1">[</span><span class="s3">&quot;ETag&quot;</span><span class="s0">, </span><span class="s3">&quot;Content-MD5&quot;</span><span class="s0">, </span><span class="s3">&quot;Digest&quot;</span><span class="s1">]:</span>
+            <span class="s0">if </span><span class="s1">r.headers.get(checksum_field):</span>
+                <span class="s1">info[checksum_field] = r.headers[checksum_field]</span>
+
+    <span class="s0">return </span><span class="s1">info</span>
+
+
+<span class="s0">async def </span><span class="s1">_file_size(url</span><span class="s0">, </span><span class="s1">session=</span><span class="s0">None, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+    <span class="s0">if </span><span class="s1">session </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">session = </span><span class="s0">await </span><span class="s1">get_client()</span>
+    <span class="s1">info = </span><span class="s0">await </span><span class="s1">_file_info(url</span><span class="s0">, </span><span class="s1">session=session</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s0">return </span><span class="s1">info.get(</span><span class="s3">&quot;size&quot;</span><span class="s1">)</span>
+
+
+<span class="s1">file_size = sync_wrapper(_file_size)</span>
+</pre>
+</body>
+</html>

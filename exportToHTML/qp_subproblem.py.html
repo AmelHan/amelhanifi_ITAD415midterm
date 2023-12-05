@@ -1,0 +1,659 @@
+<html>
+<head>
+<title>qp_subproblem.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+qp_subproblem.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Equality-constrained quadratic programming solvers.&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">scipy.sparse </span><span class="s2">import </span><span class="s1">(linalg</span><span class="s2">, </span><span class="s1">bmat</span><span class="s2">, </span><span class="s1">csc_matrix)</span>
+<span class="s2">from </span><span class="s1">math </span><span class="s2">import </span><span class="s1">copysign</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numpy.linalg </span><span class="s2">import </span><span class="s1">norm</span>
+
+<span class="s1">__all__ = [</span>
+    <span class="s3">'eqp_kktfact'</span><span class="s2">,</span>
+    <span class="s3">'sphere_intersections'</span><span class="s2">,</span>
+    <span class="s3">'box_intersections'</span><span class="s2">,</span>
+    <span class="s3">'box_sphere_intersections'</span><span class="s2">,</span>
+    <span class="s3">'inside_box_boundaries'</span><span class="s2">,</span>
+    <span class="s3">'modified_dogleg'</span><span class="s2">,</span>
+    <span class="s3">'projected_cg'</span>
+<span class="s1">]</span>
+
+
+<span class="s4"># For comparison with the projected CG</span>
+<span class="s2">def </span><span class="s1">eqp_kktfact(H</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">A</span><span class="s2">, </span><span class="s1">b):</span>
+    <span class="s0">&quot;&quot;&quot;Solve equality-constrained quadratic programming (EQP) problem. 
+ 
+    Solve ``min 1/2 x.T H x + x.t c`` subject to ``A x + b = 0`` 
+    using direct factorization of the KKT system. 
+ 
+    Parameters 
+    ---------- 
+    H : sparse matrix, shape (n, n) 
+        Hessian matrix of the EQP problem. 
+    c : array_like, shape (n,) 
+        Gradient of the quadratic objective function. 
+    A : sparse matrix 
+        Jacobian matrix of the EQP problem. 
+    b : array_like, shape (m,) 
+        Right-hand side of the constraint equation. 
+ 
+    Returns 
+    ------- 
+    x : array_like, shape (n,) 
+        Solution of the KKT problem. 
+    lagrange_multipliers : ndarray, shape (m,) 
+        Lagrange multipliers of the KKT problem. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">n</span><span class="s2">, </span><span class="s1">= np.shape(c)  </span><span class="s4"># Number of parameters</span>
+    <span class="s1">m</span><span class="s2">, </span><span class="s1">= np.shape(b)  </span><span class="s4"># Number of constraints</span>
+
+    <span class="s4"># Karush-Kuhn-Tucker matrix of coefficients.</span>
+    <span class="s4"># Defined as in Nocedal/Wright &quot;Numerical</span>
+    <span class="s4"># Optimization&quot; p.452 in Eq. (16.4).</span>
+    <span class="s1">kkt_matrix = csc_matrix(bmat([[H</span><span class="s2">, </span><span class="s1">A.T]</span><span class="s2">, </span><span class="s1">[A</span><span class="s2">, None</span><span class="s1">]]))</span>
+    <span class="s4"># Vector of coefficients.</span>
+    <span class="s1">kkt_vec = np.hstack([-c</span><span class="s2">, </span><span class="s1">-b])</span>
+
+    <span class="s4"># TODO: Use a symmetric indefinite factorization</span>
+    <span class="s4">#       to solve the system twice as fast (because</span>
+    <span class="s4">#       of the symmetry).</span>
+    <span class="s1">lu = linalg.splu(kkt_matrix)</span>
+    <span class="s1">kkt_sol = lu.solve(kkt_vec)</span>
+    <span class="s1">x = kkt_sol[:n]</span>
+    <span class="s1">lagrange_multipliers = -kkt_sol[n:n+m]</span>
+
+    <span class="s2">return </span><span class="s1">x</span><span class="s2">, </span><span class="s1">lagrange_multipliers</span>
+
+
+<span class="s2">def </span><span class="s1">sphere_intersections(z</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">trust_radius</span><span class="s2">,</span>
+                         <span class="s1">entire_line=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Find the intersection between segment (or line) and spherical constraints. 
+ 
+    Find the intersection between the segment (or line) defined by the 
+    parametric  equation ``x(t) = z + t*d`` and the ball 
+    ``||x|| &lt;= trust_radius``. 
+ 
+    Parameters 
+    ---------- 
+    z : array_like, shape (n,) 
+        Initial point. 
+    d : array_like, shape (n,) 
+        Direction. 
+    trust_radius : float 
+        Ball radius. 
+    entire_line : bool, optional 
+        When ``True``, the function returns the intersection between the line 
+        ``x(t) = z + t*d`` (``t`` can assume any value) and the ball 
+        ``||x|| &lt;= trust_radius``. When ``False``, the function returns the intersection 
+        between the segment ``x(t) = z + t*d``, ``0 &lt;= t &lt;= 1``, and the ball. 
+ 
+    Returns 
+    ------- 
+    ta, tb : float 
+        The line/segment ``x(t) = z + t*d`` is inside the ball for 
+        for ``ta &lt;= t &lt;= tb``. 
+    intersect : bool 
+        When ``True``, there is a intersection between the line/segment 
+        and the sphere. On the other hand, when ``False``, there is no 
+        intersection. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># Special case when d=0</span>
+    <span class="s2">if </span><span class="s1">norm(d) == </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, False</span>
+    <span class="s4"># Check for inf trust_radius</span>
+    <span class="s2">if </span><span class="s1">np.isinf(trust_radius):</span>
+        <span class="s2">if </span><span class="s1">entire_line:</span>
+            <span class="s1">ta = -np.inf</span>
+            <span class="s1">tb = np.inf</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">ta = </span><span class="s5">0</span>
+            <span class="s1">tb = </span><span class="s5">1</span>
+        <span class="s1">intersect = </span><span class="s2">True</span>
+        <span class="s2">return </span><span class="s1">ta</span><span class="s2">, </span><span class="s1">tb</span><span class="s2">, </span><span class="s1">intersect</span>
+
+    <span class="s1">a = np.dot(d</span><span class="s2">, </span><span class="s1">d)</span>
+    <span class="s1">b = </span><span class="s5">2 </span><span class="s1">* np.dot(z</span><span class="s2">, </span><span class="s1">d)</span>
+    <span class="s1">c = np.dot(z</span><span class="s2">, </span><span class="s1">z) - trust_radius**</span><span class="s5">2</span>
+    <span class="s1">discriminant = b*b - </span><span class="s5">4</span><span class="s1">*a*c</span>
+    <span class="s2">if </span><span class="s1">discriminant &lt; </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s1">intersect = </span><span class="s2">False</span>
+        <span class="s2">return </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">intersect</span>
+    <span class="s1">sqrt_discriminant = np.sqrt(discriminant)</span>
+
+    <span class="s4"># The following calculation is mathematically</span>
+    <span class="s4"># equivalent to:</span>
+    <span class="s4"># ta = (-b - sqrt_discriminant) / (2*a)</span>
+    <span class="s4"># tb = (-b + sqrt_discriminant) / (2*a)</span>
+    <span class="s4"># but produce smaller round off errors.</span>
+    <span class="s4"># Look at Matrix Computation p.97</span>
+    <span class="s4"># for a better justification.</span>
+    <span class="s1">aux = b + copysign(sqrt_discriminant</span><span class="s2">, </span><span class="s1">b)</span>
+    <span class="s1">ta = -aux / (</span><span class="s5">2</span><span class="s1">*a)</span>
+    <span class="s1">tb = -</span><span class="s5">2</span><span class="s1">*c / aux</span>
+    <span class="s1">ta</span><span class="s2">, </span><span class="s1">tb = sorted([ta</span><span class="s2">, </span><span class="s1">tb])</span>
+
+    <span class="s2">if </span><span class="s1">entire_line:</span>
+        <span class="s1">intersect = </span><span class="s2">True</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s4"># Checks to see if intersection happens</span>
+        <span class="s4"># within vectors length.</span>
+        <span class="s2">if </span><span class="s1">tb &lt; </span><span class="s5">0 </span><span class="s2">or </span><span class="s1">ta &gt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">intersect = </span><span class="s2">False</span>
+            <span class="s1">ta = </span><span class="s5">0</span>
+            <span class="s1">tb = </span><span class="s5">0</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">intersect = </span><span class="s2">True</span>
+            <span class="s4"># Restrict intersection interval</span>
+            <span class="s4"># between 0 and 1.</span>
+            <span class="s1">ta = max(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">ta)</span>
+            <span class="s1">tb = min(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">tb)</span>
+
+    <span class="s2">return </span><span class="s1">ta</span><span class="s2">, </span><span class="s1">tb</span><span class="s2">, </span><span class="s1">intersect</span>
+
+
+<span class="s2">def </span><span class="s1">box_intersections(z</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub</span><span class="s2">,</span>
+                      <span class="s1">entire_line=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Find the intersection between segment (or line) and box constraints. 
+ 
+    Find the intersection between the segment (or line) defined by the 
+    parametric  equation ``x(t) = z + t*d`` and the rectangular box 
+    ``lb &lt;= x &lt;= ub``. 
+ 
+    Parameters 
+    ---------- 
+    z : array_like, shape (n,) 
+        Initial point. 
+    d : array_like, shape (n,) 
+        Direction. 
+    lb : array_like, shape (n,) 
+        Lower bounds to each one of the components of ``x``. Used 
+        to delimit the rectangular box. 
+    ub : array_like, shape (n, ) 
+        Upper bounds to each one of the components of ``x``. Used 
+        to delimit the rectangular box. 
+    entire_line : bool, optional 
+        When ``True``, the function returns the intersection between the line 
+        ``x(t) = z + t*d`` (``t`` can assume any value) and the rectangular 
+        box. When ``False``, the function returns the intersection between the segment 
+        ``x(t) = z + t*d``, ``0 &lt;= t &lt;= 1``, and the rectangular box. 
+ 
+    Returns 
+    ------- 
+    ta, tb : float 
+        The line/segment ``x(t) = z + t*d`` is inside the box for 
+        for ``ta &lt;= t &lt;= tb``. 
+    intersect : bool 
+        When ``True``, there is a intersection between the line (or segment) 
+        and the rectangular box. On the other hand, when ``False``, there is no 
+        intersection. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># Make sure it is a numpy array</span>
+    <span class="s1">z = np.asarray(z)</span>
+    <span class="s1">d = np.asarray(d)</span>
+    <span class="s1">lb = np.asarray(lb)</span>
+    <span class="s1">ub = np.asarray(ub)</span>
+    <span class="s4"># Special case when d=0</span>
+    <span class="s2">if </span><span class="s1">norm(d) == </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, False</span>
+
+    <span class="s4"># Get values for which d==0</span>
+    <span class="s1">zero_d = (d == </span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s4"># If the boundaries are not satisfied for some coordinate</span>
+    <span class="s4"># for which &quot;d&quot; is zero, there is no box-line intersection.</span>
+    <span class="s2">if </span><span class="s1">(z[zero_d] &lt; lb[zero_d]).any() </span><span class="s2">or </span><span class="s1">(z[zero_d] &gt; ub[zero_d]).any():</span>
+        <span class="s1">intersect = </span><span class="s2">False</span>
+        <span class="s2">return </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">intersect</span>
+    <span class="s4"># Remove values for which d is zero</span>
+    <span class="s1">not_zero_d = np.logical_not(zero_d)</span>
+    <span class="s1">z = z[not_zero_d]</span>
+    <span class="s1">d = d[not_zero_d]</span>
+    <span class="s1">lb = lb[not_zero_d]</span>
+    <span class="s1">ub = ub[not_zero_d]</span>
+
+    <span class="s4"># Find a series of intervals (t_lb[i], t_ub[i]).</span>
+    <span class="s1">t_lb = (lb-z) / d</span>
+    <span class="s1">t_ub = (ub-z) / d</span>
+    <span class="s4"># Get the intersection of all those intervals.</span>
+    <span class="s1">ta = max(np.minimum(t_lb</span><span class="s2">, </span><span class="s1">t_ub))</span>
+    <span class="s1">tb = min(np.maximum(t_lb</span><span class="s2">, </span><span class="s1">t_ub))</span>
+
+    <span class="s4"># Check if intersection is feasible</span>
+    <span class="s2">if </span><span class="s1">ta &lt;= tb:</span>
+        <span class="s1">intersect = </span><span class="s2">True</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">intersect = </span><span class="s2">False</span>
+    <span class="s4"># Checks to see if intersection happens within vectors length.</span>
+    <span class="s2">if not </span><span class="s1">entire_line:</span>
+        <span class="s2">if </span><span class="s1">tb &lt; </span><span class="s5">0 </span><span class="s2">or </span><span class="s1">ta &gt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">intersect = </span><span class="s2">False</span>
+            <span class="s1">ta = </span><span class="s5">0</span>
+            <span class="s1">tb = </span><span class="s5">0</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s4"># Restrict intersection interval between 0 and 1.</span>
+            <span class="s1">ta = max(</span><span class="s5">0</span><span class="s2">, </span><span class="s1">ta)</span>
+            <span class="s1">tb = min(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">tb)</span>
+
+    <span class="s2">return </span><span class="s1">ta</span><span class="s2">, </span><span class="s1">tb</span><span class="s2">, </span><span class="s1">intersect</span>
+
+
+<span class="s2">def </span><span class="s1">box_sphere_intersections(z</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub</span><span class="s2">, </span><span class="s1">trust_radius</span><span class="s2">,</span>
+                             <span class="s1">entire_line=</span><span class="s2">False,</span>
+                             <span class="s1">extra_info=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Find the intersection between segment (or line) and box/sphere constraints. 
+ 
+    Find the intersection between the segment (or line) defined by the 
+    parametric  equation ``x(t) = z + t*d``, the rectangular box 
+    ``lb &lt;= x &lt;= ub`` and the ball ``||x|| &lt;= trust_radius``. 
+ 
+    Parameters 
+    ---------- 
+    z : array_like, shape (n,) 
+        Initial point. 
+    d : array_like, shape (n,) 
+        Direction. 
+    lb : array_like, shape (n,) 
+        Lower bounds to each one of the components of ``x``. Used 
+        to delimit the rectangular box. 
+    ub : array_like, shape (n, ) 
+        Upper bounds to each one of the components of ``x``. Used 
+        to delimit the rectangular box. 
+    trust_radius : float 
+        Ball radius. 
+    entire_line : bool, optional 
+        When ``True``, the function returns the intersection between the line 
+        ``x(t) = z + t*d`` (``t`` can assume any value) and the constraints. 
+        When ``False``, the function returns the intersection between the segment 
+        ``x(t) = z + t*d``, ``0 &lt;= t &lt;= 1`` and the constraints. 
+    extra_info : bool, optional 
+        When ``True``, the function returns ``intersect_sphere`` and ``intersect_box``. 
+ 
+    Returns 
+    ------- 
+    ta, tb : float 
+        The line/segment ``x(t) = z + t*d`` is inside the rectangular box and 
+        inside the ball for ``ta &lt;= t &lt;= tb``. 
+    intersect : bool 
+        When ``True``, there is a intersection between the line (or segment) 
+        and both constraints. On the other hand, when ``False``, there is no 
+        intersection. 
+    sphere_info : dict, optional 
+        Dictionary ``{ta, tb, intersect}`` containing the interval ``[ta, tb]`` 
+        for which the line intercepts the ball. And a boolean value indicating 
+        whether the sphere is intersected by the line. 
+    box_info : dict, optional 
+        Dictionary ``{ta, tb, intersect}`` containing the interval ``[ta, tb]`` 
+        for which the line intercepts the box. And a boolean value indicating 
+        whether the box is intersected by the line. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">ta_b</span><span class="s2">, </span><span class="s1">tb_b</span><span class="s2">, </span><span class="s1">intersect_b = box_intersections(z</span><span class="s2">, </span><span class="s1">d</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub</span><span class="s2">,</span>
+                                                <span class="s1">entire_line)</span>
+    <span class="s1">ta_s</span><span class="s2">, </span><span class="s1">tb_s</span><span class="s2">, </span><span class="s1">intersect_s = sphere_intersections(z</span><span class="s2">, </span><span class="s1">d</span><span class="s2">,</span>
+                                                   <span class="s1">trust_radius</span><span class="s2">,</span>
+                                                   <span class="s1">entire_line)</span>
+    <span class="s1">ta = np.maximum(ta_b</span><span class="s2">, </span><span class="s1">ta_s)</span>
+    <span class="s1">tb = np.minimum(tb_b</span><span class="s2">, </span><span class="s1">tb_s)</span>
+    <span class="s2">if </span><span class="s1">intersect_b </span><span class="s2">and </span><span class="s1">intersect_s </span><span class="s2">and </span><span class="s1">ta &lt;= tb:</span>
+        <span class="s1">intersect = </span><span class="s2">True</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">intersect = </span><span class="s2">False</span>
+
+    <span class="s2">if </span><span class="s1">extra_info:</span>
+        <span class="s1">sphere_info = {</span><span class="s3">'ta'</span><span class="s1">: ta_s</span><span class="s2">, </span><span class="s3">'tb'</span><span class="s1">: tb_s</span><span class="s2">, </span><span class="s3">'intersect'</span><span class="s1">: intersect_s}</span>
+        <span class="s1">box_info = {</span><span class="s3">'ta'</span><span class="s1">: ta_b</span><span class="s2">, </span><span class="s3">'tb'</span><span class="s1">: tb_b</span><span class="s2">, </span><span class="s3">'intersect'</span><span class="s1">: intersect_b}</span>
+        <span class="s2">return </span><span class="s1">ta</span><span class="s2">, </span><span class="s1">tb</span><span class="s2">, </span><span class="s1">intersect</span><span class="s2">, </span><span class="s1">sphere_info</span><span class="s2">, </span><span class="s1">box_info</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">ta</span><span class="s2">, </span><span class="s1">tb</span><span class="s2">, </span><span class="s1">intersect</span>
+
+
+<span class="s2">def </span><span class="s1">inside_box_boundaries(x</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub):</span>
+    <span class="s0">&quot;&quot;&quot;Check if lb &lt;= x &lt;= ub.&quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">(lb &lt;= x).all() </span><span class="s2">and </span><span class="s1">(x &lt;= ub).all()</span>
+
+
+<span class="s2">def </span><span class="s1">reinforce_box_boundaries(x</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub):</span>
+    <span class="s0">&quot;&quot;&quot;Return clipped value of x&quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">np.minimum(np.maximum(x</span><span class="s2">, </span><span class="s1">lb)</span><span class="s2">, </span><span class="s1">ub)</span>
+
+
+<span class="s2">def </span><span class="s1">modified_dogleg(A</span><span class="s2">, </span><span class="s1">Y</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">trust_radius</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub):</span>
+    <span class="s0">&quot;&quot;&quot;Approximately  minimize ``1/2*|| A x + b ||^2`` inside trust-region. 
+ 
+    Approximately solve the problem of minimizing ``1/2*|| A x + b ||^2`` 
+    subject to ``||x|| &lt; Delta`` and ``lb &lt;= x &lt;= ub`` using a modification 
+    of the classical dogleg approach. 
+ 
+    Parameters 
+    ---------- 
+    A : LinearOperator (or sparse matrix or ndarray), shape (m, n) 
+        Matrix ``A`` in the minimization problem. It should have 
+        dimension ``(m, n)`` such that ``m &lt; n``. 
+    Y : LinearOperator (or sparse matrix or ndarray), shape (n, m) 
+        LinearOperator that apply the projection matrix 
+        ``Q = A.T inv(A A.T)`` to the vector. The obtained vector 
+        ``y = Q x`` being the minimum norm solution of ``A y = x``. 
+    b : array_like, shape (m,) 
+        Vector ``b``in the minimization problem. 
+    trust_radius: float 
+        Trust radius to be considered. Delimits a sphere boundary 
+        to the problem. 
+    lb : array_like, shape (n,) 
+        Lower bounds to each one of the components of ``x``. 
+        It is expected that ``lb &lt;= 0``, otherwise the algorithm 
+        may fail. If ``lb[i] = -Inf``, the lower 
+        bound for the ith component is just ignored. 
+    ub : array_like, shape (n, ) 
+        Upper bounds to each one of the components of ``x``. 
+        It is expected that ``ub &gt;= 0``, otherwise the algorithm 
+        may fail. If ``ub[i] = Inf``, the upper bound for the ith 
+        component is just ignored. 
+ 
+    Returns 
+    ------- 
+    x : array_like, shape (n,) 
+        Solution to the problem. 
+ 
+    Notes 
+    ----- 
+    Based on implementations described in pp. 885-886 from [1]_. 
+ 
+    References 
+    ---------- 
+    .. [1] Byrd, Richard H., Mary E. Hribar, and Jorge Nocedal. 
+           &quot;An interior point algorithm for large-scale nonlinear 
+           programming.&quot; SIAM Journal on Optimization 9.4 (1999): 877-900. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># Compute minimum norm minimizer of 1/2*|| A x + b ||^2.</span>
+    <span class="s1">newton_point = -Y.dot(b)</span>
+    <span class="s4"># Check for interior point</span>
+    <span class="s2">if </span><span class="s1">inside_box_boundaries(newton_point</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub)  \</span>
+       <span class="s2">and </span><span class="s1">norm(newton_point) &lt;= trust_radius:</span>
+        <span class="s1">x = newton_point</span>
+        <span class="s2">return </span><span class="s1">x</span>
+
+    <span class="s4"># Compute gradient vector ``g = A.T b``</span>
+    <span class="s1">g = A.T.dot(b)</span>
+    <span class="s4"># Compute Cauchy point</span>
+    <span class="s4"># `cauchy_point = g.T g / (g.T A.T A g)``.</span>
+    <span class="s1">A_g = A.dot(g)</span>
+    <span class="s1">cauchy_point = -np.dot(g</span><span class="s2">, </span><span class="s1">g) / np.dot(A_g</span><span class="s2">, </span><span class="s1">A_g) * g</span>
+    <span class="s4"># Origin</span>
+    <span class="s1">origin_point = np.zeros_like(cauchy_point)</span>
+
+    <span class="s4"># Check the segment between cauchy_point and newton_point</span>
+    <span class="s4"># for a possible solution.</span>
+    <span class="s1">z = cauchy_point</span>
+    <span class="s1">p = newton_point - cauchy_point</span>
+    <span class="s1">_</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">intersect = box_sphere_intersections(z</span><span class="s2">, </span><span class="s1">p</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub</span><span class="s2">,</span>
+                                                   <span class="s1">trust_radius)</span>
+    <span class="s2">if </span><span class="s1">intersect:</span>
+        <span class="s1">x1 = z + alpha*p</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s4"># Check the segment between the origin and cauchy_point</span>
+        <span class="s4"># for a possible solution.</span>
+        <span class="s1">z = origin_point</span>
+        <span class="s1">p = cauchy_point</span>
+        <span class="s1">_</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">_ = box_sphere_intersections(z</span><span class="s2">, </span><span class="s1">p</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub</span><span class="s2">,</span>
+                                               <span class="s1">trust_radius)</span>
+        <span class="s1">x1 = z + alpha*p</span>
+
+    <span class="s4"># Check the segment between origin and newton_point</span>
+    <span class="s4"># for a possible solution.</span>
+    <span class="s1">z = origin_point</span>
+    <span class="s1">p = newton_point</span>
+    <span class="s1">_</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">_ = box_sphere_intersections(z</span><span class="s2">, </span><span class="s1">p</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub</span><span class="s2">,</span>
+                                           <span class="s1">trust_radius)</span>
+    <span class="s1">x2 = z + alpha*p</span>
+
+    <span class="s4"># Return the best solution among x1 and x2.</span>
+    <span class="s2">if </span><span class="s1">norm(A.dot(x1) + b) &lt; norm(A.dot(x2) + b):</span>
+        <span class="s2">return </span><span class="s1">x1</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">x2</span>
+
+
+<span class="s2">def </span><span class="s1">projected_cg(H</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">Z</span><span class="s2">, </span><span class="s1">Y</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">trust_radius=np.inf</span><span class="s2">,</span>
+                 <span class="s1">lb=</span><span class="s2">None, </span><span class="s1">ub=</span><span class="s2">None, </span><span class="s1">tol=</span><span class="s2">None,</span>
+                 <span class="s1">max_iter=</span><span class="s2">None, </span><span class="s1">max_infeasible_iter=</span><span class="s2">None,</span>
+                 <span class="s1">return_all=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Solve EQP problem with projected CG method. 
+ 
+    Solve equality-constrained quadratic programming problem 
+    ``min 1/2 x.T H x + x.t c``  subject to ``A x + b = 0`` and, 
+    possibly, to trust region constraints ``||x|| &lt; trust_radius`` 
+    and box constraints ``lb &lt;= x &lt;= ub``. 
+ 
+    Parameters 
+    ---------- 
+    H : LinearOperator (or sparse matrix or ndarray), shape (n, n) 
+        Operator for computing ``H v``. 
+    c : array_like, shape (n,) 
+        Gradient of the quadratic objective function. 
+    Z : LinearOperator (or sparse matrix or ndarray), shape (n, n) 
+        Operator for projecting ``x`` into the null space of A. 
+    Y : LinearOperator,  sparse matrix, ndarray, shape (n, m) 
+        Operator that, for a given a vector ``b``, compute smallest 
+        norm solution of ``A x + b = 0``. 
+    b : array_like, shape (m,) 
+        Right-hand side of the constraint equation. 
+    trust_radius : float, optional 
+        Trust radius to be considered. By default, uses ``trust_radius=inf``, 
+        which means no trust radius at all. 
+    lb : array_like, shape (n,), optional 
+        Lower bounds to each one of the components of ``x``. 
+        If ``lb[i] = -Inf`` the lower bound for the i-th 
+        component is just ignored (default). 
+    ub : array_like, shape (n, ), optional 
+        Upper bounds to each one of the components of ``x``. 
+        If ``ub[i] = Inf`` the upper bound for the i-th 
+        component is just ignored (default). 
+    tol : float, optional 
+        Tolerance used to interrupt the algorithm. 
+    max_iter : int, optional 
+        Maximum algorithm iterations. Where ``max_inter &lt;= n-m``. 
+        By default, uses ``max_iter = n-m``. 
+    max_infeasible_iter : int, optional 
+        Maximum infeasible (regarding box constraints) iterations the 
+        algorithm is allowed to take. 
+        By default, uses ``max_infeasible_iter = n-m``. 
+    return_all : bool, optional 
+        When ``true``, return the list of all vectors through the iterations. 
+ 
+    Returns 
+    ------- 
+    x : array_like, shape (n,) 
+        Solution of the EQP problem. 
+    info : Dict 
+        Dictionary containing the following: 
+ 
+            - niter : Number of iterations. 
+            - stop_cond : Reason for algorithm termination: 
+                1. Iteration limit was reached; 
+                2. Reached the trust-region boundary; 
+                3. Negative curvature detected; 
+                4. Tolerance was satisfied. 
+            - allvecs : List containing all intermediary vectors (optional). 
+            - hits_boundary : True if the proposed step is on the boundary 
+              of the trust region. 
+ 
+    Notes 
+    ----- 
+    Implementation of Algorithm 6.2 on [1]_. 
+ 
+    In the absence of spherical and box constraints, for sufficient 
+    iterations, the method returns a truly optimal result. 
+    In the presence of those constraints, the value returned is only 
+    a inexpensive approximation of the optimal value. 
+ 
+    References 
+    ---------- 
+    .. [1] Gould, Nicholas IM, Mary E. Hribar, and Jorge Nocedal. 
+           &quot;On the solution of equality constrained quadratic 
+            programming problems arising in optimization.&quot; 
+            SIAM Journal on Scientific Computing 23.4 (2001): 1376-1395. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">CLOSE_TO_ZERO = </span><span class="s5">1e-25</span>
+
+    <span class="s1">n</span><span class="s2">, </span><span class="s1">= np.shape(c)  </span><span class="s4"># Number of parameters</span>
+    <span class="s1">m</span><span class="s2">, </span><span class="s1">= np.shape(b)  </span><span class="s4"># Number of constraints</span>
+
+    <span class="s4"># Initial Values</span>
+    <span class="s1">x = Y.dot(-b)</span>
+    <span class="s1">r = Z.dot(H.dot(x) + c)</span>
+    <span class="s1">g = Z.dot(r)</span>
+    <span class="s1">p = -g</span>
+
+    <span class="s4"># Store ``x`` value</span>
+    <span class="s2">if </span><span class="s1">return_all:</span>
+        <span class="s1">allvecs = [x]</span>
+    <span class="s4"># Values for the first iteration</span>
+    <span class="s1">H_p = H.dot(p)</span>
+    <span class="s1">rt_g = norm(g)**</span><span class="s5">2  </span><span class="s4"># g.T g = r.T Z g = r.T g (ref [1]_ p.1389)</span>
+
+    <span class="s4"># If x &gt; trust-region the problem does not have a solution.</span>
+    <span class="s1">tr_distance = trust_radius - norm(x)</span>
+    <span class="s2">if </span><span class="s1">tr_distance &lt; </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Trust region problem does not have a solution.&quot;</span><span class="s1">)</span>
+    <span class="s4"># If x == trust_radius, then x is the solution</span>
+    <span class="s4"># to the optimization problem, since x is the</span>
+    <span class="s4"># minimum norm solution to Ax=b.</span>
+    <span class="s2">elif </span><span class="s1">tr_distance &lt; CLOSE_TO_ZERO:</span>
+        <span class="s1">info = {</span><span class="s3">'niter'</span><span class="s1">: </span><span class="s5">0</span><span class="s2">, </span><span class="s3">'stop_cond'</span><span class="s1">: </span><span class="s5">2</span><span class="s2">, </span><span class="s3">'hits_boundary'</span><span class="s1">: </span><span class="s2">True</span><span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">return_all:</span>
+            <span class="s1">allvecs.append(x)</span>
+            <span class="s1">info[</span><span class="s3">'allvecs'</span><span class="s1">] = allvecs</span>
+        <span class="s2">return </span><span class="s1">x</span><span class="s2">, </span><span class="s1">info</span>
+
+    <span class="s4"># Set default tolerance</span>
+    <span class="s2">if </span><span class="s1">tol </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">tol = max(min(</span><span class="s5">0.01 </span><span class="s1">* np.sqrt(rt_g)</span><span class="s2">, </span><span class="s5">0.1 </span><span class="s1">* rt_g)</span><span class="s2">, </span><span class="s1">CLOSE_TO_ZERO)</span>
+    <span class="s4"># Set default lower and upper bounds</span>
+    <span class="s2">if </span><span class="s1">lb </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">lb = np.full(n</span><span class="s2">, </span><span class="s1">-np.inf)</span>
+    <span class="s2">if </span><span class="s1">ub </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">ub = np.full(n</span><span class="s2">, </span><span class="s1">np.inf)</span>
+    <span class="s4"># Set maximum iterations</span>
+    <span class="s2">if </span><span class="s1">max_iter </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">max_iter = n-m</span>
+    <span class="s1">max_iter = min(max_iter</span><span class="s2">, </span><span class="s1">n-m)</span>
+    <span class="s4"># Set maximum infeasible iterations</span>
+    <span class="s2">if </span><span class="s1">max_infeasible_iter </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">max_infeasible_iter = n-m</span>
+
+    <span class="s1">hits_boundary = </span><span class="s2">False</span>
+    <span class="s1">stop_cond = </span><span class="s5">1</span>
+    <span class="s1">counter = </span><span class="s5">0</span>
+    <span class="s1">last_feasible_x = np.zeros_like(x)</span>
+    <span class="s1">k = </span><span class="s5">0</span>
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(max_iter):</span>
+        <span class="s4"># Stop criteria - Tolerance : r.T g &lt; tol</span>
+        <span class="s2">if </span><span class="s1">rt_g &lt; tol:</span>
+            <span class="s1">stop_cond = </span><span class="s5">4</span>
+            <span class="s2">break</span>
+        <span class="s1">k += </span><span class="s5">1</span>
+        <span class="s4"># Compute curvature</span>
+        <span class="s1">pt_H_p = H_p.dot(p)</span>
+        <span class="s4"># Stop criteria - Negative curvature</span>
+        <span class="s2">if </span><span class="s1">pt_H_p &lt;= </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">np.isinf(trust_radius):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Negative curvature not allowed &quot;</span>
+                                 <span class="s3">&quot;for unrestricted problems.&quot;</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s4"># Find intersection with constraints</span>
+                <span class="s1">_</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">intersect = box_sphere_intersections(</span>
+                    <span class="s1">x</span><span class="s2">, </span><span class="s1">p</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub</span><span class="s2">, </span><span class="s1">trust_radius</span><span class="s2">, </span><span class="s1">entire_line=</span><span class="s2">True</span><span class="s1">)</span>
+                <span class="s4"># Update solution</span>
+                <span class="s2">if </span><span class="s1">intersect:</span>
+                    <span class="s1">x = x + alpha*p</span>
+                <span class="s4"># Reinforce variables are inside box constraints.</span>
+                <span class="s4"># This is only necessary because of roundoff errors.</span>
+                <span class="s1">x = reinforce_box_boundaries(x</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub)</span>
+                <span class="s4"># Attribute information</span>
+                <span class="s1">stop_cond = </span><span class="s5">3</span>
+                <span class="s1">hits_boundary = </span><span class="s2">True</span>
+                <span class="s2">break</span>
+
+        <span class="s4"># Get next step</span>
+        <span class="s1">alpha = rt_g / pt_H_p</span>
+        <span class="s1">x_next = x + alpha*p</span>
+
+        <span class="s4"># Stop criteria - Hits boundary</span>
+        <span class="s2">if </span><span class="s1">np.linalg.norm(x_next) &gt;= trust_radius:</span>
+            <span class="s4"># Find intersection with box constraints</span>
+            <span class="s1">_</span><span class="s2">, </span><span class="s1">theta</span><span class="s2">, </span><span class="s1">intersect = box_sphere_intersections(x</span><span class="s2">, </span><span class="s1">alpha*p</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub</span><span class="s2">,</span>
+                                                           <span class="s1">trust_radius)</span>
+            <span class="s4"># Update solution</span>
+            <span class="s2">if </span><span class="s1">intersect:</span>
+                <span class="s1">x = x + theta*alpha*p</span>
+            <span class="s4"># Reinforce variables are inside box constraints.</span>
+            <span class="s4"># This is only necessary because of roundoff errors.</span>
+            <span class="s1">x = reinforce_box_boundaries(x</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub)</span>
+            <span class="s4"># Attribute information</span>
+            <span class="s1">stop_cond = </span><span class="s5">2</span>
+            <span class="s1">hits_boundary = </span><span class="s2">True</span>
+            <span class="s2">break</span>
+
+        <span class="s4"># Check if ``x`` is inside the box and start counter if it is not.</span>
+        <span class="s2">if </span><span class="s1">inside_box_boundaries(x_next</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub):</span>
+            <span class="s1">counter = </span><span class="s5">0</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">counter += </span><span class="s5">1</span>
+        <span class="s4"># Whenever outside box constraints keep looking for intersections.</span>
+        <span class="s2">if </span><span class="s1">counter &gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">_</span><span class="s2">, </span><span class="s1">theta</span><span class="s2">, </span><span class="s1">intersect = box_sphere_intersections(x</span><span class="s2">, </span><span class="s1">alpha*p</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub</span><span class="s2">,</span>
+                                                           <span class="s1">trust_radius)</span>
+            <span class="s2">if </span><span class="s1">intersect:</span>
+                <span class="s1">last_feasible_x = x + theta*alpha*p</span>
+                <span class="s4"># Reinforce variables are inside box constraints.</span>
+                <span class="s4"># This is only necessary because of roundoff errors.</span>
+                <span class="s1">last_feasible_x = reinforce_box_boundaries(last_feasible_x</span><span class="s2">,</span>
+                                                           <span class="s1">lb</span><span class="s2">, </span><span class="s1">ub)</span>
+                <span class="s1">counter = </span><span class="s5">0</span>
+        <span class="s4"># Stop after too many infeasible (regarding box constraints) iteration.</span>
+        <span class="s2">if </span><span class="s1">counter &gt; max_infeasible_iter:</span>
+            <span class="s2">break</span>
+        <span class="s4"># Store ``x_next`` value</span>
+        <span class="s2">if </span><span class="s1">return_all:</span>
+            <span class="s1">allvecs.append(x_next)</span>
+
+        <span class="s4"># Update residual</span>
+        <span class="s1">r_next = r + alpha*H_p</span>
+        <span class="s4"># Project residual g+ = Z r+</span>
+        <span class="s1">g_next = Z.dot(r_next)</span>
+        <span class="s4"># Compute conjugate direction step d</span>
+        <span class="s1">rt_g_next = norm(g_next)**</span><span class="s5">2  </span><span class="s4"># g.T g = r.T g (ref [1]_ p.1389)</span>
+        <span class="s1">beta = rt_g_next / rt_g</span>
+        <span class="s1">p = - g_next + beta*p</span>
+        <span class="s4"># Prepare for next iteration</span>
+        <span class="s1">x = x_next</span>
+        <span class="s1">g = g_next</span>
+        <span class="s1">r = g_next</span>
+        <span class="s1">rt_g = norm(g)**</span><span class="s5">2  </span><span class="s4"># g.T g = r.T Z g = r.T g (ref [1]_ p.1389)</span>
+        <span class="s1">H_p = H.dot(p)</span>
+
+    <span class="s2">if not </span><span class="s1">inside_box_boundaries(x</span><span class="s2">, </span><span class="s1">lb</span><span class="s2">, </span><span class="s1">ub):</span>
+        <span class="s1">x = last_feasible_x</span>
+        <span class="s1">hits_boundary = </span><span class="s2">True</span>
+    <span class="s1">info = {</span><span class="s3">'niter'</span><span class="s1">: k</span><span class="s2">, </span><span class="s3">'stop_cond'</span><span class="s1">: stop_cond</span><span class="s2">,</span>
+            <span class="s3">'hits_boundary'</span><span class="s1">: hits_boundary}</span>
+    <span class="s2">if </span><span class="s1">return_all:</span>
+        <span class="s1">info[</span><span class="s3">'allvecs'</span><span class="s1">] = allvecs</span>
+    <span class="s2">return </span><span class="s1">x</span><span class="s2">, </span><span class="s1">info</span>
+</pre>
+</body>
+</html>

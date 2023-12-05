@@ -1,0 +1,1111 @@
+<html>
+<head>
+<title>_netcdf.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6a8759;}
+.s4 { color: #cc7832;}
+.s5 { color: #a5c261;}
+.s6 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_netcdf.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+NetCDF reader/writer module. 
+ 
+This module is used to read and create NetCDF files. NetCDF files are 
+accessed through the `netcdf_file` object. Data written to and from NetCDF 
+files are contained in `netcdf_variable` objects. Attributes are given 
+as member variables of the `netcdf_file` and `netcdf_variable` objects. 
+ 
+This module implements the Scientific.IO.NetCDF API to read and create 
+NetCDF files. The same API is also used in the PyNIO and pynetcdf 
+modules, allowing these modules to be used interchangeably when working 
+with NetCDF files. 
+ 
+Only NetCDF3 is supported here; for NetCDF4 see 
+`netCDF4-python &lt;http://unidata.github.io/netcdf4-python/&gt;`__, 
+which has a similar API. 
+ 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># TODO:</span>
+<span class="s2"># * properly implement ``_FillValue``.</span>
+<span class="s2"># * fix character variables.</span>
+<span class="s2"># * implement PAGESIZE for Python 2.6?</span>
+
+<span class="s2"># The Scientific.IO.NetCDF API allows attributes to be added directly to</span>
+<span class="s2"># instances of ``netcdf_file`` and ``netcdf_variable``. To differentiate</span>
+<span class="s2"># between user-set attributes and instance attributes, user-set attributes</span>
+<span class="s2"># are automatically stored in the ``_attributes`` attribute by overloading</span>
+<span class="s2">#``__setattr__``. This is the reason why the code sometimes uses</span>
+<span class="s2">#``obj.__dict__['key'] = value``, instead of simply ``obj.key = value``;</span>
+<span class="s2"># otherwise the key would be inserted into userspace attributes.</span>
+
+
+<span class="s1">__all__ = [</span><span class="s3">'netcdf_file'</span><span class="s4">, </span><span class="s3">'netcdf_variable'</span><span class="s1">]</span>
+
+
+<span class="s4">import </span><span class="s1">warnings</span>
+<span class="s4">import </span><span class="s1">weakref</span>
+<span class="s4">from </span><span class="s1">operator </span><span class="s4">import </span><span class="s1">mul</span>
+<span class="s4">from </span><span class="s1">platform </span><span class="s4">import </span><span class="s1">python_implementation</span>
+
+<span class="s4">import </span><span class="s1">mmap </span><span class="s4">as </span><span class="s1">mm</span>
+
+<span class="s4">import </span><span class="s1">numpy </span><span class="s4">as </span><span class="s1">np</span>
+<span class="s4">from </span><span class="s1">numpy </span><span class="s4">import </span><span class="s1">frombuffer</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">, </span><span class="s1">empty</span><span class="s4">, </span><span class="s1">array</span><span class="s4">, </span><span class="s1">asarray</span>
+<span class="s4">from </span><span class="s1">numpy </span><span class="s4">import </span><span class="s1">little_endian </span><span class="s4">as </span><span class="s1">LITTLE_ENDIAN</span>
+<span class="s4">from </span><span class="s1">functools </span><span class="s4">import </span><span class="s1">reduce</span>
+
+
+<span class="s1">IS_PYPY = python_implementation() == </span><span class="s3">'PyPy'</span>
+
+<span class="s1">ABSENT = </span><span class="s5">b'</span><span class="s4">\x00\x00\x00\x00\x00\x00\x00\x00</span><span class="s5">'</span>
+<span class="s1">ZERO = </span><span class="s5">b'</span><span class="s4">\x00\x00\x00\x00</span><span class="s5">'</span>
+<span class="s1">NC_BYTE = </span><span class="s5">b'</span><span class="s4">\x00\x00\x00\x01</span><span class="s5">'</span>
+<span class="s1">NC_CHAR = </span><span class="s5">b'</span><span class="s4">\x00\x00\x00\x02</span><span class="s5">'</span>
+<span class="s1">NC_SHORT = </span><span class="s5">b'</span><span class="s4">\x00\x00\x00\x03</span><span class="s5">'</span>
+<span class="s1">NC_INT = </span><span class="s5">b'</span><span class="s4">\x00\x00\x00\x04</span><span class="s5">'</span>
+<span class="s1">NC_FLOAT = </span><span class="s5">b'</span><span class="s4">\x00\x00\x00\x05</span><span class="s5">'</span>
+<span class="s1">NC_DOUBLE = </span><span class="s5">b'</span><span class="s4">\x00\x00\x00\x06</span><span class="s5">'</span>
+<span class="s1">NC_DIMENSION = </span><span class="s5">b'</span><span class="s4">\x00\x00\x00\n</span><span class="s5">'</span>
+<span class="s1">NC_VARIABLE = </span><span class="s5">b'</span><span class="s4">\x00\x00\x00\x0b</span><span class="s5">'</span>
+<span class="s1">NC_ATTRIBUTE = </span><span class="s5">b'</span><span class="s4">\x00\x00\x00\x0c</span><span class="s5">'</span>
+<span class="s1">FILL_BYTE = </span><span class="s5">b'</span><span class="s4">\x81</span><span class="s5">'</span>
+<span class="s1">FILL_CHAR = </span><span class="s5">b'</span><span class="s4">\x00</span><span class="s5">'</span>
+<span class="s1">FILL_SHORT = </span><span class="s5">b'</span><span class="s4">\x80\x01</span><span class="s5">'</span>
+<span class="s1">FILL_INT = </span><span class="s5">b'</span><span class="s4">\x80\x00\x00\x01</span><span class="s5">'</span>
+<span class="s1">FILL_FLOAT = </span><span class="s5">b'</span><span class="s4">\x7C\xF0\x00\x00</span><span class="s5">'</span>
+<span class="s1">FILL_DOUBLE = </span><span class="s5">b'</span><span class="s4">\x47\x9E\x00\x00\x00\x00\x00\x00</span><span class="s5">'</span>
+
+<span class="s1">TYPEMAP = {NC_BYTE: (</span><span class="s3">'b'</span><span class="s4">, </span><span class="s6">1</span><span class="s1">)</span><span class="s4">,</span>
+           <span class="s1">NC_CHAR: (</span><span class="s3">'c'</span><span class="s4">, </span><span class="s6">1</span><span class="s1">)</span><span class="s4">,</span>
+           <span class="s1">NC_SHORT: (</span><span class="s3">'h'</span><span class="s4">, </span><span class="s6">2</span><span class="s1">)</span><span class="s4">,</span>
+           <span class="s1">NC_INT: (</span><span class="s3">'i'</span><span class="s4">, </span><span class="s6">4</span><span class="s1">)</span><span class="s4">,</span>
+           <span class="s1">NC_FLOAT: (</span><span class="s3">'f'</span><span class="s4">, </span><span class="s6">4</span><span class="s1">)</span><span class="s4">,</span>
+           <span class="s1">NC_DOUBLE: (</span><span class="s3">'d'</span><span class="s4">, </span><span class="s6">8</span><span class="s1">)}</span>
+
+<span class="s1">FILLMAP = {NC_BYTE: FILL_BYTE</span><span class="s4">,</span>
+           <span class="s1">NC_CHAR: FILL_CHAR</span><span class="s4">,</span>
+           <span class="s1">NC_SHORT: FILL_SHORT</span><span class="s4">,</span>
+           <span class="s1">NC_INT: FILL_INT</span><span class="s4">,</span>
+           <span class="s1">NC_FLOAT: FILL_FLOAT</span><span class="s4">,</span>
+           <span class="s1">NC_DOUBLE: FILL_DOUBLE}</span>
+
+<span class="s1">REVERSE = {(</span><span class="s3">'b'</span><span class="s4">, </span><span class="s6">1</span><span class="s1">): NC_BYTE</span><span class="s4">,</span>
+           <span class="s1">(</span><span class="s3">'B'</span><span class="s4">, </span><span class="s6">1</span><span class="s1">): NC_CHAR</span><span class="s4">,</span>
+           <span class="s1">(</span><span class="s3">'c'</span><span class="s4">, </span><span class="s6">1</span><span class="s1">): NC_CHAR</span><span class="s4">,</span>
+           <span class="s1">(</span><span class="s3">'h'</span><span class="s4">, </span><span class="s6">2</span><span class="s1">): NC_SHORT</span><span class="s4">,</span>
+           <span class="s1">(</span><span class="s3">'i'</span><span class="s4">, </span><span class="s6">4</span><span class="s1">): NC_INT</span><span class="s4">,</span>
+           <span class="s1">(</span><span class="s3">'f'</span><span class="s4">, </span><span class="s6">4</span><span class="s1">): NC_FLOAT</span><span class="s4">,</span>
+           <span class="s1">(</span><span class="s3">'d'</span><span class="s4">, </span><span class="s6">8</span><span class="s1">): NC_DOUBLE</span><span class="s4">,</span>
+
+           <span class="s2"># these come from asarray(1).dtype.char and asarray('foo').dtype.char,</span>
+           <span class="s2"># used when getting the types from generic attributes.</span>
+           <span class="s1">(</span><span class="s3">'l'</span><span class="s4">, </span><span class="s6">4</span><span class="s1">): NC_INT</span><span class="s4">,</span>
+           <span class="s1">(</span><span class="s3">'S'</span><span class="s4">, </span><span class="s6">1</span><span class="s1">): NC_CHAR}</span>
+
+
+<span class="s4">class </span><span class="s1">netcdf_file:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A file object for NetCDF data. 
+ 
+    A `netcdf_file` object has two standard attributes: `dimensions` and 
+    `variables`. The values of both are dictionaries, mapping dimension 
+    names to their associated lengths and variable names to variables, 
+    respectively. Application programs should never modify these 
+    dictionaries. 
+ 
+    All other attributes correspond to global attributes defined in the 
+    NetCDF file. Global file attributes are created by assigning to an 
+    attribute of the `netcdf_file` object. 
+ 
+    Parameters 
+    ---------- 
+    filename : string or file-like 
+        string -&gt; filename 
+    mode : {'r', 'w', 'a'}, optional 
+        read-write-append mode, default is 'r' 
+    mmap : None or bool, optional 
+        Whether to mmap `filename` when reading.  Default is True 
+        when `filename` is a file name, False when `filename` is a 
+        file-like object. Note that when mmap is in use, data arrays 
+        returned refer directly to the mmapped data on disk, and the 
+        file cannot be closed as long as references to it exist. 
+    version : {1, 2}, optional 
+        version of netcdf to read / write, where 1 means *Classic 
+        format* and 2 means *64-bit offset format*.  Default is 1.  See 
+        `here &lt;https://www.unidata.ucar.edu/software/netcdf/docs/netcdf_introduction.html#select_format&gt;`__ 
+        for more info. 
+    maskandscale : bool, optional 
+        Whether to automatically scale and/or mask data based on attributes. 
+        Default is False. 
+ 
+    Notes 
+    ----- 
+    The major advantage of this module over other modules is that it doesn't 
+    require the code to be linked to the NetCDF libraries. This module is 
+    derived from `pupynere &lt;https://bitbucket.org/robertodealmeida/pupynere/&gt;`_. 
+ 
+    NetCDF files are a self-describing binary data format. The file contains 
+    metadata that describes the dimensions and variables in the file. More 
+    details about NetCDF files can be found `here 
+    &lt;https://www.unidata.ucar.edu/software/netcdf/guide_toc.html&gt;`__. There 
+    are three main sections to a NetCDF data structure: 
+ 
+    1. Dimensions 
+    2. Variables 
+    3. Attributes 
+ 
+    The dimensions section records the name and length of each dimension used 
+    by the variables. The variables would then indicate which dimensions it 
+    uses and any attributes such as data units, along with containing the data 
+    values for the variable. It is good practice to include a 
+    variable that is the same name as a dimension to provide the values for 
+    that axes. Lastly, the attributes section would contain additional 
+    information such as the name of the file creator or the instrument used to 
+    collect the data. 
+ 
+    When writing data to a NetCDF file, there is often the need to indicate the 
+    'record dimension'. A record dimension is the unbounded dimension for a 
+    variable. For example, a temperature variable may have dimensions of 
+    latitude, longitude and time. If one wants to add more temperature data to 
+    the NetCDF file as time progresses, then the temperature variable should 
+    have the time dimension flagged as the record dimension. 
+ 
+    In addition, the NetCDF file header contains the position of the data in 
+    the file, so access can be done in an efficient manner without loading 
+    unnecessary data into memory. It uses the ``mmap`` module to create 
+    Numpy arrays mapped to the data on disk, for the same purpose. 
+ 
+    Note that when `netcdf_file` is used to open a file with mmap=True 
+    (default for read-only), arrays returned by it refer to data 
+    directly on the disk. The file should not be closed, and cannot be cleanly 
+    closed when asked, if such arrays are alive. You may want to copy data arrays 
+    obtained from mmapped Netcdf file if they are to be processed after the file 
+    is closed, see the example below. 
+ 
+    Examples 
+    -------- 
+    To create a NetCDF file: 
+ 
+    &gt;&gt;&gt; from scipy.io import netcdf_file 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; f = netcdf_file('simple.nc', 'w') 
+    &gt;&gt;&gt; f.history = 'Created for a test' 
+    &gt;&gt;&gt; f.createDimension('time', 10) 
+    &gt;&gt;&gt; time = f.createVariable('time', 'i', ('time',)) 
+    &gt;&gt;&gt; time[:] = np.arange(10) 
+    &gt;&gt;&gt; time.units = 'days since 2008-01-01' 
+    &gt;&gt;&gt; f.close() 
+ 
+    Note the assignment of ``arange(10)`` to ``time[:]``.  Exposing the slice 
+    of the time variable allows for the data to be set in the object, rather 
+    than letting ``arange(10)`` overwrite the ``time`` variable. 
+ 
+    To read the NetCDF file we just created: 
+ 
+    &gt;&gt;&gt; from scipy.io import netcdf_file 
+    &gt;&gt;&gt; f = netcdf_file('simple.nc', 'r') 
+    &gt;&gt;&gt; print(f.history) 
+    b'Created for a test' 
+    &gt;&gt;&gt; time = f.variables['time'] 
+    &gt;&gt;&gt; print(time.units) 
+    b'days since 2008-01-01' 
+    &gt;&gt;&gt; print(time.shape) 
+    (10,) 
+    &gt;&gt;&gt; print(time[-1]) 
+    9 
+ 
+    NetCDF files, when opened read-only, return arrays that refer 
+    directly to memory-mapped data on disk: 
+ 
+    &gt;&gt;&gt; data = time[:] 
+ 
+    If the data is to be processed after the file is closed, it needs 
+    to be copied to main memory: 
+ 
+    &gt;&gt;&gt; data = time[:].copy() 
+    &gt;&gt;&gt; f.close() 
+    &gt;&gt;&gt; data.mean() 
+    4.5 
+ 
+    A NetCDF file can also be used as context manager: 
+ 
+    &gt;&gt;&gt; from scipy.io import netcdf_file 
+    &gt;&gt;&gt; with netcdf_file('simple.nc', 'r') as f: 
+    ...     print(f.history) 
+    b'Created for a test' 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">filename</span><span class="s4">, </span><span class="s1">mode=</span><span class="s3">'r'</span><span class="s4">, </span><span class="s1">mmap=</span><span class="s4">None, </span><span class="s1">version=</span><span class="s6">1</span><span class="s4">,</span>
+                 <span class="s1">maskandscale=</span><span class="s4">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Initialize netcdf_file from fileobj (str or file-like).&quot;&quot;&quot;</span>
+        <span class="s4">if </span><span class="s1">mode </span><span class="s4">not in </span><span class="s3">'rwa'</span><span class="s1">:</span>
+            <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Mode must be either 'r', 'w' or 'a'.&quot;</span><span class="s1">)</span>
+
+        <span class="s4">if </span><span class="s1">hasattr(filename</span><span class="s4">, </span><span class="s3">'seek'</span><span class="s1">):  </span><span class="s2"># file-like</span>
+            <span class="s1">self.fp = filename</span>
+            <span class="s1">self.filename = </span><span class="s3">'None'</span>
+            <span class="s4">if </span><span class="s1">mmap </span><span class="s4">is None</span><span class="s1">:</span>
+                <span class="s1">mmap = </span><span class="s4">False</span>
+            <span class="s4">elif </span><span class="s1">mmap </span><span class="s4">and not </span><span class="s1">hasattr(filename</span><span class="s4">, </span><span class="s3">'fileno'</span><span class="s1">):</span>
+                <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">'Cannot use file object for mmap'</span><span class="s1">)</span>
+        <span class="s4">else</span><span class="s1">:  </span><span class="s2"># maybe it's a string</span>
+            <span class="s1">self.filename = filename</span>
+            <span class="s1">omode = </span><span class="s3">'r+' </span><span class="s4">if </span><span class="s1">mode == </span><span class="s3">'a' </span><span class="s4">else </span><span class="s1">mode</span>
+            <span class="s1">self.fp = open(self.filename</span><span class="s4">, </span><span class="s3">'%sb' </span><span class="s1">% omode)</span>
+            <span class="s4">if </span><span class="s1">mmap </span><span class="s4">is None</span><span class="s1">:</span>
+                <span class="s2"># Mmapped files on PyPy cannot be usually closed</span>
+                <span class="s2"># before the GC runs, so it's better to use mmap=False</span>
+                <span class="s2"># as the default.</span>
+                <span class="s1">mmap = (</span><span class="s4">not </span><span class="s1">IS_PYPY)</span>
+
+        <span class="s4">if </span><span class="s1">mode != </span><span class="s3">'r'</span><span class="s1">:</span>
+            <span class="s2"># Cannot read write-only files</span>
+            <span class="s1">mmap = </span><span class="s4">False</span>
+
+        <span class="s1">self.use_mmap = mmap</span>
+        <span class="s1">self.mode = mode</span>
+        <span class="s1">self.version_byte = version</span>
+        <span class="s1">self.maskandscale = maskandscale</span>
+
+        <span class="s1">self.dimensions = {}</span>
+        <span class="s1">self.variables = {}</span>
+
+        <span class="s1">self._dims = []</span>
+        <span class="s1">self._recs = </span><span class="s6">0</span>
+        <span class="s1">self._recsize = </span><span class="s6">0</span>
+
+        <span class="s1">self._mm = </span><span class="s4">None</span>
+        <span class="s1">self._mm_buf = </span><span class="s4">None</span>
+        <span class="s4">if </span><span class="s1">self.use_mmap:</span>
+            <span class="s1">self._mm = mm.mmap(self.fp.fileno()</span><span class="s4">, </span><span class="s6">0</span><span class="s4">, </span><span class="s1">access=mm.ACCESS_READ)</span>
+            <span class="s1">self._mm_buf = np.frombuffer(self._mm</span><span class="s4">, </span><span class="s1">dtype=np.int8)</span>
+
+        <span class="s1">self._attributes = {}</span>
+
+        <span class="s4">if </span><span class="s1">mode </span><span class="s4">in </span><span class="s3">'ra'</span><span class="s1">:</span>
+            <span class="s1">self._read()</span>
+
+    <span class="s4">def </span><span class="s1">__setattr__(self</span><span class="s4">, </span><span class="s1">attr</span><span class="s4">, </span><span class="s1">value):</span>
+        <span class="s2"># Store user defined attributes in a separate dict,</span>
+        <span class="s2"># so we can save them to file later.</span>
+        <span class="s4">try</span><span class="s1">:</span>
+            <span class="s1">self._attributes[attr] = value</span>
+        <span class="s4">except </span><span class="s1">AttributeError:</span>
+            <span class="s4">pass</span>
+        <span class="s1">self.__dict__[attr] = value</span>
+
+    <span class="s4">def </span><span class="s1">close(self):</span>
+        <span class="s0">&quot;&quot;&quot;Closes the NetCDF file.&quot;&quot;&quot;</span>
+        <span class="s4">if </span><span class="s1">hasattr(self</span><span class="s4">, </span><span class="s3">'fp'</span><span class="s1">) </span><span class="s4">and not </span><span class="s1">self.fp.closed:</span>
+            <span class="s4">try</span><span class="s1">:</span>
+                <span class="s1">self.flush()</span>
+            <span class="s4">finally</span><span class="s1">:</span>
+                <span class="s1">self.variables = {}</span>
+                <span class="s4">if </span><span class="s1">self._mm_buf </span><span class="s4">is not None</span><span class="s1">:</span>
+                    <span class="s1">ref = weakref.ref(self._mm_buf)</span>
+                    <span class="s1">self._mm_buf = </span><span class="s4">None</span>
+                    <span class="s4">if </span><span class="s1">ref() </span><span class="s4">is None</span><span class="s1">:</span>
+                        <span class="s2"># self._mm_buf is gc'd, and we can close the mmap</span>
+                        <span class="s1">self._mm.close()</span>
+                    <span class="s4">else</span><span class="s1">:</span>
+                        <span class="s2"># we cannot close self._mm, since self._mm_buf is</span>
+                        <span class="s2"># alive and there may still be arrays referring to it</span>
+                        <span class="s1">warnings.warn((</span>
+                            <span class="s3">&quot;Cannot close a netcdf_file opened with mmap=True, when &quot;</span>
+                            <span class="s3">&quot;netcdf_variables or arrays referring to its data still exist. &quot;</span>
+                            <span class="s3">&quot;All data arrays obtained from such files refer directly to &quot;</span>
+                            <span class="s3">&quot;data on disk, and must be copied before the file can be cleanly &quot;</span>
+                            <span class="s3">&quot;closed. (See netcdf_file docstring for more information on mmap.)&quot;</span>
+                        <span class="s1">)</span><span class="s4">, </span><span class="s1">category=RuntimeWarning)</span>
+                <span class="s1">self._mm = </span><span class="s4">None</span>
+                <span class="s1">self.fp.close()</span>
+    <span class="s1">__del__ = close</span>
+
+    <span class="s4">def </span><span class="s1">__enter__(self):</span>
+        <span class="s4">return </span><span class="s1">self</span>
+
+    <span class="s4">def </span><span class="s1">__exit__(self</span><span class="s4">, </span><span class="s1">type</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">traceback):</span>
+        <span class="s1">self.close()</span>
+
+    <span class="s4">def </span><span class="s1">createDimension(self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">length):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Adds a dimension to the Dimension section of the NetCDF data structure. 
+ 
+        Note that this function merely adds a new dimension that the variables can 
+        reference. The values for the dimension, if desired, should be added as 
+        a variable using `createVariable`, referring to this dimension. 
+ 
+        Parameters 
+        ---------- 
+        name : str 
+            Name of the dimension (Eg, 'lat' or 'time'). 
+        length : int 
+            Length of the dimension. 
+ 
+        See Also 
+        -------- 
+        createVariable 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s4">if </span><span class="s1">length </span><span class="s4">is None and </span><span class="s1">self._dims:</span>
+            <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Only first dimension may be unlimited!&quot;</span><span class="s1">)</span>
+
+        <span class="s1">self.dimensions[name] = length</span>
+        <span class="s1">self._dims.append(name)</span>
+
+    <span class="s4">def </span><span class="s1">createVariable(self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">type</span><span class="s4">, </span><span class="s1">dimensions):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create an empty variable for the `netcdf_file` object, specifying its data 
+        type and the dimensions it uses. 
+ 
+        Parameters 
+        ---------- 
+        name : str 
+            Name of the new variable. 
+        type : dtype or str 
+            Data type of the variable. 
+        dimensions : sequence of str 
+            List of the dimension names used by the variable, in the desired order. 
+ 
+        Returns 
+        ------- 
+        variable : netcdf_variable 
+            The newly created ``netcdf_variable`` object. 
+            This object has also been added to the `netcdf_file` object as well. 
+ 
+        See Also 
+        -------- 
+        createDimension 
+ 
+        Notes 
+        ----- 
+        Any dimensions to be used by the variable should already exist in the 
+        NetCDF data structure or should be created by `createDimension` prior to 
+        creating the NetCDF variable. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">shape = tuple([self.dimensions[dim] </span><span class="s4">for </span><span class="s1">dim </span><span class="s4">in </span><span class="s1">dimensions])</span>
+        <span class="s1">shape_ = tuple([dim </span><span class="s4">or </span><span class="s6">0 </span><span class="s4">for </span><span class="s1">dim </span><span class="s4">in </span><span class="s1">shape])  </span><span class="s2"># replace None with 0 for NumPy</span>
+
+        <span class="s1">type = dtype(type)</span>
+        <span class="s1">typecode</span><span class="s4">, </span><span class="s1">size = type.char</span><span class="s4">, </span><span class="s1">type.itemsize</span>
+        <span class="s4">if </span><span class="s1">(typecode</span><span class="s4">, </span><span class="s1">size) </span><span class="s4">not in </span><span class="s1">REVERSE:</span>
+            <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;NetCDF 3 does not support type %s&quot; </span><span class="s1">% type)</span>
+
+        <span class="s1">data = empty(shape_</span><span class="s4">, </span><span class="s1">dtype=type.newbyteorder(</span><span class="s3">&quot;B&quot;</span><span class="s1">))  </span><span class="s2"># convert to big endian always for NetCDF 3</span>
+        <span class="s1">self.variables[name] = netcdf_variable(</span>
+                <span class="s1">data</span><span class="s4">, </span><span class="s1">typecode</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">shape</span><span class="s4">, </span><span class="s1">dimensions</span><span class="s4">,</span>
+                <span class="s1">maskandscale=self.maskandscale)</span>
+        <span class="s4">return </span><span class="s1">self.variables[name]</span>
+
+    <span class="s4">def </span><span class="s1">flush(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Perform a sync-to-disk flush if the `netcdf_file` object is in write mode. 
+ 
+        See Also 
+        -------- 
+        sync : Identical function 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s4">if </span><span class="s1">hasattr(self</span><span class="s4">, </span><span class="s3">'mode'</span><span class="s1">) </span><span class="s4">and </span><span class="s1">self.mode </span><span class="s4">in </span><span class="s3">'wa'</span><span class="s1">:</span>
+            <span class="s1">self._write()</span>
+    <span class="s1">sync = flush</span>
+
+    <span class="s4">def </span><span class="s1">_write(self):</span>
+        <span class="s1">self.fp.seek(</span><span class="s6">0</span><span class="s1">)</span>
+        <span class="s1">self.fp.write(</span><span class="s5">b'CDF'</span><span class="s1">)</span>
+        <span class="s1">self.fp.write(array(self.version_byte</span><span class="s4">, </span><span class="s3">'&gt;b'</span><span class="s1">).tobytes())</span>
+
+        <span class="s2"># Write headers and data.</span>
+        <span class="s1">self._write_numrecs()</span>
+        <span class="s1">self._write_dim_array()</span>
+        <span class="s1">self._write_gatt_array()</span>
+        <span class="s1">self._write_var_array()</span>
+
+    <span class="s4">def </span><span class="s1">_write_numrecs(self):</span>
+        <span class="s2"># Get highest record count from all record variables.</span>
+        <span class="s4">for </span><span class="s1">var </span><span class="s4">in </span><span class="s1">self.variables.values():</span>
+            <span class="s4">if </span><span class="s1">var.isrec </span><span class="s4">and </span><span class="s1">len(var.data) &gt; self._recs:</span>
+                <span class="s1">self.__dict__[</span><span class="s3">'_recs'</span><span class="s1">] = len(var.data)</span>
+        <span class="s1">self._pack_int(self._recs)</span>
+
+    <span class="s4">def </span><span class="s1">_write_dim_array(self):</span>
+        <span class="s4">if </span><span class="s1">self.dimensions:</span>
+            <span class="s1">self.fp.write(NC_DIMENSION)</span>
+            <span class="s1">self._pack_int(len(self.dimensions))</span>
+            <span class="s4">for </span><span class="s1">name </span><span class="s4">in </span><span class="s1">self._dims:</span>
+                <span class="s1">self._pack_string(name)</span>
+                <span class="s1">length = self.dimensions[name]</span>
+                <span class="s1">self._pack_int(length </span><span class="s4">or </span><span class="s6">0</span><span class="s1">)  </span><span class="s2"># replace None with 0 for record dimension</span>
+        <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">self.fp.write(ABSENT)</span>
+
+    <span class="s4">def </span><span class="s1">_write_gatt_array(self):</span>
+        <span class="s1">self._write_att_array(self._attributes)</span>
+
+    <span class="s4">def </span><span class="s1">_write_att_array(self</span><span class="s4">, </span><span class="s1">attributes):</span>
+        <span class="s4">if </span><span class="s1">attributes:</span>
+            <span class="s1">self.fp.write(NC_ATTRIBUTE)</span>
+            <span class="s1">self._pack_int(len(attributes))</span>
+            <span class="s4">for </span><span class="s1">name</span><span class="s4">, </span><span class="s1">values </span><span class="s4">in </span><span class="s1">attributes.items():</span>
+                <span class="s1">self._pack_string(name)</span>
+                <span class="s1">self._write_att_values(values)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">self.fp.write(ABSENT)</span>
+
+    <span class="s4">def </span><span class="s1">_write_var_array(self):</span>
+        <span class="s4">if </span><span class="s1">self.variables:</span>
+            <span class="s1">self.fp.write(NC_VARIABLE)</span>
+            <span class="s1">self._pack_int(len(self.variables))</span>
+
+            <span class="s2"># Sort variable names non-recs first, then recs.</span>
+            <span class="s4">def </span><span class="s1">sortkey(n):</span>
+                <span class="s1">v = self.variables[n]</span>
+                <span class="s4">if </span><span class="s1">v.isrec:</span>
+                    <span class="s4">return </span><span class="s1">(-</span><span class="s6">1</span><span class="s4">,</span><span class="s1">)</span>
+                <span class="s4">return </span><span class="s1">v._shape</span>
+            <span class="s1">variables = sorted(self.variables</span><span class="s4">, </span><span class="s1">key=sortkey</span><span class="s4">, </span><span class="s1">reverse=</span><span class="s4">True</span><span class="s1">)</span>
+
+            <span class="s2"># Set the metadata for all variables.</span>
+            <span class="s4">for </span><span class="s1">name </span><span class="s4">in </span><span class="s1">variables:</span>
+                <span class="s1">self._write_var_metadata(name)</span>
+            <span class="s2"># Now that we have the metadata, we know the vsize of</span>
+            <span class="s2"># each record variable, so we can calculate recsize.</span>
+            <span class="s1">self.__dict__[</span><span class="s3">'_recsize'</span><span class="s1">] = sum([</span>
+                    <span class="s1">var._vsize </span><span class="s4">for </span><span class="s1">var </span><span class="s4">in </span><span class="s1">self.variables.values()</span>
+                    <span class="s4">if </span><span class="s1">var.isrec])</span>
+            <span class="s2"># Set the data for all variables.</span>
+            <span class="s4">for </span><span class="s1">name </span><span class="s4">in </span><span class="s1">variables:</span>
+                <span class="s1">self._write_var_data(name)</span>
+        <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">self.fp.write(ABSENT)</span>
+
+    <span class="s4">def </span><span class="s1">_write_var_metadata(self</span><span class="s4">, </span><span class="s1">name):</span>
+        <span class="s1">var = self.variables[name]</span>
+
+        <span class="s1">self._pack_string(name)</span>
+        <span class="s1">self._pack_int(len(var.dimensions))</span>
+        <span class="s4">for </span><span class="s1">dimname </span><span class="s4">in </span><span class="s1">var.dimensions:</span>
+            <span class="s1">dimid = self._dims.index(dimname)</span>
+            <span class="s1">self._pack_int(dimid)</span>
+
+        <span class="s1">self._write_att_array(var._attributes)</span>
+
+        <span class="s1">nc_type = REVERSE[var.typecode()</span><span class="s4">, </span><span class="s1">var.itemsize()]</span>
+        <span class="s1">self.fp.write(nc_type)</span>
+
+        <span class="s4">if not </span><span class="s1">var.isrec:</span>
+            <span class="s1">vsize = var.data.size * var.data.itemsize</span>
+            <span class="s1">vsize += -vsize % </span><span class="s6">4</span>
+        <span class="s4">else</span><span class="s1">:  </span><span class="s2"># record variable</span>
+            <span class="s4">try</span><span class="s1">:</span>
+                <span class="s1">vsize = var.data[</span><span class="s6">0</span><span class="s1">].size * var.data.itemsize</span>
+            <span class="s4">except </span><span class="s1">IndexError:</span>
+                <span class="s1">vsize = </span><span class="s6">0</span>
+            <span class="s1">rec_vars = len([v </span><span class="s4">for </span><span class="s1">v </span><span class="s4">in </span><span class="s1">self.variables.values()</span>
+                            <span class="s4">if </span><span class="s1">v.isrec])</span>
+            <span class="s4">if </span><span class="s1">rec_vars &gt; </span><span class="s6">1</span><span class="s1">:</span>
+                <span class="s1">vsize += -vsize % </span><span class="s6">4</span>
+        <span class="s1">self.variables[name].__dict__[</span><span class="s3">'_vsize'</span><span class="s1">] = vsize</span>
+        <span class="s1">self._pack_int(vsize)</span>
+
+        <span class="s2"># Pack a bogus begin, and set the real value later.</span>
+        <span class="s1">self.variables[name].__dict__[</span><span class="s3">'_begin'</span><span class="s1">] = self.fp.tell()</span>
+        <span class="s1">self._pack_begin(</span><span class="s6">0</span><span class="s1">)</span>
+
+    <span class="s4">def </span><span class="s1">_write_var_data(self</span><span class="s4">, </span><span class="s1">name):</span>
+        <span class="s1">var = self.variables[name]</span>
+
+        <span class="s2"># Set begin in file header.</span>
+        <span class="s1">the_beguine = self.fp.tell()</span>
+        <span class="s1">self.fp.seek(var._begin)</span>
+        <span class="s1">self._pack_begin(the_beguine)</span>
+        <span class="s1">self.fp.seek(the_beguine)</span>
+
+        <span class="s2"># Write data.</span>
+        <span class="s4">if not </span><span class="s1">var.isrec:</span>
+            <span class="s1">self.fp.write(var.data.tobytes())</span>
+            <span class="s1">count = var.data.size * var.data.itemsize</span>
+            <span class="s1">self._write_var_padding(var</span><span class="s4">, </span><span class="s1">var._vsize - count)</span>
+        <span class="s4">else</span><span class="s1">:  </span><span class="s2"># record variable</span>
+            <span class="s2"># Handle rec vars with shape[0] &lt; nrecs.</span>
+            <span class="s4">if </span><span class="s1">self._recs &gt; len(var.data):</span>
+                <span class="s1">shape = (self._recs</span><span class="s4">,</span><span class="s1">) + var.data.shape[</span><span class="s6">1</span><span class="s1">:]</span>
+                <span class="s2"># Resize in-place does not always work since</span>
+                <span class="s2"># the array might not be single-segment</span>
+                <span class="s4">try</span><span class="s1">:</span>
+                    <span class="s1">var.data.resize(shape)</span>
+                <span class="s4">except </span><span class="s1">ValueError:</span>
+                    <span class="s1">var.__dict__[</span><span class="s3">'data'</span><span class="s1">] = np.resize(var.data</span><span class="s4">, </span><span class="s1">shape).astype(var.data.dtype)</span>
+
+            <span class="s1">pos0 = pos = self.fp.tell()</span>
+            <span class="s4">for </span><span class="s1">rec </span><span class="s4">in </span><span class="s1">var.data:</span>
+                <span class="s2"># Apparently scalars cannot be converted to big endian. If we</span>
+                <span class="s2"># try to convert a ``=i4`` scalar to, say, '&gt;i4' the dtype</span>
+                <span class="s2"># will remain as ``=i4``.</span>
+                <span class="s4">if not </span><span class="s1">rec.shape </span><span class="s4">and </span><span class="s1">(rec.dtype.byteorder == </span><span class="s3">'&lt;' </span><span class="s4">or</span>
+                        <span class="s1">(rec.dtype.byteorder == </span><span class="s3">'=' </span><span class="s4">and </span><span class="s1">LITTLE_ENDIAN)):</span>
+                    <span class="s1">rec = rec.byteswap()</span>
+                <span class="s1">self.fp.write(rec.tobytes())</span>
+                <span class="s2"># Padding</span>
+                <span class="s1">count = rec.size * rec.itemsize</span>
+                <span class="s1">self._write_var_padding(var</span><span class="s4">, </span><span class="s1">var._vsize - count)</span>
+                <span class="s1">pos += self._recsize</span>
+                <span class="s1">self.fp.seek(pos)</span>
+            <span class="s1">self.fp.seek(pos0 + var._vsize)</span>
+
+    <span class="s4">def </span><span class="s1">_write_var_padding(self</span><span class="s4">, </span><span class="s1">var</span><span class="s4">, </span><span class="s1">size):</span>
+        <span class="s1">encoded_fill_value = var._get_encoded_fill_value()</span>
+        <span class="s1">num_fills = size // len(encoded_fill_value)</span>
+        <span class="s1">self.fp.write(encoded_fill_value * num_fills)</span>
+
+    <span class="s4">def </span><span class="s1">_write_att_values(self</span><span class="s4">, </span><span class="s1">values):</span>
+        <span class="s4">if </span><span class="s1">hasattr(values</span><span class="s4">, </span><span class="s3">'dtype'</span><span class="s1">):</span>
+            <span class="s1">nc_type = REVERSE[values.dtype.char</span><span class="s4">, </span><span class="s1">values.dtype.itemsize]</span>
+        <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">types = [(int</span><span class="s4">, </span><span class="s1">NC_INT)</span><span class="s4">, </span><span class="s1">(float</span><span class="s4">, </span><span class="s1">NC_FLOAT)</span><span class="s4">, </span><span class="s1">(str</span><span class="s4">, </span><span class="s1">NC_CHAR)]</span>
+
+            <span class="s2"># bytes index into scalars in py3k. Check for &quot;string&quot; types</span>
+            <span class="s4">if </span><span class="s1">isinstance(values</span><span class="s4">, </span><span class="s1">(str</span><span class="s4">, </span><span class="s1">bytes)):</span>
+                <span class="s1">sample = values</span>
+            <span class="s4">else</span><span class="s1">:</span>
+                <span class="s4">try</span><span class="s1">:</span>
+                    <span class="s1">sample = values[</span><span class="s6">0</span><span class="s1">]  </span><span class="s2"># subscriptable?</span>
+                <span class="s4">except </span><span class="s1">TypeError:</span>
+                    <span class="s1">sample = values     </span><span class="s2"># scalar</span>
+
+            <span class="s4">for </span><span class="s1">class_</span><span class="s4">, </span><span class="s1">nc_type </span><span class="s4">in </span><span class="s1">types:</span>
+                <span class="s4">if </span><span class="s1">isinstance(sample</span><span class="s4">, </span><span class="s1">class_):</span>
+                    <span class="s4">break</span>
+
+        <span class="s1">typecode</span><span class="s4">, </span><span class="s1">size = TYPEMAP[nc_type]</span>
+        <span class="s1">dtype_ = </span><span class="s3">'&gt;%s' </span><span class="s1">% typecode</span>
+        <span class="s2"># asarray() dies with bytes and '&gt;c' in py3k. Change to 'S'</span>
+        <span class="s1">dtype_ = </span><span class="s3">'S' </span><span class="s4">if </span><span class="s1">dtype_ == </span><span class="s3">'&gt;c' </span><span class="s4">else </span><span class="s1">dtype_</span>
+
+        <span class="s1">values = asarray(values</span><span class="s4">, </span><span class="s1">dtype=dtype_)</span>
+
+        <span class="s1">self.fp.write(nc_type)</span>
+
+        <span class="s4">if </span><span class="s1">values.dtype.char == </span><span class="s3">'S'</span><span class="s1">:</span>
+            <span class="s1">nelems = values.itemsize</span>
+        <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">nelems = values.size</span>
+        <span class="s1">self._pack_int(nelems)</span>
+
+        <span class="s4">if not </span><span class="s1">values.shape </span><span class="s4">and </span><span class="s1">(values.dtype.byteorder == </span><span class="s3">'&lt;' </span><span class="s4">or</span>
+                <span class="s1">(values.dtype.byteorder == </span><span class="s3">'=' </span><span class="s4">and </span><span class="s1">LITTLE_ENDIAN)):</span>
+            <span class="s1">values = values.byteswap()</span>
+        <span class="s1">self.fp.write(values.tobytes())</span>
+        <span class="s1">count = values.size * values.itemsize</span>
+        <span class="s1">self.fp.write(</span><span class="s5">b'</span><span class="s4">\x00</span><span class="s5">' </span><span class="s1">* (-count % </span><span class="s6">4</span><span class="s1">))  </span><span class="s2"># pad</span>
+
+    <span class="s4">def </span><span class="s1">_read(self):</span>
+        <span class="s2"># Check magic bytes and version</span>
+        <span class="s1">magic = self.fp.read(</span><span class="s6">3</span><span class="s1">)</span>
+        <span class="s4">if not </span><span class="s1">magic == </span><span class="s5">b'CDF'</span><span class="s1">:</span>
+            <span class="s4">raise </span><span class="s1">TypeError(</span><span class="s3">&quot;Error: %s is not a valid NetCDF 3 file&quot; </span><span class="s1">%</span>
+                            <span class="s1">self.filename)</span>
+        <span class="s1">self.__dict__[</span><span class="s3">'version_byte'</span><span class="s1">] = frombuffer(self.fp.read(</span><span class="s6">1</span><span class="s1">)</span><span class="s4">, </span><span class="s3">'&gt;b'</span><span class="s1">)[</span><span class="s6">0</span><span class="s1">]</span>
+
+        <span class="s2"># Read file headers and set data.</span>
+        <span class="s1">self._read_numrecs()</span>
+        <span class="s1">self._read_dim_array()</span>
+        <span class="s1">self._read_gatt_array()</span>
+        <span class="s1">self._read_var_array()</span>
+
+    <span class="s4">def </span><span class="s1">_read_numrecs(self):</span>
+        <span class="s1">self.__dict__[</span><span class="s3">'_recs'</span><span class="s1">] = self._unpack_int()</span>
+
+    <span class="s4">def </span><span class="s1">_read_dim_array(self):</span>
+        <span class="s1">header = self.fp.read(</span><span class="s6">4</span><span class="s1">)</span>
+        <span class="s4">if </span><span class="s1">header </span><span class="s4">not in </span><span class="s1">[ZERO</span><span class="s4">, </span><span class="s1">NC_DIMENSION]:</span>
+            <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Unexpected header.&quot;</span><span class="s1">)</span>
+        <span class="s1">count = self._unpack_int()</span>
+
+        <span class="s4">for </span><span class="s1">dim </span><span class="s4">in </span><span class="s1">range(count):</span>
+            <span class="s1">name = self._unpack_string().decode(</span><span class="s3">'latin1'</span><span class="s1">)</span>
+            <span class="s1">length = self._unpack_int() </span><span class="s4">or None  </span><span class="s2"># None for record dimension</span>
+            <span class="s1">self.dimensions[name] = length</span>
+            <span class="s1">self._dims.append(name)  </span><span class="s2"># preserve order</span>
+
+    <span class="s4">def </span><span class="s1">_read_gatt_array(self):</span>
+        <span class="s4">for </span><span class="s1">k</span><span class="s4">, </span><span class="s1">v </span><span class="s4">in </span><span class="s1">self._read_att_array().items():</span>
+            <span class="s1">self.__setattr__(k</span><span class="s4">, </span><span class="s1">v)</span>
+
+    <span class="s4">def </span><span class="s1">_read_att_array(self):</span>
+        <span class="s1">header = self.fp.read(</span><span class="s6">4</span><span class="s1">)</span>
+        <span class="s4">if </span><span class="s1">header </span><span class="s4">not in </span><span class="s1">[ZERO</span><span class="s4">, </span><span class="s1">NC_ATTRIBUTE]:</span>
+            <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Unexpected header.&quot;</span><span class="s1">)</span>
+        <span class="s1">count = self._unpack_int()</span>
+
+        <span class="s1">attributes = {}</span>
+        <span class="s4">for </span><span class="s1">attr </span><span class="s4">in </span><span class="s1">range(count):</span>
+            <span class="s1">name = self._unpack_string().decode(</span><span class="s3">'latin1'</span><span class="s1">)</span>
+            <span class="s1">attributes[name] = self._read_att_values()</span>
+        <span class="s4">return </span><span class="s1">attributes</span>
+
+    <span class="s4">def </span><span class="s1">_read_var_array(self):</span>
+        <span class="s1">header = self.fp.read(</span><span class="s6">4</span><span class="s1">)</span>
+        <span class="s4">if </span><span class="s1">header </span><span class="s4">not in </span><span class="s1">[ZERO</span><span class="s4">, </span><span class="s1">NC_VARIABLE]:</span>
+            <span class="s4">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Unexpected header.&quot;</span><span class="s1">)</span>
+
+        <span class="s1">begin = </span><span class="s6">0</span>
+        <span class="s1">dtypes = {</span><span class="s3">'names'</span><span class="s1">: []</span><span class="s4">, </span><span class="s3">'formats'</span><span class="s1">: []}</span>
+        <span class="s1">rec_vars = []</span>
+        <span class="s1">count = self._unpack_int()</span>
+        <span class="s4">for </span><span class="s1">var </span><span class="s4">in </span><span class="s1">range(count):</span>
+            <span class="s1">(name</span><span class="s4">, </span><span class="s1">dimensions</span><span class="s4">, </span><span class="s1">shape</span><span class="s4">, </span><span class="s1">attributes</span><span class="s4">,</span>
+             <span class="s1">typecode</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">dtype_</span><span class="s4">, </span><span class="s1">begin_</span><span class="s4">, </span><span class="s1">vsize) = self._read_var()</span>
+            <span class="s2"># https://www.unidata.ucar.edu/software/netcdf/guide_toc.html</span>
+            <span class="s2"># Note that vsize is the product of the dimension lengths</span>
+            <span class="s2"># (omitting the record dimension) and the number of bytes</span>
+            <span class="s2"># per value (determined from the type), increased to the</span>
+            <span class="s2"># next multiple of 4, for each variable. If a record</span>
+            <span class="s2"># variable, this is the amount of space per record. The</span>
+            <span class="s2"># netCDF &quot;record size&quot; is calculated as the sum of the</span>
+            <span class="s2"># vsize's of all the record variables.</span>
+            <span class="s2">#</span>
+            <span class="s2"># The vsize field is actually redundant, because its value</span>
+            <span class="s2"># may be computed from other information in the header. The</span>
+            <span class="s2"># 32-bit vsize field is not large enough to contain the size</span>
+            <span class="s2"># of variables that require more than 2^32 - 4 bytes, so</span>
+            <span class="s2"># 2^32 - 1 is used in the vsize field for such variables.</span>
+            <span class="s4">if </span><span class="s1">shape </span><span class="s4">and </span><span class="s1">shape[</span><span class="s6">0</span><span class="s1">] </span><span class="s4">is None</span><span class="s1">:  </span><span class="s2"># record variable</span>
+                <span class="s1">rec_vars.append(name)</span>
+                <span class="s2"># The netCDF &quot;record size&quot; is calculated as the sum of</span>
+                <span class="s2"># the vsize's of all the record variables.</span>
+                <span class="s1">self.__dict__[</span><span class="s3">'_recsize'</span><span class="s1">] += vsize</span>
+                <span class="s4">if </span><span class="s1">begin == </span><span class="s6">0</span><span class="s1">:</span>
+                    <span class="s1">begin = begin_</span>
+                <span class="s1">dtypes[</span><span class="s3">'names'</span><span class="s1">].append(name)</span>
+                <span class="s1">dtypes[</span><span class="s3">'formats'</span><span class="s1">].append(str(shape[</span><span class="s6">1</span><span class="s1">:]) + dtype_)</span>
+
+                <span class="s2"># Handle padding with a virtual variable.</span>
+                <span class="s4">if </span><span class="s1">typecode </span><span class="s4">in </span><span class="s3">'bch'</span><span class="s1">:</span>
+                    <span class="s1">actual_size = reduce(mul</span><span class="s4">, </span><span class="s1">(</span><span class="s6">1</span><span class="s4">,</span><span class="s1">) + shape[</span><span class="s6">1</span><span class="s1">:]) * size</span>
+                    <span class="s1">padding = -actual_size % </span><span class="s6">4</span>
+                    <span class="s4">if </span><span class="s1">padding:</span>
+                        <span class="s1">dtypes[</span><span class="s3">'names'</span><span class="s1">].append(</span><span class="s3">'_padding_%d' </span><span class="s1">% var)</span>
+                        <span class="s1">dtypes[</span><span class="s3">'formats'</span><span class="s1">].append(</span><span class="s3">'(%d,)&gt;b' </span><span class="s1">% padding)</span>
+
+                <span class="s2"># Data will be set later.</span>
+                <span class="s1">data = </span><span class="s4">None</span>
+            <span class="s4">else</span><span class="s1">:  </span><span class="s2"># not a record variable</span>
+                <span class="s2"># Calculate size to avoid problems with vsize (above)</span>
+                <span class="s1">a_size = reduce(mul</span><span class="s4">, </span><span class="s1">shape</span><span class="s4">, </span><span class="s6">1</span><span class="s1">) * size</span>
+                <span class="s4">if </span><span class="s1">self.use_mmap:</span>
+                    <span class="s1">data = self._mm_buf[begin_:begin_+a_size].view(dtype=dtype_)</span>
+                    <span class="s1">data.shape = shape</span>
+                <span class="s4">else</span><span class="s1">:</span>
+                    <span class="s1">pos = self.fp.tell()</span>
+                    <span class="s1">self.fp.seek(begin_)</span>
+                    <span class="s1">data = frombuffer(self.fp.read(a_size)</span><span class="s4">, </span><span class="s1">dtype=dtype_</span>
+                                      <span class="s1">).copy()</span>
+                    <span class="s1">data.shape = shape</span>
+                    <span class="s1">self.fp.seek(pos)</span>
+
+            <span class="s2"># Add variable.</span>
+            <span class="s1">self.variables[name] = netcdf_variable(</span>
+                    <span class="s1">data</span><span class="s4">, </span><span class="s1">typecode</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">shape</span><span class="s4">, </span><span class="s1">dimensions</span><span class="s4">, </span><span class="s1">attributes</span><span class="s4">,</span>
+                    <span class="s1">maskandscale=self.maskandscale)</span>
+
+        <span class="s4">if </span><span class="s1">rec_vars:</span>
+            <span class="s2"># Remove padding when only one record variable.</span>
+            <span class="s4">if </span><span class="s1">len(rec_vars) == </span><span class="s6">1</span><span class="s1">:</span>
+                <span class="s1">dtypes[</span><span class="s3">'names'</span><span class="s1">] = dtypes[</span><span class="s3">'names'</span><span class="s1">][:</span><span class="s6">1</span><span class="s1">]</span>
+                <span class="s1">dtypes[</span><span class="s3">'formats'</span><span class="s1">] = dtypes[</span><span class="s3">'formats'</span><span class="s1">][:</span><span class="s6">1</span><span class="s1">]</span>
+
+            <span class="s2"># Build rec array.</span>
+            <span class="s4">if </span><span class="s1">self.use_mmap:</span>
+                <span class="s1">rec_array = self._mm_buf[begin:begin+self._recs*self._recsize].view(dtype=dtypes)</span>
+                <span class="s1">rec_array.shape = (self._recs</span><span class="s4">,</span><span class="s1">)</span>
+            <span class="s4">else</span><span class="s1">:</span>
+                <span class="s1">pos = self.fp.tell()</span>
+                <span class="s1">self.fp.seek(begin)</span>
+                <span class="s1">rec_array = frombuffer(self.fp.read(self._recs*self._recsize)</span><span class="s4">,</span>
+                                       <span class="s1">dtype=dtypes).copy()</span>
+                <span class="s1">rec_array.shape = (self._recs</span><span class="s4">,</span><span class="s1">)</span>
+                <span class="s1">self.fp.seek(pos)</span>
+
+            <span class="s4">for </span><span class="s1">var </span><span class="s4">in </span><span class="s1">rec_vars:</span>
+                <span class="s1">self.variables[var].__dict__[</span><span class="s3">'data'</span><span class="s1">] = rec_array[var]</span>
+
+    <span class="s4">def </span><span class="s1">_read_var(self):</span>
+        <span class="s1">name = self._unpack_string().decode(</span><span class="s3">'latin1'</span><span class="s1">)</span>
+        <span class="s1">dimensions = []</span>
+        <span class="s1">shape = []</span>
+        <span class="s1">dims = self._unpack_int()</span>
+
+        <span class="s4">for </span><span class="s1">i </span><span class="s4">in </span><span class="s1">range(dims):</span>
+            <span class="s1">dimid = self._unpack_int()</span>
+            <span class="s1">dimname = self._dims[dimid]</span>
+            <span class="s1">dimensions.append(dimname)</span>
+            <span class="s1">dim = self.dimensions[dimname]</span>
+            <span class="s1">shape.append(dim)</span>
+        <span class="s1">dimensions = tuple(dimensions)</span>
+        <span class="s1">shape = tuple(shape)</span>
+
+        <span class="s1">attributes = self._read_att_array()</span>
+        <span class="s1">nc_type = self.fp.read(</span><span class="s6">4</span><span class="s1">)</span>
+        <span class="s1">vsize = self._unpack_int()</span>
+        <span class="s1">begin = [self._unpack_int</span><span class="s4">, </span><span class="s1">self._unpack_int64][self.version_byte-</span><span class="s6">1</span><span class="s1">]()</span>
+
+        <span class="s1">typecode</span><span class="s4">, </span><span class="s1">size = TYPEMAP[nc_type]</span>
+        <span class="s1">dtype_ = </span><span class="s3">'&gt;%s' </span><span class="s1">% typecode</span>
+
+        <span class="s4">return </span><span class="s1">name</span><span class="s4">, </span><span class="s1">dimensions</span><span class="s4">, </span><span class="s1">shape</span><span class="s4">, </span><span class="s1">attributes</span><span class="s4">, </span><span class="s1">typecode</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">dtype_</span><span class="s4">, </span><span class="s1">begin</span><span class="s4">, </span><span class="s1">vsize</span>
+
+    <span class="s4">def </span><span class="s1">_read_att_values(self):</span>
+        <span class="s1">nc_type = self.fp.read(</span><span class="s6">4</span><span class="s1">)</span>
+        <span class="s1">n = self._unpack_int()</span>
+
+        <span class="s1">typecode</span><span class="s4">, </span><span class="s1">size = TYPEMAP[nc_type]</span>
+
+        <span class="s1">count = n*size</span>
+        <span class="s1">values = self.fp.read(int(count))</span>
+        <span class="s1">self.fp.read(-count % </span><span class="s6">4</span><span class="s1">)  </span><span class="s2"># read padding</span>
+
+        <span class="s4">if </span><span class="s1">typecode != </span><span class="s3">'c'</span><span class="s1">:</span>
+            <span class="s1">values = frombuffer(values</span><span class="s4">, </span><span class="s1">dtype=</span><span class="s3">'&gt;%s' </span><span class="s1">% typecode).copy()</span>
+            <span class="s4">if </span><span class="s1">values.shape == (</span><span class="s6">1</span><span class="s4">,</span><span class="s1">):</span>
+                <span class="s1">values = values[</span><span class="s6">0</span><span class="s1">]</span>
+        <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">values = values.rstrip(</span><span class="s5">b'</span><span class="s4">\x00</span><span class="s5">'</span><span class="s1">)</span>
+        <span class="s4">return </span><span class="s1">values</span>
+
+    <span class="s4">def </span><span class="s1">_pack_begin(self</span><span class="s4">, </span><span class="s1">begin):</span>
+        <span class="s4">if </span><span class="s1">self.version_byte == </span><span class="s6">1</span><span class="s1">:</span>
+            <span class="s1">self._pack_int(begin)</span>
+        <span class="s4">elif </span><span class="s1">self.version_byte == </span><span class="s6">2</span><span class="s1">:</span>
+            <span class="s1">self._pack_int64(begin)</span>
+
+    <span class="s4">def </span><span class="s1">_pack_int(self</span><span class="s4">, </span><span class="s1">value):</span>
+        <span class="s1">self.fp.write(array(value</span><span class="s4">, </span><span class="s3">'&gt;i'</span><span class="s1">).tobytes())</span>
+    <span class="s1">_pack_int32 = _pack_int</span>
+
+    <span class="s4">def </span><span class="s1">_unpack_int(self):</span>
+        <span class="s4">return </span><span class="s1">int(frombuffer(self.fp.read(</span><span class="s6">4</span><span class="s1">)</span><span class="s4">, </span><span class="s3">'&gt;i'</span><span class="s1">)[</span><span class="s6">0</span><span class="s1">])</span>
+    <span class="s1">_unpack_int32 = _unpack_int</span>
+
+    <span class="s4">def </span><span class="s1">_pack_int64(self</span><span class="s4">, </span><span class="s1">value):</span>
+        <span class="s1">self.fp.write(array(value</span><span class="s4">, </span><span class="s3">'&gt;q'</span><span class="s1">).tobytes())</span>
+
+    <span class="s4">def </span><span class="s1">_unpack_int64(self):</span>
+        <span class="s4">return </span><span class="s1">frombuffer(self.fp.read(</span><span class="s6">8</span><span class="s1">)</span><span class="s4">, </span><span class="s3">'&gt;q'</span><span class="s1">)[</span><span class="s6">0</span><span class="s1">]</span>
+
+    <span class="s4">def </span><span class="s1">_pack_string(self</span><span class="s4">, </span><span class="s1">s):</span>
+        <span class="s1">count = len(s)</span>
+        <span class="s1">self._pack_int(count)</span>
+        <span class="s1">self.fp.write(s.encode(</span><span class="s3">'latin1'</span><span class="s1">))</span>
+        <span class="s1">self.fp.write(</span><span class="s5">b'</span><span class="s4">\x00</span><span class="s5">' </span><span class="s1">* (-count % </span><span class="s6">4</span><span class="s1">))  </span><span class="s2"># pad</span>
+
+    <span class="s4">def </span><span class="s1">_unpack_string(self):</span>
+        <span class="s1">count = self._unpack_int()</span>
+        <span class="s1">s = self.fp.read(count).rstrip(</span><span class="s5">b'</span><span class="s4">\x00</span><span class="s5">'</span><span class="s1">)</span>
+        <span class="s1">self.fp.read(-count % </span><span class="s6">4</span><span class="s1">)  </span><span class="s2"># read padding</span>
+        <span class="s4">return </span><span class="s1">s</span>
+
+
+<span class="s4">class </span><span class="s1">netcdf_variable:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A data object for netcdf files. 
+ 
+    `netcdf_variable` objects are constructed by calling the method 
+    `netcdf_file.createVariable` on the `netcdf_file` object. `netcdf_variable` 
+    objects behave much like array objects defined in numpy, except that their 
+    data resides in a file. Data is read by indexing and written by assigning 
+    to an indexed subset; the entire array can be accessed by the index ``[:]`` 
+    or (for scalars) by using the methods `getValue` and `assignValue`. 
+    `netcdf_variable` objects also have attribute `shape` with the same meaning 
+    as for arrays, but the shape cannot be modified. There is another read-only 
+    attribute `dimensions`, whose value is the tuple of dimension names. 
+ 
+    All other attributes correspond to variable attributes defined in 
+    the NetCDF file. Variable attributes are created by assigning to an 
+    attribute of the `netcdf_variable` object. 
+ 
+    Parameters 
+    ---------- 
+    data : array_like 
+        The data array that holds the values for the variable. 
+        Typically, this is initialized as empty, but with the proper shape. 
+    typecode : dtype character code 
+        Desired data-type for the data array. 
+    size : int 
+        Desired element size for the data array. 
+    shape : sequence of ints 
+        The shape of the array. This should match the lengths of the 
+        variable's dimensions. 
+    dimensions : sequence of strings 
+        The names of the dimensions used by the variable. Must be in the 
+        same order of the dimension lengths given by `shape`. 
+    attributes : dict, optional 
+        Attribute values (any type) keyed by string names. These attributes 
+        become attributes for the netcdf_variable object. 
+    maskandscale : bool, optional 
+        Whether to automatically scale and/or mask data based on attributes. 
+        Default is False. 
+ 
+ 
+    Attributes 
+    ---------- 
+    dimensions : list of str 
+        List of names of dimensions used by the variable object. 
+    isrec, shape 
+        Properties 
+ 
+    See also 
+    -------- 
+    isrec, shape 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s4">def </span><span class="s1">__init__(self</span><span class="s4">, </span><span class="s1">data</span><span class="s4">, </span><span class="s1">typecode</span><span class="s4">, </span><span class="s1">size</span><span class="s4">, </span><span class="s1">shape</span><span class="s4">, </span><span class="s1">dimensions</span><span class="s4">,</span>
+                 <span class="s1">attributes=</span><span class="s4">None,</span>
+                 <span class="s1">maskandscale=</span><span class="s4">False</span><span class="s1">):</span>
+        <span class="s1">self.data = data</span>
+        <span class="s1">self._typecode = typecode</span>
+        <span class="s1">self._size = size</span>
+        <span class="s1">self._shape = shape</span>
+        <span class="s1">self.dimensions = dimensions</span>
+        <span class="s1">self.maskandscale = maskandscale</span>
+
+        <span class="s1">self._attributes = attributes </span><span class="s4">or </span><span class="s1">{}</span>
+        <span class="s4">for </span><span class="s1">k</span><span class="s4">, </span><span class="s1">v </span><span class="s4">in </span><span class="s1">self._attributes.items():</span>
+            <span class="s1">self.__dict__[k] = v</span>
+
+    <span class="s4">def </span><span class="s1">__setattr__(self</span><span class="s4">, </span><span class="s1">attr</span><span class="s4">, </span><span class="s1">value):</span>
+        <span class="s2"># Store user defined attributes in a separate dict,</span>
+        <span class="s2"># so we can save them to file later.</span>
+        <span class="s4">try</span><span class="s1">:</span>
+            <span class="s1">self._attributes[attr] = value</span>
+        <span class="s4">except </span><span class="s1">AttributeError:</span>
+            <span class="s4">pass</span>
+        <span class="s1">self.__dict__[attr] = value</span>
+
+    <span class="s4">def </span><span class="s1">isrec(self):</span>
+        <span class="s0">&quot;&quot;&quot;Returns whether the variable has a record dimension or not. 
+ 
+        A record dimension is a dimension along which additional data could be 
+        easily appended in the netcdf data structure without much rewriting of 
+        the data file. This attribute is a read-only property of the 
+        `netcdf_variable`. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s4">return </span><span class="s1">bool(self.data.shape) </span><span class="s4">and not </span><span class="s1">self._shape[</span><span class="s6">0</span><span class="s1">]</span>
+    <span class="s1">isrec = property(isrec)</span>
+
+    <span class="s4">def </span><span class="s1">shape(self):</span>
+        <span class="s0">&quot;&quot;&quot;Returns the shape tuple of the data variable. 
+ 
+        This is a read-only attribute and can not be modified in the 
+        same manner of other numpy arrays. 
+        &quot;&quot;&quot;</span>
+        <span class="s4">return </span><span class="s1">self.data.shape</span>
+    <span class="s1">shape = property(shape)</span>
+
+    <span class="s4">def </span><span class="s1">getValue(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Retrieve a scalar value from a `netcdf_variable` of length one. 
+ 
+        Raises 
+        ------ 
+        ValueError 
+            If the netcdf variable is an array of length greater than one, 
+            this exception will be raised. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s4">return </span><span class="s1">self.data.item()</span>
+
+    <span class="s4">def </span><span class="s1">assignValue(self</span><span class="s4">, </span><span class="s1">value):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Assign a scalar value to a `netcdf_variable` of length one. 
+ 
+        Parameters 
+        ---------- 
+        value : scalar 
+            Scalar value (of compatible type) to assign to a length-one netcdf 
+            variable. This value will be written to file. 
+ 
+        Raises 
+        ------ 
+        ValueError 
+            If the input is not a scalar, or if the destination is not a length-one 
+            netcdf variable. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s4">if not </span><span class="s1">self.data.flags.writeable:</span>
+            <span class="s2"># Work-around for a bug in NumPy.  Calling itemset() on a read-only</span>
+            <span class="s2"># memory-mapped array causes a seg. fault.</span>
+            <span class="s2"># See NumPy ticket #1622, and SciPy ticket #1202.</span>
+            <span class="s2"># This check for `writeable` can be removed when the oldest version</span>
+            <span class="s2"># of NumPy still supported by scipy contains the fix for #1622.</span>
+            <span class="s4">raise </span><span class="s1">RuntimeError(</span><span class="s3">&quot;variable is not writeable&quot;</span><span class="s1">)</span>
+
+        <span class="s1">self.data.itemset(value)</span>
+
+    <span class="s4">def </span><span class="s1">typecode(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the typecode of the variable. 
+ 
+        Returns 
+        ------- 
+        typecode : char 
+            The character typecode of the variable (e.g., 'i' for int). 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s4">return </span><span class="s1">self._typecode</span>
+
+    <span class="s4">def </span><span class="s1">itemsize(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return the itemsize of the variable. 
+ 
+        Returns 
+        ------- 
+        itemsize : int 
+            The element size of the variable (e.g., 8 for float64). 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s4">return </span><span class="s1">self._size</span>
+
+    <span class="s4">def </span><span class="s1">__getitem__(self</span><span class="s4">, </span><span class="s1">index):</span>
+        <span class="s4">if not </span><span class="s1">self.maskandscale:</span>
+            <span class="s4">return </span><span class="s1">self.data[index]</span>
+
+        <span class="s1">data = self.data[index].copy()</span>
+        <span class="s1">missing_value = self._get_missing_value()</span>
+        <span class="s1">data = self._apply_missing_value(data</span><span class="s4">, </span><span class="s1">missing_value)</span>
+        <span class="s1">scale_factor = self._attributes.get(</span><span class="s3">'scale_factor'</span><span class="s1">)</span>
+        <span class="s1">add_offset = self._attributes.get(</span><span class="s3">'add_offset'</span><span class="s1">)</span>
+        <span class="s4">if </span><span class="s1">add_offset </span><span class="s4">is not None or </span><span class="s1">scale_factor </span><span class="s4">is not None</span><span class="s1">:</span>
+            <span class="s1">data = data.astype(np.float64)</span>
+        <span class="s4">if </span><span class="s1">scale_factor </span><span class="s4">is not None</span><span class="s1">:</span>
+            <span class="s1">data = data * scale_factor</span>
+        <span class="s4">if </span><span class="s1">add_offset </span><span class="s4">is not None</span><span class="s1">:</span>
+            <span class="s1">data += add_offset</span>
+
+        <span class="s4">return </span><span class="s1">data</span>
+
+    <span class="s4">def </span><span class="s1">__setitem__(self</span><span class="s4">, </span><span class="s1">index</span><span class="s4">, </span><span class="s1">data):</span>
+        <span class="s4">if </span><span class="s1">self.maskandscale:</span>
+            <span class="s1">missing_value = (</span>
+                    <span class="s1">self._get_missing_value() </span><span class="s4">or</span>
+                    <span class="s1">getattr(data</span><span class="s4">, </span><span class="s3">'fill_value'</span><span class="s4">, </span><span class="s6">999999</span><span class="s1">))</span>
+            <span class="s1">self._attributes.setdefault(</span><span class="s3">'missing_value'</span><span class="s4">, </span><span class="s1">missing_value)</span>
+            <span class="s1">self._attributes.setdefault(</span><span class="s3">'_FillValue'</span><span class="s4">, </span><span class="s1">missing_value)</span>
+            <span class="s1">data = ((data - self._attributes.get(</span><span class="s3">'add_offset'</span><span class="s4">, </span><span class="s6">0.0</span><span class="s1">)) /</span>
+                    <span class="s1">self._attributes.get(</span><span class="s3">'scale_factor'</span><span class="s4">, </span><span class="s6">1.0</span><span class="s1">))</span>
+            <span class="s1">data = np.ma.asarray(data).filled(missing_value)</span>
+            <span class="s4">if </span><span class="s1">self._typecode </span><span class="s4">not in </span><span class="s3">'fd' </span><span class="s4">and </span><span class="s1">data.dtype.kind == </span><span class="s3">'f'</span><span class="s1">:</span>
+                <span class="s1">data = np.round(data)</span>
+
+        <span class="s2"># Expand data for record vars?</span>
+        <span class="s4">if </span><span class="s1">self.isrec:</span>
+            <span class="s4">if </span><span class="s1">isinstance(index</span><span class="s4">, </span><span class="s1">tuple):</span>
+                <span class="s1">rec_index = index[</span><span class="s6">0</span><span class="s1">]</span>
+            <span class="s4">else</span><span class="s1">:</span>
+                <span class="s1">rec_index = index</span>
+            <span class="s4">if </span><span class="s1">isinstance(rec_index</span><span class="s4">, </span><span class="s1">slice):</span>
+                <span class="s1">recs = (rec_index.start </span><span class="s4">or </span><span class="s6">0</span><span class="s1">) + len(data)</span>
+            <span class="s4">else</span><span class="s1">:</span>
+                <span class="s1">recs = rec_index + </span><span class="s6">1</span>
+            <span class="s4">if </span><span class="s1">recs &gt; len(self.data):</span>
+                <span class="s1">shape = (recs</span><span class="s4">,</span><span class="s1">) + self._shape[</span><span class="s6">1</span><span class="s1">:]</span>
+                <span class="s2"># Resize in-place does not always work since</span>
+                <span class="s2"># the array might not be single-segment</span>
+                <span class="s4">try</span><span class="s1">:</span>
+                    <span class="s1">self.data.resize(shape)</span>
+                <span class="s4">except </span><span class="s1">ValueError:</span>
+                    <span class="s1">self.__dict__[</span><span class="s3">'data'</span><span class="s1">] = np.resize(self.data</span><span class="s4">, </span><span class="s1">shape).astype(self.data.dtype)</span>
+        <span class="s1">self.data[index] = data</span>
+
+    <span class="s4">def </span><span class="s1">_default_encoded_fill_value(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The default encoded fill-value for this Variable's data type. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">nc_type = REVERSE[self.typecode()</span><span class="s4">, </span><span class="s1">self.itemsize()]</span>
+        <span class="s4">return </span><span class="s1">FILLMAP[nc_type]</span>
+
+    <span class="s4">def </span><span class="s1">_get_encoded_fill_value(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the encoded fill value for this variable as bytes. 
+ 
+        This is taken from either the _FillValue attribute, or the default fill 
+        value for this variable's data type. 
+        &quot;&quot;&quot;</span>
+        <span class="s4">if </span><span class="s3">'_FillValue' </span><span class="s4">in </span><span class="s1">self._attributes:</span>
+            <span class="s1">fill_value = np.array(self._attributes[</span><span class="s3">'_FillValue'</span><span class="s1">]</span><span class="s4">,</span>
+                                  <span class="s1">dtype=self.data.dtype).tobytes()</span>
+            <span class="s4">if </span><span class="s1">len(fill_value) == self.itemsize():</span>
+                <span class="s4">return </span><span class="s1">fill_value</span>
+            <span class="s4">else</span><span class="s1">:</span>
+                <span class="s4">return </span><span class="s1">self._default_encoded_fill_value()</span>
+        <span class="s4">else</span><span class="s1">:</span>
+            <span class="s4">return </span><span class="s1">self._default_encoded_fill_value()</span>
+
+    <span class="s4">def </span><span class="s1">_get_missing_value(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the value denoting &quot;no data&quot; for this variable. 
+ 
+        If this variable does not have a missing/fill value, returns None. 
+ 
+        If both _FillValue and missing_value are given, give precedence to 
+        _FillValue. The netCDF standard gives special meaning to _FillValue; 
+        missing_value is  just used for compatibility with old datasets. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s4">if </span><span class="s3">'_FillValue' </span><span class="s4">in </span><span class="s1">self._attributes:</span>
+            <span class="s1">missing_value = self._attributes[</span><span class="s3">'_FillValue'</span><span class="s1">]</span>
+        <span class="s4">elif </span><span class="s3">'missing_value' </span><span class="s4">in </span><span class="s1">self._attributes:</span>
+            <span class="s1">missing_value = self._attributes[</span><span class="s3">'missing_value'</span><span class="s1">]</span>
+        <span class="s4">else</span><span class="s1">:</span>
+            <span class="s1">missing_value = </span><span class="s4">None</span>
+
+        <span class="s4">return </span><span class="s1">missing_value</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s4">def </span><span class="s1">_apply_missing_value(data</span><span class="s4">, </span><span class="s1">missing_value):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Applies the given missing value to the data array. 
+ 
+        Returns a numpy.ma array, with any value equal to missing_value masked 
+        out (unless missing_value is None, in which case the original array is 
+        returned). 
+        &quot;&quot;&quot;</span>
+
+        <span class="s4">if </span><span class="s1">missing_value </span><span class="s4">is None</span><span class="s1">:</span>
+            <span class="s1">newdata = data</span>
+        <span class="s4">else</span><span class="s1">:</span>
+            <span class="s4">try</span><span class="s1">:</span>
+                <span class="s1">missing_value_isnan = np.isnan(missing_value)</span>
+            <span class="s4">except </span><span class="s1">(TypeError</span><span class="s4">, </span><span class="s1">NotImplementedError):</span>
+                <span class="s2"># some data types (e.g., characters) cannot be tested for NaN</span>
+                <span class="s1">missing_value_isnan = </span><span class="s4">False</span>
+
+            <span class="s4">if </span><span class="s1">missing_value_isnan:</span>
+                <span class="s1">mymask = np.isnan(data)</span>
+            <span class="s4">else</span><span class="s1">:</span>
+                <span class="s1">mymask = (data == missing_value)</span>
+
+            <span class="s1">newdata = np.ma.masked_where(mymask</span><span class="s4">, </span><span class="s1">data)</span>
+
+        <span class="s4">return </span><span class="s1">newdata</span>
+
+
+<span class="s1">NetCDFFile = netcdf_file</span>
+<span class="s1">NetCDFVariable = netcdf_variable</span>
+</pre>
+</body>
+</html>

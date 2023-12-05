@@ -1,0 +1,1453 @@
+<html>
+<head>
+<title>contingency_tables.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+contingency_tables.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Methods for analyzing two-way contingency tables (i.e. frequency 
+tables for observations that are cross-classified with respect to two 
+categorical variables). 
+ 
+The main classes are: 
+ 
+  * Table : implements methods that can be applied to any two-way 
+  contingency table. 
+ 
+  * SquareTable : implements methods that can be applied to a square 
+  two-way contingency table. 
+ 
+  * Table2x2 : implements methods that can be applied to a 2x2 
+  contingency table. 
+ 
+  * StratifiedTable : implements methods that can be applied to a 
+  collection of 2x2 contingency tables. 
+ 
+Also contains functions for conducting McNemar's test and Cochran's q 
+test. 
+ 
+Note that the inference procedures may depend on how the data were 
+sampled.  In general the observed units are independent and 
+identically distributed. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">warnings</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">pandas </span><span class="s2">as </span><span class="s1">pd</span>
+<span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">stats</span>
+
+<span class="s2">from </span><span class="s1">statsmodels </span><span class="s2">import </span><span class="s1">iolib</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools </span><span class="s2">import </span><span class="s1">sm_exceptions</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.decorators </span><span class="s2">import </span><span class="s1">cache_readonly</span>
+
+
+<span class="s2">def </span><span class="s1">_make_df_square(table):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Reindex a pandas DataFrame so that it becomes square, meaning that 
+    the row and column indices contain the same values, in the same 
+    order.  The row and column index are extended to achieve this. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">if not </span><span class="s1">isinstance(table</span><span class="s2">, </span><span class="s1">pd.DataFrame):</span>
+        <span class="s2">return </span><span class="s1">table</span>
+
+    <span class="s3"># If the table is not square, make it square</span>
+    <span class="s2">if not </span><span class="s1">table.index.equals(table.columns):</span>
+        <span class="s1">ix = list(set(table.index) | set(table.columns))</span>
+        <span class="s1">ix.sort()</span>
+        <span class="s1">table = table.reindex(index=ix</span><span class="s2">, </span><span class="s1">columns=ix</span><span class="s2">, </span><span class="s1">fill_value=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s3"># Ensures that the rows and columns are in the same order.</span>
+    <span class="s1">table = table.reindex(table.columns)</span>
+
+    <span class="s2">return </span><span class="s1">table</span>
+
+
+<span class="s2">class </span><span class="s1">_Bunch:</span>
+
+    <span class="s2">def </span><span class="s1">__repr__(self):</span>
+        <span class="s2">return </span><span class="s5">&quot;&lt;bunch containing results, print to see contents&gt;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__str__(self):</span>
+        <span class="s1">ky = [k </span><span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">self.__dict__.items()]</span>
+        <span class="s1">ky.sort()</span>
+        <span class="s1">m = max([len(k) </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">ky])</span>
+        <span class="s1">tab = []</span>
+        <span class="s1">f = </span><span class="s5">&quot;{:&quot; </span><span class="s1">+ str(m) + </span><span class="s5">&quot;}   {}&quot;</span>
+        <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">ky:</span>
+            <span class="s1">tab.append(f.format(k</span><span class="s2">, </span><span class="s1">self.__dict__[k]))</span>
+        <span class="s2">return </span><span class="s5">&quot;</span><span class="s2">\n</span><span class="s5">&quot;</span><span class="s1">.join(tab)</span>
+
+
+<span class="s2">class </span><span class="s1">Table:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A two-way contingency table. 
+ 
+    Parameters 
+    ---------- 
+    table : array_like 
+        A contingency table. 
+    shift_zeros : bool 
+        If True and any cell count is zero, add 0.5 to all values 
+        in the table. 
+ 
+    Attributes 
+    ---------- 
+    table_orig : array_like 
+        The original table is cached as `table_orig`. 
+ 
+    See Also 
+    -------- 
+    statsmodels.graphics.mosaicplot.mosaic 
+    scipy.stats.chi2_contingency 
+ 
+    Notes 
+    ----- 
+    The inference procedures used here are all based on a sampling 
+    model in which the units are independent and identically 
+    distributed, with each unit being classified with respect to two 
+    categorical variables. 
+ 
+    References 
+    ---------- 
+    Definitions of residuals: 
+        https://onlinecourses.science.psu.edu/stat504/node/86 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">table</span><span class="s2">, </span><span class="s1">shift_zeros=</span><span class="s2">True</span><span class="s1">):</span>
+
+        <span class="s1">self.table_orig = table</span>
+        <span class="s1">self.table = np.asarray(table</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+
+        <span class="s2">if </span><span class="s1">shift_zeros </span><span class="s2">and </span><span class="s1">(self.table.min() == </span><span class="s4">0</span><span class="s1">):</span>
+            <span class="s1">self.table[self.table == </span><span class="s4">0</span><span class="s1">] = </span><span class="s4">0.5</span>
+
+    <span class="s2">def </span><span class="s1">__str__(self):</span>
+        <span class="s1">s = (</span><span class="s5">&quot;A %dx%d contingency table with counts:</span><span class="s2">\n</span><span class="s5">&quot; </span><span class="s1">%</span>
+             <span class="s1">tuple(self.table.shape))</span>
+        <span class="s1">s += np.array_str(self.table)</span>
+        <span class="s2">return </span><span class="s1">s</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">from_data(cls</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">shift_zeros=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Construct a Table object from data. 
+ 
+        Parameters 
+        ---------- 
+        data : array_like 
+            The raw data, from which a contingency table is constructed 
+            using the first two columns. 
+        shift_zeros : bool 
+            If True and any cell count is zero, add 0.5 to all values 
+            in the table. 
+ 
+        Returns 
+        ------- 
+        A Table instance. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(data</span><span class="s2">, </span><span class="s1">pd.DataFrame):</span>
+            <span class="s1">table = pd.crosstab(data.iloc[:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">data.iloc[:</span><span class="s2">, </span><span class="s4">1</span><span class="s1">])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">table = pd.crosstab(data[:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">data[:</span><span class="s2">, </span><span class="s4">1</span><span class="s1">])</span>
+
+        <span class="s2">return </span><span class="s1">cls(table</span><span class="s2">, </span><span class="s1">shift_zeros)</span>
+
+    <span class="s2">def </span><span class="s1">test_nominal_association(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Assess independence for nominal factors. 
+ 
+        Assessment of independence between rows and columns using 
+        chi^2 testing.  The rows and columns are treated as nominal 
+        (unordered) categorical variables. 
+ 
+        Returns 
+        ------- 
+        A bunch containing the following attributes: 
+ 
+        statistic : float 
+            The chi^2 test statistic. 
+        df : int 
+            The degrees of freedom of the reference distribution 
+        pvalue : float 
+            The p-value for the test. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">statistic = np.asarray(self.chi2_contribs).sum()</span>
+        <span class="s1">df = np.prod(np.asarray(self.table.shape) - </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">pvalue = </span><span class="s4">1 </span><span class="s1">- stats.chi2.cdf(statistic</span><span class="s2">, </span><span class="s1">df)</span>
+        <span class="s1">b = _Bunch()</span>
+        <span class="s1">b.statistic = statistic</span>
+        <span class="s1">b.df = df</span>
+        <span class="s1">b.pvalue = pvalue</span>
+        <span class="s2">return </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">test_ordinal_association(self</span><span class="s2">, </span><span class="s1">row_scores=</span><span class="s2">None, </span><span class="s1">col_scores=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Assess independence between two ordinal variables. 
+ 
+        This is the 'linear by linear' association test, which uses 
+        weights or scores to target the test to have more power 
+        against ordered alternatives. 
+ 
+        Parameters 
+        ---------- 
+        row_scores : array_like 
+            An array of numeric row scores 
+        col_scores : array_like 
+            An array of numeric column scores 
+ 
+        Returns 
+        ------- 
+        A bunch with the following attributes: 
+ 
+        statistic : float 
+            The test statistic. 
+        null_mean : float 
+            The expected value of the test statistic under the null 
+            hypothesis. 
+        null_sd : float 
+            The standard deviation of the test statistic under the 
+            null hypothesis. 
+        zscore : float 
+            The Z-score for the test statistic. 
+        pvalue : float 
+            The p-value for the test. 
+ 
+        Notes 
+        ----- 
+        The scores define the trend to which the test is most sensitive. 
+ 
+        Using the default row and column scores gives the 
+        Cochran-Armitage trend test. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">row_scores </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">row_scores = np.arange(self.table.shape[</span><span class="s4">0</span><span class="s1">])</span>
+
+        <span class="s2">if </span><span class="s1">col_scores </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">col_scores = np.arange(self.table.shape[</span><span class="s4">1</span><span class="s1">])</span>
+
+        <span class="s2">if </span><span class="s1">len(row_scores) != self.table.shape[</span><span class="s4">0</span><span class="s1">]:</span>
+            <span class="s1">msg = (</span><span class="s5">&quot;The length of `row_scores` must match the first &quot; </span><span class="s1">+</span>
+                   <span class="s5">&quot;dimension of `table`.&quot;</span><span class="s1">)</span>
+            <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+
+        <span class="s2">if </span><span class="s1">len(col_scores) != self.table.shape[</span><span class="s4">1</span><span class="s1">]:</span>
+            <span class="s1">msg = (</span><span class="s5">&quot;The length of `col_scores` must match the second &quot; </span><span class="s1">+</span>
+                   <span class="s5">&quot;dimension of `table`.&quot;</span><span class="s1">)</span>
+            <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+
+        <span class="s3"># The test statistic</span>
+        <span class="s1">statistic = np.dot(row_scores</span><span class="s2">, </span><span class="s1">np.dot(self.table</span><span class="s2">, </span><span class="s1">col_scores))</span>
+
+        <span class="s3"># Some needed quantities</span>
+        <span class="s1">n_obs = self.table.sum()</span>
+        <span class="s1">rtot = self.table.sum(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">um = np.dot(row_scores</span><span class="s2">, </span><span class="s1">rtot)</span>
+        <span class="s1">u2m = np.dot(row_scores**</span><span class="s4">2</span><span class="s2">, </span><span class="s1">rtot)</span>
+        <span class="s1">ctot = self.table.sum(</span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s1">vn = np.dot(col_scores</span><span class="s2">, </span><span class="s1">ctot)</span>
+        <span class="s1">v2n = np.dot(col_scores**</span><span class="s4">2</span><span class="s2">, </span><span class="s1">ctot)</span>
+
+        <span class="s3"># The null mean and variance of the test statistic</span>
+        <span class="s1">e_stat = um * vn / n_obs</span>
+        <span class="s1">v_stat = (u2m - um**</span><span class="s4">2 </span><span class="s1">/ n_obs) * (v2n - vn**</span><span class="s4">2 </span><span class="s1">/ n_obs) / (n_obs - </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">sd_stat = np.sqrt(v_stat)</span>
+
+        <span class="s1">zscore = (statistic - e_stat) / sd_stat</span>
+        <span class="s1">pvalue = </span><span class="s4">2 </span><span class="s1">* stats.norm.cdf(-np.abs(zscore))</span>
+
+        <span class="s1">b = _Bunch()</span>
+        <span class="s1">b.statistic = statistic</span>
+        <span class="s1">b.null_mean = e_stat</span>
+        <span class="s1">b.null_sd = sd_stat</span>
+        <span class="s1">b.zscore = zscore</span>
+        <span class="s1">b.pvalue = pvalue</span>
+        <span class="s2">return </span><span class="s1">b</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">marginal_probabilities(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimate marginal probability distributions for the rows and columns. 
+ 
+        Returns 
+        ------- 
+        row : ndarray 
+            Marginal row probabilities 
+        col : ndarray 
+            Marginal column probabilities 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">n = self.table.sum()</span>
+        <span class="s1">row = self.table.sum(</span><span class="s4">1</span><span class="s1">) / n</span>
+        <span class="s1">col = self.table.sum(</span><span class="s4">0</span><span class="s1">) / n</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(self.table_orig</span><span class="s2">, </span><span class="s1">pd.DataFrame):</span>
+            <span class="s1">row = pd.Series(row</span><span class="s2">, </span><span class="s1">self.table_orig.index)</span>
+            <span class="s1">col = pd.Series(col</span><span class="s2">, </span><span class="s1">self.table_orig.columns)</span>
+
+        <span class="s2">return </span><span class="s1">row</span><span class="s2">, </span><span class="s1">col</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">independence_probabilities(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns fitted joint probabilities under independence. 
+ 
+        The returned table is outer(row, column), where row and 
+        column are the estimated marginal distributions 
+        of the rows and columns. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">row</span><span class="s2">, </span><span class="s1">col = self.marginal_probabilities</span>
+        <span class="s1">itab = np.outer(row</span><span class="s2">, </span><span class="s1">col)</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(self.table_orig</span><span class="s2">, </span><span class="s1">pd.DataFrame):</span>
+            <span class="s1">itab = pd.DataFrame(itab</span><span class="s2">, </span><span class="s1">self.table_orig.index</span><span class="s2">,</span>
+                                <span class="s1">self.table_orig.columns)</span>
+
+        <span class="s2">return </span><span class="s1">itab</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">fittedvalues(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns fitted cell counts under independence. 
+ 
+        The returned cell counts are estimates under a model 
+        where the rows and columns of the table are independent. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">probs = self.independence_probabilities</span>
+        <span class="s1">fit = self.table.sum() * probs</span>
+        <span class="s2">return </span><span class="s1">fit</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">resid_pearson(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns Pearson residuals. 
+ 
+        The Pearson residuals are calculated under a model where 
+        the rows and columns of the table are independent. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">fit = self.fittedvalues</span>
+        <span class="s1">resids = (self.table - fit) / np.sqrt(fit)</span>
+        <span class="s2">return </span><span class="s1">resids</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">standardized_resids(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns standardized residuals under independence. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">row</span><span class="s2">, </span><span class="s1">col = self.marginal_probabilities</span>
+        <span class="s1">sresids = self.resid_pearson / np.sqrt(np.outer(</span><span class="s4">1 </span><span class="s1">- row</span><span class="s2">, </span><span class="s4">1 </span><span class="s1">- col))</span>
+        <span class="s2">return </span><span class="s1">sresids</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">chi2_contribs(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the contributions to the chi^2 statistic for independence. 
+ 
+        The returned table contains the contribution of each cell to the chi^2 
+        test statistic for the null hypothesis that the rows and columns 
+        are independent. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">self.resid_pearson**</span><span class="s4">2</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">local_log_oddsratios(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns local log odds ratios. 
+ 
+        The local log odds ratios are the log odds ratios 
+        calculated for contiguous 2x2 sub-tables. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">ta = self.table.copy()</span>
+        <span class="s1">a = ta[</span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">b = ta[</span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">:]</span>
+        <span class="s1">c = ta[</span><span class="s4">1</span><span class="s1">:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">d = ta[</span><span class="s4">1</span><span class="s1">:</span><span class="s2">, </span><span class="s4">1</span><span class="s1">:]</span>
+        <span class="s1">tab = np.log(a) + np.log(d) - np.log(b) - np.log(c)</span>
+        <span class="s1">rslt = np.empty(self.table.shape</span><span class="s2">, </span><span class="s1">np.float64)</span>
+        <span class="s1">rslt *= np.nan</span>
+        <span class="s1">rslt[</span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">] = tab</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(self.table_orig</span><span class="s2">, </span><span class="s1">pd.DataFrame):</span>
+            <span class="s1">rslt = pd.DataFrame(rslt</span><span class="s2">, </span><span class="s1">index=self.table_orig.index</span><span class="s2">,</span>
+                                <span class="s1">columns=self.table_orig.columns)</span>
+
+        <span class="s2">return </span><span class="s1">rslt</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">local_oddsratios(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns local odds ratios. 
+ 
+        See documentation for local_log_oddsratios. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">np.exp(self.local_log_oddsratios)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">cumulative_log_oddsratios(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns cumulative log odds ratios. 
+ 
+        The cumulative log odds ratios for a contingency table 
+        with ordered rows and columns are calculated by collapsing 
+        all cells to the left/right and above/below a given point, 
+        to obtain a 2x2 table from which a log odds ratio can be 
+        calculated. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">ta = self.table.cumsum(</span><span class="s4">0</span><span class="s1">).cumsum(</span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s1">a = ta[</span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">b = ta[</span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">:] - a</span>
+        <span class="s1">c = ta[-</span><span class="s4">1</span><span class="s1">:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">] - a</span>
+        <span class="s1">d = ta[-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">] - (a + b + c)</span>
+
+        <span class="s1">tab = np.log(a) + np.log(d) - np.log(b) - np.log(c)</span>
+        <span class="s1">rslt = np.empty(self.table.shape</span><span class="s2">, </span><span class="s1">np.float64)</span>
+        <span class="s1">rslt *= np.nan</span>
+        <span class="s1">rslt[</span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">] = tab</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(self.table_orig</span><span class="s2">, </span><span class="s1">pd.DataFrame):</span>
+            <span class="s1">rslt = pd.DataFrame(rslt</span><span class="s2">, </span><span class="s1">index=self.table_orig.index</span><span class="s2">,</span>
+                                <span class="s1">columns=self.table_orig.columns)</span>
+
+        <span class="s2">return </span><span class="s1">rslt</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">cumulative_oddsratios(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the cumulative odds ratios for a contingency table. 
+ 
+        See documentation for cumulative_log_oddsratio. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">np.exp(self.cumulative_log_oddsratios)</span>
+
+
+<span class="s2">class </span><span class="s1">SquareTable(Table):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Methods for analyzing a square contingency table. 
+ 
+    Parameters 
+    ---------- 
+    table : array_like 
+        A square contingency table, or DataFrame that is converted 
+        to a square form. 
+    shift_zeros : bool 
+        If True and any cell count is zero, add 0.5 to all values 
+        in the table. 
+ 
+    Notes 
+    ----- 
+    These methods should only be used when the rows and columns of the 
+    table have the same categories.  If `table` is provided as a 
+    Pandas DataFrame, the row and column indices will be extended to 
+    create a square table, inserting zeros where a row or column is 
+    missing.  Otherwise the table should be provided in a square form, 
+    with the (implicit) row and column categories appearing in the 
+    same order. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">table</span><span class="s2">, </span><span class="s1">shift_zeros=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s1">table = _make_df_square(table)  </span><span class="s3"># Non-pandas passes through</span>
+        <span class="s1">k1</span><span class="s2">, </span><span class="s1">k2 = table.shape</span>
+        <span class="s2">if </span><span class="s1">k1 != k2:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'table must be square'</span><span class="s1">)</span>
+
+        <span class="s1">super(SquareTable</span><span class="s2">, </span><span class="s1">self).__init__(table</span><span class="s2">, </span><span class="s1">shift_zeros)</span>
+
+    <span class="s2">def </span><span class="s1">symmetry(self</span><span class="s2">, </span><span class="s1">method=</span><span class="s5">&quot;bowker&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Test for symmetry of a joint distribution. 
+ 
+        This procedure tests the null hypothesis that the joint 
+        distribution is symmetric around the main diagonal, that is 
+ 
+        .. math:: 
+ 
+        p_{i, j} = p_{j, i}  for all i, j 
+ 
+        Returns 
+        ------- 
+        Bunch 
+            A bunch with attributes 
+ 
+            * statistic : float 
+                chisquare test statistic 
+            * p-value : float 
+                p-value of the test statistic based on chisquare distribution 
+            * df : int 
+                degrees of freedom of the chisquare distribution 
+ 
+        Notes 
+        ----- 
+        The implementation is based on the SAS documentation. R includes 
+        it in `mcnemar.test` if the table is not 2 by 2.  However a more 
+        direct generalization of the McNemar test to larger tables is 
+        provided by the homogeneity test (TableSymmetry.homogeneity). 
+ 
+        The p-value is based on the chi-square distribution which requires 
+        that the sample size is not very small to be a good approximation 
+        of the true distribution. For 2x2 contingency tables the exact 
+        distribution can be obtained with `mcnemar` 
+ 
+        See Also 
+        -------- 
+        mcnemar 
+        homogeneity 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">method.lower() != </span><span class="s5">&quot;bowker&quot;</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;method for symmetry testing must be 'bowker'&quot;</span><span class="s1">)</span>
+
+        <span class="s1">k = self.table.shape[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">upp_idx = np.triu_indices(k</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s1">tril = self.table.T[upp_idx]   </span><span class="s3"># lower triangle in column order</span>
+        <span class="s1">triu = self.table[upp_idx]     </span><span class="s3"># upper triangle in row order</span>
+
+        <span class="s1">statistic = ((tril - triu)**</span><span class="s4">2 </span><span class="s1">/ (tril + triu + </span><span class="s4">1e-20</span><span class="s1">)).sum()</span>
+        <span class="s1">df = k * (k-</span><span class="s4">1</span><span class="s1">) / </span><span class="s4">2.</span>
+        <span class="s1">pvalue = stats.chi2.sf(statistic</span><span class="s2">, </span><span class="s1">df)</span>
+
+        <span class="s1">b = _Bunch()</span>
+        <span class="s1">b.statistic = statistic</span>
+        <span class="s1">b.pvalue = pvalue</span>
+        <span class="s1">b.df = df</span>
+
+        <span class="s2">return </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">homogeneity(self</span><span class="s2">, </span><span class="s1">method=</span><span class="s5">&quot;stuart_maxwell&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compare row and column marginal distributions. 
+ 
+        Parameters 
+        ---------- 
+        method : str 
+            Either 'stuart_maxwell' or 'bhapkar', leading to two different 
+            estimates of the covariance matrix for the estimated 
+            difference between the row margins and the column margins. 
+ 
+        Returns 
+        ------- 
+        Bunch 
+            A bunch with attributes: 
+ 
+            * statistic : float 
+                The chi^2 test statistic 
+            * pvalue : float 
+                The p-value of the test statistic 
+            * df : int 
+                The degrees of freedom of the reference distribution 
+ 
+        Notes 
+        ----- 
+        For a 2x2 table this is equivalent to McNemar's test.  More 
+        generally the procedure tests the null hypothesis that the 
+        marginal distribution of the row factor is equal to the 
+        marginal distribution of the column factor.  For this to be 
+        meaningful, the two factors must have the same sample space 
+        (i.e. the same categories). 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">self.table.shape[</span><span class="s4">0</span><span class="s1">] &lt; </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'table is empty'</span><span class="s1">)</span>
+        <span class="s2">elif </span><span class="s1">self.table.shape[</span><span class="s4">0</span><span class="s1">] == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">b = _Bunch()</span>
+            <span class="s1">b.statistic = </span><span class="s4">0</span>
+            <span class="s1">b.pvalue = </span><span class="s4">1</span>
+            <span class="s1">b.df = </span><span class="s4">0</span>
+            <span class="s2">return </span><span class="s1">b</span>
+
+        <span class="s1">method = method.lower()</span>
+        <span class="s2">if </span><span class="s1">method </span><span class="s2">not in </span><span class="s1">[</span><span class="s5">&quot;bhapkar&quot;</span><span class="s2">, </span><span class="s5">&quot;stuart_maxwell&quot;</span><span class="s1">]:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;method '%s' for homogeneity not known&quot; </span><span class="s1">% method)</span>
+
+        <span class="s1">n_obs = self.table.sum()</span>
+        <span class="s1">pr = self.table.astype(np.float64) / n_obs</span>
+
+        <span class="s3"># Compute margins, eliminate last row/column so there is no</span>
+        <span class="s3"># degeneracy</span>
+        <span class="s1">row = pr.sum(</span><span class="s4">1</span><span class="s1">)[</span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">col = pr.sum(</span><span class="s4">0</span><span class="s1">)[</span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">pr = pr[</span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s3"># The estimated difference between row and column margins.</span>
+        <span class="s1">d = col - row</span>
+
+        <span class="s3"># The degrees of freedom of the chi^2 reference distribution.</span>
+        <span class="s1">df = pr.shape[</span><span class="s4">0</span><span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">method == </span><span class="s5">&quot;bhapkar&quot;</span><span class="s1">:</span>
+            <span class="s1">vmat = -(pr + pr.T) - np.outer(d</span><span class="s2">, </span><span class="s1">d)</span>
+            <span class="s1">dv = col + row - </span><span class="s4">2</span><span class="s1">*np.diag(pr) - d**</span><span class="s4">2</span>
+            <span class="s1">np.fill_diagonal(vmat</span><span class="s2">, </span><span class="s1">dv)</span>
+        <span class="s2">elif </span><span class="s1">method == </span><span class="s5">&quot;stuart_maxwell&quot;</span><span class="s1">:</span>
+            <span class="s1">vmat = -(pr + pr.T)</span>
+            <span class="s1">dv = row + col - </span><span class="s4">2</span><span class="s1">*np.diag(pr)</span>
+            <span class="s1">np.fill_diagonal(vmat</span><span class="s2">, </span><span class="s1">dv)</span>
+
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">statistic = n_obs * np.dot(d</span><span class="s2">, </span><span class="s1">np.linalg.solve(vmat</span><span class="s2">, </span><span class="s1">d))</span>
+        <span class="s2">except </span><span class="s1">np.linalg.LinAlgError:</span>
+            <span class="s1">warnings.warn(</span><span class="s5">&quot;Unable to invert covariance matrix&quot;</span><span class="s2">,</span>
+                          <span class="s1">sm_exceptions.SingularMatrixWarning)</span>
+            <span class="s1">b = _Bunch()</span>
+            <span class="s1">b.statistic = np.nan</span>
+            <span class="s1">b.pvalue = np.nan</span>
+            <span class="s1">b.df = df</span>
+            <span class="s2">return </span><span class="s1">b</span>
+
+        <span class="s1">pvalue = </span><span class="s4">1 </span><span class="s1">- stats.chi2.cdf(statistic</span><span class="s2">, </span><span class="s1">df)</span>
+
+        <span class="s1">b = _Bunch()</span>
+        <span class="s1">b.statistic = statistic</span>
+        <span class="s1">b.pvalue = pvalue</span>
+        <span class="s1">b.df = df</span>
+
+        <span class="s2">return </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">summary(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">float_format=</span><span class="s5">&quot;%.3f&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Produce a summary of the analysis. 
+ 
+        Parameters 
+        ---------- 
+        alpha : float 
+            `1 - alpha` is the nominal coverage probability of the interval. 
+        float_format : str 
+            Used to format numeric values in the table. 
+        method : str 
+            The method for producing the confidence interval.  Currently 
+            must be 'normal' which uses the normal approximation. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">fmt = float_format</span>
+
+        <span class="s1">headers = [</span><span class="s5">&quot;Statistic&quot;</span><span class="s2">, </span><span class="s5">&quot;P-value&quot;</span><span class="s2">, </span><span class="s5">&quot;DF&quot;</span><span class="s1">]</span>
+        <span class="s1">stubs = [</span><span class="s5">&quot;Symmetry&quot;</span><span class="s2">, </span><span class="s5">&quot;Homogeneity&quot;</span><span class="s1">]</span>
+        <span class="s1">sy = self.symmetry()</span>
+        <span class="s1">hm = self.homogeneity()</span>
+        <span class="s1">data = [[fmt % sy.statistic</span><span class="s2">, </span><span class="s1">fmt % sy.pvalue</span><span class="s2">, </span><span class="s5">'%d' </span><span class="s1">% sy.df]</span><span class="s2">,</span>
+                <span class="s1">[fmt % hm.statistic</span><span class="s2">, </span><span class="s1">fmt % hm.pvalue</span><span class="s2">, </span><span class="s5">'%d' </span><span class="s1">% hm.df]]</span>
+        <span class="s1">tab = iolib.SimpleTable(data</span><span class="s2">, </span><span class="s1">headers</span><span class="s2">, </span><span class="s1">stubs</span><span class="s2">, </span><span class="s1">data_aligns=</span><span class="s5">&quot;r&quot;</span><span class="s2">,</span>
+                                <span class="s1">table_dec_above=</span><span class="s5">''</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">tab</span>
+
+
+<span class="s2">class </span><span class="s1">Table2x2(SquareTable):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Analyses that can be performed on a 2x2 contingency table. 
+ 
+    Parameters 
+    ---------- 
+    table : array_like 
+        A 2x2 contingency table 
+    shift_zeros : bool 
+        If true, 0.5 is added to all cells of the table if any cell is 
+        equal to zero. 
+ 
+    Notes 
+    ----- 
+    The inference procedures used here are all based on a sampling 
+    model in which the units are independent and identically 
+    distributed, with each unit being classified with respect to two 
+    categorical variables. 
+ 
+    Note that for the risk ratio, the analysis is not symmetric with 
+    respect to the rows and columns of the contingency table.  The two 
+    rows define population subgroups, column 0 is the number of 
+    'events', and column 1 is the number of 'non-events'. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">table</span><span class="s2">, </span><span class="s1">shift_zeros=</span><span class="s2">True</span><span class="s1">):</span>
+
+        <span class="s2">if </span><span class="s1">type(table) </span><span class="s2">is </span><span class="s1">list:</span>
+            <span class="s1">table = np.asarray(table)</span>
+
+        <span class="s2">if </span><span class="s1">(table.ndim != </span><span class="s4">2</span><span class="s1">) </span><span class="s2">or </span><span class="s1">(table.shape[</span><span class="s4">0</span><span class="s1">] != </span><span class="s4">2</span><span class="s1">) </span><span class="s2">or </span><span class="s1">(table.shape[</span><span class="s4">1</span><span class="s1">] != </span><span class="s4">2</span><span class="s1">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;Table2x2 takes a 2x2 table as input.&quot;</span><span class="s1">)</span>
+
+        <span class="s1">super(Table2x2</span><span class="s2">, </span><span class="s1">self).__init__(table</span><span class="s2">, </span><span class="s1">shift_zeros)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">from_data(cls</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">shift_zeros=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Construct a Table object from data. 
+ 
+        Parameters 
+        ---------- 
+        data : array_like 
+            The raw data, the first column defines the rows and the 
+            second column defines the columns. 
+        shift_zeros : bool 
+            If True, and if there are any zeros in the contingency 
+            table, add 0.5 to all four cells of the table. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(data</span><span class="s2">, </span><span class="s1">pd.DataFrame):</span>
+            <span class="s1">table = pd.crosstab(data.iloc[:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">data.iloc[:</span><span class="s2">, </span><span class="s4">1</span><span class="s1">])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">table = pd.crosstab(data[:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">data[:</span><span class="s2">, </span><span class="s4">1</span><span class="s1">])</span>
+        <span class="s2">return </span><span class="s1">cls(table</span><span class="s2">, </span><span class="s1">shift_zeros)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">log_oddsratio(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the log odds ratio for a 2x2 table. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">f = self.table.flatten()</span>
+        <span class="s2">return </span><span class="s1">np.dot(np.log(f)</span><span class="s2">, </span><span class="s1">np.r_[</span><span class="s4">1</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">])</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">oddsratio(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the odds ratio for a 2x2 table. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">(self.table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">] * self.table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">] /</span>
+                <span class="s1">(self.table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">] * self.table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]))</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">log_oddsratio_se(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the standard error for the log odds ratio. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">np.sqrt(np.sum(</span><span class="s4">1 </span><span class="s1">/ self.table))</span>
+
+    <span class="s2">def </span><span class="s1">oddsratio_pvalue(self</span><span class="s2">, </span><span class="s1">null=</span><span class="s4">1</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        P-value for a hypothesis test about the odds ratio. 
+ 
+        Parameters 
+        ---------- 
+        null : float 
+            The null value of the odds ratio. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">self.log_oddsratio_pvalue(np.log(null))</span>
+
+    <span class="s2">def </span><span class="s1">log_oddsratio_pvalue(self</span><span class="s2">, </span><span class="s1">null=</span><span class="s4">0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        P-value for a hypothesis test about the log odds ratio. 
+ 
+        Parameters 
+        ---------- 
+        null : float 
+            The null value of the log odds ratio. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">zscore = (self.log_oddsratio - null) / self.log_oddsratio_se</span>
+        <span class="s1">pvalue = </span><span class="s4">2 </span><span class="s1">* stats.norm.cdf(-np.abs(zscore))</span>
+        <span class="s2">return </span><span class="s1">pvalue</span>
+
+    <span class="s2">def </span><span class="s1">log_oddsratio_confint(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">method=</span><span class="s5">&quot;normal&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A confidence level for the log odds ratio. 
+ 
+        Parameters 
+        ---------- 
+        alpha : float 
+            `1 - alpha` is the nominal coverage probability of the 
+            confidence interval. 
+        method : str 
+            The method for producing the confidence interval.  Currently 
+            must be 'normal' which uses the normal approximation. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">f = -stats.norm.ppf(alpha / </span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s1">lor = self.log_oddsratio</span>
+        <span class="s1">se = self.log_oddsratio_se</span>
+        <span class="s1">lcb = lor - f * se</span>
+        <span class="s1">ucb = lor + f * se</span>
+        <span class="s2">return </span><span class="s1">lcb</span><span class="s2">, </span><span class="s1">ucb</span>
+
+    <span class="s2">def </span><span class="s1">oddsratio_confint(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">method=</span><span class="s5">&quot;normal&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A confidence interval for the odds ratio. 
+ 
+        Parameters 
+        ---------- 
+        alpha : float 
+            `1 - alpha` is the nominal coverage probability of the 
+            confidence interval. 
+        method : str 
+            The method for producing the confidence interval.  Currently 
+            must be 'normal' which uses the normal approximation. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">lcb</span><span class="s2">, </span><span class="s1">ucb = self.log_oddsratio_confint(alpha</span><span class="s2">, </span><span class="s1">method=method)</span>
+        <span class="s2">return </span><span class="s1">np.exp(lcb)</span><span class="s2">, </span><span class="s1">np.exp(ucb)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">riskratio(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the risk ratio for a 2x2 table. 
+ 
+        The risk ratio is calculated with respect to the rows. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">p = self.table[:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">] / self.table.sum(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">p[</span><span class="s4">0</span><span class="s1">] / p[</span><span class="s4">1</span><span class="s1">]</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">log_riskratio(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the log of the risk ratio. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">np.log(self.riskratio)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">log_riskratio_se(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the standard error of the log of the risk ratio. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">n = self.table.sum(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">p = self.table[:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">] / n</span>
+        <span class="s1">va = np.sum((</span><span class="s4">1 </span><span class="s1">- p) / (n*p))</span>
+        <span class="s2">return </span><span class="s1">np.sqrt(va)</span>
+
+    <span class="s2">def </span><span class="s1">riskratio_pvalue(self</span><span class="s2">, </span><span class="s1">null=</span><span class="s4">1</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        p-value for a hypothesis test about the risk ratio. 
+ 
+        Parameters 
+        ---------- 
+        null : float 
+            The null value of the risk ratio. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">self.log_riskratio_pvalue(np.log(null))</span>
+
+    <span class="s2">def </span><span class="s1">log_riskratio_pvalue(self</span><span class="s2">, </span><span class="s1">null=</span><span class="s4">0</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        p-value for a hypothesis test about the log risk ratio. 
+ 
+        Parameters 
+        ---------- 
+        null : float 
+            The null value of the log risk ratio. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">zscore = (self.log_riskratio - null) / self.log_riskratio_se</span>
+        <span class="s1">pvalue = </span><span class="s4">2 </span><span class="s1">* stats.norm.cdf(-np.abs(zscore))</span>
+        <span class="s2">return </span><span class="s1">pvalue</span>
+
+    <span class="s2">def </span><span class="s1">log_riskratio_confint(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">method=</span><span class="s5">&quot;normal&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A confidence interval for the log risk ratio. 
+ 
+        Parameters 
+        ---------- 
+        alpha : float 
+            `1 - alpha` is the nominal coverage probability of the 
+            confidence interval. 
+        method : str 
+            The method for producing the confidence interval.  Currently 
+            must be 'normal' which uses the normal approximation. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">f = -stats.norm.ppf(alpha / </span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s1">lrr = self.log_riskratio</span>
+        <span class="s1">se = self.log_riskratio_se</span>
+        <span class="s1">lcb = lrr - f * se</span>
+        <span class="s1">ucb = lrr + f * se</span>
+        <span class="s2">return </span><span class="s1">lcb</span><span class="s2">, </span><span class="s1">ucb</span>
+
+    <span class="s2">def </span><span class="s1">riskratio_confint(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">method=</span><span class="s5">&quot;normal&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A confidence interval for the risk ratio. 
+ 
+        Parameters 
+        ---------- 
+        alpha : float 
+            `1 - alpha` is the nominal coverage probability of the 
+            confidence interval. 
+        method : str 
+            The method for producing the confidence interval.  Currently 
+            must be 'normal' which uses the normal approximation. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">lcb</span><span class="s2">, </span><span class="s1">ucb = self.log_riskratio_confint(alpha</span><span class="s2">, </span><span class="s1">method=method)</span>
+        <span class="s2">return </span><span class="s1">np.exp(lcb)</span><span class="s2">, </span><span class="s1">np.exp(ucb)</span>
+
+    <span class="s2">def </span><span class="s1">summary(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">float_format=</span><span class="s5">&quot;%.3f&quot;</span><span class="s2">, </span><span class="s1">method=</span><span class="s5">&quot;normal&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Summarizes results for a 2x2 table analysis. 
+ 
+        Parameters 
+        ---------- 
+        alpha : float 
+            `1 - alpha` is the nominal coverage probability of the confidence 
+            intervals. 
+        float_format : str 
+            Used to format the numeric values in the table. 
+        method : str 
+            The method for producing the confidence interval.  Currently 
+            must be 'normal' which uses the normal approximation. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">def </span><span class="s1">fmt(x):</span>
+            <span class="s2">if </span><span class="s1">isinstance(x</span><span class="s2">, </span><span class="s1">str):</span>
+                <span class="s2">return </span><span class="s1">x</span>
+            <span class="s2">return </span><span class="s1">float_format % x</span>
+
+        <span class="s1">headers = [</span><span class="s5">&quot;Estimate&quot;</span><span class="s2">, </span><span class="s5">&quot;SE&quot;</span><span class="s2">, </span><span class="s5">&quot;LCB&quot;</span><span class="s2">, </span><span class="s5">&quot;UCB&quot;</span><span class="s2">, </span><span class="s5">&quot;p-value&quot;</span><span class="s1">]</span>
+        <span class="s1">stubs = [</span><span class="s5">&quot;Odds ratio&quot;</span><span class="s2">, </span><span class="s5">&quot;Log odds ratio&quot;</span><span class="s2">, </span><span class="s5">&quot;Risk ratio&quot;</span><span class="s2">,</span>
+                 <span class="s5">&quot;Log risk ratio&quot;</span><span class="s1">]</span>
+
+        <span class="s1">lcb1</span><span class="s2">, </span><span class="s1">ucb1 = self.oddsratio_confint(alpha</span><span class="s2">, </span><span class="s1">method)</span>
+        <span class="s1">lcb2</span><span class="s2">, </span><span class="s1">ucb2 = self.log_oddsratio_confint(alpha</span><span class="s2">, </span><span class="s1">method)</span>
+        <span class="s1">lcb3</span><span class="s2">, </span><span class="s1">ucb3 = self.riskratio_confint(alpha</span><span class="s2">, </span><span class="s1">method)</span>
+        <span class="s1">lcb4</span><span class="s2">, </span><span class="s1">ucb4 = self.log_riskratio_confint(alpha</span><span class="s2">, </span><span class="s1">method)</span>
+        <span class="s1">data = [[fmt(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">[self.oddsratio</span><span class="s2">, </span><span class="s5">&quot;&quot;</span><span class="s2">, </span><span class="s1">lcb1</span><span class="s2">, </span><span class="s1">ucb1</span><span class="s2">,</span>
+                                  <span class="s1">self.oddsratio_pvalue()]]</span><span class="s2">,</span>
+                <span class="s1">[fmt(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">[self.log_oddsratio</span><span class="s2">, </span><span class="s1">self.log_oddsratio_se</span><span class="s2">,</span>
+                                  <span class="s1">lcb2</span><span class="s2">, </span><span class="s1">ucb2</span><span class="s2">, </span><span class="s1">self.oddsratio_pvalue()]]</span><span class="s2">,</span>
+                <span class="s1">[fmt(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">[self.riskratio</span><span class="s2">, </span><span class="s5">&quot;&quot;</span><span class="s2">, </span><span class="s1">lcb3</span><span class="s2">, </span><span class="s1">ucb3</span><span class="s2">,</span>
+                                  <span class="s1">self.riskratio_pvalue()]]</span><span class="s2">,</span>
+                <span class="s1">[fmt(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">[self.log_riskratio</span><span class="s2">, </span><span class="s1">self.log_riskratio_se</span><span class="s2">,</span>
+                                  <span class="s1">lcb4</span><span class="s2">, </span><span class="s1">ucb4</span><span class="s2">, </span><span class="s1">self.riskratio_pvalue()]]]</span>
+        <span class="s1">tab = iolib.SimpleTable(data</span><span class="s2">, </span><span class="s1">headers</span><span class="s2">, </span><span class="s1">stubs</span><span class="s2">, </span><span class="s1">data_aligns=</span><span class="s5">&quot;r&quot;</span><span class="s2">,</span>
+                                <span class="s1">table_dec_above=</span><span class="s5">''</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">tab</span>
+
+
+<span class="s2">class </span><span class="s1">StratifiedTable:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Analyses for a collection of 2x2 contingency tables. 
+ 
+    Such a collection may arise by stratifying a single 2x2 table with 
+    respect to another factor.  This class implements the 
+    'Cochran-Mantel-Haenszel' and 'Breslow-Day' procedures for 
+    analyzing collections of 2x2 contingency tables. 
+ 
+    Parameters 
+    ---------- 
+    tables : list or ndarray 
+        Either a list containing several 2x2 contingency tables, or 
+        a 2x2xk ndarray in which each slice along the third axis is a 
+        2x2 contingency table. 
+ 
+    Notes 
+    ----- 
+    This results are based on a sampling model in which the units are 
+    independent both within and between strata. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">tables</span><span class="s2">, </span><span class="s1">shift_zeros=</span><span class="s2">False</span><span class="s1">):</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(tables</span><span class="s2">, </span><span class="s1">np.ndarray):</span>
+            <span class="s1">sp = tables.shape</span>
+            <span class="s2">if </span><span class="s1">(len(sp) != </span><span class="s4">3</span><span class="s1">) </span><span class="s2">or </span><span class="s1">(sp[</span><span class="s4">0</span><span class="s1">] != </span><span class="s4">2</span><span class="s1">) </span><span class="s2">or </span><span class="s1">(sp[</span><span class="s4">1</span><span class="s1">] != </span><span class="s4">2</span><span class="s1">):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;If an ndarray, argument must be 2x2xn&quot;</span><span class="s1">)</span>
+            <span class="s1">table = tables * </span><span class="s4">1.  </span><span class="s3"># use atleast float dtype</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">any([np.asarray(x).shape != (</span><span class="s4">2</span><span class="s2">, </span><span class="s4">2</span><span class="s1">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">tables]):</span>
+                <span class="s1">m = </span><span class="s5">&quot;If `tables` is a list, all of its elements should be 2x2&quot;</span>
+                <span class="s2">raise </span><span class="s1">ValueError(m)</span>
+
+            <span class="s3"># Create a data cube</span>
+            <span class="s1">table = np.dstack(tables).astype(np.float64)</span>
+
+        <span class="s2">if </span><span class="s1">shift_zeros:</span>
+            <span class="s1">zx = (table == </span><span class="s4">0</span><span class="s1">).sum(</span><span class="s4">0</span><span class="s1">).sum(</span><span class="s4">0</span><span class="s1">)</span>
+            <span class="s1">ix = np.flatnonzero(zx &gt; </span><span class="s4">0</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">len(ix) &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">table = table.copy()</span>
+                <span class="s1">table[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">ix] += </span><span class="s4">0.5</span>
+
+        <span class="s1">self.table = table</span>
+
+        <span class="s1">self._cache = {}</span>
+
+        <span class="s3"># Quantities to precompute.  Table entries are [[a, b], [c,</span>
+        <span class="s3"># d]], 'ad' is 'a * d', 'apb' is 'a + b', 'dma' is 'd - a',</span>
+        <span class="s3"># etc.</span>
+        <span class="s1">self._apb = table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:] + table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">self._apc = table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:] + table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">self._bpd = table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">:] + table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">self._cpd = table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:] + table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">self._ad = table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:] * table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">self._bc = table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">:] * table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">self._apd = table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:] + table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">self._dma = table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">:] - table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">self._n = table.sum(</span><span class="s4">0</span><span class="s1">).sum(</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">from_data(cls</span><span class="s2">, </span><span class="s1">var1</span><span class="s2">, </span><span class="s1">var2</span><span class="s2">, </span><span class="s1">strata</span><span class="s2">, </span><span class="s1">data):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Construct a StratifiedTable object from data. 
+ 
+        Parameters 
+        ---------- 
+        var1 : int or string 
+            The column index or name of `data` specifying the variable 
+            defining the rows of the contingency table.  The variable 
+            must have only two distinct values. 
+        var2 : int or string 
+            The column index or name of `data` specifying the variable 
+            defining the columns of the contingency table.  The variable 
+            must have only two distinct values. 
+        strata : int or string 
+            The column index or name of `data` specifying the variable 
+            defining the strata. 
+        data : array_like 
+            The raw data.  A cross-table for analysis is constructed 
+            from the first two columns. 
+ 
+        Returns 
+        ------- 
+        StratifiedTable 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if not </span><span class="s1">isinstance(data</span><span class="s2">, </span><span class="s1">pd.DataFrame):</span>
+            <span class="s1">data1 = pd.DataFrame(index=np.arange(data.shape[</span><span class="s4">0</span><span class="s1">])</span><span class="s2">,</span>
+                                 <span class="s1">columns=[var1</span><span class="s2">, </span><span class="s1">var2</span><span class="s2">, </span><span class="s1">strata])</span>
+            <span class="s1">data1[data1.columns[var1]] = data[:</span><span class="s2">, </span><span class="s1">var1]</span>
+            <span class="s1">data1[data1.columns[var2]] = data[:</span><span class="s2">, </span><span class="s1">var2]</span>
+            <span class="s1">data1[data1.columns[strata]] = data[:</span><span class="s2">, </span><span class="s1">strata]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">data1 = data[[var1</span><span class="s2">, </span><span class="s1">var2</span><span class="s2">, </span><span class="s1">strata]]</span>
+
+        <span class="s1">gb = data1.groupby(strata).groups</span>
+        <span class="s1">tables = []</span>
+        <span class="s2">for </span><span class="s1">g </span><span class="s2">in </span><span class="s1">gb:</span>
+            <span class="s1">ii = gb[g]</span>
+            <span class="s1">tab = pd.crosstab(data1.loc[ii</span><span class="s2">, </span><span class="s1">var1]</span><span class="s2">, </span><span class="s1">data1.loc[ii</span><span class="s2">, </span><span class="s1">var2])</span>
+            <span class="s2">if </span><span class="s1">(tab.shape != np.r_[</span><span class="s4">2</span><span class="s2">, </span><span class="s4">2</span><span class="s1">]).any():</span>
+                <span class="s1">msg = </span><span class="s5">&quot;Invalid table dimensions&quot;</span>
+                <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+            <span class="s1">tables.append(np.asarray(tab))</span>
+
+        <span class="s2">return </span><span class="s1">cls(tables)</span>
+
+    <span class="s2">def </span><span class="s1">test_null_odds(self</span><span class="s2">, </span><span class="s1">correction=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Test that all tables have odds ratio equal to 1. 
+ 
+        This is the 'Mantel-Haenszel' test. 
+ 
+        Parameters 
+        ---------- 
+        correction : bool 
+            If True, use the continuity correction when calculating the 
+            test statistic. 
+ 
+        Returns 
+        ------- 
+        Bunch 
+            A bunch containing the chi^2 test statistic and p-value. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">statistic = np.sum(self.table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:] -</span>
+                           <span class="s1">self._apb * self._apc / self._n)</span>
+        <span class="s1">statistic = np.abs(statistic)</span>
+        <span class="s2">if </span><span class="s1">correction:</span>
+            <span class="s1">statistic -= </span><span class="s4">0.5</span>
+        <span class="s1">statistic = statistic**</span><span class="s4">2</span>
+        <span class="s1">denom = self._apb * self._apc * self._bpd * self._cpd</span>
+        <span class="s1">denom /= (self._n**</span><span class="s4">2 </span><span class="s1">* (self._n - </span><span class="s4">1</span><span class="s1">))</span>
+        <span class="s1">denom = np.sum(denom)</span>
+        <span class="s1">statistic /= denom</span>
+
+        <span class="s3"># df is always 1</span>
+        <span class="s1">pvalue = </span><span class="s4">1 </span><span class="s1">- stats.chi2.cdf(statistic</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s1">b = _Bunch()</span>
+        <span class="s1">b.statistic = statistic</span>
+        <span class="s1">b.pvalue = pvalue</span>
+
+        <span class="s2">return </span><span class="s1">b</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">oddsratio_pooled(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The pooled odds ratio. 
+ 
+        The value is an estimate of a common odds ratio across all of the 
+        stratified tables. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">odds_ratio = np.sum(self._ad / self._n) / np.sum(self._bc / self._n)</span>
+        <span class="s2">return </span><span class="s1">odds_ratio</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">logodds_pooled(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the logarithm of the pooled odds ratio. 
+ 
+        See oddsratio_pooled for more information. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">np.log(self.oddsratio_pooled)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">riskratio_pooled(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimate of the pooled risk ratio. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">acd = self.table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:] * self._cpd</span>
+        <span class="s1">cab = self.table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:] * self._apb</span>
+
+        <span class="s1">rr = np.sum(acd / self._n) / np.sum(cab / self._n)</span>
+        <span class="s2">return </span><span class="s1">rr</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">logodds_pooled_se(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimated standard error of the pooled log odds ratio 
+ 
+        References 
+        ---------- 
+        J. Robins, N. Breslow, S. Greenland. &quot;Estimators of the 
+        Mantel-Haenszel Variance Consistent in Both Sparse Data and 
+        Large-Strata Limiting Models.&quot; Biometrics 42, no. 2 (1986): 311-23. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">adns = np.sum(self._ad / self._n)</span>
+        <span class="s1">bcns = np.sum(self._bc / self._n)</span>
+        <span class="s1">lor_va = np.sum(self._apd * self._ad / self._n**</span><span class="s4">2</span><span class="s1">) / adns**</span><span class="s4">2</span>
+        <span class="s1">mid = self._apd * self._bc / self._n**</span><span class="s4">2</span>
+        <span class="s1">mid += (</span><span class="s4">1 </span><span class="s1">- self._apd / self._n) * self._ad / self._n</span>
+        <span class="s1">mid = np.sum(mid)</span>
+        <span class="s1">mid /= (adns * bcns)</span>
+        <span class="s1">lor_va += mid</span>
+        <span class="s1">lor_va += np.sum((</span><span class="s4">1 </span><span class="s1">- self._apd / self._n) *</span>
+                         <span class="s1">self._bc / self._n) / bcns**</span><span class="s4">2</span>
+        <span class="s1">lor_va /= </span><span class="s4">2</span>
+        <span class="s1">lor_se = np.sqrt(lor_va)</span>
+        <span class="s2">return </span><span class="s1">lor_se</span>
+
+    <span class="s2">def </span><span class="s1">logodds_pooled_confint(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">method=</span><span class="s5">&quot;normal&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A confidence interval for the pooled log odds ratio. 
+ 
+        Parameters 
+        ---------- 
+        alpha : float 
+            `1 - alpha` is the nominal coverage probability of the 
+            interval. 
+        method : str 
+            The method for producing the confidence interval.  Currently 
+            must be 'normal' which uses the normal approximation. 
+ 
+        Returns 
+        ------- 
+        lcb : float 
+            The lower confidence limit. 
+        ucb : float 
+            The upper confidence limit. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">lor = np.log(self.oddsratio_pooled)</span>
+        <span class="s1">lor_se = self.logodds_pooled_se</span>
+
+        <span class="s1">f = -stats.norm.ppf(alpha / </span><span class="s4">2</span><span class="s1">)</span>
+
+        <span class="s1">lcb = lor - f * lor_se</span>
+        <span class="s1">ucb = lor + f * lor_se</span>
+
+        <span class="s2">return </span><span class="s1">lcb</span><span class="s2">, </span><span class="s1">ucb</span>
+
+    <span class="s2">def </span><span class="s1">oddsratio_pooled_confint(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">method=</span><span class="s5">&quot;normal&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A confidence interval for the pooled odds ratio. 
+ 
+        Parameters 
+        ---------- 
+        alpha : float 
+            `1 - alpha` is the nominal coverage probability of the 
+            interval. 
+        method : str 
+            The method for producing the confidence interval.  Currently 
+            must be 'normal' which uses the normal approximation. 
+ 
+        Returns 
+        ------- 
+        lcb : float 
+            The lower confidence limit. 
+        ucb : float 
+            The upper confidence limit. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">lcb</span><span class="s2">, </span><span class="s1">ucb = self.logodds_pooled_confint(alpha</span><span class="s2">, </span><span class="s1">method=method)</span>
+        <span class="s1">lcb = np.exp(lcb)</span>
+        <span class="s1">ucb = np.exp(ucb)</span>
+        <span class="s2">return </span><span class="s1">lcb</span><span class="s2">, </span><span class="s1">ucb</span>
+
+    <span class="s2">def </span><span class="s1">test_equal_odds(self</span><span class="s2">, </span><span class="s1">adjust=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Test that all odds ratios are identical. 
+ 
+        This is the 'Breslow-Day' testing procedure. 
+ 
+        Parameters 
+        ---------- 
+        adjust : bool 
+            Use the 'Tarone' adjustment to achieve the chi^2 
+            asymptotic distribution. 
+ 
+        Returns 
+        ------- 
+        A bunch containing the following attributes: 
+ 
+        statistic : float 
+            The chi^2 test statistic. 
+        p-value : float 
+            The p-value for the test. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">table = self.table</span>
+
+        <span class="s1">r = self.oddsratio_pooled</span>
+        <span class="s1">a = </span><span class="s4">1 </span><span class="s1">- r</span>
+        <span class="s1">b = r * (self._apb + self._apc) + self._dma</span>
+        <span class="s1">c = -r * self._apb * self._apc</span>
+
+        <span class="s3"># Expected value of first cell</span>
+        <span class="s1">dr = np.sqrt(b**</span><span class="s4">2 </span><span class="s1">- </span><span class="s4">4</span><span class="s1">*a*c)</span>
+        <span class="s1">e11 = (-b + dr) / (</span><span class="s4">2</span><span class="s1">*a)</span>
+
+        <span class="s3"># Variance of the first cell</span>
+        <span class="s1">v11 = (</span><span class="s4">1 </span><span class="s1">/ e11 + </span><span class="s4">1 </span><span class="s1">/ (self._apc - e11) + </span><span class="s4">1 </span><span class="s1">/ (self._apb - e11) +</span>
+               <span class="s4">1 </span><span class="s1">/ (self._dma + e11))</span>
+        <span class="s1">v11 = </span><span class="s4">1 </span><span class="s1">/ v11</span>
+
+        <span class="s1">statistic = np.sum((table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:] - e11)**</span><span class="s4">2 </span><span class="s1">/ v11)</span>
+
+        <span class="s2">if </span><span class="s1">adjust:</span>
+            <span class="s1">adj = table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:].sum() - e11.sum()</span>
+            <span class="s1">adj = adj**</span><span class="s4">2</span>
+            <span class="s1">adj /= np.sum(v11)</span>
+            <span class="s1">statistic -= adj</span>
+
+        <span class="s1">pvalue = </span><span class="s4">1 </span><span class="s1">- stats.chi2.cdf(statistic</span><span class="s2">, </span><span class="s1">table.shape[</span><span class="s4">2</span><span class="s1">] - </span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s1">b = _Bunch()</span>
+        <span class="s1">b.statistic = statistic</span>
+        <span class="s1">b.pvalue = pvalue</span>
+
+        <span class="s2">return </span><span class="s1">b</span>
+
+    <span class="s2">def </span><span class="s1">summary(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">float_format=</span><span class="s5">&quot;%.3f&quot;</span><span class="s2">, </span><span class="s1">method=</span><span class="s5">&quot;normal&quot;</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A summary of all the main results. 
+ 
+        Parameters 
+        ---------- 
+        alpha : float 
+            `1 - alpha` is the nominal coverage probability of the 
+            confidence intervals. 
+        float_format : str 
+            Used for formatting numeric values in the summary. 
+        method : str 
+            The method for producing the confidence interval.  Currently 
+            must be 'normal' which uses the normal approximation. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">def </span><span class="s1">fmt(x):</span>
+            <span class="s2">if </span><span class="s1">isinstance(x</span><span class="s2">, </span><span class="s1">str):</span>
+                <span class="s2">return </span><span class="s1">x</span>
+            <span class="s2">return </span><span class="s1">float_format % x</span>
+
+        <span class="s1">co_lcb</span><span class="s2">, </span><span class="s1">co_ucb = self.oddsratio_pooled_confint(</span>
+            <span class="s1">alpha=alpha</span><span class="s2">, </span><span class="s1">method=method)</span>
+        <span class="s1">clo_lcb</span><span class="s2">, </span><span class="s1">clo_ucb = self.logodds_pooled_confint(</span>
+            <span class="s1">alpha=alpha</span><span class="s2">, </span><span class="s1">method=method)</span>
+        <span class="s1">headers = [</span><span class="s5">&quot;Estimate&quot;</span><span class="s2">, </span><span class="s5">&quot;LCB&quot;</span><span class="s2">, </span><span class="s5">&quot;UCB&quot;</span><span class="s1">]</span>
+        <span class="s1">stubs = [</span><span class="s5">&quot;Pooled odds&quot;</span><span class="s2">, </span><span class="s5">&quot;Pooled log odds&quot;</span><span class="s2">, </span><span class="s5">&quot;Pooled risk ratio&quot;</span><span class="s2">, </span><span class="s5">&quot;&quot;</span><span class="s1">]</span>
+        <span class="s1">data = [[fmt(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">[self.oddsratio_pooled</span><span class="s2">, </span><span class="s1">co_lcb</span><span class="s2">, </span><span class="s1">co_ucb]]</span><span class="s2">,</span>
+                <span class="s1">[fmt(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">[self.logodds_pooled</span><span class="s2">, </span><span class="s1">clo_lcb</span><span class="s2">, </span><span class="s1">clo_ucb]]</span><span class="s2">,</span>
+                <span class="s1">[fmt(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">[self.riskratio_pooled</span><span class="s2">, </span><span class="s5">&quot;&quot;</span><span class="s2">, </span><span class="s5">&quot;&quot;</span><span class="s1">]]</span><span class="s2">,</span>
+                <span class="s1">[</span><span class="s5">''</span><span class="s2">, </span><span class="s5">''</span><span class="s2">, </span><span class="s5">''</span><span class="s1">]]</span>
+        <span class="s1">tab1 = iolib.SimpleTable(data</span><span class="s2">, </span><span class="s1">headers</span><span class="s2">, </span><span class="s1">stubs</span><span class="s2">, </span><span class="s1">data_aligns=</span><span class="s5">&quot;r&quot;</span><span class="s2">,</span>
+                                 <span class="s1">table_dec_above=</span><span class="s5">''</span><span class="s1">)</span>
+
+        <span class="s1">headers = [</span><span class="s5">&quot;Statistic&quot;</span><span class="s2">, </span><span class="s5">&quot;P-value&quot;</span><span class="s2">, </span><span class="s5">&quot;&quot;</span><span class="s1">]</span>
+        <span class="s1">stubs = [</span><span class="s5">&quot;Test of OR=1&quot;</span><span class="s2">, </span><span class="s5">&quot;Test constant OR&quot;</span><span class="s1">]</span>
+        <span class="s1">rslt1 = self.test_null_odds()</span>
+        <span class="s1">rslt2 = self.test_equal_odds()</span>
+        <span class="s1">data = [[fmt(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">[rslt1.statistic</span><span class="s2">, </span><span class="s1">rslt1.pvalue</span><span class="s2">, </span><span class="s5">&quot;&quot;</span><span class="s1">]]</span><span class="s2">,</span>
+                <span class="s1">[fmt(x) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">[rslt2.statistic</span><span class="s2">, </span><span class="s1">rslt2.pvalue</span><span class="s2">, </span><span class="s5">&quot;&quot;</span><span class="s1">]]]</span>
+        <span class="s1">tab2 = iolib.SimpleTable(data</span><span class="s2">, </span><span class="s1">headers</span><span class="s2">, </span><span class="s1">stubs</span><span class="s2">, </span><span class="s1">data_aligns=</span><span class="s5">&quot;r&quot;</span><span class="s1">)</span>
+        <span class="s1">tab1.extend(tab2)</span>
+
+        <span class="s1">headers = [</span><span class="s5">&quot;&quot;</span><span class="s2">, </span><span class="s5">&quot;&quot;</span><span class="s2">, </span><span class="s5">&quot;&quot;</span><span class="s1">]</span>
+        <span class="s1">stubs = [</span><span class="s5">&quot;Number of tables&quot;</span><span class="s2">, </span><span class="s5">&quot;Min n&quot;</span><span class="s2">, </span><span class="s5">&quot;Max n&quot;</span><span class="s2">, </span><span class="s5">&quot;Avg n&quot;</span><span class="s2">, </span><span class="s5">&quot;Total n&quot;</span><span class="s1">]</span>
+        <span class="s1">ss = self.table.sum(</span><span class="s4">0</span><span class="s1">).sum(</span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s1">data = [[</span><span class="s5">&quot;%d&quot; </span><span class="s1">% self.table.shape[</span><span class="s4">2</span><span class="s1">]</span><span class="s2">, </span><span class="s5">''</span><span class="s2">, </span><span class="s5">''</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s1">[</span><span class="s5">&quot;%d&quot; </span><span class="s1">% min(ss)</span><span class="s2">, </span><span class="s5">''</span><span class="s2">, </span><span class="s5">''</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s1">[</span><span class="s5">&quot;%d&quot; </span><span class="s1">% max(ss)</span><span class="s2">, </span><span class="s5">''</span><span class="s2">, </span><span class="s5">''</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s1">[</span><span class="s5">&quot;%.0f&quot; </span><span class="s1">% np.mean(ss)</span><span class="s2">, </span><span class="s5">''</span><span class="s2">, </span><span class="s5">''</span><span class="s1">]</span><span class="s2">,</span>
+                <span class="s1">[</span><span class="s5">&quot;%d&quot; </span><span class="s1">% sum(ss)</span><span class="s2">, </span><span class="s5">''</span><span class="s2">, </span><span class="s5">''</span><span class="s2">, </span><span class="s5">''</span><span class="s1">]]</span>
+        <span class="s1">tab3 = iolib.SimpleTable(data</span><span class="s2">, </span><span class="s1">headers</span><span class="s2">, </span><span class="s1">stubs</span><span class="s2">, </span><span class="s1">data_aligns=</span><span class="s5">&quot;r&quot;</span><span class="s1">)</span>
+        <span class="s1">tab1.extend(tab3)</span>
+
+        <span class="s2">return </span><span class="s1">tab1</span>
+
+
+<span class="s2">def </span><span class="s1">mcnemar(table</span><span class="s2">, </span><span class="s1">exact=</span><span class="s2">True, </span><span class="s1">correction=</span><span class="s2">True</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    McNemar test of homogeneity. 
+ 
+    Parameters 
+    ---------- 
+    table : array_like 
+        A square contingency table. 
+    exact : bool 
+        If exact is true, then the binomial distribution will be used. 
+        If exact is false, then the chisquare distribution will be 
+        used, which is the approximation to the distribution of the 
+        test statistic for large sample sizes. 
+    correction : bool 
+        If true, then a continuity correction is used for the chisquare 
+        distribution (if exact is false.) 
+ 
+    Returns 
+    ------- 
+    A bunch with attributes: 
+ 
+    statistic : float or int, array 
+        The test statistic is the chisquare statistic if exact is 
+        false. If the exact binomial distribution is used, then this 
+        contains the min(n1, n2), where n1, n2 are cases that are zero 
+        in one sample but one in the other sample. 
+    pvalue : float or array 
+        p-value of the null hypothesis of equal marginal distributions. 
+ 
+    Notes 
+    ----- 
+    This is a special case of Cochran's Q test, and of the homogeneity 
+    test. The results when the chisquare distribution is used are 
+    identical, except for continuity correction. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">table = _make_df_square(table)</span>
+    <span class="s1">table = np.asarray(table</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+    <span class="s1">n1</span><span class="s2">, </span><span class="s1">n2 = table[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">table[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span>
+
+    <span class="s2">if </span><span class="s1">exact:</span>
+        <span class="s1">statistic = np.minimum(n1</span><span class="s2">, </span><span class="s1">n2)</span>
+        <span class="s3"># binom is symmetric with p=0.5</span>
+        <span class="s3"># SciPy 1.7+ requires int arguments</span>
+        <span class="s1">int_sum = int(n1 + n2)</span>
+        <span class="s2">if </span><span class="s1">int_sum != (n1 + n2):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;exact can only be used with tables containing integers.&quot;</span>
+            <span class="s1">)</span>
+        <span class="s1">pvalue = stats.binom.cdf(statistic</span><span class="s2">, </span><span class="s1">int_sum</span><span class="s2">, </span><span class="s4">0.5</span><span class="s1">) * </span><span class="s4">2</span>
+        <span class="s1">pvalue = np.minimum(pvalue</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)  </span><span class="s3"># limit to 1 if n1==n2</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">corr = int(correction)  </span><span class="s3"># convert bool to 0 or 1</span>
+        <span class="s1">statistic = (np.abs(n1 - n2) - corr)**</span><span class="s4">2 </span><span class="s1">/ (</span><span class="s4">1. </span><span class="s1">* (n1 + n2))</span>
+        <span class="s1">df = </span><span class="s4">1</span>
+        <span class="s1">pvalue = stats.chi2.sf(statistic</span><span class="s2">, </span><span class="s1">df)</span>
+
+    <span class="s1">b = _Bunch()</span>
+    <span class="s1">b.statistic = statistic</span>
+    <span class="s1">b.pvalue = pvalue</span>
+    <span class="s2">return </span><span class="s1">b</span>
+
+
+<span class="s2">def </span><span class="s1">cochrans_q(x</span><span class="s2">, </span><span class="s1">return_object=</span><span class="s2">True</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Cochran's Q test for identical binomial proportions. 
+ 
+    Parameters 
+    ---------- 
+    x : array_like, 2d (N, k) 
+        data with N cases and k variables 
+    return_object : bool 
+        Return values as bunch instead of as individual values. 
+ 
+    Returns 
+    ------- 
+    Returns a bunch containing the following attributes, or the 
+    individual values according to the value of `return_object`. 
+ 
+    statistic : float 
+       test statistic 
+    pvalue : float 
+       pvalue from the chisquare distribution 
+ 
+    Notes 
+    ----- 
+    Cochran's Q is a k-sample extension of the McNemar test. If there 
+    are only two groups, then Cochran's Q test and the McNemar test 
+    are equivalent. 
+ 
+    The procedure tests that the probability of success is the same 
+    for every group.  The alternative hypothesis is that at least two 
+    groups have a different probability of success. 
+ 
+    In Wikipedia terminology, rows are blocks and columns are 
+    treatments.  The number of rows N, should be large for the 
+    chisquare distribution to be a good approximation. 
+ 
+    The Null hypothesis of the test is that all treatments have the 
+    same effect. 
+ 
+    References 
+    ---------- 
+    https://en.wikipedia.org/wiki/Cochran_test 
+    SAS Manual for NPAR TESTS 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">x = np.asarray(x</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+    <span class="s1">gruni = np.unique(x)</span>
+    <span class="s1">N</span><span class="s2">, </span><span class="s1">k = x.shape</span>
+    <span class="s1">count_row_success = (x == gruni[-</span><span class="s4">1</span><span class="s1">]).sum(</span><span class="s4">1</span><span class="s2">, </span><span class="s1">float)</span>
+    <span class="s1">count_col_success = (x == gruni[-</span><span class="s4">1</span><span class="s1">]).sum(</span><span class="s4">0</span><span class="s2">, </span><span class="s1">float)</span>
+    <span class="s1">count_row_ss = count_row_success.sum()</span>
+    <span class="s1">count_col_ss = count_col_success.sum()</span>
+    <span class="s2">assert </span><span class="s1">count_row_ss == count_col_ss  </span><span class="s3"># just a calculation check</span>
+
+    <span class="s3"># From the SAS manual</span>
+    <span class="s1">q_stat = ((k-</span><span class="s4">1</span><span class="s1">) * (k * np.sum(count_col_success**</span><span class="s4">2</span><span class="s1">) - count_col_ss**</span><span class="s4">2</span><span class="s1">)</span>
+              <span class="s1">/ (k * count_row_ss - np.sum(count_row_success**</span><span class="s4">2</span><span class="s1">)))</span>
+
+    <span class="s3"># Note: the denominator looks just like k times the variance of</span>
+    <span class="s3"># the columns</span>
+    <span class="s3"># Wikipedia uses a different, but equivalent expression</span>
+    <span class="s3"># q_stat = (k-1) * (k *  np.sum(count_row_success**2) - count_row_ss**2)</span>
+    <span class="s3">#         / (k * count_col_ss - np.sum(count_col_success**2))</span>
+
+    <span class="s1">df = k - </span><span class="s4">1</span>
+    <span class="s1">pvalue = stats.chi2.sf(q_stat</span><span class="s2">, </span><span class="s1">df)</span>
+
+    <span class="s2">if </span><span class="s1">return_object:</span>
+        <span class="s1">b = _Bunch()</span>
+        <span class="s1">b.statistic = q_stat</span>
+        <span class="s1">b.df = df</span>
+        <span class="s1">b.pvalue = pvalue</span>
+        <span class="s2">return </span><span class="s1">b</span>
+
+    <span class="s2">return </span><span class="s1">q_stat</span><span class="s2">, </span><span class="s1">pvalue</span><span class="s2">, </span><span class="s1">df</span>
+</pre>
+</body>
+</html>

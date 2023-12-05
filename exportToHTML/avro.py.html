@@ -1,0 +1,323 @@
+<html>
+<head>
+<title>avro.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #a5c261;}
+.s3 { color: #6897bb;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6a8759;}
+.s6 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+avro.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">io</span>
+<span class="s0">import </span><span class="s1">uuid</span>
+
+<span class="s0">from </span><span class="s1">fsspec.core </span><span class="s0">import </span><span class="s1">OpenFile</span><span class="s0">, </span><span class="s1">get_fs_token_paths</span><span class="s0">, </span><span class="s1">open_files</span>
+<span class="s0">from </span><span class="s1">fsspec.utils </span><span class="s0">import </span><span class="s1">read_block</span>
+<span class="s0">from </span><span class="s1">fsspec.utils </span><span class="s0">import </span><span class="s1">tokenize </span><span class="s0">as </span><span class="s1">fs_tokenize</span>
+
+<span class="s0">from </span><span class="s1">dask.highlevelgraph </span><span class="s0">import </span><span class="s1">HighLevelGraph</span>
+
+<span class="s1">MAGIC = </span><span class="s2">b&quot;Obj</span><span class="s0">\x01</span><span class="s2">&quot;</span>
+<span class="s1">SYNC_SIZE = </span><span class="s3">16</span>
+
+
+<span class="s0">def </span><span class="s1">read_long(fo):</span>
+    <span class="s4">&quot;&quot;&quot;variable-length, zig-zag encoding.&quot;&quot;&quot;</span>
+    <span class="s1">c = fo.read(</span><span class="s3">1</span><span class="s1">)</span>
+    <span class="s1">b = ord(c)</span>
+    <span class="s1">n = b &amp; </span><span class="s3">0x7F</span>
+    <span class="s1">shift = </span><span class="s3">7</span>
+    <span class="s0">while </span><span class="s1">(b &amp; </span><span class="s3">0x80</span><span class="s1">) != </span><span class="s3">0</span><span class="s1">:</span>
+        <span class="s1">b = ord(fo.read(</span><span class="s3">1</span><span class="s1">))</span>
+        <span class="s1">n |= (b &amp; </span><span class="s3">0x7F</span><span class="s1">) &lt;&lt; shift</span>
+        <span class="s1">shift += </span><span class="s3">7</span>
+    <span class="s0">return </span><span class="s1">(n &gt;&gt; </span><span class="s3">1</span><span class="s1">) ^ -(n &amp; </span><span class="s3">1</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">read_bytes(fo):</span>
+    <span class="s4">&quot;&quot;&quot;a long followed by that many bytes of data.&quot;&quot;&quot;</span>
+    <span class="s1">size = read_long(fo)</span>
+    <span class="s0">return </span><span class="s1">fo.read(size)</span>
+
+
+<span class="s0">def </span><span class="s1">read_header(fo):</span>
+    <span class="s4">&quot;&quot;&quot;Extract an avro file's header 
+ 
+    fo: file-like 
+        This should be in bytes mode, e.g., io.BytesIO 
+ 
+    Returns dict representing the header 
+ 
+    Parameters 
+    ---------- 
+    fo: file-like 
+    &quot;&quot;&quot;</span>
+    <span class="s0">assert </span><span class="s1">fo.read(len(MAGIC)) == MAGIC</span><span class="s0">, </span><span class="s5">&quot;Magic avro bytes missing&quot;</span>
+    <span class="s1">meta = {}</span>
+    <span class="s1">out = {</span><span class="s5">&quot;meta&quot;</span><span class="s1">: meta}</span>
+    <span class="s0">while True</span><span class="s1">:</span>
+        <span class="s1">n_keys = read_long(fo)</span>
+        <span class="s0">if </span><span class="s1">n_keys == </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s0">break</span>
+        <span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(n_keys):</span>
+            <span class="s6"># ignore dtype mapping for bag version</span>
+            <span class="s1">read_bytes(fo)  </span><span class="s6"># schema keys</span>
+            <span class="s1">read_bytes(fo)  </span><span class="s6"># schema values</span>
+    <span class="s1">out[</span><span class="s5">&quot;sync&quot;</span><span class="s1">] = fo.read(SYNC_SIZE)</span>
+    <span class="s1">out[</span><span class="s5">&quot;header_size&quot;</span><span class="s1">] = fo.tell()</span>
+    <span class="s1">fo.seek(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">out[</span><span class="s5">&quot;head_bytes&quot;</span><span class="s1">] = fo.read(out[</span><span class="s5">&quot;header_size&quot;</span><span class="s1">])</span>
+    <span class="s0">return </span><span class="s1">out</span>
+
+
+<span class="s0">def </span><span class="s1">open_head(fs</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">compression):</span>
+    <span class="s4">&quot;&quot;&quot;Open a file just to read its head and size&quot;&quot;&quot;</span>
+    <span class="s0">with </span><span class="s1">OpenFile(fs</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">compression=compression) </span><span class="s0">as </span><span class="s1">f:</span>
+        <span class="s1">head = read_header(f)</span>
+    <span class="s1">size = fs.info(path)[</span><span class="s5">&quot;size&quot;</span><span class="s1">]</span>
+    <span class="s0">return </span><span class="s1">head</span><span class="s0">, </span><span class="s1">size</span>
+
+
+<span class="s0">def </span><span class="s1">read_avro(urlpath</span><span class="s0">, </span><span class="s1">blocksize=</span><span class="s3">100000000</span><span class="s0">, </span><span class="s1">storage_options=</span><span class="s0">None, </span><span class="s1">compression=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s4">&quot;&quot;&quot;Read set of avro files 
+ 
+    Use this with arbitrary nested avro schemas. Please refer to the 
+    fastavro documentation for its capabilities: 
+    https://github.com/fastavro/fastavro 
+ 
+    Parameters 
+    ---------- 
+    urlpath: string or list 
+        Absolute or relative filepath, URL (may include protocols like 
+        ``s3://``), or globstring pointing to data. 
+    blocksize: int or None 
+        Size of chunks in bytes. If None, there will be no chunking and each 
+        file will become one partition. 
+    storage_options: dict or None 
+        passed to backend file-system 
+    compression: str or None 
+        Compression format of the targe(s), like 'gzip'. Should only be used 
+        with blocksize=None. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask </span><span class="s0">import </span><span class="s1">compute</span><span class="s0">, </span><span class="s1">delayed</span>
+    <span class="s0">from </span><span class="s1">dask.bag </span><span class="s0">import </span><span class="s1">from_delayed</span>
+    <span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">import_required</span>
+
+    <span class="s1">import_required(</span>
+        <span class="s5">&quot;fastavro&quot;</span><span class="s0">, </span><span class="s5">&quot;fastavro is a required dependency for using bag.read_avro().&quot;</span>
+    <span class="s1">)</span>
+
+    <span class="s1">storage_options = storage_options </span><span class="s0">or </span><span class="s1">{}</span>
+    <span class="s0">if </span><span class="s1">blocksize </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s1">fs</span><span class="s0">, </span><span class="s1">fs_token</span><span class="s0">, </span><span class="s1">paths = get_fs_token_paths(</span>
+            <span class="s1">urlpath</span><span class="s0">, </span><span class="s1">mode=</span><span class="s5">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">storage_options=storage_options</span>
+        <span class="s1">)</span>
+        <span class="s1">dhead = delayed(open_head)</span>
+        <span class="s1">out = compute(*[dhead(fs</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">compression) </span><span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">paths])</span>
+        <span class="s1">heads</span><span class="s0">, </span><span class="s1">sizes = zip(*out)</span>
+        <span class="s1">dread = delayed(read_chunk)</span>
+
+        <span class="s1">offsets = []</span>
+        <span class="s1">lengths = []</span>
+        <span class="s0">for </span><span class="s1">size </span><span class="s0">in </span><span class="s1">sizes:</span>
+            <span class="s1">off = list(range(</span><span class="s3">0</span><span class="s0">, </span><span class="s1">size</span><span class="s0">, </span><span class="s1">blocksize))</span>
+            <span class="s1">length = [blocksize] * len(off)</span>
+            <span class="s1">offsets.append(off)</span>
+            <span class="s1">lengths.append(length)</span>
+
+        <span class="s1">out = []</span>
+        <span class="s0">for </span><span class="s1">path</span><span class="s0">, </span><span class="s1">offset</span><span class="s0">, </span><span class="s1">length</span><span class="s0">, </span><span class="s1">head </span><span class="s0">in </span><span class="s1">zip(paths</span><span class="s0">, </span><span class="s1">offsets</span><span class="s0">, </span><span class="s1">lengths</span><span class="s0">, </span><span class="s1">heads):</span>
+            <span class="s1">delimiter = head[</span><span class="s5">&quot;sync&quot;</span><span class="s1">]</span>
+            <span class="s1">f = OpenFile(fs</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">compression=compression)</span>
+            <span class="s1">token = fs_tokenize(</span>
+                <span class="s1">fs_token</span><span class="s0">, </span><span class="s1">delimiter</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">fs.ukey(path)</span><span class="s0">, </span><span class="s1">compression</span><span class="s0">, </span><span class="s1">offset</span>
+            <span class="s1">)</span>
+            <span class="s1">keys = [</span><span class="s5">f&quot;read-avro-</span><span class="s0">{</span><span class="s1">o</span><span class="s0">}</span><span class="s5">-</span><span class="s0">{</span><span class="s1">token</span><span class="s0">}</span><span class="s5">&quot; </span><span class="s0">for </span><span class="s1">o </span><span class="s0">in </span><span class="s1">offset]</span>
+            <span class="s1">values = [</span>
+                <span class="s1">dread(f</span><span class="s0">, </span><span class="s1">o</span><span class="s0">, </span><span class="s1">l</span><span class="s0">, </span><span class="s1">head</span><span class="s0">, </span><span class="s1">dask_key_name=key)</span>
+                <span class="s0">for </span><span class="s1">o</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">l </span><span class="s0">in </span><span class="s1">zip(offset</span><span class="s0">, </span><span class="s1">keys</span><span class="s0">, </span><span class="s1">length)</span>
+            <span class="s1">]</span>
+            <span class="s1">out.extend(values)</span>
+
+        <span class="s0">return </span><span class="s1">from_delayed(out)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">files = open_files(urlpath</span><span class="s0">, </span><span class="s1">compression=compression</span><span class="s0">, </span><span class="s1">**storage_options)</span>
+        <span class="s1">dread = delayed(read_file)</span>
+        <span class="s1">chunks = [dread(fo) </span><span class="s0">for </span><span class="s1">fo </span><span class="s0">in </span><span class="s1">files]</span>
+        <span class="s0">return </span><span class="s1">from_delayed(chunks)</span>
+
+
+<span class="s0">def </span><span class="s1">read_chunk(fobj</span><span class="s0">, </span><span class="s1">off</span><span class="s0">, </span><span class="s1">l</span><span class="s0">, </span><span class="s1">head):</span>
+    <span class="s4">&quot;&quot;&quot;Get rows from raw bytes block&quot;&quot;&quot;</span>
+    <span class="s0">import </span><span class="s1">fastavro</span>
+
+    <span class="s0">if </span><span class="s1">hasattr(fastavro</span><span class="s0">, </span><span class="s5">&quot;iter_avro&quot;</span><span class="s1">):</span>
+        <span class="s1">reader = fastavro.iter_avro</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">reader = fastavro.reader</span>
+
+    <span class="s0">with </span><span class="s1">fobj </span><span class="s0">as </span><span class="s1">f:</span>
+        <span class="s1">chunk = read_block(f</span><span class="s0">, </span><span class="s1">off</span><span class="s0">, </span><span class="s1">l</span><span class="s0">, </span><span class="s1">head[</span><span class="s5">&quot;sync&quot;</span><span class="s1">])</span>
+    <span class="s1">head_bytes = head[</span><span class="s5">&quot;head_bytes&quot;</span><span class="s1">]</span>
+    <span class="s0">if not </span><span class="s1">chunk.startswith(MAGIC):</span>
+        <span class="s1">chunk = head_bytes + chunk</span>
+    <span class="s1">i = io.BytesIO(chunk)</span>
+    <span class="s0">return </span><span class="s1">list(reader(i))</span>
+
+
+<span class="s0">def </span><span class="s1">read_file(fo):</span>
+    <span class="s4">&quot;&quot;&quot;Get rows from file-like&quot;&quot;&quot;</span>
+    <span class="s0">import </span><span class="s1">fastavro</span>
+
+    <span class="s0">if </span><span class="s1">hasattr(fastavro</span><span class="s0">, </span><span class="s5">&quot;iter_avro&quot;</span><span class="s1">):</span>
+        <span class="s1">reader = fastavro.iter_avro</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">reader = fastavro.reader</span>
+
+    <span class="s0">with </span><span class="s1">fo </span><span class="s0">as </span><span class="s1">f:</span>
+        <span class="s0">return </span><span class="s1">list(reader(f))</span>
+
+
+<span class="s0">def </span><span class="s1">to_avro(</span>
+    <span class="s1">b</span><span class="s0">,</span>
+    <span class="s1">filename</span><span class="s0">,</span>
+    <span class="s1">schema</span><span class="s0">,</span>
+    <span class="s1">name_function=</span><span class="s0">None,</span>
+    <span class="s1">storage_options=</span><span class="s0">None,</span>
+    <span class="s1">codec=</span><span class="s5">&quot;null&quot;</span><span class="s0">,</span>
+    <span class="s1">sync_interval=</span><span class="s3">16000</span><span class="s0">,</span>
+    <span class="s1">metadata=</span><span class="s0">None,</span>
+    <span class="s1">compute=</span><span class="s0">True,</span>
+    <span class="s1">**kwargs</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s4">&quot;&quot;&quot;Write bag to set of avro files 
+ 
+    The schema is a complex dictionary describing the data, see 
+    https://avro.apache.org/docs/1.8.2/gettingstartedpython.html#Defining+a+schema 
+    and https://fastavro.readthedocs.io/en/latest/writer.html . 
+    It's structure is as follows:: 
+ 
+        {'name': 'Test', 
+         'namespace': 'Test', 
+         'doc': 'Descriptive text', 
+         'type': 'record', 
+         'fields': [ 
+            {'name': 'a', 'type': 'int'}, 
+         ]} 
+ 
+    where the &quot;name&quot; field is required, but &quot;namespace&quot; and &quot;doc&quot; are optional 
+    descriptors; &quot;type&quot; must always be &quot;record&quot;. The list of fields should 
+    have an entry for every key of the input records, and the types are 
+    like the primitive, complex or logical types of the Avro spec 
+    ( https://avro.apache.org/docs/1.8.2/spec.html ). 
+ 
+    Results in one avro file per input partition. 
+ 
+    Parameters 
+    ---------- 
+    b: dask.bag.Bag 
+    filename: list of str or str 
+        Filenames to write to. If a list, number must match the number of 
+        partitions. If a string, must include a glob character &quot;*&quot;, which will 
+        be expanded using name_function 
+    schema: dict 
+        Avro schema dictionary, see above 
+    name_function: None or callable 
+        Expands integers into strings, see 
+        ``dask.bytes.utils.build_name_function`` 
+    storage_options: None or dict 
+        Extra key/value options to pass to the backend file-system 
+    codec: 'null', 'deflate', or 'snappy' 
+        Compression algorithm 
+    sync_interval: int 
+        Number of records to include in each block within a file 
+    metadata: None or dict 
+        Included in the file header 
+    compute: bool 
+        If True, files are written immediately, and function blocks. If False, 
+        returns delayed objects, which can be computed by the user where 
+        convenient. 
+    kwargs: passed to compute(), if compute=True 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import dask.bag as db 
+    &gt;&gt;&gt; b = db.from_sequence([{'name': 'Alice', 'value': 100}, 
+    ...                       {'name': 'Bob', 'value': 200}]) 
+    &gt;&gt;&gt; schema = {'name': 'People', 'doc': &quot;Set of people's scores&quot;, 
+    ...           'type': 'record', 
+    ...           'fields': [ 
+    ...               {'name': 'name', 'type': 'string'}, 
+    ...               {'name': 'value', 'type': 'int'}]} 
+    &gt;&gt;&gt; b.to_avro('my-data.*.avro', schema)  # doctest: +SKIP 
+    ['my-data.0.avro', 'my-data.1.avro'] 
+    &quot;&quot;&quot;</span>
+    <span class="s6"># TODO infer schema from first partition of data</span>
+    <span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">import_required</span>
+
+    <span class="s1">import_required(</span>
+        <span class="s5">&quot;fastavro&quot;</span><span class="s0">, </span><span class="s5">&quot;fastavro is a required dependency for using bag.to_avro().&quot;</span>
+    <span class="s1">)</span>
+    <span class="s1">_verify_schema(schema)</span>
+
+    <span class="s1">storage_options = storage_options </span><span class="s0">or </span><span class="s1">{}</span>
+    <span class="s1">files = open_files(</span>
+        <span class="s1">filename</span><span class="s0">,</span>
+        <span class="s5">&quot;wb&quot;</span><span class="s0">,</span>
+        <span class="s1">name_function=name_function</span><span class="s0">,</span>
+        <span class="s1">num=b.npartitions</span><span class="s0">,</span>
+        <span class="s1">**storage_options</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">name = </span><span class="s5">&quot;to-avro-&quot; </span><span class="s1">+ uuid.uuid4().hex</span>
+    <span class="s1">dsk = {</span>
+        <span class="s1">(name</span><span class="s0">, </span><span class="s1">i): (</span>
+            <span class="s1">_write_avro_part</span><span class="s0">,</span>
+            <span class="s1">(b.name</span><span class="s0">, </span><span class="s1">i)</span><span class="s0">,</span>
+            <span class="s1">f</span><span class="s0">,</span>
+            <span class="s1">schema</span><span class="s0">,</span>
+            <span class="s1">codec</span><span class="s0">,</span>
+            <span class="s1">sync_interval</span><span class="s0">,</span>
+            <span class="s1">metadata</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">f </span><span class="s0">in </span><span class="s1">enumerate(files)</span>
+    <span class="s1">}</span>
+    <span class="s1">graph = HighLevelGraph.from_collections(name</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">dependencies=[b])</span>
+    <span class="s1">out = type(b)(graph</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">b.npartitions)</span>
+    <span class="s0">if </span><span class="s1">compute:</span>
+        <span class="s1">out.compute(**kwargs)</span>
+        <span class="s0">return </span><span class="s1">[f.path </span><span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">files]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">out.to_delayed()</span>
+
+
+<span class="s0">def </span><span class="s1">_verify_schema(s):</span>
+    <span class="s0">assert </span><span class="s1">isinstance(s</span><span class="s0">, </span><span class="s1">dict)</span><span class="s0">, </span><span class="s5">&quot;Schema must be dictionary&quot;</span>
+    <span class="s0">for </span><span class="s1">field </span><span class="s0">in </span><span class="s1">[</span><span class="s5">&quot;name&quot;</span><span class="s0">, </span><span class="s5">&quot;type&quot;</span><span class="s0">, </span><span class="s5">&quot;fields&quot;</span><span class="s1">]:</span>
+        <span class="s0">assert </span><span class="s1">field </span><span class="s0">in </span><span class="s1">s</span><span class="s0">, </span><span class="s5">&quot;Schema missing '%s' field&quot; </span><span class="s1">% field</span>
+    <span class="s0">assert </span><span class="s1">s[</span><span class="s5">&quot;type&quot;</span><span class="s1">] == </span><span class="s5">&quot;record&quot;</span><span class="s0">, </span><span class="s5">&quot;Schema must be of type 'record'&quot;</span>
+    <span class="s0">assert </span><span class="s1">isinstance(s[</span><span class="s5">&quot;fields&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s1">list)</span><span class="s0">, </span><span class="s5">&quot;Fields entry must be a list&quot;</span>
+    <span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">s[</span><span class="s5">&quot;fields&quot;</span><span class="s1">]:</span>
+        <span class="s0">assert </span><span class="s5">&quot;name&quot; </span><span class="s0">in </span><span class="s1">f </span><span class="s0">and </span><span class="s5">&quot;type&quot; </span><span class="s0">in </span><span class="s1">f</span><span class="s0">, </span><span class="s5">&quot;Field spec incomplete: %s&quot; </span><span class="s1">% f</span>
+
+
+<span class="s0">def </span><span class="s1">_write_avro_part(part</span><span class="s0">, </span><span class="s1">f</span><span class="s0">, </span><span class="s1">schema</span><span class="s0">, </span><span class="s1">codec</span><span class="s0">, </span><span class="s1">sync_interval</span><span class="s0">, </span><span class="s1">metadata):</span>
+    <span class="s4">&quot;&quot;&quot;Create single avro file from list of dictionaries&quot;&quot;&quot;</span>
+    <span class="s0">import </span><span class="s1">fastavro</span>
+
+    <span class="s0">with </span><span class="s1">f </span><span class="s0">as </span><span class="s1">f:</span>
+        <span class="s1">fastavro.writer(f</span><span class="s0">, </span><span class="s1">schema</span><span class="s0">, </span><span class="s1">part</span><span class="s0">, </span><span class="s1">codec</span><span class="s0">, </span><span class="s1">sync_interval</span><span class="s0">, </span><span class="s1">metadata)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,574 @@
+<html>
+<head>
+<title>graph_manipulation.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+graph_manipulation.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Tools to modify already existing dask graphs. Unlike in :mod:`dask.optimization`, the 
+output collections produced by this module are typically not functionally equivalent to 
+their inputs. 
+&quot;&quot;&quot;</span>
+<span class="s2">from </span><span class="s1">__future__ </span><span class="s2">import </span><span class="s1">annotations</span>
+
+<span class="s2">import </span><span class="s1">uuid</span>
+<span class="s2">from </span><span class="s1">collections.abc </span><span class="s2">import </span><span class="s1">Callable</span><span class="s2">, </span><span class="s1">Hashable</span>
+<span class="s2">from </span><span class="s1">typing </span><span class="s2">import </span><span class="s1">Literal</span><span class="s2">, </span><span class="s1">TypeVar</span>
+
+<span class="s2">from </span><span class="s1">dask.base </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">clone_key</span><span class="s2">,</span>
+    <span class="s1">get_collection_names</span><span class="s2">,</span>
+    <span class="s1">get_name_from_key</span><span class="s2">,</span>
+    <span class="s1">replace_name_in_key</span><span class="s2">,</span>
+    <span class="s1">tokenize</span><span class="s2">,</span>
+    <span class="s1">unpack_collections</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s2">from </span><span class="s1">dask.blockwise </span><span class="s2">import </span><span class="s1">blockwise</span>
+<span class="s2">from </span><span class="s1">dask.core </span><span class="s2">import </span><span class="s1">flatten</span>
+<span class="s2">from </span><span class="s1">dask.delayed </span><span class="s2">import </span><span class="s1">Delayed</span><span class="s2">, </span><span class="s1">delayed</span>
+<span class="s2">from </span><span class="s1">dask.highlevelgraph </span><span class="s2">import </span><span class="s1">HighLevelGraph</span><span class="s2">, </span><span class="s1">Layer</span><span class="s2">, </span><span class="s1">MaterializedLayer</span>
+<span class="s2">from </span><span class="s1">dask.typing </span><span class="s2">import </span><span class="s1">Graph</span><span class="s2">, </span><span class="s1">Key</span>
+
+<span class="s1">__all__ = (</span><span class="s3">&quot;bind&quot;</span><span class="s2">, </span><span class="s3">&quot;checkpoint&quot;</span><span class="s2">, </span><span class="s3">&quot;clone&quot;</span><span class="s2">, </span><span class="s3">&quot;wait_on&quot;</span><span class="s1">)</span>
+
+<span class="s1">T = TypeVar(</span><span class="s3">&quot;T&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">checkpoint(</span>
+    <span class="s1">*collections</span><span class="s2">,</span>
+    <span class="s1">split_every: float | Literal[</span><span class="s2">False</span><span class="s1">] | </span><span class="s2">None </span><span class="s1">= </span><span class="s2">None,</span>
+<span class="s1">) -&gt; Delayed:</span>
+    <span class="s0">&quot;&quot;&quot;Build a :doc:`delayed` which waits until all chunks of the input collection(s) 
+    have been computed before returning None. 
+ 
+    Parameters 
+    ---------- 
+    collections 
+        Zero or more Dask collections or nested data structures containing zero or more 
+        collections 
+    split_every: int &gt;= 2 or False, optional 
+        Determines the depth of the recursive aggregation. If greater than the number of 
+        input keys, the aggregation will be performed in multiple steps; the depth of 
+        the aggregation graph will be :math:`log_{split_every}(input keys)`. Setting to 
+        a low value can reduce cache size and network transfers, at the cost of more CPU 
+        and a larger dask graph. 
+ 
+        Set to False to disable. Defaults to 8. 
+ 
+    Returns 
+    ------- 
+    :doc:`delayed` yielding None 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">split_every </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">split_every = </span><span class="s4">8</span>
+    <span class="s2">elif </span><span class="s1">split_every </span><span class="s2">is not False</span><span class="s1">:</span>
+        <span class="s1">split_every = int(split_every)</span>
+        <span class="s2">if </span><span class="s1">split_every &lt; </span><span class="s4">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;split_every must be False, None, or &gt;= 2&quot;</span><span class="s1">)</span>
+
+    <span class="s1">collections</span><span class="s2">, </span><span class="s1">_ = unpack_collections(*collections)</span>
+    <span class="s2">if </span><span class="s1">len(collections) == </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">_checkpoint_one(collections[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">split_every)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">delayed(chunks.checkpoint)(</span>
+            <span class="s1">*(_checkpoint_one(c</span><span class="s2">, </span><span class="s1">split_every) </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">collections)</span>
+        <span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_checkpoint_one(collection</span><span class="s2">, </span><span class="s1">split_every) -&gt; Delayed:</span>
+    <span class="s1">tok = tokenize(collection)</span>
+    <span class="s1">name = </span><span class="s3">&quot;checkpoint-&quot; </span><span class="s1">+ tok</span>
+
+    <span class="s1">keys_iter = flatten(collection.__dask_keys__())</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">next(keys_iter)</span>
+        <span class="s1">next(keys_iter)</span>
+    <span class="s2">except </span><span class="s1">StopIteration:</span>
+        <span class="s5"># Collection has 0 or 1 keys; no need for a map step</span>
+        <span class="s1">layer: Graph = {name: (chunks.checkpoint</span><span class="s2">, </span><span class="s1">collection.__dask_keys__())}</span>
+        <span class="s1">dsk = HighLevelGraph.from_collections(name</span><span class="s2">, </span><span class="s1">layer</span><span class="s2">, </span><span class="s1">dependencies=(collection</span><span class="s2">,</span><span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">Delayed(name</span><span class="s2">, </span><span class="s1">dsk)</span>
+
+    <span class="s5"># Collection has 2+ keys; apply a two-step map-&gt;reduce algorithm so that we</span>
+    <span class="s5"># transfer over the network and store in RAM only a handful of None's instead of</span>
+    <span class="s5"># the full computed collection's contents</span>
+    <span class="s1">dsks = []</span>
+    <span class="s1">map_names = set()</span>
+    <span class="s1">map_keys = []</span>
+
+    <span class="s2">for </span><span class="s1">prev_name </span><span class="s2">in </span><span class="s1">get_collection_names(collection):</span>
+        <span class="s1">map_name = </span><span class="s3">&quot;checkpoint_map-&quot; </span><span class="s1">+ tokenize(prev_name</span><span class="s2">, </span><span class="s1">tok)</span>
+        <span class="s1">map_names.add(map_name)</span>
+        <span class="s1">map_layer = _build_map_layer(chunks.checkpoint</span><span class="s2">, </span><span class="s1">prev_name</span><span class="s2">, </span><span class="s1">map_name</span><span class="s2">, </span><span class="s1">collection)</span>
+        <span class="s1">map_keys += list(map_layer.get_output_keys())</span>
+        <span class="s1">dsks.append(</span>
+            <span class="s1">HighLevelGraph.from_collections(</span>
+                <span class="s1">map_name</span><span class="s2">, </span><span class="s1">map_layer</span><span class="s2">, </span><span class="s1">dependencies=(collection</span><span class="s2">,</span><span class="s1">)</span>
+            <span class="s1">)</span>
+        <span class="s1">)</span>
+
+    <span class="s5"># recursive aggregation</span>
+    <span class="s1">reduce_layer: dict = {}</span>
+    <span class="s2">while </span><span class="s1">split_every </span><span class="s2">and </span><span class="s1">len(map_keys) &gt; split_every:</span>
+        <span class="s1">k = (name</span><span class="s2">, </span><span class="s1">len(reduce_layer))</span>
+        <span class="s1">reduce_layer[k] = (chunks.checkpoint</span><span class="s2">, </span><span class="s1">map_keys[:split_every])</span>
+        <span class="s1">map_keys = map_keys[split_every:] + [k]</span>
+    <span class="s1">reduce_layer[name] = (chunks.checkpoint</span><span class="s2">, </span><span class="s1">map_keys)</span>
+
+    <span class="s1">dsks.append(HighLevelGraph({name: reduce_layer}</span><span class="s2">, </span><span class="s1">dependencies={name: map_names}))</span>
+    <span class="s1">dsk = HighLevelGraph.merge(*dsks)</span>
+
+    <span class="s2">return </span><span class="s1">Delayed(name</span><span class="s2">, </span><span class="s1">dsk)</span>
+
+
+<span class="s2">def </span><span class="s1">_can_apply_blockwise(collection) -&gt; bool:</span>
+    <span class="s0">&quot;&quot;&quot;Return True if _map_blocks can be sped up via blockwise operations; False 
+    otherwise. 
+ 
+    FIXME this returns False for collections that wrap around around da.Array, such as 
+          pint.Quantity, xarray DataArray, Dataset, and Variable. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">from </span><span class="s1">dask.bag </span><span class="s2">import </span><span class="s1">Bag</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(collection</span><span class="s2">, </span><span class="s1">Bag):</span>
+            <span class="s2">return True</span>
+    <span class="s2">except </span><span class="s1">ImportError:</span>
+        <span class="s2">pass</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">from </span><span class="s1">dask.array </span><span class="s2">import </span><span class="s1">Array</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(collection</span><span class="s2">, </span><span class="s1">Array):</span>
+            <span class="s2">return True</span>
+    <span class="s2">except </span><span class="s1">ImportError:</span>
+        <span class="s2">pass</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">from </span><span class="s1">dask.dataframe </span><span class="s2">import </span><span class="s1">DataFrame</span><span class="s2">, </span><span class="s1">Series</span>
+
+        <span class="s2">return </span><span class="s1">isinstance(collection</span><span class="s2">, </span><span class="s1">(DataFrame</span><span class="s2">, </span><span class="s1">Series))</span>
+    <span class="s2">except </span><span class="s1">ImportError:</span>
+        <span class="s2">return False</span>
+
+
+<span class="s2">def </span><span class="s1">_build_map_layer(</span>
+    <span class="s1">func: Callable</span><span class="s2">,</span>
+    <span class="s1">prev_name: str</span><span class="s2">,</span>
+    <span class="s1">new_name: str</span><span class="s2">,</span>
+    <span class="s1">collection</span><span class="s2">,</span>
+    <span class="s1">dependencies: tuple[Delayed</span><span class="s2">, </span><span class="s1">...] = ()</span><span class="s2">,</span>
+<span class="s1">) -&gt; Layer:</span>
+    <span class="s0">&quot;&quot;&quot;Apply func to all keys of collection. Create a Blockwise layer whenever possible; 
+    fall back to MaterializedLayer otherwise. 
+ 
+    Parameters 
+    ---------- 
+    func 
+        Callable to be invoked on the graph node 
+    prev_name : str 
+        name of the layer to map from; in case of dask base collections, this is the 
+        collection name. Note how third-party collections, e.g. xarray.Dataset, can 
+        have multiple names. 
+    new_name : str 
+        name of the layer to map to 
+    collection 
+        Arbitrary dask collection 
+    dependencies 
+        Zero or more Delayed objects, which will be passed as arbitrary variadic args to 
+        func after the collection's chunk 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">_can_apply_blockwise(collection):</span>
+        <span class="s5"># Use a Blockwise layer</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">numblocks = collection.numblocks</span>
+        <span class="s2">except </span><span class="s1">AttributeError:</span>
+            <span class="s1">numblocks = (collection.npartitions</span><span class="s2">,</span><span class="s1">)</span>
+        <span class="s1">indices = tuple(i </span><span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">enumerate(numblocks))</span>
+        <span class="s1">kwargs = {</span><span class="s3">&quot;_deps&quot;</span><span class="s1">: [d.key </span><span class="s2">for </span><span class="s1">d </span><span class="s2">in </span><span class="s1">dependencies]} </span><span class="s2">if </span><span class="s1">dependencies </span><span class="s2">else </span><span class="s1">{}</span>
+
+        <span class="s2">return </span><span class="s1">blockwise(</span>
+            <span class="s1">func</span><span class="s2">,</span>
+            <span class="s1">new_name</span><span class="s2">,</span>
+            <span class="s1">indices</span><span class="s2">,</span>
+            <span class="s1">prev_name</span><span class="s2">,</span>
+            <span class="s1">indices</span><span class="s2">,</span>
+            <span class="s1">numblocks={prev_name: numblocks}</span><span class="s2">,</span>
+            <span class="s1">dependencies=dependencies</span><span class="s2">,</span>
+            <span class="s1">**kwargs</span><span class="s2">,</span>
+        <span class="s1">)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s5"># Delayed, bag.Item, dataframe.core.Scalar, or third-party collection;</span>
+        <span class="s5"># fall back to MaterializedLayer</span>
+        <span class="s1">dep_keys = tuple(d.key </span><span class="s2">for </span><span class="s1">d </span><span class="s2">in </span><span class="s1">dependencies)</span>
+        <span class="s2">return </span><span class="s1">MaterializedLayer(</span>
+            <span class="s1">{</span>
+                <span class="s1">replace_name_in_key(k</span><span class="s2">, </span><span class="s1">{prev_name: new_name}): (func</span><span class="s2">, </span><span class="s1">k) + dep_keys</span>
+                <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">flatten(collection.__dask_keys__())</span>
+                <span class="s2">if </span><span class="s1">get_name_from_key(k) == prev_name</span>
+            <span class="s1">}</span>
+        <span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">bind(</span>
+    <span class="s1">children: T</span><span class="s2">,</span>
+    <span class="s1">parents</span><span class="s2">,</span>
+    <span class="s1">*</span><span class="s2">,</span>
+    <span class="s1">omit=</span><span class="s2">None,</span>
+    <span class="s1">seed: Hashable | </span><span class="s2">None </span><span class="s1">= </span><span class="s2">None,</span>
+    <span class="s1">assume_layers: bool = </span><span class="s2">True,</span>
+    <span class="s1">split_every: float | Literal[</span><span class="s2">False</span><span class="s1">] | </span><span class="s2">None </span><span class="s1">= </span><span class="s2">None,</span>
+<span class="s1">) -&gt; T:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Make ``children`` collection(s), optionally omitting sub-collections, dependent on 
+    ``parents`` collection(s). Two examples follow. 
+ 
+    The first example creates an array ``b2`` whose computation first computes an array 
+    ``a`` completely and then computes ``b`` completely, recomputing ``a`` in the 
+    process: 
+ 
+    &gt;&gt;&gt; import dask 
+    &gt;&gt;&gt; import dask.array as da 
+    &gt;&gt;&gt; a = da.ones(4, chunks=2) 
+    &gt;&gt;&gt; b = a + 1 
+    &gt;&gt;&gt; b2 = bind(b, a) 
+    &gt;&gt;&gt; len(b2.dask) 
+    9 
+    &gt;&gt;&gt; b2.compute() 
+    array([2., 2., 2., 2.]) 
+ 
+    The second example creates arrays ``b3`` and ``c3``, whose computation first 
+    computes an array ``a`` and then computes the additions, this time not 
+    recomputing ``a`` in the process: 
+ 
+    &gt;&gt;&gt; c = a + 2 
+    &gt;&gt;&gt; b3, c3 = bind((b, c), a, omit=a) 
+    &gt;&gt;&gt; len(b3.dask), len(c3.dask) 
+    (7, 7) 
+    &gt;&gt;&gt; dask.compute(b3, c3) 
+    (array([2., 2., 2., 2.]), array([3., 3., 3., 3.])) 
+ 
+    Parameters 
+    ---------- 
+    children 
+        Dask collection or nested structure of Dask collections 
+    parents 
+        Dask collection or nested structure of Dask collections 
+    omit 
+        Dask collection or nested structure of Dask collections 
+    seed 
+        Hashable used to seed the key regeneration. Omit to default to a random number 
+        that will produce different keys at every call. 
+    assume_layers 
+        True 
+            Use a fast algorithm that works at layer level, which assumes that all 
+            collections in ``children`` and ``omit`` 
+ 
+            #. use :class:`~dask.highlevelgraph.HighLevelGraph`, 
+            #. define the ``__dask_layers__()`` method, and 
+            #. never had their graphs squashed and rebuilt between the creation of the 
+               ``omit`` collections and the ``children`` collections; in other words if 
+               the keys of the ``omit`` collections can be found among the keys of the 
+               ``children`` collections, then the same must also hold true for the 
+               layers. 
+        False 
+            Use a slower algorithm that works at keys level, which makes none of the 
+            above assumptions. 
+    split_every 
+        See :func:`checkpoint` 
+ 
+    Returns 
+    ------- 
+    Same as ``children`` 
+        Dask collection or structure of dask collection equivalent to ``children``, 
+        which compute to the same values. All nodes of ``children`` will be regenerated, 
+        up to and excluding the nodes of ``omit``. Nodes immediately above ``omit``, or 
+        the leaf nodes if the collections in ``omit`` are not found, are prevented from 
+        computing until all collections in ``parents`` have been fully computed. 
+        The keys of the regenerated nodes will be different from the original ones, so 
+        that they can be used within the same graph. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">seed </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">seed = uuid.uuid4().bytes</span>
+
+    <span class="s5"># parents=None is a special case invoked by the one-liner wrapper clone() below</span>
+    <span class="s1">blocker = (</span>
+        <span class="s1">checkpoint(parents</span><span class="s2">, </span><span class="s1">split_every=split_every) </span><span class="s2">if </span><span class="s1">parents </span><span class="s2">is not None else None</span>
+    <span class="s1">)</span>
+
+    <span class="s1">omit</span><span class="s2">, </span><span class="s1">_ = unpack_collections(omit)</span>
+    <span class="s2">if </span><span class="s1">assume_layers:</span>
+        <span class="s5"># Set of all the top-level layers of the collections in omit</span>
+        <span class="s1">omit_layers = {layer </span><span class="s2">for </span><span class="s1">coll </span><span class="s2">in </span><span class="s1">omit </span><span class="s2">for </span><span class="s1">layer </span><span class="s2">in </span><span class="s1">coll.__dask_layers__()}</span>
+        <span class="s1">omit_keys = set()</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">omit_layers = set()</span>
+        <span class="s5"># Set of *all* the keys, not just the top-level ones, of the collections in omit</span>
+        <span class="s1">omit_keys = {key </span><span class="s2">for </span><span class="s1">coll </span><span class="s2">in </span><span class="s1">omit </span><span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">coll.__dask_graph__()}</span>
+
+    <span class="s1">unpacked_children</span><span class="s2">, </span><span class="s1">repack = unpack_collections(children)</span>
+    <span class="s2">return </span><span class="s1">repack(</span>
+        <span class="s1">[</span>
+            <span class="s1">_bind_one(child</span><span class="s2">, </span><span class="s1">blocker</span><span class="s2">, </span><span class="s1">omit_layers</span><span class="s2">, </span><span class="s1">omit_keys</span><span class="s2">, </span><span class="s1">seed)</span>
+            <span class="s2">for </span><span class="s1">child </span><span class="s2">in </span><span class="s1">unpacked_children</span>
+        <span class="s1">]</span>
+    <span class="s1">)[</span><span class="s4">0</span><span class="s1">]</span>
+
+
+<span class="s2">def </span><span class="s1">_bind_one(</span>
+    <span class="s1">child: T</span><span class="s2">,</span>
+    <span class="s1">blocker: Delayed | </span><span class="s2">None,</span>
+    <span class="s1">omit_layers: set[str]</span><span class="s2">,</span>
+    <span class="s1">omit_keys: set[Key]</span><span class="s2">,</span>
+    <span class="s1">seed: Hashable</span><span class="s2">,</span>
+<span class="s1">) -&gt; T:</span>
+    <span class="s1">prev_coll_names = get_collection_names(child)</span>
+    <span class="s2">if not </span><span class="s1">prev_coll_names:</span>
+        <span class="s5"># Collection with no keys; this is a legitimate use case but, at the moment of</span>
+        <span class="s5"># writing, can only happen with third-party collections</span>
+        <span class="s2">return </span><span class="s1">child</span>
+
+    <span class="s1">dsk = child.__dask_graph__()  </span><span class="s5"># type: ignore</span>
+    <span class="s1">new_layers: dict[str</span><span class="s2">, </span><span class="s1">Layer] = {}</span>
+    <span class="s1">new_deps: dict[str</span><span class="s2">, </span><span class="s1">set[str]] = {}</span>
+
+    <span class="s2">if </span><span class="s1">isinstance(dsk</span><span class="s2">, </span><span class="s1">HighLevelGraph):</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">layers_to_clone = set(child.__dask_layers__())  </span><span class="s5"># type: ignore</span>
+        <span class="s2">except </span><span class="s1">AttributeError:</span>
+            <span class="s1">layers_to_clone = prev_coll_names.copy()</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">if </span><span class="s1">len(prev_coll_names) == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">hlg_name = next(iter(prev_coll_names))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">hlg_name = tokenize(*prev_coll_names)</span>
+        <span class="s1">dsk = HighLevelGraph.from_collections(hlg_name</span><span class="s2">, </span><span class="s1">dsk)</span>
+        <span class="s1">layers_to_clone = {hlg_name}</span>
+
+    <span class="s1">clone_keys = dsk.get_all_external_keys() - omit_keys</span>
+    <span class="s2">for </span><span class="s1">layer_name </span><span class="s2">in </span><span class="s1">omit_layers:</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">layer = dsk.layers[layer_name]</span>
+        <span class="s2">except </span><span class="s1">KeyError:</span>
+            <span class="s2">continue</span>
+        <span class="s1">clone_keys -= layer.get_output_keys()</span>
+    <span class="s5"># Note: when assume_layers=True, clone_keys can contain keys of the omit collections</span>
+    <span class="s5"># that are not top-level. This is OK, as they will never be encountered inside the</span>
+    <span class="s5"># values of their dependent layers.</span>
+
+    <span class="s2">if </span><span class="s1">blocker </span><span class="s2">is not None</span><span class="s1">:</span>
+        <span class="s1">blocker_key = blocker.key</span>
+        <span class="s1">blocker_dsk = blocker.__dask_graph__()</span>
+        <span class="s2">assert </span><span class="s1">isinstance(blocker_dsk</span><span class="s2">, </span><span class="s1">HighLevelGraph)</span>
+        <span class="s1">new_layers.update(blocker_dsk.layers)</span>
+        <span class="s1">new_deps.update(blocker_dsk.dependencies)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">blocker_key = </span><span class="s2">None</span>
+
+    <span class="s1">layers_to_copy_verbatim = set()</span>
+
+    <span class="s2">while </span><span class="s1">layers_to_clone:</span>
+        <span class="s1">prev_layer_name = layers_to_clone.pop()</span>
+        <span class="s1">new_layer_name = clone_key(prev_layer_name</span><span class="s2">, </span><span class="s1">seed=seed)</span>
+        <span class="s2">if </span><span class="s1">new_layer_name </span><span class="s2">in </span><span class="s1">new_layers:</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">layer = dsk.layers[prev_layer_name]</span>
+        <span class="s1">layer_deps = dsk.dependencies[prev_layer_name]</span>
+        <span class="s1">layer_deps_to_clone = layer_deps - omit_layers</span>
+        <span class="s1">layer_deps_to_omit = layer_deps &amp; omit_layers</span>
+        <span class="s1">layers_to_clone |= layer_deps_to_clone</span>
+        <span class="s1">layers_to_copy_verbatim |= layer_deps_to_omit</span>
+
+        <span class="s1">new_layers[new_layer_name]</span><span class="s2">, </span><span class="s1">is_bound = layer.clone(</span>
+            <span class="s1">keys=clone_keys</span><span class="s2">, </span><span class="s1">seed=seed</span><span class="s2">, </span><span class="s1">bind_to=blocker_key</span>
+        <span class="s1">)</span>
+        <span class="s1">new_dep = {</span>
+            <span class="s1">clone_key(dep</span><span class="s2">, </span><span class="s1">seed=seed) </span><span class="s2">for </span><span class="s1">dep </span><span class="s2">in </span><span class="s1">layer_deps_to_clone</span>
+        <span class="s1">} | layer_deps_to_omit</span>
+        <span class="s2">if </span><span class="s1">is_bound:</span>
+            <span class="s1">new_dep.add(blocker_key)</span>
+        <span class="s1">new_deps[new_layer_name] = new_dep</span>
+
+    <span class="s5"># Add the layers of the collections from omit from child.dsk. Note that, when</span>
+    <span class="s5"># assume_layers=False, it would be unsafe to simply do HighLevelGraph.merge(dsk,</span>
+    <span class="s5"># omit[i].dsk). Also, collections in omit may or may not be parents of this specific</span>
+    <span class="s5"># child, or of any children at all.</span>
+    <span class="s2">while </span><span class="s1">layers_to_copy_verbatim:</span>
+        <span class="s1">layer_name = layers_to_copy_verbatim.pop()</span>
+        <span class="s2">if </span><span class="s1">layer_name </span><span class="s2">in </span><span class="s1">new_layers:</span>
+            <span class="s2">continue</span>
+        <span class="s1">layer_deps = dsk.dependencies[layer_name]</span>
+        <span class="s1">layers_to_copy_verbatim |= layer_deps</span>
+        <span class="s1">new_deps[layer_name] = layer_deps</span>
+        <span class="s1">new_layers[layer_name] = dsk.layers[layer_name]</span>
+
+    <span class="s1">rebuild</span><span class="s2">, </span><span class="s1">args = child.__dask_postpersist__()  </span><span class="s5"># type: ignore</span>
+    <span class="s2">return </span><span class="s1">rebuild(</span>
+        <span class="s1">HighLevelGraph(new_layers</span><span class="s2">, </span><span class="s1">new_deps)</span><span class="s2">,</span>
+        <span class="s1">*args</span><span class="s2">,</span>
+        <span class="s1">rename={prev_name: clone_key(prev_name</span><span class="s2">, </span><span class="s1">seed) </span><span class="s2">for </span><span class="s1">prev_name </span><span class="s2">in </span><span class="s1">prev_coll_names}</span><span class="s2">,</span>
+    <span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">clone(*collections</span><span class="s2">, </span><span class="s1">omit=</span><span class="s2">None, </span><span class="s1">seed: Hashable = </span><span class="s2">None, </span><span class="s1">assume_layers: bool = </span><span class="s2">True</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Clone dask collections, returning equivalent collections that are generated from 
+    independent calculations. 
+ 
+    Examples 
+    -------- 
+    (tokens have been simplified for the sake of brevity) 
+ 
+    &gt;&gt;&gt; import dask.array as da 
+    &gt;&gt;&gt; x_i = da.asarray([1, 1, 1, 1], chunks=2) 
+    &gt;&gt;&gt; y_i = x_i + 1 
+    &gt;&gt;&gt; z_i = y_i + 2 
+    &gt;&gt;&gt; dict(z_i.dask)  # doctest: +SKIP 
+    {('array-1', 0): array([1, 1]), 
+     ('array-1', 1): array([1, 1]), 
+     ('add-2', 0): (&lt;function operator.add&gt;, ('array-1', 0), 1), 
+     ('add-2', 1): (&lt;function operator.add&gt;, ('array-1', 1), 1), 
+     ('add-3', 0): (&lt;function operator.add&gt;, ('add-2', 0), 1), 
+     ('add-3', 1): (&lt;function operator.add&gt;, ('add-2', 1), 1)} 
+    &gt;&gt;&gt; w_i = clone(z_i, omit=x_i) 
+    &gt;&gt;&gt; w_i.compute() 
+    array([4, 4, 4, 4]) 
+    &gt;&gt;&gt; dict(w_i.dask)  # doctest: +SKIP 
+    {('array-1', 0): array([1, 1]), 
+     ('array-1', 1): array([1, 1]), 
+     ('add-4', 0): (&lt;function operator.add&gt;, ('array-1', 0), 1), 
+     ('add-4', 1): (&lt;function operator.add&gt;, ('array-1', 1), 1), 
+     ('add-5', 0): (&lt;function operator.add&gt;, ('add-4', 0), 1), 
+     ('add-5', 1): (&lt;function operator.add&gt;, ('add-4', 1), 1)} 
+ 
+    The typical usage pattern for clone() is the following: 
+ 
+    &gt;&gt;&gt; x = cheap_computation_with_large_output()  # doctest: +SKIP 
+    &gt;&gt;&gt; y = expensive_and_long_computation(x)  # doctest: +SKIP 
+    &gt;&gt;&gt; z = wrap_up(clone(x), y)  # doctest: +SKIP 
+ 
+    In the above code, the chunks of x will be forgotten as soon as they are consumed by 
+    the chunks of y, and then they'll be regenerated from scratch at the very end of the 
+    computation. Without clone(), x would only be computed once and then kept in memory 
+    throughout the whole computation of y, needlessly consuming memory. 
+ 
+    Parameters 
+    ---------- 
+    collections 
+        Zero or more Dask collections or nested structures of Dask collections 
+    omit 
+        Dask collection or nested structure of Dask collections which will not be cloned 
+    seed 
+        See :func:`bind` 
+    assume_layers 
+        See :func:`bind` 
+ 
+    Returns 
+    ------- 
+    Same as ``collections`` 
+        Dask collections of the same type as the inputs, which compute to the same 
+        value, or nested structures equivalent to the inputs, where the original 
+        collections have been replaced. 
+        The keys of the regenerated nodes in the new collections will be different from 
+        the original ones, so that they can be used within the same graph. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">out = bind(</span>
+        <span class="s1">collections</span><span class="s2">, </span><span class="s1">parents=</span><span class="s2">None, </span><span class="s1">omit=omit</span><span class="s2">, </span><span class="s1">seed=seed</span><span class="s2">, </span><span class="s1">assume_layers=assume_layers</span>
+    <span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">out[</span><span class="s4">0</span><span class="s1">] </span><span class="s2">if </span><span class="s1">len(collections) == </span><span class="s4">1 </span><span class="s2">else </span><span class="s1">out</span>
+
+
+<span class="s2">def </span><span class="s1">wait_on(</span>
+    <span class="s1">*collections</span><span class="s2">,</span>
+    <span class="s1">split_every: float | Literal[</span><span class="s2">False</span><span class="s1">] | </span><span class="s2">None </span><span class="s1">= </span><span class="s2">None,</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Ensure that all chunks of all input collections have been computed before 
+    computing the dependents of any of the chunks. 
+ 
+    The following example creates a dask array ``u`` that, when used in a computation, 
+    will only proceed when all chunks of the array ``x`` have been computed, but 
+    otherwise matches ``x``: 
+ 
+    &gt;&gt;&gt; import dask.array as da 
+    &gt;&gt;&gt; x = da.ones(10, chunks=5) 
+    &gt;&gt;&gt; u = wait_on(x) 
+ 
+    The following example will create two arrays ``u`` and ``v`` that, when used in a 
+    computation, will only proceed when all chunks of the arrays ``x`` and ``y`` have 
+    been computed but otherwise match ``x`` and ``y``: 
+ 
+    &gt;&gt;&gt; x = da.ones(10, chunks=5) 
+    &gt;&gt;&gt; y = da.zeros(10, chunks=5) 
+    &gt;&gt;&gt; u, v = wait_on(x, y) 
+ 
+    Parameters 
+    ---------- 
+    collections 
+        Zero or more Dask collections or nested structures of Dask collections 
+    split_every 
+        See :func:`checkpoint` 
+ 
+    Returns 
+    ------- 
+    Same as ``collections`` 
+        Dask collection of the same type as the input, which computes to the same value, 
+        or a nested structure equivalent to the input where the original collections 
+        have been replaced. 
+        The keys of the regenerated nodes of the new collections will be different from 
+        the original ones, so that they can be used within the same graph. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">blocker = checkpoint(*collections</span><span class="s2">, </span><span class="s1">split_every=split_every)</span>
+
+    <span class="s2">def </span><span class="s1">block_one(coll):</span>
+        <span class="s1">tok = tokenize(coll</span><span class="s2">, </span><span class="s1">blocker)</span>
+        <span class="s1">dsks = []</span>
+        <span class="s1">rename = {}</span>
+        <span class="s2">for </span><span class="s1">prev_name </span><span class="s2">in </span><span class="s1">get_collection_names(coll):</span>
+            <span class="s1">new_name = </span><span class="s3">&quot;wait_on-&quot; </span><span class="s1">+ tokenize(prev_name</span><span class="s2">, </span><span class="s1">tok)</span>
+            <span class="s1">rename[prev_name] = new_name</span>
+            <span class="s1">layer = _build_map_layer(</span>
+                <span class="s1">chunks.bind</span><span class="s2">, </span><span class="s1">prev_name</span><span class="s2">, </span><span class="s1">new_name</span><span class="s2">, </span><span class="s1">coll</span><span class="s2">, </span><span class="s1">dependencies=(blocker</span><span class="s2">,</span><span class="s1">)</span>
+            <span class="s1">)</span>
+            <span class="s1">dsks.append(</span>
+                <span class="s1">HighLevelGraph.from_collections(</span>
+                    <span class="s1">new_name</span><span class="s2">, </span><span class="s1">layer</span><span class="s2">, </span><span class="s1">dependencies=(coll</span><span class="s2">, </span><span class="s1">blocker)</span>
+                <span class="s1">)</span>
+            <span class="s1">)</span>
+        <span class="s1">dsk = HighLevelGraph.merge(*dsks)</span>
+        <span class="s1">rebuild</span><span class="s2">, </span><span class="s1">args = coll.__dask_postpersist__()</span>
+        <span class="s2">return </span><span class="s1">rebuild(dsk</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">rename=rename)</span>
+
+    <span class="s1">unpacked</span><span class="s2">, </span><span class="s1">repack = unpack_collections(*collections)</span>
+    <span class="s1">out = repack([block_one(coll) </span><span class="s2">for </span><span class="s1">coll </span><span class="s2">in </span><span class="s1">unpacked])</span>
+    <span class="s2">return </span><span class="s1">out[</span><span class="s4">0</span><span class="s1">] </span><span class="s2">if </span><span class="s1">len(collections) == </span><span class="s4">1 </span><span class="s2">else </span><span class="s1">out</span>
+
+
+<span class="s2">class </span><span class="s1">chunks:</span>
+    <span class="s0">&quot;&quot;&quot;Callables to be inserted in the Dask graph&quot;&quot;&quot;</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">bind(node: T</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs) -&gt; T:</span>
+        <span class="s0">&quot;&quot;&quot;Dummy graph node of :func:`bind` and :func:`wait_on`. 
+        Wait for both node and all variadic args to complete; then return node. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">node</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">checkpoint(*args</span><span class="s2">, </span><span class="s1">**kwargs) -&gt; </span><span class="s2">None</span><span class="s1">:</span>
+        <span class="s0">&quot;&quot;&quot;Dummy graph node of :func:`checkpoint`. 
+        Wait for all variadic args to complete; then return None. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,1158 @@
+<html>
+<head>
+<title>emitter.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #a9b7c6;}
+.s1 { color: #808080;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+emitter.py</font>
+</center></td></tr></table>
+<pre>
+<span class="s1"># Emitter expects events obeying the following grammar:</span>
+<span class="s1"># stream ::= STREAM-START document* STREAM-END</span>
+<span class="s1"># document ::= DOCUMENT-START node DOCUMENT-END</span>
+<span class="s1"># node ::= SCALAR | sequence | mapping</span>
+<span class="s1"># sequence ::= SEQUENCE-START node* SEQUENCE-END</span>
+<span class="s1"># mapping ::= MAPPING-START (node node)* MAPPING-END</span>
+
+<span class="s0">__all__ = [</span><span class="s2">'Emitter'</span><span class="s3">, </span><span class="s2">'EmitterError'</span><span class="s0">]</span>
+
+<span class="s3">from </span><span class="s0">.error </span><span class="s3">import </span><span class="s0">YAMLError</span>
+<span class="s3">from </span><span class="s0">.events </span><span class="s3">import </span><span class="s0">*</span>
+
+<span class="s3">class </span><span class="s0">EmitterError(YAMLError):</span>
+    <span class="s3">pass</span>
+
+<span class="s3">class </span><span class="s0">ScalarAnalysis:</span>
+    <span class="s3">def </span><span class="s0">__init__(self</span><span class="s3">, </span><span class="s0">scalar</span><span class="s3">, </span><span class="s0">empty</span><span class="s3">, </span><span class="s0">multiline</span><span class="s3">,</span>
+            <span class="s0">allow_flow_plain</span><span class="s3">, </span><span class="s0">allow_block_plain</span><span class="s3">,</span>
+            <span class="s0">allow_single_quoted</span><span class="s3">, </span><span class="s0">allow_double_quoted</span><span class="s3">,</span>
+            <span class="s0">allow_block):</span>
+        <span class="s0">self.scalar = scalar</span>
+        <span class="s0">self.empty = empty</span>
+        <span class="s0">self.multiline = multiline</span>
+        <span class="s0">self.allow_flow_plain = allow_flow_plain</span>
+        <span class="s0">self.allow_block_plain = allow_block_plain</span>
+        <span class="s0">self.allow_single_quoted = allow_single_quoted</span>
+        <span class="s0">self.allow_double_quoted = allow_double_quoted</span>
+        <span class="s0">self.allow_block = allow_block</span>
+
+<span class="s3">class </span><span class="s0">Emitter:</span>
+
+    <span class="s0">DEFAULT_TAG_PREFIXES = {</span>
+        <span class="s2">'!' </span><span class="s0">: </span><span class="s2">'!'</span><span class="s3">,</span>
+        <span class="s2">'tag:yaml.org,2002:' </span><span class="s0">: </span><span class="s2">'!!'</span><span class="s3">,</span>
+    <span class="s0">}</span>
+
+    <span class="s3">def </span><span class="s0">__init__(self</span><span class="s3">, </span><span class="s0">stream</span><span class="s3">, </span><span class="s0">canonical=</span><span class="s3">None, </span><span class="s0">indent=</span><span class="s3">None, </span><span class="s0">width=</span><span class="s3">None,</span>
+            <span class="s0">allow_unicode=</span><span class="s3">None, </span><span class="s0">line_break=</span><span class="s3">None</span><span class="s0">):</span>
+
+        <span class="s1"># The stream should have the methods `write` and possibly `flush`.</span>
+        <span class="s0">self.stream = stream</span>
+
+        <span class="s1"># Encoding can be overridden by STREAM-START.</span>
+        <span class="s0">self.encoding = </span><span class="s3">None</span>
+
+        <span class="s1"># Emitter is a state machine with a stack of states to handle nested</span>
+        <span class="s1"># structures.</span>
+        <span class="s0">self.states = []</span>
+        <span class="s0">self.state = self.expect_stream_start</span>
+
+        <span class="s1"># Current event and the event queue.</span>
+        <span class="s0">self.events = []</span>
+        <span class="s0">self.event = </span><span class="s3">None</span>
+
+        <span class="s1"># The current indentation level and the stack of previous indents.</span>
+        <span class="s0">self.indents = []</span>
+        <span class="s0">self.indent = </span><span class="s3">None</span>
+
+        <span class="s1"># Flow level.</span>
+        <span class="s0">self.flow_level = </span><span class="s4">0</span>
+
+        <span class="s1"># Contexts.</span>
+        <span class="s0">self.root_context = </span><span class="s3">False</span>
+        <span class="s0">self.sequence_context = </span><span class="s3">False</span>
+        <span class="s0">self.mapping_context = </span><span class="s3">False</span>
+        <span class="s0">self.simple_key_context = </span><span class="s3">False</span>
+
+        <span class="s1"># Characteristics of the last emitted character:</span>
+        <span class="s1">#  - current position.</span>
+        <span class="s1">#  - is it a whitespace?</span>
+        <span class="s1">#  - is it an indention character</span>
+        <span class="s1">#    (indentation space, '-', '?', or ':')?</span>
+        <span class="s0">self.line = </span><span class="s4">0</span>
+        <span class="s0">self.column = </span><span class="s4">0</span>
+        <span class="s0">self.whitespace = </span><span class="s3">True</span>
+        <span class="s0">self.indention = </span><span class="s3">True</span>
+
+        <span class="s1"># Whether the document requires an explicit document indicator</span>
+        <span class="s0">self.open_ended = </span><span class="s3">False</span>
+
+        <span class="s1"># Formatting details.</span>
+        <span class="s0">self.canonical = canonical</span>
+        <span class="s0">self.allow_unicode = allow_unicode</span>
+        <span class="s0">self.best_indent = </span><span class="s4">2</span>
+        <span class="s3">if </span><span class="s0">indent </span><span class="s3">and </span><span class="s4">1 </span><span class="s0">&lt; indent &lt; </span><span class="s4">10</span><span class="s0">:</span>
+            <span class="s0">self.best_indent = indent</span>
+        <span class="s0">self.best_width = </span><span class="s4">80</span>
+        <span class="s3">if </span><span class="s0">width </span><span class="s3">and </span><span class="s0">width &gt; self.best_indent*</span><span class="s4">2</span><span class="s0">:</span>
+            <span class="s0">self.best_width = width</span>
+        <span class="s0">self.best_line_break = </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span>
+        <span class="s3">if </span><span class="s0">line_break </span><span class="s3">in </span><span class="s0">[</span><span class="s2">'</span><span class="s3">\r</span><span class="s2">'</span><span class="s3">, </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s3">, </span><span class="s2">'</span><span class="s3">\r\n</span><span class="s2">'</span><span class="s0">]:</span>
+            <span class="s0">self.best_line_break = line_break</span>
+
+        <span class="s1"># Tag prefixes.</span>
+        <span class="s0">self.tag_prefixes = </span><span class="s3">None</span>
+
+        <span class="s1"># Prepared anchor and tag.</span>
+        <span class="s0">self.prepared_anchor = </span><span class="s3">None</span>
+        <span class="s0">self.prepared_tag = </span><span class="s3">None</span>
+
+        <span class="s1"># Scalar analysis and style.</span>
+        <span class="s0">self.analysis = </span><span class="s3">None</span>
+        <span class="s0">self.style = </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s0">dispose(self):</span>
+        <span class="s1"># Reset the state attributes (to clear self-references)</span>
+        <span class="s0">self.states = []</span>
+        <span class="s0">self.state = </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s0">emit(self</span><span class="s3">, </span><span class="s0">event):</span>
+        <span class="s0">self.events.append(event)</span>
+        <span class="s3">while not </span><span class="s0">self.need_more_events():</span>
+            <span class="s0">self.event = self.events.pop(</span><span class="s4">0</span><span class="s0">)</span>
+            <span class="s0">self.state()</span>
+            <span class="s0">self.event = </span><span class="s3">None</span>
+
+    <span class="s1"># In some cases, we wait for a few next events before emitting.</span>
+
+    <span class="s3">def </span><span class="s0">need_more_events(self):</span>
+        <span class="s3">if not </span><span class="s0">self.events:</span>
+            <span class="s3">return True</span>
+        <span class="s0">event = self.events[</span><span class="s4">0</span><span class="s0">]</span>
+        <span class="s3">if </span><span class="s0">isinstance(event</span><span class="s3">, </span><span class="s0">DocumentStartEvent):</span>
+            <span class="s3">return </span><span class="s0">self.need_events(</span><span class="s4">1</span><span class="s0">)</span>
+        <span class="s3">elif </span><span class="s0">isinstance(event</span><span class="s3">, </span><span class="s0">SequenceStartEvent):</span>
+            <span class="s3">return </span><span class="s0">self.need_events(</span><span class="s4">2</span><span class="s0">)</span>
+        <span class="s3">elif </span><span class="s0">isinstance(event</span><span class="s3">, </span><span class="s0">MappingStartEvent):</span>
+            <span class="s3">return </span><span class="s0">self.need_events(</span><span class="s4">3</span><span class="s0">)</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">return False</span>
+
+    <span class="s3">def </span><span class="s0">need_events(self</span><span class="s3">, </span><span class="s0">count):</span>
+        <span class="s0">level = </span><span class="s4">0</span>
+        <span class="s3">for </span><span class="s0">event </span><span class="s3">in </span><span class="s0">self.events[</span><span class="s4">1</span><span class="s0">:]:</span>
+            <span class="s3">if </span><span class="s0">isinstance(event</span><span class="s3">, </span><span class="s0">(DocumentStartEvent</span><span class="s3">, </span><span class="s0">CollectionStartEvent)):</span>
+                <span class="s0">level += </span><span class="s4">1</span>
+            <span class="s3">elif </span><span class="s0">isinstance(event</span><span class="s3">, </span><span class="s0">(DocumentEndEvent</span><span class="s3">, </span><span class="s0">CollectionEndEvent)):</span>
+                <span class="s0">level -= </span><span class="s4">1</span>
+            <span class="s3">elif </span><span class="s0">isinstance(event</span><span class="s3">, </span><span class="s0">StreamEndEvent):</span>
+                <span class="s0">level = -</span><span class="s4">1</span>
+            <span class="s3">if </span><span class="s0">level &lt; </span><span class="s4">0</span><span class="s0">:</span>
+                <span class="s3">return False</span>
+        <span class="s3">return </span><span class="s0">(len(self.events) &lt; count+</span><span class="s4">1</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">increase_indent(self</span><span class="s3">, </span><span class="s0">flow=</span><span class="s3">False, </span><span class="s0">indentless=</span><span class="s3">False</span><span class="s0">):</span>
+        <span class="s0">self.indents.append(self.indent)</span>
+        <span class="s3">if </span><span class="s0">self.indent </span><span class="s3">is None</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">flow:</span>
+                <span class="s0">self.indent = self.best_indent</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s0">self.indent = </span><span class="s4">0</span>
+        <span class="s3">elif not </span><span class="s0">indentless:</span>
+            <span class="s0">self.indent += self.best_indent</span>
+
+    <span class="s1"># States.</span>
+
+    <span class="s1"># Stream handlers.</span>
+
+    <span class="s3">def </span><span class="s0">expect_stream_start(self):</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">StreamStartEvent):</span>
+            <span class="s3">if </span><span class="s0">self.event.encoding </span><span class="s3">and not </span><span class="s0">hasattr(self.stream</span><span class="s3">, </span><span class="s2">'encoding'</span><span class="s0">):</span>
+                <span class="s0">self.encoding = self.event.encoding</span>
+            <span class="s0">self.write_stream_start()</span>
+            <span class="s0">self.state = self.expect_first_document_start</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;expected StreamStartEvent, but got %s&quot;</span>
+                    <span class="s0">% self.event)</span>
+
+    <span class="s3">def </span><span class="s0">expect_nothing(self):</span>
+        <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;expected nothing, but got %s&quot; </span><span class="s0">% self.event)</span>
+
+    <span class="s1"># Document handlers.</span>
+
+    <span class="s3">def </span><span class="s0">expect_first_document_start(self):</span>
+        <span class="s3">return </span><span class="s0">self.expect_document_start(first=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">expect_document_start(self</span><span class="s3">, </span><span class="s0">first=</span><span class="s3">False</span><span class="s0">):</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">DocumentStartEvent):</span>
+            <span class="s3">if </span><span class="s0">(self.event.version </span><span class="s3">or </span><span class="s0">self.event.tags) </span><span class="s3">and </span><span class="s0">self.open_ended:</span>
+                <span class="s0">self.write_indicator(</span><span class="s2">'...'</span><span class="s3">, True</span><span class="s0">)</span>
+                <span class="s0">self.write_indent()</span>
+            <span class="s3">if </span><span class="s0">self.event.version:</span>
+                <span class="s0">version_text = self.prepare_version(self.event.version)</span>
+                <span class="s0">self.write_version_directive(version_text)</span>
+            <span class="s0">self.tag_prefixes = self.DEFAULT_TAG_PREFIXES.copy()</span>
+            <span class="s3">if </span><span class="s0">self.event.tags:</span>
+                <span class="s0">handles = sorted(self.event.tags.keys())</span>
+                <span class="s3">for </span><span class="s0">handle </span><span class="s3">in </span><span class="s0">handles:</span>
+                    <span class="s0">prefix = self.event.tags[handle]</span>
+                    <span class="s0">self.tag_prefixes[prefix] = handle</span>
+                    <span class="s0">handle_text = self.prepare_tag_handle(handle)</span>
+                    <span class="s0">prefix_text = self.prepare_tag_prefix(prefix)</span>
+                    <span class="s0">self.write_tag_directive(handle_text</span><span class="s3">, </span><span class="s0">prefix_text)</span>
+            <span class="s0">implicit = (first </span><span class="s3">and not </span><span class="s0">self.event.explicit </span><span class="s3">and not </span><span class="s0">self.canonical</span>
+                    <span class="s3">and not </span><span class="s0">self.event.version </span><span class="s3">and not </span><span class="s0">self.event.tags</span>
+                    <span class="s3">and not </span><span class="s0">self.check_empty_document())</span>
+            <span class="s3">if not </span><span class="s0">implicit:</span>
+                <span class="s0">self.write_indent()</span>
+                <span class="s0">self.write_indicator(</span><span class="s2">'---'</span><span class="s3">, True</span><span class="s0">)</span>
+                <span class="s3">if </span><span class="s0">self.canonical:</span>
+                    <span class="s0">self.write_indent()</span>
+            <span class="s0">self.state = self.expect_document_root</span>
+        <span class="s3">elif </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">StreamEndEvent):</span>
+            <span class="s3">if </span><span class="s0">self.open_ended:</span>
+                <span class="s0">self.write_indicator(</span><span class="s2">'...'</span><span class="s3">, True</span><span class="s0">)</span>
+                <span class="s0">self.write_indent()</span>
+            <span class="s0">self.write_stream_end()</span>
+            <span class="s0">self.state = self.expect_nothing</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;expected DocumentStartEvent, but got %s&quot;</span>
+                    <span class="s0">% self.event)</span>
+
+    <span class="s3">def </span><span class="s0">expect_document_end(self):</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">DocumentEndEvent):</span>
+            <span class="s0">self.write_indent()</span>
+            <span class="s3">if </span><span class="s0">self.event.explicit:</span>
+                <span class="s0">self.write_indicator(</span><span class="s2">'...'</span><span class="s3">, True</span><span class="s0">)</span>
+                <span class="s0">self.write_indent()</span>
+            <span class="s0">self.flush_stream()</span>
+            <span class="s0">self.state = self.expect_document_start</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;expected DocumentEndEvent, but got %s&quot;</span>
+                    <span class="s0">% self.event)</span>
+
+    <span class="s3">def </span><span class="s0">expect_document_root(self):</span>
+        <span class="s0">self.states.append(self.expect_document_end)</span>
+        <span class="s0">self.expect_node(root=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s1"># Node handlers.</span>
+
+    <span class="s3">def </span><span class="s0">expect_node(self</span><span class="s3">, </span><span class="s0">root=</span><span class="s3">False, </span><span class="s0">sequence=</span><span class="s3">False, </span><span class="s0">mapping=</span><span class="s3">False,</span>
+            <span class="s0">simple_key=</span><span class="s3">False</span><span class="s0">):</span>
+        <span class="s0">self.root_context = root</span>
+        <span class="s0">self.sequence_context = sequence</span>
+        <span class="s0">self.mapping_context = mapping</span>
+        <span class="s0">self.simple_key_context = simple_key</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">AliasEvent):</span>
+            <span class="s0">self.expect_alias()</span>
+        <span class="s3">elif </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">(ScalarEvent</span><span class="s3">, </span><span class="s0">CollectionStartEvent)):</span>
+            <span class="s0">self.process_anchor(</span><span class="s2">'&amp;'</span><span class="s0">)</span>
+            <span class="s0">self.process_tag()</span>
+            <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">ScalarEvent):</span>
+                <span class="s0">self.expect_scalar()</span>
+            <span class="s3">elif </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">SequenceStartEvent):</span>
+                <span class="s3">if </span><span class="s0">self.flow_level </span><span class="s3">or </span><span class="s0">self.canonical </span><span class="s3">or </span><span class="s0">self.event.flow_style   \</span>
+                        <span class="s3">or </span><span class="s0">self.check_empty_sequence():</span>
+                    <span class="s0">self.expect_flow_sequence()</span>
+                <span class="s3">else</span><span class="s0">:</span>
+                    <span class="s0">self.expect_block_sequence()</span>
+            <span class="s3">elif </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">MappingStartEvent):</span>
+                <span class="s3">if </span><span class="s0">self.flow_level </span><span class="s3">or </span><span class="s0">self.canonical </span><span class="s3">or </span><span class="s0">self.event.flow_style   \</span>
+                        <span class="s3">or </span><span class="s0">self.check_empty_mapping():</span>
+                    <span class="s0">self.expect_flow_mapping()</span>
+                <span class="s3">else</span><span class="s0">:</span>
+                    <span class="s0">self.expect_block_mapping()</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;expected NodeEvent, but got %s&quot; </span><span class="s0">% self.event)</span>
+
+    <span class="s3">def </span><span class="s0">expect_alias(self):</span>
+        <span class="s3">if </span><span class="s0">self.event.anchor </span><span class="s3">is None</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;anchor is not specified for alias&quot;</span><span class="s0">)</span>
+        <span class="s0">self.process_anchor(</span><span class="s2">'*'</span><span class="s0">)</span>
+        <span class="s0">self.state = self.states.pop()</span>
+
+    <span class="s3">def </span><span class="s0">expect_scalar(self):</span>
+        <span class="s0">self.increase_indent(flow=</span><span class="s3">True</span><span class="s0">)</span>
+        <span class="s0">self.process_scalar()</span>
+        <span class="s0">self.indent = self.indents.pop()</span>
+        <span class="s0">self.state = self.states.pop()</span>
+
+    <span class="s1"># Flow sequence handlers.</span>
+
+    <span class="s3">def </span><span class="s0">expect_flow_sequence(self):</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">'['</span><span class="s3">, True, </span><span class="s0">whitespace=</span><span class="s3">True</span><span class="s0">)</span>
+        <span class="s0">self.flow_level += </span><span class="s4">1</span>
+        <span class="s0">self.increase_indent(flow=</span><span class="s3">True</span><span class="s0">)</span>
+        <span class="s0">self.state = self.expect_first_flow_sequence_item</span>
+
+    <span class="s3">def </span><span class="s0">expect_first_flow_sequence_item(self):</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">SequenceEndEvent):</span>
+            <span class="s0">self.indent = self.indents.pop()</span>
+            <span class="s0">self.flow_level -= </span><span class="s4">1</span>
+            <span class="s0">self.write_indicator(</span><span class="s2">']'</span><span class="s3">, False</span><span class="s0">)</span>
+            <span class="s0">self.state = self.states.pop()</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">self.canonical </span><span class="s3">or </span><span class="s0">self.column &gt; self.best_width:</span>
+                <span class="s0">self.write_indent()</span>
+            <span class="s0">self.states.append(self.expect_flow_sequence_item)</span>
+            <span class="s0">self.expect_node(sequence=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">expect_flow_sequence_item(self):</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">SequenceEndEvent):</span>
+            <span class="s0">self.indent = self.indents.pop()</span>
+            <span class="s0">self.flow_level -= </span><span class="s4">1</span>
+            <span class="s3">if </span><span class="s0">self.canonical:</span>
+                <span class="s0">self.write_indicator(</span><span class="s2">','</span><span class="s3">, False</span><span class="s0">)</span>
+                <span class="s0">self.write_indent()</span>
+            <span class="s0">self.write_indicator(</span><span class="s2">']'</span><span class="s3">, False</span><span class="s0">)</span>
+            <span class="s0">self.state = self.states.pop()</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">self.write_indicator(</span><span class="s2">','</span><span class="s3">, False</span><span class="s0">)</span>
+            <span class="s3">if </span><span class="s0">self.canonical </span><span class="s3">or </span><span class="s0">self.column &gt; self.best_width:</span>
+                <span class="s0">self.write_indent()</span>
+            <span class="s0">self.states.append(self.expect_flow_sequence_item)</span>
+            <span class="s0">self.expect_node(sequence=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s1"># Flow mapping handlers.</span>
+
+    <span class="s3">def </span><span class="s0">expect_flow_mapping(self):</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">'{'</span><span class="s3">, True, </span><span class="s0">whitespace=</span><span class="s3">True</span><span class="s0">)</span>
+        <span class="s0">self.flow_level += </span><span class="s4">1</span>
+        <span class="s0">self.increase_indent(flow=</span><span class="s3">True</span><span class="s0">)</span>
+        <span class="s0">self.state = self.expect_first_flow_mapping_key</span>
+
+    <span class="s3">def </span><span class="s0">expect_first_flow_mapping_key(self):</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">MappingEndEvent):</span>
+            <span class="s0">self.indent = self.indents.pop()</span>
+            <span class="s0">self.flow_level -= </span><span class="s4">1</span>
+            <span class="s0">self.write_indicator(</span><span class="s2">'}'</span><span class="s3">, False</span><span class="s0">)</span>
+            <span class="s0">self.state = self.states.pop()</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">self.canonical </span><span class="s3">or </span><span class="s0">self.column &gt; self.best_width:</span>
+                <span class="s0">self.write_indent()</span>
+            <span class="s3">if not </span><span class="s0">self.canonical </span><span class="s3">and </span><span class="s0">self.check_simple_key():</span>
+                <span class="s0">self.states.append(self.expect_flow_mapping_simple_value)</span>
+                <span class="s0">self.expect_node(mapping=</span><span class="s3">True, </span><span class="s0">simple_key=</span><span class="s3">True</span><span class="s0">)</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s0">self.write_indicator(</span><span class="s2">'?'</span><span class="s3">, True</span><span class="s0">)</span>
+                <span class="s0">self.states.append(self.expect_flow_mapping_value)</span>
+                <span class="s0">self.expect_node(mapping=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">expect_flow_mapping_key(self):</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">MappingEndEvent):</span>
+            <span class="s0">self.indent = self.indents.pop()</span>
+            <span class="s0">self.flow_level -= </span><span class="s4">1</span>
+            <span class="s3">if </span><span class="s0">self.canonical:</span>
+                <span class="s0">self.write_indicator(</span><span class="s2">','</span><span class="s3">, False</span><span class="s0">)</span>
+                <span class="s0">self.write_indent()</span>
+            <span class="s0">self.write_indicator(</span><span class="s2">'}'</span><span class="s3">, False</span><span class="s0">)</span>
+            <span class="s0">self.state = self.states.pop()</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">self.write_indicator(</span><span class="s2">','</span><span class="s3">, False</span><span class="s0">)</span>
+            <span class="s3">if </span><span class="s0">self.canonical </span><span class="s3">or </span><span class="s0">self.column &gt; self.best_width:</span>
+                <span class="s0">self.write_indent()</span>
+            <span class="s3">if not </span><span class="s0">self.canonical </span><span class="s3">and </span><span class="s0">self.check_simple_key():</span>
+                <span class="s0">self.states.append(self.expect_flow_mapping_simple_value)</span>
+                <span class="s0">self.expect_node(mapping=</span><span class="s3">True, </span><span class="s0">simple_key=</span><span class="s3">True</span><span class="s0">)</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s0">self.write_indicator(</span><span class="s2">'?'</span><span class="s3">, True</span><span class="s0">)</span>
+                <span class="s0">self.states.append(self.expect_flow_mapping_value)</span>
+                <span class="s0">self.expect_node(mapping=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">expect_flow_mapping_simple_value(self):</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">':'</span><span class="s3">, False</span><span class="s0">)</span>
+        <span class="s0">self.states.append(self.expect_flow_mapping_key)</span>
+        <span class="s0">self.expect_node(mapping=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">expect_flow_mapping_value(self):</span>
+        <span class="s3">if </span><span class="s0">self.canonical </span><span class="s3">or </span><span class="s0">self.column &gt; self.best_width:</span>
+            <span class="s0">self.write_indent()</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">':'</span><span class="s3">, True</span><span class="s0">)</span>
+        <span class="s0">self.states.append(self.expect_flow_mapping_key)</span>
+        <span class="s0">self.expect_node(mapping=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s1"># Block sequence handlers.</span>
+
+    <span class="s3">def </span><span class="s0">expect_block_sequence(self):</span>
+        <span class="s0">indentless = (self.mapping_context </span><span class="s3">and not </span><span class="s0">self.indention)</span>
+        <span class="s0">self.increase_indent(flow=</span><span class="s3">False, </span><span class="s0">indentless=indentless)</span>
+        <span class="s0">self.state = self.expect_first_block_sequence_item</span>
+
+    <span class="s3">def </span><span class="s0">expect_first_block_sequence_item(self):</span>
+        <span class="s3">return </span><span class="s0">self.expect_block_sequence_item(first=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">expect_block_sequence_item(self</span><span class="s3">, </span><span class="s0">first=</span><span class="s3">False</span><span class="s0">):</span>
+        <span class="s3">if not </span><span class="s0">first </span><span class="s3">and </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">SequenceEndEvent):</span>
+            <span class="s0">self.indent = self.indents.pop()</span>
+            <span class="s0">self.state = self.states.pop()</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">self.write_indent()</span>
+            <span class="s0">self.write_indicator(</span><span class="s2">'-'</span><span class="s3">, True, </span><span class="s0">indention=</span><span class="s3">True</span><span class="s0">)</span>
+            <span class="s0">self.states.append(self.expect_block_sequence_item)</span>
+            <span class="s0">self.expect_node(sequence=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s1"># Block mapping handlers.</span>
+
+    <span class="s3">def </span><span class="s0">expect_block_mapping(self):</span>
+        <span class="s0">self.increase_indent(flow=</span><span class="s3">False</span><span class="s0">)</span>
+        <span class="s0">self.state = self.expect_first_block_mapping_key</span>
+
+    <span class="s3">def </span><span class="s0">expect_first_block_mapping_key(self):</span>
+        <span class="s3">return </span><span class="s0">self.expect_block_mapping_key(first=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">expect_block_mapping_key(self</span><span class="s3">, </span><span class="s0">first=</span><span class="s3">False</span><span class="s0">):</span>
+        <span class="s3">if not </span><span class="s0">first </span><span class="s3">and </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">MappingEndEvent):</span>
+            <span class="s0">self.indent = self.indents.pop()</span>
+            <span class="s0">self.state = self.states.pop()</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">self.write_indent()</span>
+            <span class="s3">if </span><span class="s0">self.check_simple_key():</span>
+                <span class="s0">self.states.append(self.expect_block_mapping_simple_value)</span>
+                <span class="s0">self.expect_node(mapping=</span><span class="s3">True, </span><span class="s0">simple_key=</span><span class="s3">True</span><span class="s0">)</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s0">self.write_indicator(</span><span class="s2">'?'</span><span class="s3">, True, </span><span class="s0">indention=</span><span class="s3">True</span><span class="s0">)</span>
+                <span class="s0">self.states.append(self.expect_block_mapping_value)</span>
+                <span class="s0">self.expect_node(mapping=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">expect_block_mapping_simple_value(self):</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">':'</span><span class="s3">, False</span><span class="s0">)</span>
+        <span class="s0">self.states.append(self.expect_block_mapping_key)</span>
+        <span class="s0">self.expect_node(mapping=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">expect_block_mapping_value(self):</span>
+        <span class="s0">self.write_indent()</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">':'</span><span class="s3">, True, </span><span class="s0">indention=</span><span class="s3">True</span><span class="s0">)</span>
+        <span class="s0">self.states.append(self.expect_block_mapping_key)</span>
+        <span class="s0">self.expect_node(mapping=</span><span class="s3">True</span><span class="s0">)</span>
+
+    <span class="s1"># Checkers.</span>
+
+    <span class="s3">def </span><span class="s0">check_empty_sequence(self):</span>
+        <span class="s3">return </span><span class="s0">(isinstance(self.event</span><span class="s3">, </span><span class="s0">SequenceStartEvent) </span><span class="s3">and </span><span class="s0">self.events</span>
+                <span class="s3">and </span><span class="s0">isinstance(self.events[</span><span class="s4">0</span><span class="s0">]</span><span class="s3">, </span><span class="s0">SequenceEndEvent))</span>
+
+    <span class="s3">def </span><span class="s0">check_empty_mapping(self):</span>
+        <span class="s3">return </span><span class="s0">(isinstance(self.event</span><span class="s3">, </span><span class="s0">MappingStartEvent) </span><span class="s3">and </span><span class="s0">self.events</span>
+                <span class="s3">and </span><span class="s0">isinstance(self.events[</span><span class="s4">0</span><span class="s0">]</span><span class="s3">, </span><span class="s0">MappingEndEvent))</span>
+
+    <span class="s3">def </span><span class="s0">check_empty_document(self):</span>
+        <span class="s3">if not </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">DocumentStartEvent) </span><span class="s3">or not </span><span class="s0">self.events:</span>
+            <span class="s3">return False</span>
+        <span class="s0">event = self.events[</span><span class="s4">0</span><span class="s0">]</span>
+        <span class="s3">return </span><span class="s0">(isinstance(event</span><span class="s3">, </span><span class="s0">ScalarEvent) </span><span class="s3">and </span><span class="s0">event.anchor </span><span class="s3">is None</span>
+                <span class="s3">and </span><span class="s0">event.tag </span><span class="s3">is None and </span><span class="s0">event.implicit </span><span class="s3">and </span><span class="s0">event.value == </span><span class="s2">''</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">check_simple_key(self):</span>
+        <span class="s0">length = </span><span class="s4">0</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">NodeEvent) </span><span class="s3">and </span><span class="s0">self.event.anchor </span><span class="s3">is not None</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">self.prepared_anchor </span><span class="s3">is None</span><span class="s0">:</span>
+                <span class="s0">self.prepared_anchor = self.prepare_anchor(self.event.anchor)</span>
+            <span class="s0">length += len(self.prepared_anchor)</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">(ScalarEvent</span><span class="s3">, </span><span class="s0">CollectionStartEvent))  \</span>
+                <span class="s3">and </span><span class="s0">self.event.tag </span><span class="s3">is not None</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">self.prepared_tag </span><span class="s3">is None</span><span class="s0">:</span>
+                <span class="s0">self.prepared_tag = self.prepare_tag(self.event.tag)</span>
+            <span class="s0">length += len(self.prepared_tag)</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">ScalarEvent):</span>
+            <span class="s3">if </span><span class="s0">self.analysis </span><span class="s3">is None</span><span class="s0">:</span>
+                <span class="s0">self.analysis = self.analyze_scalar(self.event.value)</span>
+            <span class="s0">length += len(self.analysis.scalar)</span>
+        <span class="s3">return </span><span class="s0">(length &lt; </span><span class="s4">128 </span><span class="s3">and </span><span class="s0">(isinstance(self.event</span><span class="s3">, </span><span class="s0">AliasEvent)</span>
+            <span class="s3">or </span><span class="s0">(isinstance(self.event</span><span class="s3">, </span><span class="s0">ScalarEvent)</span>
+                    <span class="s3">and not </span><span class="s0">self.analysis.empty </span><span class="s3">and not </span><span class="s0">self.analysis.multiline)</span>
+            <span class="s3">or </span><span class="s0">self.check_empty_sequence() </span><span class="s3">or </span><span class="s0">self.check_empty_mapping()))</span>
+
+    <span class="s1"># Anchor, Tag, and Scalar processors.</span>
+
+    <span class="s3">def </span><span class="s0">process_anchor(self</span><span class="s3">, </span><span class="s0">indicator):</span>
+        <span class="s3">if </span><span class="s0">self.event.anchor </span><span class="s3">is None</span><span class="s0">:</span>
+            <span class="s0">self.prepared_anchor = </span><span class="s3">None</span>
+            <span class="s3">return</span>
+        <span class="s3">if </span><span class="s0">self.prepared_anchor </span><span class="s3">is None</span><span class="s0">:</span>
+            <span class="s0">self.prepared_anchor = self.prepare_anchor(self.event.anchor)</span>
+        <span class="s3">if </span><span class="s0">self.prepared_anchor:</span>
+            <span class="s0">self.write_indicator(indicator+self.prepared_anchor</span><span class="s3">, True</span><span class="s0">)</span>
+        <span class="s0">self.prepared_anchor = </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s0">process_tag(self):</span>
+        <span class="s0">tag = self.event.tag</span>
+        <span class="s3">if </span><span class="s0">isinstance(self.event</span><span class="s3">, </span><span class="s0">ScalarEvent):</span>
+            <span class="s3">if </span><span class="s0">self.style </span><span class="s3">is None</span><span class="s0">:</span>
+                <span class="s0">self.style = self.choose_scalar_style()</span>
+            <span class="s3">if </span><span class="s0">((</span><span class="s3">not </span><span class="s0">self.canonical </span><span class="s3">or </span><span class="s0">tag </span><span class="s3">is None</span><span class="s0">) </span><span class="s3">and</span>
+                <span class="s0">((self.style == </span><span class="s2">'' </span><span class="s3">and </span><span class="s0">self.event.implicit[</span><span class="s4">0</span><span class="s0">])</span>
+                        <span class="s3">or </span><span class="s0">(self.style != </span><span class="s2">'' </span><span class="s3">and </span><span class="s0">self.event.implicit[</span><span class="s4">1</span><span class="s0">]))):</span>
+                <span class="s0">self.prepared_tag = </span><span class="s3">None</span>
+                <span class="s3">return</span>
+            <span class="s3">if </span><span class="s0">self.event.implicit[</span><span class="s4">0</span><span class="s0">] </span><span class="s3">and </span><span class="s0">tag </span><span class="s3">is None</span><span class="s0">:</span>
+                <span class="s0">tag = </span><span class="s2">'!'</span>
+                <span class="s0">self.prepared_tag = </span><span class="s3">None</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">(</span><span class="s3">not </span><span class="s0">self.canonical </span><span class="s3">or </span><span class="s0">tag </span><span class="s3">is None</span><span class="s0">) </span><span class="s3">and </span><span class="s0">self.event.implicit:</span>
+                <span class="s0">self.prepared_tag = </span><span class="s3">None</span>
+                <span class="s3">return</span>
+        <span class="s3">if </span><span class="s0">tag </span><span class="s3">is None</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;tag is not specified&quot;</span><span class="s0">)</span>
+        <span class="s3">if </span><span class="s0">self.prepared_tag </span><span class="s3">is None</span><span class="s0">:</span>
+            <span class="s0">self.prepared_tag = self.prepare_tag(tag)</span>
+        <span class="s3">if </span><span class="s0">self.prepared_tag:</span>
+            <span class="s0">self.write_indicator(self.prepared_tag</span><span class="s3">, True</span><span class="s0">)</span>
+        <span class="s0">self.prepared_tag = </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s0">choose_scalar_style(self):</span>
+        <span class="s3">if </span><span class="s0">self.analysis </span><span class="s3">is None</span><span class="s0">:</span>
+            <span class="s0">self.analysis = self.analyze_scalar(self.event.value)</span>
+        <span class="s3">if </span><span class="s0">self.event.style == </span><span class="s2">'&quot;' </span><span class="s3">or </span><span class="s0">self.canonical:</span>
+            <span class="s3">return </span><span class="s2">'&quot;'</span>
+        <span class="s3">if not </span><span class="s0">self.event.style </span><span class="s3">and </span><span class="s0">self.event.implicit[</span><span class="s4">0</span><span class="s0">]:</span>
+            <span class="s3">if </span><span class="s0">(</span><span class="s3">not </span><span class="s0">(self.simple_key_context </span><span class="s3">and</span>
+                    <span class="s0">(self.analysis.empty </span><span class="s3">or </span><span class="s0">self.analysis.multiline))</span>
+                <span class="s3">and </span><span class="s0">(self.flow_level </span><span class="s3">and </span><span class="s0">self.analysis.allow_flow_plain</span>
+                    <span class="s3">or </span><span class="s0">(</span><span class="s3">not </span><span class="s0">self.flow_level </span><span class="s3">and </span><span class="s0">self.analysis.allow_block_plain))):</span>
+                <span class="s3">return </span><span class="s2">''</span>
+        <span class="s3">if </span><span class="s0">self.event.style </span><span class="s3">and </span><span class="s0">self.event.style </span><span class="s3">in </span><span class="s2">'|&gt;'</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">(</span><span class="s3">not </span><span class="s0">self.flow_level </span><span class="s3">and not </span><span class="s0">self.simple_key_context</span>
+                    <span class="s3">and </span><span class="s0">self.analysis.allow_block):</span>
+                <span class="s3">return </span><span class="s0">self.event.style</span>
+        <span class="s3">if not </span><span class="s0">self.event.style </span><span class="s3">or </span><span class="s0">self.event.style == </span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s3">if </span><span class="s0">(self.analysis.allow_single_quoted </span><span class="s3">and</span>
+                    <span class="s3">not </span><span class="s0">(self.simple_key_context </span><span class="s3">and </span><span class="s0">self.analysis.multiline)):</span>
+                <span class="s3">return </span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span>
+        <span class="s3">return </span><span class="s2">'&quot;'</span>
+
+    <span class="s3">def </span><span class="s0">process_scalar(self):</span>
+        <span class="s3">if </span><span class="s0">self.analysis </span><span class="s3">is None</span><span class="s0">:</span>
+            <span class="s0">self.analysis = self.analyze_scalar(self.event.value)</span>
+        <span class="s3">if </span><span class="s0">self.style </span><span class="s3">is None</span><span class="s0">:</span>
+            <span class="s0">self.style = self.choose_scalar_style()</span>
+        <span class="s0">split = (</span><span class="s3">not </span><span class="s0">self.simple_key_context)</span>
+        <span class="s1">#if self.analysis.multiline and split    \</span>
+        <span class="s1">#        and (not self.style or self.style in '\'\&quot;'):</span>
+        <span class="s1">#    self.write_indent()</span>
+        <span class="s3">if </span><span class="s0">self.style == </span><span class="s2">'&quot;'</span><span class="s0">:</span>
+            <span class="s0">self.write_double_quoted(self.analysis.scalar</span><span class="s3">, </span><span class="s0">split)</span>
+        <span class="s3">elif </span><span class="s0">self.style == </span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span><span class="s0">:</span>
+            <span class="s0">self.write_single_quoted(self.analysis.scalar</span><span class="s3">, </span><span class="s0">split)</span>
+        <span class="s3">elif </span><span class="s0">self.style == </span><span class="s2">'&gt;'</span><span class="s0">:</span>
+            <span class="s0">self.write_folded(self.analysis.scalar)</span>
+        <span class="s3">elif </span><span class="s0">self.style == </span><span class="s2">'|'</span><span class="s0">:</span>
+            <span class="s0">self.write_literal(self.analysis.scalar)</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">self.write_plain(self.analysis.scalar</span><span class="s3">, </span><span class="s0">split)</span>
+        <span class="s0">self.analysis = </span><span class="s3">None</span>
+        <span class="s0">self.style = </span><span class="s3">None</span>
+
+    <span class="s1"># Analyzers.</span>
+
+    <span class="s3">def </span><span class="s0">prepare_version(self</span><span class="s3">, </span><span class="s0">version):</span>
+        <span class="s0">major</span><span class="s3">, </span><span class="s0">minor = version</span>
+        <span class="s3">if </span><span class="s0">major != </span><span class="s4">1</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;unsupported YAML version: %d.%d&quot; </span><span class="s0">% (major</span><span class="s3">, </span><span class="s0">minor))</span>
+        <span class="s3">return </span><span class="s2">'%d.%d' </span><span class="s0">% (major</span><span class="s3">, </span><span class="s0">minor)</span>
+
+    <span class="s3">def </span><span class="s0">prepare_tag_handle(self</span><span class="s3">, </span><span class="s0">handle):</span>
+        <span class="s3">if not </span><span class="s0">handle:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;tag handle must not be empty&quot;</span><span class="s0">)</span>
+        <span class="s3">if </span><span class="s0">handle[</span><span class="s4">0</span><span class="s0">] != </span><span class="s2">'!' </span><span class="s3">or </span><span class="s0">handle[-</span><span class="s4">1</span><span class="s0">] != </span><span class="s2">'!'</span><span class="s0">:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;tag handle must start and end with '!': %r&quot; </span><span class="s0">% handle)</span>
+        <span class="s3">for </span><span class="s0">ch </span><span class="s3">in </span><span class="s0">handle[</span><span class="s4">1</span><span class="s0">:-</span><span class="s4">1</span><span class="s0">]:</span>
+            <span class="s3">if not </span><span class="s0">(</span><span class="s2">'0' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'9' </span><span class="s3">or </span><span class="s2">'A' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'Z' </span><span class="s3">or </span><span class="s2">'a' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'z'    </span><span class="s0">\</span>
+                    <span class="s3">or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'-_'</span><span class="s0">):</span>
+                <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;invalid character %r in the tag handle: %r&quot;</span>
+                        <span class="s0">% (ch</span><span class="s3">, </span><span class="s0">handle))</span>
+        <span class="s3">return </span><span class="s0">handle</span>
+
+    <span class="s3">def </span><span class="s0">prepare_tag_prefix(self</span><span class="s3">, </span><span class="s0">prefix):</span>
+        <span class="s3">if not </span><span class="s0">prefix:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;tag prefix must not be empty&quot;</span><span class="s0">)</span>
+        <span class="s0">chunks = []</span>
+        <span class="s0">start = end = </span><span class="s4">0</span>
+        <span class="s3">if </span><span class="s0">prefix[</span><span class="s4">0</span><span class="s0">] == </span><span class="s2">'!'</span><span class="s0">:</span>
+            <span class="s0">end = </span><span class="s4">1</span>
+        <span class="s3">while </span><span class="s0">end &lt; len(prefix):</span>
+            <span class="s0">ch = prefix[end]</span>
+            <span class="s3">if </span><span class="s2">'0' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'9' </span><span class="s3">or </span><span class="s2">'A' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'Z' </span><span class="s3">or </span><span class="s2">'a' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'z' </span><span class="s0">\</span>
+                    <span class="s3">or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'-;/?!:@&amp;=+$,_.~*</span><span class="s3">\'</span><span class="s2">()[]'</span><span class="s0">:</span>
+                <span class="s0">end += </span><span class="s4">1</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">start &lt; end:</span>
+                    <span class="s0">chunks.append(prefix[start:end])</span>
+                <span class="s0">start = end = end+</span><span class="s4">1</span>
+                <span class="s0">data = ch.encode(</span><span class="s2">'utf-8'</span><span class="s0">)</span>
+                <span class="s3">for </span><span class="s0">ch </span><span class="s3">in </span><span class="s0">data:</span>
+                    <span class="s0">chunks.append(</span><span class="s2">'%%%02X' </span><span class="s0">% ord(ch))</span>
+        <span class="s3">if </span><span class="s0">start &lt; end:</span>
+            <span class="s0">chunks.append(prefix[start:end])</span>
+        <span class="s3">return </span><span class="s2">''</span><span class="s0">.join(chunks)</span>
+
+    <span class="s3">def </span><span class="s0">prepare_tag(self</span><span class="s3">, </span><span class="s0">tag):</span>
+        <span class="s3">if not </span><span class="s0">tag:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;tag must not be empty&quot;</span><span class="s0">)</span>
+        <span class="s3">if </span><span class="s0">tag == </span><span class="s2">'!'</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s0">tag</span>
+        <span class="s0">handle = </span><span class="s3">None</span>
+        <span class="s0">suffix = tag</span>
+        <span class="s0">prefixes = sorted(self.tag_prefixes.keys())</span>
+        <span class="s3">for </span><span class="s0">prefix </span><span class="s3">in </span><span class="s0">prefixes:</span>
+            <span class="s3">if </span><span class="s0">tag.startswith(prefix)   \</span>
+                    <span class="s3">and </span><span class="s0">(prefix == </span><span class="s2">'!' </span><span class="s3">or </span><span class="s0">len(prefix) &lt; len(tag)):</span>
+                <span class="s0">handle = self.tag_prefixes[prefix]</span>
+                <span class="s0">suffix = tag[len(prefix):]</span>
+        <span class="s0">chunks = []</span>
+        <span class="s0">start = end = </span><span class="s4">0</span>
+        <span class="s3">while </span><span class="s0">end &lt; len(suffix):</span>
+            <span class="s0">ch = suffix[end]</span>
+            <span class="s3">if </span><span class="s2">'0' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'9' </span><span class="s3">or </span><span class="s2">'A' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'Z' </span><span class="s3">or </span><span class="s2">'a' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'z' </span><span class="s0">\</span>
+                    <span class="s3">or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'-;/?:@&amp;=+$,_.~*</span><span class="s3">\'</span><span class="s2">()[]'   </span><span class="s0">\</span>
+                    <span class="s3">or </span><span class="s0">(ch == </span><span class="s2">'!' </span><span class="s3">and </span><span class="s0">handle != </span><span class="s2">'!'</span><span class="s0">):</span>
+                <span class="s0">end += </span><span class="s4">1</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">start &lt; end:</span>
+                    <span class="s0">chunks.append(suffix[start:end])</span>
+                <span class="s0">start = end = end+</span><span class="s4">1</span>
+                <span class="s0">data = ch.encode(</span><span class="s2">'utf-8'</span><span class="s0">)</span>
+                <span class="s3">for </span><span class="s0">ch </span><span class="s3">in </span><span class="s0">data:</span>
+                    <span class="s0">chunks.append(</span><span class="s2">'%%%02X' </span><span class="s0">% ch)</span>
+        <span class="s3">if </span><span class="s0">start &lt; end:</span>
+            <span class="s0">chunks.append(suffix[start:end])</span>
+        <span class="s0">suffix_text = </span><span class="s2">''</span><span class="s0">.join(chunks)</span>
+        <span class="s3">if </span><span class="s0">handle:</span>
+            <span class="s3">return </span><span class="s2">'%s%s' </span><span class="s0">% (handle</span><span class="s3">, </span><span class="s0">suffix_text)</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s3">return </span><span class="s2">'!&lt;%s&gt;' </span><span class="s0">% suffix_text</span>
+
+    <span class="s3">def </span><span class="s0">prepare_anchor(self</span><span class="s3">, </span><span class="s0">anchor):</span>
+        <span class="s3">if not </span><span class="s0">anchor:</span>
+            <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;anchor must not be empty&quot;</span><span class="s0">)</span>
+        <span class="s3">for </span><span class="s0">ch </span><span class="s3">in </span><span class="s0">anchor:</span>
+            <span class="s3">if not </span><span class="s0">(</span><span class="s2">'0' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'9' </span><span class="s3">or </span><span class="s2">'A' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'Z' </span><span class="s3">or </span><span class="s2">'a' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'z'    </span><span class="s0">\</span>
+                    <span class="s3">or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'-_'</span><span class="s0">):</span>
+                <span class="s3">raise </span><span class="s0">EmitterError(</span><span class="s2">&quot;invalid character %r in the anchor: %r&quot;</span>
+                        <span class="s0">% (ch</span><span class="s3">, </span><span class="s0">anchor))</span>
+        <span class="s3">return </span><span class="s0">anchor</span>
+
+    <span class="s3">def </span><span class="s0">analyze_scalar(self</span><span class="s3">, </span><span class="s0">scalar):</span>
+
+        <span class="s1"># Empty scalar is a special case.</span>
+        <span class="s3">if not </span><span class="s0">scalar:</span>
+            <span class="s3">return </span><span class="s0">ScalarAnalysis(scalar=scalar</span><span class="s3">, </span><span class="s0">empty=</span><span class="s3">True, </span><span class="s0">multiline=</span><span class="s3">False,</span>
+                    <span class="s0">allow_flow_plain=</span><span class="s3">False, </span><span class="s0">allow_block_plain=</span><span class="s3">True,</span>
+                    <span class="s0">allow_single_quoted=</span><span class="s3">True, </span><span class="s0">allow_double_quoted=</span><span class="s3">True,</span>
+                    <span class="s0">allow_block=</span><span class="s3">False</span><span class="s0">)</span>
+
+        <span class="s1"># Indicators and special characters.</span>
+        <span class="s0">block_indicators = </span><span class="s3">False</span>
+        <span class="s0">flow_indicators = </span><span class="s3">False</span>
+        <span class="s0">line_breaks = </span><span class="s3">False</span>
+        <span class="s0">special_characters = </span><span class="s3">False</span>
+
+        <span class="s1"># Important whitespace combinations.</span>
+        <span class="s0">leading_space = </span><span class="s3">False</span>
+        <span class="s0">leading_break = </span><span class="s3">False</span>
+        <span class="s0">trailing_space = </span><span class="s3">False</span>
+        <span class="s0">trailing_break = </span><span class="s3">False</span>
+        <span class="s0">break_space = </span><span class="s3">False</span>
+        <span class="s0">space_break = </span><span class="s3">False</span>
+
+        <span class="s1"># Check document indicators.</span>
+        <span class="s3">if </span><span class="s0">scalar.startswith(</span><span class="s2">'---'</span><span class="s0">) </span><span class="s3">or </span><span class="s0">scalar.startswith(</span><span class="s2">'...'</span><span class="s0">):</span>
+            <span class="s0">block_indicators = </span><span class="s3">True</span>
+            <span class="s0">flow_indicators = </span><span class="s3">True</span>
+
+        <span class="s1"># First character or preceded by a whitespace.</span>
+        <span class="s0">preceded_by_whitespace = </span><span class="s3">True</span>
+
+        <span class="s1"># Last character or followed by a whitespace.</span>
+        <span class="s0">followed_by_whitespace = (len(scalar) == </span><span class="s4">1 </span><span class="s3">or</span>
+                <span class="s0">scalar[</span><span class="s4">1</span><span class="s0">] </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">)</span>
+
+        <span class="s1"># The previous character is a space.</span>
+        <span class="s0">previous_space = </span><span class="s3">False</span>
+
+        <span class="s1"># The previous character is a break.</span>
+        <span class="s0">previous_break = </span><span class="s3">False</span>
+
+        <span class="s0">index = </span><span class="s4">0</span>
+        <span class="s3">while </span><span class="s0">index &lt; len(scalar):</span>
+            <span class="s0">ch = scalar[index]</span>
+
+            <span class="s1"># Check for indicators.</span>
+            <span class="s3">if </span><span class="s0">index == </span><span class="s4">0</span><span class="s0">:</span>
+                <span class="s1"># Leading indicators are special characters.</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'#,[]{}&amp;*!|&gt;</span><span class="s3">\'\&quot;</span><span class="s2">%@`'</span><span class="s0">:</span>
+                    <span class="s0">flow_indicators = </span><span class="s3">True</span>
+                    <span class="s0">block_indicators = </span><span class="s3">True</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'?:'</span><span class="s0">:</span>
+                    <span class="s0">flow_indicators = </span><span class="s3">True</span>
+                    <span class="s3">if </span><span class="s0">followed_by_whitespace:</span>
+                        <span class="s0">block_indicators = </span><span class="s3">True</span>
+                <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'-' </span><span class="s3">and </span><span class="s0">followed_by_whitespace:</span>
+                    <span class="s0">flow_indicators = </span><span class="s3">True</span>
+                    <span class="s0">block_indicators = </span><span class="s3">True</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s1"># Some indicators cannot appear within a scalar as well.</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">',?[]{}'</span><span class="s0">:</span>
+                    <span class="s0">flow_indicators = </span><span class="s3">True</span>
+                <span class="s3">if </span><span class="s0">ch == </span><span class="s2">':'</span><span class="s0">:</span>
+                    <span class="s0">flow_indicators = </span><span class="s3">True</span>
+                    <span class="s3">if </span><span class="s0">followed_by_whitespace:</span>
+                        <span class="s0">block_indicators = </span><span class="s3">True</span>
+                <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'#' </span><span class="s3">and </span><span class="s0">preceded_by_whitespace:</span>
+                    <span class="s0">flow_indicators = </span><span class="s3">True</span>
+                    <span class="s0">block_indicators = </span><span class="s3">True</span>
+
+            <span class="s1"># Check for line breaks, special, and unicode characters.</span>
+            <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">line_breaks = </span><span class="s3">True</span>
+            <span class="s3">if not </span><span class="s0">(ch == </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">' </span><span class="s3">or </span><span class="s2">'</span><span class="s3">\x20</span><span class="s2">' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'</span><span class="s3">\x7E</span><span class="s2">'</span><span class="s0">):</span>
+                <span class="s3">if </span><span class="s0">(ch == </span><span class="s2">'</span><span class="s3">\x85</span><span class="s2">' </span><span class="s3">or </span><span class="s2">'</span><span class="s3">\xA0</span><span class="s2">' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'</span><span class="s3">\uD7FF</span><span class="s2">'</span>
+                        <span class="s3">or </span><span class="s2">'</span><span class="s3">\uE000</span><span class="s2">' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'</span><span class="s3">\uFFFD</span><span class="s2">'</span>
+                        <span class="s3">or </span><span class="s2">'</span><span class="s3">\U00010000</span><span class="s2">' </span><span class="s0">&lt;= ch &lt; </span><span class="s2">'</span><span class="s3">\U0010ffff</span><span class="s2">'</span><span class="s0">) </span><span class="s3">and </span><span class="s0">ch != </span><span class="s2">'</span><span class="s3">\uFEFF</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s0">unicode_characters = </span><span class="s3">True</span>
+                    <span class="s3">if not </span><span class="s0">self.allow_unicode:</span>
+                        <span class="s0">special_characters = </span><span class="s3">True</span>
+                <span class="s3">else</span><span class="s0">:</span>
+                    <span class="s0">special_characters = </span><span class="s3">True</span>
+
+            <span class="s1"># Detect important whitespace combinations.</span>
+            <span class="s3">if </span><span class="s0">ch == </span><span class="s2">' '</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">index == </span><span class="s4">0</span><span class="s0">:</span>
+                    <span class="s0">leading_space = </span><span class="s3">True</span>
+                <span class="s3">if </span><span class="s0">index == len(scalar)-</span><span class="s4">1</span><span class="s0">:</span>
+                    <span class="s0">trailing_space = </span><span class="s3">True</span>
+                <span class="s3">if </span><span class="s0">previous_break:</span>
+                    <span class="s0">break_space = </span><span class="s3">True</span>
+                <span class="s0">previous_space = </span><span class="s3">True</span>
+                <span class="s0">previous_break = </span><span class="s3">False</span>
+            <span class="s3">elif </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">index == </span><span class="s4">0</span><span class="s0">:</span>
+                    <span class="s0">leading_break = </span><span class="s3">True</span>
+                <span class="s3">if </span><span class="s0">index == len(scalar)-</span><span class="s4">1</span><span class="s0">:</span>
+                    <span class="s0">trailing_break = </span><span class="s3">True</span>
+                <span class="s3">if </span><span class="s0">previous_space:</span>
+                    <span class="s0">space_break = </span><span class="s3">True</span>
+                <span class="s0">previous_space = </span><span class="s3">False</span>
+                <span class="s0">previous_break = </span><span class="s3">True</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s0">previous_space = </span><span class="s3">False</span>
+                <span class="s0">previous_break = </span><span class="s3">False</span>
+
+            <span class="s1"># Prepare for the next character.</span>
+            <span class="s0">index += </span><span class="s4">1</span>
+            <span class="s0">preceded_by_whitespace = (ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">)</span>
+            <span class="s0">followed_by_whitespace = (index+</span><span class="s4">1 </span><span class="s0">&gt;= len(scalar) </span><span class="s3">or</span>
+                    <span class="s0">scalar[index+</span><span class="s4">1</span><span class="s0">] </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\0 \t\r\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">)</span>
+
+        <span class="s1"># Let's decide what styles are allowed.</span>
+        <span class="s0">allow_flow_plain = </span><span class="s3">True</span>
+        <span class="s0">allow_block_plain = </span><span class="s3">True</span>
+        <span class="s0">allow_single_quoted = </span><span class="s3">True</span>
+        <span class="s0">allow_double_quoted = </span><span class="s3">True</span>
+        <span class="s0">allow_block = </span><span class="s3">True</span>
+
+        <span class="s1"># Leading and trailing whitespaces are bad for plain scalars.</span>
+        <span class="s3">if </span><span class="s0">(leading_space </span><span class="s3">or </span><span class="s0">leading_break</span>
+                <span class="s3">or </span><span class="s0">trailing_space </span><span class="s3">or </span><span class="s0">trailing_break):</span>
+            <span class="s0">allow_flow_plain = allow_block_plain = </span><span class="s3">False</span>
+
+        <span class="s1"># We do not permit trailing spaces for block scalars.</span>
+        <span class="s3">if </span><span class="s0">trailing_space:</span>
+            <span class="s0">allow_block = </span><span class="s3">False</span>
+
+        <span class="s1"># Spaces at the beginning of a new line are only acceptable for block</span>
+        <span class="s1"># scalars.</span>
+        <span class="s3">if </span><span class="s0">break_space:</span>
+            <span class="s0">allow_flow_plain = allow_block_plain = allow_single_quoted = </span><span class="s3">False</span>
+
+        <span class="s1"># Spaces followed by breaks, as well as special character are only</span>
+        <span class="s1"># allowed for double quoted scalars.</span>
+        <span class="s3">if </span><span class="s0">space_break </span><span class="s3">or </span><span class="s0">special_characters:</span>
+            <span class="s0">allow_flow_plain = allow_block_plain =  \</span>
+            <span class="s0">allow_single_quoted = allow_block = </span><span class="s3">False</span>
+
+        <span class="s1"># Although the plain scalar writer supports breaks, we never emit</span>
+        <span class="s1"># multiline plain scalars.</span>
+        <span class="s3">if </span><span class="s0">line_breaks:</span>
+            <span class="s0">allow_flow_plain = allow_block_plain = </span><span class="s3">False</span>
+
+        <span class="s1"># Flow indicators are forbidden for flow plain scalars.</span>
+        <span class="s3">if </span><span class="s0">flow_indicators:</span>
+            <span class="s0">allow_flow_plain = </span><span class="s3">False</span>
+
+        <span class="s1"># Block indicators are forbidden for block plain scalars.</span>
+        <span class="s3">if </span><span class="s0">block_indicators:</span>
+            <span class="s0">allow_block_plain = </span><span class="s3">False</span>
+
+        <span class="s3">return </span><span class="s0">ScalarAnalysis(scalar=scalar</span><span class="s3">,</span>
+                <span class="s0">empty=</span><span class="s3">False, </span><span class="s0">multiline=line_breaks</span><span class="s3">,</span>
+                <span class="s0">allow_flow_plain=allow_flow_plain</span><span class="s3">,</span>
+                <span class="s0">allow_block_plain=allow_block_plain</span><span class="s3">,</span>
+                <span class="s0">allow_single_quoted=allow_single_quoted</span><span class="s3">,</span>
+                <span class="s0">allow_double_quoted=allow_double_quoted</span><span class="s3">,</span>
+                <span class="s0">allow_block=allow_block)</span>
+
+    <span class="s1"># Writers.</span>
+
+    <span class="s3">def </span><span class="s0">flush_stream(self):</span>
+        <span class="s3">if </span><span class="s0">hasattr(self.stream</span><span class="s3">, </span><span class="s2">'flush'</span><span class="s0">):</span>
+            <span class="s0">self.stream.flush()</span>
+
+    <span class="s3">def </span><span class="s0">write_stream_start(self):</span>
+        <span class="s1"># Write BOM if needed.</span>
+        <span class="s3">if </span><span class="s0">self.encoding </span><span class="s3">and </span><span class="s0">self.encoding.startswith(</span><span class="s2">'utf-16'</span><span class="s0">):</span>
+            <span class="s0">self.stream.write(</span><span class="s2">'</span><span class="s3">\uFEFF</span><span class="s2">'</span><span class="s0">.encode(self.encoding))</span>
+
+    <span class="s3">def </span><span class="s0">write_stream_end(self):</span>
+        <span class="s0">self.flush_stream()</span>
+
+    <span class="s3">def </span><span class="s0">write_indicator(self</span><span class="s3">, </span><span class="s0">indicator</span><span class="s3">, </span><span class="s0">need_whitespace</span><span class="s3">,</span>
+            <span class="s0">whitespace=</span><span class="s3">False, </span><span class="s0">indention=</span><span class="s3">False</span><span class="s0">):</span>
+        <span class="s3">if </span><span class="s0">self.whitespace </span><span class="s3">or not </span><span class="s0">need_whitespace:</span>
+            <span class="s0">data = indicator</span>
+        <span class="s3">else</span><span class="s0">:</span>
+            <span class="s0">data = </span><span class="s2">' '</span><span class="s0">+indicator</span>
+        <span class="s0">self.whitespace = whitespace</span>
+        <span class="s0">self.indention = self.indention </span><span class="s3">and </span><span class="s0">indention</span>
+        <span class="s0">self.column += len(data)</span>
+        <span class="s0">self.open_ended = </span><span class="s3">False</span>
+        <span class="s3">if </span><span class="s0">self.encoding:</span>
+            <span class="s0">data = data.encode(self.encoding)</span>
+        <span class="s0">self.stream.write(data)</span>
+
+    <span class="s3">def </span><span class="s0">write_indent(self):</span>
+        <span class="s0">indent = self.indent </span><span class="s3">or </span><span class="s4">0</span>
+        <span class="s3">if not </span><span class="s0">self.indention </span><span class="s3">or </span><span class="s0">self.column &gt; indent   \</span>
+                <span class="s3">or </span><span class="s0">(self.column == indent </span><span class="s3">and not </span><span class="s0">self.whitespace):</span>
+            <span class="s0">self.write_line_break()</span>
+        <span class="s3">if </span><span class="s0">self.column &lt; indent:</span>
+            <span class="s0">self.whitespace = </span><span class="s3">True</span>
+            <span class="s0">data = </span><span class="s2">' '</span><span class="s0">*(indent-self.column)</span>
+            <span class="s0">self.column = indent</span>
+            <span class="s3">if </span><span class="s0">self.encoding:</span>
+                <span class="s0">data = data.encode(self.encoding)</span>
+            <span class="s0">self.stream.write(data)</span>
+
+    <span class="s3">def </span><span class="s0">write_line_break(self</span><span class="s3">, </span><span class="s0">data=</span><span class="s3">None</span><span class="s0">):</span>
+        <span class="s3">if </span><span class="s0">data </span><span class="s3">is None</span><span class="s0">:</span>
+            <span class="s0">data = self.best_line_break</span>
+        <span class="s0">self.whitespace = </span><span class="s3">True</span>
+        <span class="s0">self.indention = </span><span class="s3">True</span>
+        <span class="s0">self.line += </span><span class="s4">1</span>
+        <span class="s0">self.column = </span><span class="s4">0</span>
+        <span class="s3">if </span><span class="s0">self.encoding:</span>
+            <span class="s0">data = data.encode(self.encoding)</span>
+        <span class="s0">self.stream.write(data)</span>
+
+    <span class="s3">def </span><span class="s0">write_version_directive(self</span><span class="s3">, </span><span class="s0">version_text):</span>
+        <span class="s0">data = </span><span class="s2">'%%YAML %s' </span><span class="s0">% version_text</span>
+        <span class="s3">if </span><span class="s0">self.encoding:</span>
+            <span class="s0">data = data.encode(self.encoding)</span>
+        <span class="s0">self.stream.write(data)</span>
+        <span class="s0">self.write_line_break()</span>
+
+    <span class="s3">def </span><span class="s0">write_tag_directive(self</span><span class="s3">, </span><span class="s0">handle_text</span><span class="s3">, </span><span class="s0">prefix_text):</span>
+        <span class="s0">data = </span><span class="s2">'%%TAG %s %s' </span><span class="s0">% (handle_text</span><span class="s3">, </span><span class="s0">prefix_text)</span>
+        <span class="s3">if </span><span class="s0">self.encoding:</span>
+            <span class="s0">data = data.encode(self.encoding)</span>
+        <span class="s0">self.stream.write(data)</span>
+        <span class="s0">self.write_line_break()</span>
+
+    <span class="s1"># Scalar streams.</span>
+
+    <span class="s3">def </span><span class="s0">write_single_quoted(self</span><span class="s3">, </span><span class="s0">text</span><span class="s3">, </span><span class="s0">split=</span><span class="s3">True</span><span class="s0">):</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span><span class="s3">, True</span><span class="s0">)</span>
+        <span class="s0">spaces = </span><span class="s3">False</span>
+        <span class="s0">breaks = </span><span class="s3">False</span>
+        <span class="s0">start = end = </span><span class="s4">0</span>
+        <span class="s3">while </span><span class="s0">end &lt;= len(text):</span>
+            <span class="s0">ch = </span><span class="s3">None</span>
+            <span class="s3">if </span><span class="s0">end &lt; len(text):</span>
+                <span class="s0">ch = text[end]</span>
+            <span class="s3">if </span><span class="s0">spaces:</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">is None or </span><span class="s0">ch != </span><span class="s2">' '</span><span class="s0">:</span>
+                    <span class="s3">if </span><span class="s0">start+</span><span class="s4">1 </span><span class="s0">== end </span><span class="s3">and </span><span class="s0">self.column &gt; self.best_width </span><span class="s3">and </span><span class="s0">split   \</span>
+                            <span class="s3">and </span><span class="s0">start != </span><span class="s4">0 </span><span class="s3">and </span><span class="s0">end != len(text):</span>
+                        <span class="s0">self.write_indent()</span>
+                    <span class="s3">else</span><span class="s0">:</span>
+                        <span class="s0">data = text[start:end]</span>
+                        <span class="s0">self.column += len(data)</span>
+                        <span class="s3">if </span><span class="s0">self.encoding:</span>
+                            <span class="s0">data = data.encode(self.encoding)</span>
+                        <span class="s0">self.stream.write(data)</span>
+                    <span class="s0">start = end</span>
+            <span class="s3">elif </span><span class="s0">breaks:</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">is None or </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s3">if </span><span class="s0">text[start] == </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s0">:</span>
+                        <span class="s0">self.write_line_break()</span>
+                    <span class="s3">for </span><span class="s0">br </span><span class="s3">in </span><span class="s0">text[start:end]:</span>
+                        <span class="s3">if </span><span class="s0">br == </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s0">:</span>
+                            <span class="s0">self.write_line_break()</span>
+                        <span class="s3">else</span><span class="s0">:</span>
+                            <span class="s0">self.write_line_break(br)</span>
+                    <span class="s0">self.write_indent()</span>
+                    <span class="s0">start = end</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">is None or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">' </span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">' </span><span class="s3">or </span><span class="s0">ch == </span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s3">if </span><span class="s0">start &lt; end:</span>
+                        <span class="s0">data = text[start:end]</span>
+                        <span class="s0">self.column += len(data)</span>
+                        <span class="s3">if </span><span class="s0">self.encoding:</span>
+                            <span class="s0">data = data.encode(self.encoding)</span>
+                        <span class="s0">self.stream.write(data)</span>
+                        <span class="s0">start = end</span>
+            <span class="s3">if </span><span class="s0">ch == </span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">data = </span><span class="s2">'</span><span class="s3">\'\'</span><span class="s2">'</span>
+                <span class="s0">self.column += </span><span class="s4">2</span>
+                <span class="s3">if </span><span class="s0">self.encoding:</span>
+                    <span class="s0">data = data.encode(self.encoding)</span>
+                <span class="s0">self.stream.write(data)</span>
+                <span class="s0">start = end + </span><span class="s4">1</span>
+            <span class="s3">if </span><span class="s0">ch </span><span class="s3">is not None</span><span class="s0">:</span>
+                <span class="s0">spaces = (ch == </span><span class="s2">' '</span><span class="s0">)</span>
+                <span class="s0">breaks = (ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">)</span>
+            <span class="s0">end += </span><span class="s4">1</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">'</span><span class="s3">\'</span><span class="s2">'</span><span class="s3">, False</span><span class="s0">)</span>
+
+    <span class="s0">ESCAPE_REPLACEMENTS = {</span>
+        <span class="s2">'</span><span class="s3">\0</span><span class="s2">'</span><span class="s0">:       </span><span class="s2">'0'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\x07</span><span class="s2">'</span><span class="s0">:     </span><span class="s2">'a'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\x08</span><span class="s2">'</span><span class="s0">:     </span><span class="s2">'b'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\x09</span><span class="s2">'</span><span class="s0">:     </span><span class="s2">'t'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\x0A</span><span class="s2">'</span><span class="s0">:     </span><span class="s2">'n'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\x0B</span><span class="s2">'</span><span class="s0">:     </span><span class="s2">'v'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\x0C</span><span class="s2">'</span><span class="s0">:     </span><span class="s2">'f'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\x0D</span><span class="s2">'</span><span class="s0">:     </span><span class="s2">'r'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\x1B</span><span class="s2">'</span><span class="s0">:     </span><span class="s2">'e'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\&quot;</span><span class="s2">'</span><span class="s0">:       </span><span class="s2">'</span><span class="s3">\&quot;</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\\</span><span class="s2">'</span><span class="s0">:       </span><span class="s2">'</span><span class="s3">\\</span><span class="s2">'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\x85</span><span class="s2">'</span><span class="s0">:     </span><span class="s2">'N'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\xA0</span><span class="s2">'</span><span class="s0">:     </span><span class="s2">'_'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\u2028</span><span class="s2">'</span><span class="s0">:   </span><span class="s2">'L'</span><span class="s3">,</span>
+        <span class="s2">'</span><span class="s3">\u2029</span><span class="s2">'</span><span class="s0">:   </span><span class="s2">'P'</span><span class="s3">,</span>
+    <span class="s0">}</span>
+
+    <span class="s3">def </span><span class="s0">write_double_quoted(self</span><span class="s3">, </span><span class="s0">text</span><span class="s3">, </span><span class="s0">split=</span><span class="s3">True</span><span class="s0">):</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">'&quot;'</span><span class="s3">, True</span><span class="s0">)</span>
+        <span class="s0">start = end = </span><span class="s4">0</span>
+        <span class="s3">while </span><span class="s0">end &lt;= len(text):</span>
+            <span class="s0">ch = </span><span class="s3">None</span>
+            <span class="s3">if </span><span class="s0">end &lt; len(text):</span>
+                <span class="s0">ch = text[end]</span>
+            <span class="s3">if </span><span class="s0">ch </span><span class="s3">is None or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'&quot;</span><span class="s3">\\\x85\u2028\u2029\uFEFF</span><span class="s2">' </span><span class="s0">\</span>
+                    <span class="s3">or not </span><span class="s0">(</span><span class="s2">'</span><span class="s3">\x20</span><span class="s2">' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'</span><span class="s3">\x7E</span><span class="s2">'</span>
+                        <span class="s3">or </span><span class="s0">(self.allow_unicode</span>
+                            <span class="s3">and </span><span class="s0">(</span><span class="s2">'</span><span class="s3">\xA0</span><span class="s2">' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'</span><span class="s3">\uD7FF</span><span class="s2">'</span>
+                                <span class="s3">or </span><span class="s2">'</span><span class="s3">\uE000</span><span class="s2">' </span><span class="s0">&lt;= ch &lt;= </span><span class="s2">'</span><span class="s3">\uFFFD</span><span class="s2">'</span><span class="s0">))):</span>
+                <span class="s3">if </span><span class="s0">start &lt; end:</span>
+                    <span class="s0">data = text[start:end]</span>
+                    <span class="s0">self.column += len(data)</span>
+                    <span class="s3">if </span><span class="s0">self.encoding:</span>
+                        <span class="s0">data = data.encode(self.encoding)</span>
+                    <span class="s0">self.stream.write(data)</span>
+                    <span class="s0">start = end</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">is not None</span><span class="s0">:</span>
+                    <span class="s3">if </span><span class="s0">ch </span><span class="s3">in </span><span class="s0">self.ESCAPE_REPLACEMENTS:</span>
+                        <span class="s0">data = </span><span class="s2">'</span><span class="s3">\\</span><span class="s2">'</span><span class="s0">+self.ESCAPE_REPLACEMENTS[ch]</span>
+                    <span class="s3">elif </span><span class="s0">ch &lt;= </span><span class="s2">'</span><span class="s3">\xFF</span><span class="s2">'</span><span class="s0">:</span>
+                        <span class="s0">data = </span><span class="s2">'</span><span class="s3">\\</span><span class="s2">x%02X' </span><span class="s0">% ord(ch)</span>
+                    <span class="s3">elif </span><span class="s0">ch &lt;= </span><span class="s2">'</span><span class="s3">\uFFFF</span><span class="s2">'</span><span class="s0">:</span>
+                        <span class="s0">data = </span><span class="s2">'</span><span class="s3">\\</span><span class="s2">u%04X' </span><span class="s0">% ord(ch)</span>
+                    <span class="s3">else</span><span class="s0">:</span>
+                        <span class="s0">data = </span><span class="s2">'</span><span class="s3">\\</span><span class="s2">U%08X' </span><span class="s0">% ord(ch)</span>
+                    <span class="s0">self.column += len(data)</span>
+                    <span class="s3">if </span><span class="s0">self.encoding:</span>
+                        <span class="s0">data = data.encode(self.encoding)</span>
+                    <span class="s0">self.stream.write(data)</span>
+                    <span class="s0">start = end+</span><span class="s4">1</span>
+            <span class="s3">if </span><span class="s4">0 </span><span class="s0">&lt; end &lt; len(text)-</span><span class="s4">1 </span><span class="s3">and </span><span class="s0">(ch == </span><span class="s2">' ' </span><span class="s3">or </span><span class="s0">start &gt;= end)    \</span>
+                    <span class="s3">and </span><span class="s0">self.column+(end-start) &gt; self.best_width </span><span class="s3">and </span><span class="s0">split:</span>
+                <span class="s0">data = text[start:end]+</span><span class="s2">'</span><span class="s3">\\</span><span class="s2">'</span>
+                <span class="s3">if </span><span class="s0">start &lt; end:</span>
+                    <span class="s0">start = end</span>
+                <span class="s0">self.column += len(data)</span>
+                <span class="s3">if </span><span class="s0">self.encoding:</span>
+                    <span class="s0">data = data.encode(self.encoding)</span>
+                <span class="s0">self.stream.write(data)</span>
+                <span class="s0">self.write_indent()</span>
+                <span class="s0">self.whitespace = </span><span class="s3">False</span>
+                <span class="s0">self.indention = </span><span class="s3">False</span>
+                <span class="s3">if </span><span class="s0">text[start] == </span><span class="s2">' '</span><span class="s0">:</span>
+                    <span class="s0">data = </span><span class="s2">'</span><span class="s3">\\</span><span class="s2">'</span>
+                    <span class="s0">self.column += len(data)</span>
+                    <span class="s3">if </span><span class="s0">self.encoding:</span>
+                        <span class="s0">data = data.encode(self.encoding)</span>
+                    <span class="s0">self.stream.write(data)</span>
+            <span class="s0">end += </span><span class="s4">1</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">'&quot;'</span><span class="s3">, False</span><span class="s0">)</span>
+
+    <span class="s3">def </span><span class="s0">determine_block_hints(self</span><span class="s3">, </span><span class="s0">text):</span>
+        <span class="s0">hints = </span><span class="s2">''</span>
+        <span class="s3">if </span><span class="s0">text:</span>
+            <span class="s3">if </span><span class="s0">text[</span><span class="s4">0</span><span class="s0">] </span><span class="s3">in </span><span class="s2">' </span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">hints += str(self.best_indent)</span>
+            <span class="s3">if </span><span class="s0">text[-</span><span class="s4">1</span><span class="s0">] </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">hints += </span><span class="s2">'-'</span>
+            <span class="s3">elif </span><span class="s0">len(text) == </span><span class="s4">1 </span><span class="s3">or </span><span class="s0">text[-</span><span class="s4">2</span><span class="s0">] </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                <span class="s0">hints += </span><span class="s2">'+'</span>
+        <span class="s3">return </span><span class="s0">hints</span>
+
+    <span class="s3">def </span><span class="s0">write_folded(self</span><span class="s3">, </span><span class="s0">text):</span>
+        <span class="s0">hints = self.determine_block_hints(text)</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">'&gt;'</span><span class="s0">+hints</span><span class="s3">, True</span><span class="s0">)</span>
+        <span class="s3">if </span><span class="s0">hints[-</span><span class="s4">1</span><span class="s0">:] == </span><span class="s2">'+'</span><span class="s0">:</span>
+            <span class="s0">self.open_ended = </span><span class="s3">True</span>
+        <span class="s0">self.write_line_break()</span>
+        <span class="s0">leading_space = </span><span class="s3">True</span>
+        <span class="s0">spaces = </span><span class="s3">False</span>
+        <span class="s0">breaks = </span><span class="s3">True</span>
+        <span class="s0">start = end = </span><span class="s4">0</span>
+        <span class="s3">while </span><span class="s0">end &lt;= len(text):</span>
+            <span class="s0">ch = </span><span class="s3">None</span>
+            <span class="s3">if </span><span class="s0">end &lt; len(text):</span>
+                <span class="s0">ch = text[end]</span>
+            <span class="s3">if </span><span class="s0">breaks:</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">is None or </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s3">if not </span><span class="s0">leading_space </span><span class="s3">and </span><span class="s0">ch </span><span class="s3">is not None and </span><span class="s0">ch != </span><span class="s2">' '   </span><span class="s0">\</span>
+                            <span class="s3">and </span><span class="s0">text[start] == </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s0">:</span>
+                        <span class="s0">self.write_line_break()</span>
+                    <span class="s0">leading_space = (ch == </span><span class="s2">' '</span><span class="s0">)</span>
+                    <span class="s3">for </span><span class="s0">br </span><span class="s3">in </span><span class="s0">text[start:end]:</span>
+                        <span class="s3">if </span><span class="s0">br == </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s0">:</span>
+                            <span class="s0">self.write_line_break()</span>
+                        <span class="s3">else</span><span class="s0">:</span>
+                            <span class="s0">self.write_line_break(br)</span>
+                    <span class="s3">if </span><span class="s0">ch </span><span class="s3">is not None</span><span class="s0">:</span>
+                        <span class="s0">self.write_indent()</span>
+                    <span class="s0">start = end</span>
+            <span class="s3">elif </span><span class="s0">spaces:</span>
+                <span class="s3">if </span><span class="s0">ch != </span><span class="s2">' '</span><span class="s0">:</span>
+                    <span class="s3">if </span><span class="s0">start+</span><span class="s4">1 </span><span class="s0">== end </span><span class="s3">and </span><span class="s0">self.column &gt; self.best_width:</span>
+                        <span class="s0">self.write_indent()</span>
+                    <span class="s3">else</span><span class="s0">:</span>
+                        <span class="s0">data = text[start:end]</span>
+                        <span class="s0">self.column += len(data)</span>
+                        <span class="s3">if </span><span class="s0">self.encoding:</span>
+                            <span class="s0">data = data.encode(self.encoding)</span>
+                        <span class="s0">self.stream.write(data)</span>
+                    <span class="s0">start = end</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">is None or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">' </span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s0">data = text[start:end]</span>
+                    <span class="s0">self.column += len(data)</span>
+                    <span class="s3">if </span><span class="s0">self.encoding:</span>
+                        <span class="s0">data = data.encode(self.encoding)</span>
+                    <span class="s0">self.stream.write(data)</span>
+                    <span class="s3">if </span><span class="s0">ch </span><span class="s3">is None</span><span class="s0">:</span>
+                        <span class="s0">self.write_line_break()</span>
+                    <span class="s0">start = end</span>
+            <span class="s3">if </span><span class="s0">ch </span><span class="s3">is not None</span><span class="s0">:</span>
+                <span class="s0">breaks = (ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">)</span>
+                <span class="s0">spaces = (ch == </span><span class="s2">' '</span><span class="s0">)</span>
+            <span class="s0">end += </span><span class="s4">1</span>
+
+    <span class="s3">def </span><span class="s0">write_literal(self</span><span class="s3">, </span><span class="s0">text):</span>
+        <span class="s0">hints = self.determine_block_hints(text)</span>
+        <span class="s0">self.write_indicator(</span><span class="s2">'|'</span><span class="s0">+hints</span><span class="s3">, True</span><span class="s0">)</span>
+        <span class="s3">if </span><span class="s0">hints[-</span><span class="s4">1</span><span class="s0">:] == </span><span class="s2">'+'</span><span class="s0">:</span>
+            <span class="s0">self.open_ended = </span><span class="s3">True</span>
+        <span class="s0">self.write_line_break()</span>
+        <span class="s0">breaks = </span><span class="s3">True</span>
+        <span class="s0">start = end = </span><span class="s4">0</span>
+        <span class="s3">while </span><span class="s0">end &lt;= len(text):</span>
+            <span class="s0">ch = </span><span class="s3">None</span>
+            <span class="s3">if </span><span class="s0">end &lt; len(text):</span>
+                <span class="s0">ch = text[end]</span>
+            <span class="s3">if </span><span class="s0">breaks:</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">is None or </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s3">for </span><span class="s0">br </span><span class="s3">in </span><span class="s0">text[start:end]:</span>
+                        <span class="s3">if </span><span class="s0">br == </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s0">:</span>
+                            <span class="s0">self.write_line_break()</span>
+                        <span class="s3">else</span><span class="s0">:</span>
+                            <span class="s0">self.write_line_break(br)</span>
+                    <span class="s3">if </span><span class="s0">ch </span><span class="s3">is not None</span><span class="s0">:</span>
+                        <span class="s0">self.write_indent()</span>
+                    <span class="s0">start = end</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">is None or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s0">data = text[start:end]</span>
+                    <span class="s3">if </span><span class="s0">self.encoding:</span>
+                        <span class="s0">data = data.encode(self.encoding)</span>
+                    <span class="s0">self.stream.write(data)</span>
+                    <span class="s3">if </span><span class="s0">ch </span><span class="s3">is None</span><span class="s0">:</span>
+                        <span class="s0">self.write_line_break()</span>
+                    <span class="s0">start = end</span>
+            <span class="s3">if </span><span class="s0">ch </span><span class="s3">is not None</span><span class="s0">:</span>
+                <span class="s0">breaks = (ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">)</span>
+            <span class="s0">end += </span><span class="s4">1</span>
+
+    <span class="s3">def </span><span class="s0">write_plain(self</span><span class="s3">, </span><span class="s0">text</span><span class="s3">, </span><span class="s0">split=</span><span class="s3">True</span><span class="s0">):</span>
+        <span class="s3">if </span><span class="s0">self.root_context:</span>
+            <span class="s0">self.open_ended = </span><span class="s3">True</span>
+        <span class="s3">if not </span><span class="s0">text:</span>
+            <span class="s3">return</span>
+        <span class="s3">if not </span><span class="s0">self.whitespace:</span>
+            <span class="s0">data = </span><span class="s2">' '</span>
+            <span class="s0">self.column += len(data)</span>
+            <span class="s3">if </span><span class="s0">self.encoding:</span>
+                <span class="s0">data = data.encode(self.encoding)</span>
+            <span class="s0">self.stream.write(data)</span>
+        <span class="s0">self.whitespace = </span><span class="s3">False</span>
+        <span class="s0">self.indention = </span><span class="s3">False</span>
+        <span class="s0">spaces = </span><span class="s3">False</span>
+        <span class="s0">breaks = </span><span class="s3">False</span>
+        <span class="s0">start = end = </span><span class="s4">0</span>
+        <span class="s3">while </span><span class="s0">end &lt;= len(text):</span>
+            <span class="s0">ch = </span><span class="s3">None</span>
+            <span class="s3">if </span><span class="s0">end &lt; len(text):</span>
+                <span class="s0">ch = text[end]</span>
+            <span class="s3">if </span><span class="s0">spaces:</span>
+                <span class="s3">if </span><span class="s0">ch != </span><span class="s2">' '</span><span class="s0">:</span>
+                    <span class="s3">if </span><span class="s0">start+</span><span class="s4">1 </span><span class="s0">== end </span><span class="s3">and </span><span class="s0">self.column &gt; self.best_width </span><span class="s3">and </span><span class="s0">split:</span>
+                        <span class="s0">self.write_indent()</span>
+                        <span class="s0">self.whitespace = </span><span class="s3">False</span>
+                        <span class="s0">self.indention = </span><span class="s3">False</span>
+                    <span class="s3">else</span><span class="s0">:</span>
+                        <span class="s0">data = text[start:end]</span>
+                        <span class="s0">self.column += len(data)</span>
+                        <span class="s3">if </span><span class="s0">self.encoding:</span>
+                            <span class="s0">data = data.encode(self.encoding)</span>
+                        <span class="s0">self.stream.write(data)</span>
+                    <span class="s0">start = end</span>
+            <span class="s3">elif </span><span class="s0">breaks:</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">not in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s3">if </span><span class="s0">text[start] == </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s0">:</span>
+                        <span class="s0">self.write_line_break()</span>
+                    <span class="s3">for </span><span class="s0">br </span><span class="s3">in </span><span class="s0">text[start:end]:</span>
+                        <span class="s3">if </span><span class="s0">br == </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s0">:</span>
+                            <span class="s0">self.write_line_break()</span>
+                        <span class="s3">else</span><span class="s0">:</span>
+                            <span class="s0">self.write_line_break(br)</span>
+                    <span class="s0">self.write_indent()</span>
+                    <span class="s0">self.whitespace = </span><span class="s3">False</span>
+                    <span class="s0">self.indention = </span><span class="s3">False</span>
+                    <span class="s0">start = end</span>
+            <span class="s3">else</span><span class="s0">:</span>
+                <span class="s3">if </span><span class="s0">ch </span><span class="s3">is None or </span><span class="s0">ch </span><span class="s3">in </span><span class="s2">' </span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">:</span>
+                    <span class="s0">data = text[start:end]</span>
+                    <span class="s0">self.column += len(data)</span>
+                    <span class="s3">if </span><span class="s0">self.encoding:</span>
+                        <span class="s0">data = data.encode(self.encoding)</span>
+                    <span class="s0">self.stream.write(data)</span>
+                    <span class="s0">start = end</span>
+            <span class="s3">if </span><span class="s0">ch </span><span class="s3">is not None</span><span class="s0">:</span>
+                <span class="s0">spaces = (ch == </span><span class="s2">' '</span><span class="s0">)</span>
+                <span class="s0">breaks = (ch </span><span class="s3">in </span><span class="s2">'</span><span class="s3">\n\x85\u2028\u2029</span><span class="s2">'</span><span class="s0">)</span>
+            <span class="s0">end += </span><span class="s4">1</span>
+</pre>
+</body>
+</html>

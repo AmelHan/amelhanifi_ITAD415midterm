@@ -1,0 +1,376 @@
+<html>
+<head>
+<title>test_linear_loss.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_linear_loss.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Tests for LinearModelLoss 
+ 
+Note that correctness of losses (which compose LinearModelLoss) is already well 
+covered in the _loss module. 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">pytest</span>
+<span class="s2">from </span><span class="s1">numpy.testing </span><span class="s2">import </span><span class="s1">assert_allclose</span>
+<span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">linalg</span><span class="s2">, </span><span class="s1">optimize</span><span class="s2">, </span><span class="s1">sparse</span>
+
+<span class="s2">from </span><span class="s1">sklearn._loss.loss </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">HalfBinomialLoss</span><span class="s2">,</span>
+    <span class="s1">HalfMultinomialLoss</span><span class="s2">,</span>
+    <span class="s1">HalfPoissonLoss</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s2">from </span><span class="s1">sklearn.datasets </span><span class="s2">import </span><span class="s1">make_low_rank_matrix</span>
+<span class="s2">from </span><span class="s1">sklearn.linear_model._linear_loss </span><span class="s2">import </span><span class="s1">LinearModelLoss</span>
+<span class="s2">from </span><span class="s1">sklearn.utils.extmath </span><span class="s2">import </span><span class="s1">squared_norm</span>
+
+<span class="s3"># We do not need to test all losses, just what LinearModelLoss does on top of the</span>
+<span class="s3"># base losses.</span>
+<span class="s1">LOSSES = [HalfBinomialLoss</span><span class="s2">, </span><span class="s1">HalfMultinomialLoss</span><span class="s2">, </span><span class="s1">HalfPoissonLoss]</span>
+
+
+<span class="s2">def </span><span class="s1">random_X_y_coef(</span>
+    <span class="s1">linear_model_loss</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_features</span><span class="s2">, </span><span class="s1">coef_bound=(-</span><span class="s4">2</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">seed=</span><span class="s4">42</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Random generate y, X and coef in valid range.&quot;&quot;&quot;</span>
+    <span class="s1">rng = np.random.RandomState(seed)</span>
+    <span class="s1">n_dof = n_features + linear_model_loss.fit_intercept</span>
+    <span class="s1">X = make_low_rank_matrix(</span>
+        <span class="s1">n_samples=n_samples</span><span class="s2">,</span>
+        <span class="s1">n_features=n_features</span><span class="s2">,</span>
+        <span class="s1">random_state=rng</span><span class="s2">,</span>
+    <span class="s1">)</span>
+    <span class="s1">coef = linear_model_loss.init_zero_coef(X)</span>
+
+    <span class="s2">if </span><span class="s1">linear_model_loss.base_loss.is_multiclass:</span>
+        <span class="s1">n_classes = linear_model_loss.base_loss.n_classes</span>
+        <span class="s1">coef.flat[:] = rng.uniform(</span>
+            <span class="s1">low=coef_bound[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">high=coef_bound[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">size=n_classes * n_dof</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">linear_model_loss.fit_intercept:</span>
+            <span class="s1">raw_prediction = X @ coef[:</span><span class="s2">, </span><span class="s1">:-</span><span class="s4">1</span><span class="s1">].T + coef[:</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">raw_prediction = X @ coef.T</span>
+        <span class="s1">proba = linear_model_loss.base_loss.link.inverse(raw_prediction)</span>
+
+        <span class="s3"># y = rng.choice(np.arange(n_classes), p=proba) does not work.</span>
+        <span class="s3"># See https://stackoverflow.com/a/34190035/16761084</span>
+        <span class="s2">def </span><span class="s1">choice_vectorized(items</span><span class="s2">, </span><span class="s1">p):</span>
+            <span class="s1">s = p.cumsum(axis=</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s1">r = rng.rand(p.shape[</span><span class="s4">0</span><span class="s1">])[:</span><span class="s2">, None</span><span class="s1">]</span>
+            <span class="s1">k = (s &lt; r).sum(axis=</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s2">return </span><span class="s1">items[k]</span>
+
+        <span class="s1">y = choice_vectorized(np.arange(n_classes)</span><span class="s2">, </span><span class="s1">p=proba).astype(np.float64)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">coef.flat[:] = rng.uniform(</span>
+            <span class="s1">low=coef_bound[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">high=coef_bound[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">size=n_dof</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">linear_model_loss.fit_intercept:</span>
+            <span class="s1">raw_prediction = X @ coef[:-</span><span class="s4">1</span><span class="s1">] + coef[-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">raw_prediction = X @ coef</span>
+        <span class="s1">y = linear_model_loss.base_loss.link.inverse(</span>
+            <span class="s1">raw_prediction + rng.uniform(low=-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">high=</span><span class="s4">1</span><span class="s2">, </span><span class="s1">size=n_samples)</span>
+        <span class="s1">)</span>
+
+    <span class="s2">return </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">coef</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;base_loss&quot;</span><span class="s2">, </span><span class="s1">LOSSES)</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;fit_intercept&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s2">False, True</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;n_features&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">10</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;dtype&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s2">None, </span><span class="s1">np.float32</span><span class="s2">, </span><span class="s1">np.float64</span><span class="s2">, </span><span class="s1">np.int64])</span>
+<span class="s2">def </span><span class="s1">test_init_zero_coef(base_loss</span><span class="s2">, </span><span class="s1">fit_intercept</span><span class="s2">, </span><span class="s1">n_features</span><span class="s2">, </span><span class="s1">dtype):</span>
+    <span class="s0">&quot;&quot;&quot;Test that init_zero_coef initializes coef correctly.&quot;&quot;&quot;</span>
+    <span class="s1">loss = LinearModelLoss(base_loss=base_loss()</span><span class="s2">, </span><span class="s1">fit_intercept=fit_intercept)</span>
+    <span class="s1">rng = np.random.RandomState(</span><span class="s4">42</span><span class="s1">)</span>
+    <span class="s1">X = rng.normal(size=(</span><span class="s4">5</span><span class="s2">, </span><span class="s1">n_features))</span>
+    <span class="s1">coef = loss.init_zero_coef(X</span><span class="s2">, </span><span class="s1">dtype=dtype)</span>
+    <span class="s2">if </span><span class="s1">loss.base_loss.is_multiclass:</span>
+        <span class="s1">n_classes = loss.base_loss.n_classes</span>
+        <span class="s2">assert </span><span class="s1">coef.shape == (n_classes</span><span class="s2">, </span><span class="s1">n_features + fit_intercept)</span>
+        <span class="s2">assert </span><span class="s1">coef.flags[</span><span class="s5">&quot;F_CONTIGUOUS&quot;</span><span class="s1">]</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">assert </span><span class="s1">coef.shape == (n_features + fit_intercept</span><span class="s2">,</span><span class="s1">)</span>
+
+    <span class="s2">if </span><span class="s1">dtype </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">assert </span><span class="s1">coef.dtype == X.dtype</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">assert </span><span class="s1">coef.dtype == dtype</span>
+
+    <span class="s2">assert </span><span class="s1">np.count_nonzero(coef) == </span><span class="s4">0</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;base_loss&quot;</span><span class="s2">, </span><span class="s1">LOSSES)</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;fit_intercept&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s2">False, True</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;sample_weight&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s2">None, </span><span class="s5">&quot;range&quot;</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;l2_reg_strength&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_loss_grad_hess_are_the_same(</span>
+    <span class="s1">base_loss</span><span class="s2">, </span><span class="s1">fit_intercept</span><span class="s2">, </span><span class="s1">sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Test that loss and gradient are the same across different functions.&quot;&quot;&quot;</span>
+    <span class="s1">loss = LinearModelLoss(base_loss=base_loss()</span><span class="s2">, </span><span class="s1">fit_intercept=fit_intercept)</span>
+    <span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">coef = random_X_y_coef(</span>
+        <span class="s1">linear_model_loss=loss</span><span class="s2">, </span><span class="s1">n_samples=</span><span class="s4">10</span><span class="s2">, </span><span class="s1">n_features=</span><span class="s4">5</span><span class="s2">, </span><span class="s1">seed=</span><span class="s4">42</span>
+    <span class="s1">)</span>
+
+    <span class="s2">if </span><span class="s1">sample_weight == </span><span class="s5">&quot;range&quot;</span><span class="s1">:</span>
+        <span class="s1">sample_weight = np.linspace(</span><span class="s4">1</span><span class="s2">, </span><span class="s1">y.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">num=y.shape[</span><span class="s4">0</span><span class="s1">])</span>
+
+    <span class="s1">l1 = loss.loss(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s1">g1 = loss.gradient(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s1">l2</span><span class="s2">, </span><span class="s1">g2 = loss.loss_gradient(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s1">g3</span><span class="s2">, </span><span class="s1">h3 = loss.gradient_hessian_product(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s2">if not </span><span class="s1">base_loss.is_multiclass:</span>
+        <span class="s1">g4</span><span class="s2">, </span><span class="s1">h4</span><span class="s2">, </span><span class="s1">_ = loss.gradient_hessian(</span>
+            <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+        <span class="s1">)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">with </span><span class="s1">pytest.raises(NotImplementedError):</span>
+            <span class="s1">loss.gradient_hessian(</span>
+                <span class="s1">coef</span><span class="s2">,</span>
+                <span class="s1">X</span><span class="s2">,</span>
+                <span class="s1">y</span><span class="s2">,</span>
+                <span class="s1">sample_weight=sample_weight</span><span class="s2">,</span>
+                <span class="s1">l2_reg_strength=l2_reg_strength</span><span class="s2">,</span>
+            <span class="s1">)</span>
+
+    <span class="s1">assert_allclose(l1</span><span class="s2">, </span><span class="s1">l2)</span>
+    <span class="s1">assert_allclose(g1</span><span class="s2">, </span><span class="s1">g2)</span>
+    <span class="s1">assert_allclose(g1</span><span class="s2">, </span><span class="s1">g3)</span>
+    <span class="s2">if not </span><span class="s1">base_loss.is_multiclass:</span>
+        <span class="s1">assert_allclose(g1</span><span class="s2">, </span><span class="s1">g4)</span>
+        <span class="s1">assert_allclose(h4 @ g4</span><span class="s2">, </span><span class="s1">h3(g3))</span>
+
+    <span class="s3"># same for sparse X</span>
+    <span class="s1">X = sparse.csr_matrix(X)</span>
+    <span class="s1">l1_sp = loss.loss(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s1">g1_sp = loss.gradient(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s1">l2_sp</span><span class="s2">, </span><span class="s1">g2_sp = loss.loss_gradient(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s1">g3_sp</span><span class="s2">, </span><span class="s1">h3_sp = loss.gradient_hessian_product(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s2">if not </span><span class="s1">base_loss.is_multiclass:</span>
+        <span class="s1">g4_sp</span><span class="s2">, </span><span class="s1">h4_sp</span><span class="s2">, </span><span class="s1">_ = loss.gradient_hessian(</span>
+            <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+        <span class="s1">)</span>
+
+    <span class="s1">assert_allclose(l1</span><span class="s2">, </span><span class="s1">l1_sp)</span>
+    <span class="s1">assert_allclose(l1</span><span class="s2">, </span><span class="s1">l2_sp)</span>
+    <span class="s1">assert_allclose(g1</span><span class="s2">, </span><span class="s1">g1_sp)</span>
+    <span class="s1">assert_allclose(g1</span><span class="s2">, </span><span class="s1">g2_sp)</span>
+    <span class="s1">assert_allclose(g1</span><span class="s2">, </span><span class="s1">g3_sp)</span>
+    <span class="s1">assert_allclose(h3(g1)</span><span class="s2">, </span><span class="s1">h3_sp(g1_sp))</span>
+    <span class="s2">if not </span><span class="s1">base_loss.is_multiclass:</span>
+        <span class="s1">assert_allclose(g1</span><span class="s2">, </span><span class="s1">g4_sp)</span>
+        <span class="s1">assert_allclose(h4 @ g4</span><span class="s2">, </span><span class="s1">h4_sp @ g1_sp)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;base_loss&quot;</span><span class="s2">, </span><span class="s1">LOSSES)</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;sample_weight&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s2">None, </span><span class="s5">&quot;range&quot;</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;l2_reg_strength&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;X_sparse&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s2">False, True</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_loss_gradients_hessp_intercept(</span>
+    <span class="s1">base_loss</span><span class="s2">, </span><span class="s1">sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength</span><span class="s2">, </span><span class="s1">X_sparse</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Test that loss and gradient handle intercept correctly.&quot;&quot;&quot;</span>
+    <span class="s1">loss = LinearModelLoss(base_loss=base_loss()</span><span class="s2">, </span><span class="s1">fit_intercept=</span><span class="s2">False</span><span class="s1">)</span>
+    <span class="s1">loss_inter = LinearModelLoss(base_loss=base_loss()</span><span class="s2">, </span><span class="s1">fit_intercept=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_features = </span><span class="s4">10</span><span class="s2">, </span><span class="s4">5</span>
+    <span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">coef = random_X_y_coef(</span>
+        <span class="s1">linear_model_loss=loss</span><span class="s2">, </span><span class="s1">n_samples=n_samples</span><span class="s2">, </span><span class="s1">n_features=n_features</span><span class="s2">, </span><span class="s1">seed=</span><span class="s4">42</span>
+    <span class="s1">)</span>
+
+    <span class="s1">X[:</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">] = </span><span class="s4">1  </span><span class="s3"># make last column of 1 to mimic intercept term</span>
+    <span class="s1">X_inter = X[</span>
+        <span class="s1">:</span><span class="s2">, </span><span class="s1">:-</span><span class="s4">1</span>
+    <span class="s1">]  </span><span class="s3"># exclude intercept column as it is added automatically by loss_inter</span>
+
+    <span class="s2">if </span><span class="s1">X_sparse:</span>
+        <span class="s1">X = sparse.csr_matrix(X)</span>
+
+    <span class="s2">if </span><span class="s1">sample_weight == </span><span class="s5">&quot;range&quot;</span><span class="s1">:</span>
+        <span class="s1">sample_weight = np.linspace(</span><span class="s4">1</span><span class="s2">, </span><span class="s1">y.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">num=y.shape[</span><span class="s4">0</span><span class="s1">])</span>
+
+    <span class="s1">l</span><span class="s2">, </span><span class="s1">g = loss.loss_gradient(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s1">_</span><span class="s2">, </span><span class="s1">hessp = loss.gradient_hessian_product(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s1">l_inter</span><span class="s2">, </span><span class="s1">g_inter = loss_inter.loss_gradient(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X_inter</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s1">_</span><span class="s2">, </span><span class="s1">hessp_inter = loss_inter.gradient_hessian_product(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X_inter</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+
+    <span class="s3"># Note, that intercept gets no L2 penalty.</span>
+    <span class="s2">assert </span><span class="s1">l == pytest.approx(</span>
+        <span class="s1">l_inter + </span><span class="s4">0.5 </span><span class="s1">* l2_reg_strength * squared_norm(coef.T[-</span><span class="s4">1</span><span class="s1">])</span>
+    <span class="s1">)</span>
+
+    <span class="s1">g_inter_corrected = g_inter</span>
+    <span class="s1">g_inter_corrected.T[-</span><span class="s4">1</span><span class="s1">] += l2_reg_strength * coef.T[-</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s1">assert_allclose(g</span><span class="s2">, </span><span class="s1">g_inter_corrected)</span>
+
+    <span class="s1">s = np.random.RandomState(</span><span class="s4">42</span><span class="s1">).randn(*coef.shape)</span>
+    <span class="s1">h = hessp(s)</span>
+    <span class="s1">h_inter = hessp_inter(s)</span>
+    <span class="s1">h_inter_corrected = h_inter</span>
+    <span class="s1">h_inter_corrected.T[-</span><span class="s4">1</span><span class="s1">] += l2_reg_strength * s.T[-</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s1">assert_allclose(h</span><span class="s2">, </span><span class="s1">h_inter_corrected)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;base_loss&quot;</span><span class="s2">, </span><span class="s1">LOSSES)</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;fit_intercept&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s2">False, True</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;sample_weight&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s2">None, </span><span class="s5">&quot;range&quot;</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;l2_reg_strength&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_gradients_hessians_numerically(</span>
+    <span class="s1">base_loss</span><span class="s2">, </span><span class="s1">fit_intercept</span><span class="s2">, </span><span class="s1">sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Test gradients and hessians with numerical derivatives. 
+ 
+    Gradient should equal the numerical derivatives of the loss function. 
+    Hessians should equal the numerical derivatives of gradients. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">loss = LinearModelLoss(base_loss=base_loss()</span><span class="s2">, </span><span class="s1">fit_intercept=fit_intercept)</span>
+    <span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_features = </span><span class="s4">10</span><span class="s2">, </span><span class="s4">5</span>
+    <span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">coef = random_X_y_coef(</span>
+        <span class="s1">linear_model_loss=loss</span><span class="s2">, </span><span class="s1">n_samples=n_samples</span><span class="s2">, </span><span class="s1">n_features=n_features</span><span class="s2">, </span><span class="s1">seed=</span><span class="s4">42</span>
+    <span class="s1">)</span>
+    <span class="s1">coef = coef.ravel(order=</span><span class="s5">&quot;F&quot;</span><span class="s1">)  </span><span class="s3"># this is important only for multinomial loss</span>
+
+    <span class="s2">if </span><span class="s1">sample_weight == </span><span class="s5">&quot;range&quot;</span><span class="s1">:</span>
+        <span class="s1">sample_weight = np.linspace(</span><span class="s4">1</span><span class="s2">, </span><span class="s1">y.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">num=y.shape[</span><span class="s4">0</span><span class="s1">])</span>
+
+    <span class="s3"># 1. Check gradients numerically</span>
+    <span class="s1">eps = </span><span class="s4">1e-6</span>
+    <span class="s1">g</span><span class="s2">, </span><span class="s1">hessp = loss.gradient_hessian_product(</span>
+        <span class="s1">coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">sample_weight=sample_weight</span><span class="s2">, </span><span class="s1">l2_reg_strength=l2_reg_strength</span>
+    <span class="s1">)</span>
+    <span class="s3"># Use a trick to get central finite difference of accuracy 4 (five-point stencil)</span>
+    <span class="s3"># https://en.wikipedia.org/wiki/Numerical_differentiation</span>
+    <span class="s3"># https://en.wikipedia.org/wiki/Finite_difference_coefficient</span>
+    <span class="s3"># approx_g1 = (f(x + eps) - f(x - eps)) / (2*eps)</span>
+    <span class="s1">approx_g1 = optimize.approx_fprime(</span>
+        <span class="s1">coef</span><span class="s2">,</span>
+        <span class="s2">lambda </span><span class="s1">coef: loss.loss(</span>
+            <span class="s1">coef - eps</span><span class="s2">,</span>
+            <span class="s1">X</span><span class="s2">,</span>
+            <span class="s1">y</span><span class="s2">,</span>
+            <span class="s1">sample_weight=sample_weight</span><span class="s2">,</span>
+            <span class="s1">l2_reg_strength=l2_reg_strength</span><span class="s2">,</span>
+        <span class="s1">)</span><span class="s2">,</span>
+        <span class="s4">2 </span><span class="s1">* eps</span><span class="s2">,</span>
+    <span class="s1">)</span>
+    <span class="s3"># approx_g2 = (f(x + 2*eps) - f(x - 2*eps)) / (4*eps)</span>
+    <span class="s1">approx_g2 = optimize.approx_fprime(</span>
+        <span class="s1">coef</span><span class="s2">,</span>
+        <span class="s2">lambda </span><span class="s1">coef: loss.loss(</span>
+            <span class="s1">coef - </span><span class="s4">2 </span><span class="s1">* eps</span><span class="s2">,</span>
+            <span class="s1">X</span><span class="s2">,</span>
+            <span class="s1">y</span><span class="s2">,</span>
+            <span class="s1">sample_weight=sample_weight</span><span class="s2">,</span>
+            <span class="s1">l2_reg_strength=l2_reg_strength</span><span class="s2">,</span>
+        <span class="s1">)</span><span class="s2">,</span>
+        <span class="s4">4 </span><span class="s1">* eps</span><span class="s2">,</span>
+    <span class="s1">)</span>
+    <span class="s3"># Five-point stencil approximation</span>
+    <span class="s3"># See: https://en.wikipedia.org/wiki/Five-point_stencil#1D_first_derivative</span>
+    <span class="s1">approx_g = (</span><span class="s4">4 </span><span class="s1">* approx_g1 - approx_g2) / </span><span class="s4">3</span>
+    <span class="s1">assert_allclose(g</span><span class="s2">, </span><span class="s1">approx_g</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s4">1e-2</span><span class="s2">, </span><span class="s1">atol=</span><span class="s4">1e-8</span><span class="s1">)</span>
+
+    <span class="s3"># 2. Check hessp numerically along the second direction of the gradient</span>
+    <span class="s1">vector = np.zeros_like(g)</span>
+    <span class="s1">vector[</span><span class="s4">1</span><span class="s1">] = </span><span class="s4">1</span>
+    <span class="s1">hess_col = hessp(vector)</span>
+    <span class="s3"># Computation of the Hessian is particularly fragile to numerical errors when doing</span>
+    <span class="s3"># simple finite differences. Here we compute the grad along a path in the direction</span>
+    <span class="s3"># of the vector and then use a least-square regression to estimate the slope</span>
+    <span class="s1">eps = </span><span class="s4">1e-3</span>
+    <span class="s1">d_x = np.linspace(-eps</span><span class="s2">, </span><span class="s1">eps</span><span class="s2">, </span><span class="s4">30</span><span class="s1">)</span>
+    <span class="s1">d_grad = np.array(</span>
+        <span class="s1">[</span>
+            <span class="s1">loss.gradient(</span>
+                <span class="s1">coef + t * vector</span><span class="s2">,</span>
+                <span class="s1">X</span><span class="s2">,</span>
+                <span class="s1">y</span><span class="s2">,</span>
+                <span class="s1">sample_weight=sample_weight</span><span class="s2">,</span>
+                <span class="s1">l2_reg_strength=l2_reg_strength</span><span class="s2">,</span>
+            <span class="s1">)</span>
+            <span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">d_x</span>
+        <span class="s1">]</span>
+    <span class="s1">)</span>
+    <span class="s1">d_grad -= d_grad.mean(axis=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">approx_hess_col = linalg.lstsq(d_x[:</span><span class="s2">, </span><span class="s1">np.newaxis]</span><span class="s2">, </span><span class="s1">d_grad)[</span><span class="s4">0</span><span class="s1">].ravel()</span>
+    <span class="s1">assert_allclose(approx_hess_col</span><span class="s2">, </span><span class="s1">hess_col</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s4">1e-3</span><span class="s1">)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;fit_intercept&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s2">False, True</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_multinomial_coef_shape(fit_intercept):</span>
+    <span class="s0">&quot;&quot;&quot;Test that multinomial LinearModelLoss respects shape of coef.&quot;&quot;&quot;</span>
+    <span class="s1">loss = LinearModelLoss(base_loss=HalfMultinomialLoss()</span><span class="s2">, </span><span class="s1">fit_intercept=fit_intercept)</span>
+    <span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_features = </span><span class="s4">10</span><span class="s2">, </span><span class="s4">5</span>
+    <span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">coef = random_X_y_coef(</span>
+        <span class="s1">linear_model_loss=loss</span><span class="s2">, </span><span class="s1">n_samples=n_samples</span><span class="s2">, </span><span class="s1">n_features=n_features</span><span class="s2">, </span><span class="s1">seed=</span><span class="s4">42</span>
+    <span class="s1">)</span>
+    <span class="s1">s = np.random.RandomState(</span><span class="s4">42</span><span class="s1">).randn(*coef.shape)</span>
+
+    <span class="s1">l</span><span class="s2">, </span><span class="s1">g = loss.loss_gradient(coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y)</span>
+    <span class="s1">g1 = loss.gradient(coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y)</span>
+    <span class="s1">g2</span><span class="s2">, </span><span class="s1">hessp = loss.gradient_hessian_product(coef</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y)</span>
+    <span class="s1">h = hessp(s)</span>
+    <span class="s2">assert </span><span class="s1">g.shape == coef.shape</span>
+    <span class="s2">assert </span><span class="s1">h.shape == coef.shape</span>
+    <span class="s1">assert_allclose(g</span><span class="s2">, </span><span class="s1">g1)</span>
+    <span class="s1">assert_allclose(g</span><span class="s2">, </span><span class="s1">g2)</span>
+
+    <span class="s1">coef_r = coef.ravel(order=</span><span class="s5">&quot;F&quot;</span><span class="s1">)</span>
+    <span class="s1">s_r = s.ravel(order=</span><span class="s5">&quot;F&quot;</span><span class="s1">)</span>
+    <span class="s1">l_r</span><span class="s2">, </span><span class="s1">g_r = loss.loss_gradient(coef_r</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y)</span>
+    <span class="s1">g1_r = loss.gradient(coef_r</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y)</span>
+    <span class="s1">g2_r</span><span class="s2">, </span><span class="s1">hessp_r = loss.gradient_hessian_product(coef_r</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y)</span>
+    <span class="s1">h_r = hessp_r(s_r)</span>
+    <span class="s2">assert </span><span class="s1">g_r.shape == coef_r.shape</span>
+    <span class="s2">assert </span><span class="s1">h_r.shape == coef_r.shape</span>
+    <span class="s1">assert_allclose(g_r</span><span class="s2">, </span><span class="s1">g1_r)</span>
+    <span class="s1">assert_allclose(g_r</span><span class="s2">, </span><span class="s1">g2_r)</span>
+
+    <span class="s1">assert_allclose(g</span><span class="s2">, </span><span class="s1">g_r.reshape(loss.base_loss.n_classes</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">order=</span><span class="s5">&quot;F&quot;</span><span class="s1">))</span>
+    <span class="s1">assert_allclose(h</span><span class="s2">, </span><span class="s1">h_r.reshape(loss.base_loss.n_classes</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">order=</span><span class="s5">&quot;F&quot;</span><span class="s1">))</span>
+</pre>
+</body>
+</html>

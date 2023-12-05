@@ -1,0 +1,351 @@
+<html>
+<head>
+<title>large_elm.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+large_elm.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">from </span><span class="s1">sklearn.base </span><span class="s0">import </span><span class="s1">RegressorMixin</span>
+<span class="s0">from </span><span class="s1">sklearn.metrics </span><span class="s0">import </span><span class="s1">pairwise_distances</span>
+<span class="s0">from </span><span class="s1">sklearn.utils.validation </span><span class="s0">import </span><span class="s1">check_is_fitted</span><span class="s0">, </span><span class="s1">check_array</span>
+
+<span class="s0">import </span><span class="s1">dask.array </span><span class="s0">as </span><span class="s1">da</span>
+<span class="s0">import </span><span class="s1">dask.dataframe </span><span class="s0">as </span><span class="s1">dd</span>
+
+<span class="s0">from </span><span class="s1">.elm </span><span class="s0">import </span><span class="s1">_BaseELM</span>
+<span class="s0">from </span><span class="s1">dask.distributed </span><span class="s0">import </span><span class="s1">Client</span><span class="s0">, </span><span class="s1">LocalCluster</span><span class="s0">, </span><span class="s1">wait</span>
+<span class="s0">from </span><span class="s1">.utils </span><span class="s0">import </span><span class="s1">_is_list_of_strings</span><span class="s0">, </span><span class="s1">_dense</span><span class="s0">, </span><span class="s1">HiddenLayerType</span><span class="s0">, </span><span class="s1">dummy</span>
+
+
+<span class="s0">def </span><span class="s1">_read_numeric_file(fname):</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">dd.read_parquet(fname)</span>
+    <span class="s0">except</span><span class="s1">:</span>
+        <span class="s0">pass</span>
+
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">dd.read_csv(fname)</span>
+    <span class="s0">except</span><span class="s1">:</span>
+        <span class="s0">pass</span>
+
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">np.load(fname)</span>
+    <span class="s0">except</span><span class="s1">:</span>
+        <span class="s0">pass</span>
+
+<span class="s0">class </span><span class="s1">LargeELMRegressor(_BaseELM</span><span class="s0">, </span><span class="s1">RegressorMixin):</span>
+    <span class="s2">&quot;&quot;&quot;ELM Regressor for larger-than-memory problems. 
+ 
+    Uses `Dask &lt;https://dask.org&gt;`_ for batch analysis of data in Parquet files. 
+ 
+    .. attention:: Why do I need Parquet files? 
+ 
+        Parquet files provide necessary information about the data without loading whole file content from 
+        disk. It makes a tremendous runtime difference compared to simpler `.csv` or `.json` file formats. 
+        Reading from files saves memory by loading data in small chunks, supporting arbitrary large input files. 
+        It also solves current memory leaks with Numpy matrix inputs in Dask. 
+ 
+        Any data format can be easily converted to Parquet, see `Analytical methods &lt;techniques.html&gt;`_ section. 
+ 
+        HDF5 is almost as good as Parquet, but performs worse with Dask due to internal data layout. 
+ 
+    .. todo: Write converters. 
+ 
+    .. todo: Memo about number of workers: one is good, several cover disk read latency but need more memory. 
+        On one machine matrix operators always run in parallel, do not benefit from Dask. 
+ 
+    .. todo: Memory consumption with large number of neurons - 100,000 neurons require 200GB or swap space, with 
+        read+write reaching 1GB/s. Suggested a fast SSD, or HDD + extra workers to hide swap latency. 
+        Mention that Dask is not the perfect solution, kept here for future updates. And it actually solves 
+        stuff larger than memory, albeit at a very high time+swap cost. 
+ 
+    .. todo: Avoid large batch sizes as workers can fail, safe bet is 2000-5000 range. 
+ 
+    .. todo: Fast HtH and in-place Cholesky solver. 
+ 
+    .. todo: Pro tip in documentation: run ELM with dummy 1000 data samples and 1e+9 regularization, 
+        This will test possible memory issues for workers without wasting your time on computing full HH. 
+ 
+    .. todo: Option to keep full HH permanently somewhere at disk. Saves before the final step, 
+        avoids failures from memory issues during Cholesky solver. 
+ 
+    .. todo: GPU + batch Cholesky solver, for both ELM and LargeELM. 
+ 
+    Requirements 
+    ------------ 
+        * Pandas 
+        * pyarrow 
+        * python-snappy 
+ 
+    Parameters 
+    ---------- 
+ 
+    batch_size : int 
+        Batch size used for both data samples and hidden neurons. With batch Cholesky solver, allows for very large 
+        numbers of hidden neurons of over 100,000; limited only by the computation time and disk swap space. 
+ 
+        .. hint:: Include bias and original features for best performance. 
+ 
+        ELM will include a bias term (1 extra feature), and the original features with `include_original_features=True`. 
+        For optimal performance, choose `batch_size` to be equal or evenly divide the 
+        `n_neurons + 1 (bias) + n_inputs (if include_original_features=True)`. 
+ 
+        .. todo:: Exact batch_size vs. GPU performance 
+    &quot;&quot;&quot;</span>
+
+
+    <span class="s0">def </span><span class="s1">__del__(self):</span>
+        <span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'client_'</span><span class="s1">):</span>
+            <span class="s1">self.client_.close()</span>
+            <span class="s1">self.cluster_.close()</span>
+
+    <span class="s0">def </span><span class="s1">_setup_dask_client(self):</span>
+        <span class="s1">self.cluster_ = LocalCluster(</span>
+            <span class="s1">n_workers=</span><span class="s4">4</span><span class="s0">, </span><span class="s1">threads_per_worker=</span><span class="s4">1</span><span class="s0">,</span>
+            <span class="s1">local_dir=</span><span class="s3">&quot;/Users/akusok/wrkdir/dask-temp&quot;</span><span class="s0">,</span>
+            <span class="s1">memory_limit=</span><span class="s3">&quot;8GB&quot;</span>
+        <span class="s1">)</span>
+        <span class="s1">self.client_ = Client(self.cluster_)</span>
+
+        <span class="s1">W_list = [hl.projection_.components_ </span><span class="s0">for </span><span class="s1">hl </span><span class="s0">in </span><span class="s1">self.hidden_layers_]</span>
+        <span class="s1">W_dask = [da.from_array(_dense(W)</span><span class="s0">, </span><span class="s1">chunks=self.bsize_) </span><span class="s0">for </span><span class="s1">W </span><span class="s0">in </span><span class="s1">W_list]</span>
+        <span class="s1">self.W_ = self.client_.persist(W_dask)</span>
+
+        <span class="s0">def </span><span class="s1">foo():</span>
+            <span class="s0">import </span><span class="s1">os</span>
+            <span class="s1">os.environ[</span><span class="s3">'OMP_NUM_THREADS'</span><span class="s1">] = </span><span class="s3">'1'</span>
+        <span class="s1">self.client_.run(foo)</span>
+
+        <span class="s1">print(</span><span class="s3">&quot;Running on:&quot;</span><span class="s0">, </span><span class="s1">self.client_)</span>
+
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">dashboard = self.client_.scheduler_info()[</span><span class="s3">'address'</span><span class="s1">].split(</span><span class="s3">&quot;:&quot;</span><span class="s1">)</span>
+            <span class="s1">dashboard[</span><span class="s4">0</span><span class="s1">] = </span><span class="s3">&quot;http&quot;</span>
+            <span class="s1">dashboard[-</span><span class="s4">1</span><span class="s1">] = str(self.client_.scheduler_info()[</span><span class="s3">'services'</span><span class="s1">][</span><span class="s3">'dashboard'</span><span class="s1">])</span>
+            <span class="s1">print(</span><span class="s3">&quot;Dashboard at&quot;</span><span class="s0">, </span><span class="s3">&quot;:&quot;</span><span class="s1">.join(dashboard))</span>
+        <span class="s0">except</span><span class="s1">:</span>
+            <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">_project(self</span><span class="s0">, </span><span class="s1">X_dask):</span>
+        <span class="s2">&quot;&quot;&quot;Compute hidden layer output with Dask functionality. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">H_list = []</span>
+        <span class="s0">for </span><span class="s1">hl</span><span class="s0">, </span><span class="s1">W </span><span class="s0">in </span><span class="s1">zip(self.hidden_layers_</span><span class="s0">, </span><span class="s1">self.W_):</span>
+            <span class="s0">if </span><span class="s1">hl.hidden_layer_ == HiddenLayerType.PAIRWISE:</span>
+                <span class="s1">H0 = X_dask.map_blocks(</span>
+                    <span class="s1">pairwise_distances</span><span class="s0">,</span>
+                    <span class="s1">W</span><span class="s0">,</span>
+                    <span class="s1">dtype=X_dask.dtype</span><span class="s0">,</span>
+                    <span class="s1">chunks=(X_dask.chunks[</span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">(W.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s0">,</span><span class="s1">))</span><span class="s0">,</span>
+                    <span class="s1">metric=hl.pairwise_metric</span>
+                <span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">XW_dask = da.dot(X_dask</span><span class="s0">, </span><span class="s1">W.transpose())</span>
+                <span class="s0">if </span><span class="s1">hl.ufunc_ </span><span class="s0">is </span><span class="s1">dummy:</span>
+                    <span class="s1">H0 = XW_dask</span>
+                <span class="s0">elif </span><span class="s1">hl.ufunc_ </span><span class="s0">is </span><span class="s1">np.tanh:</span>
+                    <span class="s1">H0 = da.tanh(XW_dask)</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">H0 = XW_dask.map_blocks(hl.ufunc_)</span>
+            <span class="s1">H_list.append(H0)</span>
+
+        <span class="s0">if </span><span class="s1">self.include_original_features:</span>
+            <span class="s1">H_list.append(X_dask)</span>
+        <span class="s1">H_list.append(da.ones((X_dask.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s4">1</span><span class="s1">)))</span>
+
+        <span class="s1">H_dask = da.concatenate(H_list</span><span class="s0">, </span><span class="s1">axis=</span><span class="s4">1</span><span class="s1">).rechunk(self.bsize_)</span>
+        <span class="s0">return </span><span class="s1">H_dask</span>
+
+    <span class="s0">def </span><span class="s1">_compute(self</span><span class="s0">, </span><span class="s1">X</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">sync_every</span><span class="s0">, </span><span class="s1">HH=</span><span class="s0">None, </span><span class="s1">HY=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Computing matrices HH and HY, the actually long part. 
+ 
+        .. todo: actually distributed computations that scatter batches of data file names, 
+            and reduce-sum the HH,HY matrices. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s5"># processing files</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">X_file</span><span class="s0">, </span><span class="s1">y_file </span><span class="s0">in </span><span class="s1">zip(range(len(X))</span><span class="s0">, </span><span class="s1">X</span><span class="s0">, </span><span class="s1">y):</span>
+            <span class="s1">X_dask = dd.read_parquet(X_file).to_dask_array(lengths=</span><span class="s0">True</span><span class="s1">)</span>
+            <span class="s1">Y_dask = dd.read_parquet(y_file).to_dask_array(lengths=</span><span class="s0">True</span><span class="s1">)</span>
+            <span class="s1">H_dask = self._project(X_dask)</span>
+
+            <span class="s0">if </span><span class="s1">HH </span><span class="s0">is None</span><span class="s1">:  </span><span class="s5"># first iteration</span>
+                <span class="s1">HH = da.dot(H_dask.transpose()</span><span class="s0">, </span><span class="s1">H_dask)</span>
+                <span class="s1">HY = da.dot(H_dask.transpose()</span><span class="s0">, </span><span class="s1">Y_dask)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">HH += da.dot(H_dask.transpose()</span><span class="s0">, </span><span class="s1">H_dask)</span>
+                <span class="s1">HY += da.dot(H_dask.transpose()</span><span class="s0">, </span><span class="s1">Y_dask)</span>
+                <span class="s0">if </span><span class="s1">sync_every </span><span class="s0">is not None and </span><span class="s1">i % sync_every == </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">wait([HH</span><span class="s0">, </span><span class="s1">HY])</span>
+
+            <span class="s5"># synchronization</span>
+            <span class="s0">if </span><span class="s1">sync_every </span><span class="s0">is not None and </span><span class="s1">i % sync_every == </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">HH</span><span class="s0">, </span><span class="s1">HY = self.client_.persist([HH</span><span class="s0">, </span><span class="s1">HY])</span>
+
+        <span class="s5"># finishing solution</span>
+        <span class="s0">if </span><span class="s1">sync_every </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">wait([HH</span><span class="s0">, </span><span class="s1">HY])</span>
+        <span class="s0">return </span><span class="s1">HH</span><span class="s0">, </span><span class="s1">HY</span>
+
+    <span class="s0">def </span><span class="s1">_solve(self</span><span class="s0">, </span><span class="s1">HH</span><span class="s0">, </span><span class="s1">HY):</span>
+        <span class="s2">&quot;&quot;&quot;Compute output weights from HH and HY using Dask functionality. 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># make HH/HY divisible by chunk size</span>
+        <span class="s1">n_features</span><span class="s0">, </span><span class="s1">_ = HH.shape</span>
+        <span class="s1">padding = </span><span class="s4">0</span>
+        <span class="s0">if </span><span class="s1">n_features &gt; self.bsize_ </span><span class="s0">and </span><span class="s1">n_features % self.bsize_ &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">print(</span><span class="s3">&quot;Adjusting batch size {} to n_features {}&quot;</span><span class="s1">.format(self.bsize_</span><span class="s0">, </span><span class="s1">n_features))</span>
+            <span class="s1">padding = self.bsize_ - (n_features % self.bsize_)</span>
+            <span class="s1">P01 = da.zeros((n_features</span><span class="s0">, </span><span class="s1">padding))</span>
+            <span class="s1">P10 = da.zeros((padding</span><span class="s0">, </span><span class="s1">n_features))</span>
+            <span class="s1">P11 = da.zeros((padding</span><span class="s0">, </span><span class="s1">padding))</span>
+            <span class="s1">HH = da.block([[HH</span><span class="s0">,  </span><span class="s1">P01]</span><span class="s0">,</span>
+                           <span class="s1">[P10</span><span class="s0">, </span><span class="s1">P11]])</span>
+
+            <span class="s1">P1 = da.zeros((padding</span><span class="s0">, </span><span class="s1">HY.shape[</span><span class="s4">1</span><span class="s1">]))</span>
+            <span class="s1">HY = da.block([[HY]</span><span class="s0">,</span>
+                           <span class="s1">[P1]])</span>
+
+        <span class="s5"># rechunk, add bias, and solve</span>
+        <span class="s1">HH = HH.rechunk(self.bsize_) + self.alpha * da.eye(HH.shape[</span><span class="s4">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">chunks=self.bsize_)</span>
+        <span class="s1">HY = HY.rechunk(self.bsize_)</span>
+
+        <span class="s1">B = da.linalg.solve(HH</span><span class="s0">, </span><span class="s1">HY</span><span class="s0">, </span><span class="s1">sym_pos=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">padding &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">B = B[:n_features]</span>
+
+        <span class="s0">return </span><span class="s1">B</span>
+
+    <span class="s0">def </span><span class="s1">fit(self</span><span class="s0">, </span><span class="s1">X</span><span class="s0">, </span><span class="s1">y=</span><span class="s0">None, </span><span class="s1">sync_every=</span><span class="s4">10</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Fits an ELM with data in a bunch of files. 
+ 
+        Model will use the set of features from the first file. 
+        Same features must have same names across the whole dataset. 
+ 
+        .. todo: Check what happens if features are in different order or missing. 
+ 
+        Does **not** support sparse data. 
+ 
+        .. todo: Check if some sparse data would work. 
+ 
+        .. todo: Check that sync_every does not affect results 
+ 
+        .. todo: Add single precision 
+ 
+        .. todo: Parquet file format examples in documentation 
+ 
+        Original features and bias are added to the end of data, for easier rechunk-merge. This way full chunks 
+        of hidden neuron outputs stay intact. 
+ 
+ 
+        Parameters 
+        ---------- 
+ 
+        X : [str] 
+            List of input data files in Parquet format. 
+ 
+        y : [str] 
+            List of target data files in Parquet format. 
+ 
+        sync_every : int or None 
+            Synchronize computations after this many files are processed. None for running without synchronization. 
+            Less synchronization improves run speed with smaller data files, but may result in large swap space usage 
+            for large data problems. Use smaller number for more frequent synchronization if swap space 
+            becomes a problem. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">if not </span><span class="s1">_is_list_of_strings(X) </span><span class="s0">or not </span><span class="s1">_is_list_of_strings(y):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Expected X and y as lists of file names.&quot;</span><span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">len(X) != len(y):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Expected X and y as lists of files with the same length. &quot;</span>
+                             <span class="s3">&quot;Got len(X)={} and len(y)={}&quot;</span><span class="s1">.format(len(X)</span><span class="s0">, </span><span class="s1">len(y)))</span>
+
+        <span class="s5"># read first file and get parameters</span>
+        <span class="s1">X_dask = dd.read_parquet(X[</span><span class="s4">0</span><span class="s1">]).to_dask_array(lengths=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s1">Y_dask = dd.read_parquet(y[</span><span class="s4">0</span><span class="s1">]).to_dask_array(lengths=</span><span class="s0">True</span><span class="s1">)</span>
+
+        <span class="s1">n_samples</span><span class="s0">, </span><span class="s1">n_features = X_dask.shape</span>
+        <span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'n_features_'</span><span class="s1">) </span><span class="s0">and </span><span class="s1">self.n_features_ != n_features:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">'Shape of input is different from what was seen in `fit`'</span><span class="s1">)</span>
+
+        <span class="s1">_</span><span class="s0">, </span><span class="s1">n_outputs = Y_dask.shape</span>
+        <span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'n_outputs_'</span><span class="s1">) </span><span class="s0">and </span><span class="s1">self.n_outputs_ != n_outputs:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">'Shape of outputs is different from what was seen in `fit`'</span><span class="s1">)</span>
+
+        <span class="s5"># set batch size, default is bsize=2000 or all-at-once with less than 10_000 samples</span>
+        <span class="s1">self.bsize_ = self.batch_size</span>
+        <span class="s0">if </span><span class="s1">self.bsize_ </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self.bsize_ = n_samples </span><span class="s0">if </span><span class="s1">n_samples &lt; </span><span class="s4">10 </span><span class="s1">* </span><span class="s4">1000 </span><span class="s0">else </span><span class="s4">2000</span>
+
+        <span class="s5"># init model if not fit yet</span>
+        <span class="s0">if not </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">'hidden_layers_'</span><span class="s1">):</span>
+            <span class="s1">self.n_features_ = n_features</span>
+            <span class="s1">self.n_outputs_ = n_outputs</span>
+
+            <span class="s1">X_sample = X_dask[:</span><span class="s4">10</span><span class="s1">].compute()</span>
+            <span class="s1">self._init_hidden_layers(X_sample)</span>
+            <span class="s1">self._setup_dask_client()</span>
+
+        <span class="s1">HH</span><span class="s0">, </span><span class="s1">HY = self._compute(X</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">sync_every=sync_every)</span>
+        <span class="s1">self.B = self._solve(HH</span><span class="s0">, </span><span class="s1">HY)</span>
+        <span class="s1">self.is_fitted_ = </span><span class="s0">True</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">predict(self</span><span class="s0">, </span><span class="s1">X):</span>
+        <span class="s2">&quot;&quot;&quot;Prediction works with both lists of Parquet files and numeric arrays. 
+ 
+        Parameters 
+        ---------- 
+ 
+        X : array-like, [str] 
+            Input data as list of Parquet files, or as a numeric array. 
+ 
+        Returns 
+        ------- 
+        Yh : array, shape (n_samples, n_outputs) 
+            Predicted values for all input samples. 
+ 
+            .. attention:: Returns all outputs as a single in-memory array! 
+ 
+                Danger of running out out memory for high-dimensional outputs, if a large set of input 
+                files is provided. Feed data in smaller batches in such case. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted(self</span><span class="s0">, </span><span class="s3">'is_fitted_'</span><span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">_is_list_of_strings(X):</span>
+            <span class="s1">Yh_list = []</span>
+
+            <span class="s5"># processing files</span>
+            <span class="s0">for </span><span class="s1">X_file </span><span class="s0">in </span><span class="s1">X:</span>
+                <span class="s1">X_dask = dd.read_parquet(X_file).to_dask_array(lengths=</span><span class="s0">True</span><span class="s1">)</span>
+                <span class="s1">H_dask = self._project(X_dask)</span>
+                <span class="s1">Yh_list.append(da.dot(H_dask</span><span class="s0">, </span><span class="s1">self.B))</span>
+
+            <span class="s1">Yh_dask = da.concatenate(Yh_list</span><span class="s0">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+            <span class="s0">return </span><span class="s1">Yh_dask.compute()</span>
+
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">X = check_array(X</span><span class="s0">, </span><span class="s1">accept_sparse=</span><span class="s0">True</span><span class="s1">)</span>
+            <span class="s1">H = [np.ones((X.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s4">1</span><span class="s1">))]</span>
+            <span class="s0">if </span><span class="s1">self.include_original_features:</span>
+                <span class="s1">H.append(_dense(X))</span>
+            <span class="s1">H.extend([hl.transform(X) </span><span class="s0">for </span><span class="s1">hl </span><span class="s0">in </span><span class="s1">self.hidden_layers_])</span>
+
+            <span class="s0">return </span><span class="s1">np.hstack(H) @ self.B.compute()</span>
+</pre>
+</body>
+</html>

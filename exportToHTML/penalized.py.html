@@ -1,0 +1,492 @@
+<html>
+<head>
+<title>penalized.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+penalized.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+<span class="s2">&quot;&quot;&quot;linear model with Theil prior probabilistic restrictions, generalized Ridge 
+ 
+Created on Tue Dec 20 00:10:10 2011 
+ 
+Author: Josef Perktold 
+License: BSD-3 
+ 
+open issues 
+* selection of smoothing factor, strength of prior, cross validation 
+* GLS, does this really work this way 
+* None of inherited results have been checked yet, 
+  I'm not sure if any need to be adjusted or if only interpretation changes 
+  One question is which results are based on likelihood (residuals) and which 
+  are based on &quot;posterior&quot; as for example bse and cov_params 
+ 
+* helper functions to construct priors? 
+* increasing penalization for ordered regressors, e.g. polynomials 
+ 
+* compare with random/mixed effects/coefficient, like estimated priors 
+ 
+ 
+ 
+there is something fishy with the result instance, some things, e.g. 
+normalized_cov_params, do not look like they update correctly as we 
+search over lambda -&gt; some stale state again ? 
+ 
+I added df_model to result class using the hatmatrix, but df_model is defined 
+in model instance not in result instance. -&gt; not clear where refactoring should 
+occur. df_resid does not get updated correctly. 
+problem with definition of df_model, it has 1 subtracted for constant 
+ 
+ 
+ 
+&quot;&quot;&quot;</span>
+<span class="s3">from </span><span class="s1">statsmodels.compat.python </span><span class="s3">import </span><span class="s1">lrange</span>
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+
+<span class="s3">from </span><span class="s1">statsmodels.tools.decorators </span><span class="s3">import </span><span class="s1">cache_readonly</span>
+<span class="s3">from </span><span class="s1">statsmodels.regression.linear_model </span><span class="s3">import </span><span class="s1">OLS</span><span class="s3">, </span><span class="s1">GLS</span><span class="s3">, </span><span class="s1">RegressionResults</span>
+<span class="s3">from </span><span class="s1">statsmodels.regression.feasible_gls </span><span class="s3">import </span><span class="s1">atleast_2dcols</span>
+
+
+<span class="s3">class </span><span class="s1">TheilGLS(GLS):</span>
+    <span class="s2">r&quot;&quot;&quot;GLS with stochastic restrictions 
+ 
+    TheilGLS estimates the following linear model 
+ 
+    .. math:: y = X \beta + u 
+ 
+    using additional information given by a stochastic constraint 
+ 
+    .. math:: q = R \beta + v 
+ 
+    :math:`E(u) = 0`, :math:`cov(u) = \Sigma` 
+    :math:`cov(u, v) = \Sigma_p`, with full rank. 
+ 
+    u and v are assumed to be independent of each other. 
+    If :math:`E(v) = 0`, then the estimator is unbiased. 
+ 
+    Note: The explanatory variables are not rescaled, the parameter estimates 
+    not scale equivariant and fitted values are not scale invariant since 
+    scaling changes the relative penalization weights (for given \Sigma_p). 
+ 
+    Note: GLS is not tested yet, only Sigma is identity is tested 
+ 
+    Notes 
+    ----- 
+ 
+    The parameter estimates solves the moment equation: 
+ 
+    .. math:: (X' \Sigma X + \lambda R' \sigma^2 \Sigma_p^{-1} R) b = X' \Sigma y + \lambda R' \Sigma_p^{-1} q 
+ 
+    :math:`\lambda` is the penalization weight similar to Ridge regression. 
+ 
+    If lambda is zero, then the parameter estimate is the same as OLS. If 
+    lambda goes to infinity, then the restriction is imposed with equality. 
+    In the model `pen_weight` is used as name instead of $\lambda$ 
+ 
+    R does not have to be square. The number of rows of R can be smaller 
+    than the number of parameters. In this case not all linear combination 
+    of parameters are penalized. 
+ 
+    The stochastic constraint can be interpreted in several different ways: 
+ 
+     - The prior information represents parameter estimates from independent 
+       prior samples. 
+     - We can consider it just as linear restrictions that we do not want 
+       to impose without uncertainty. 
+     - With a full rank square restriction matrix R, the parameter estimate 
+       is the same as a Bayesian posterior mean for the case of an informative 
+       normal prior, normal likelihood and known error variance Sigma. If R 
+       is less than full rank, then it defines a partial prior. 
+ 
+    References 
+    ---------- 
+    Theil Goldberger 
+ 
+    Baum, Christopher slides for tgmixed in Stata 
+ 
+    (I do not remember what I used when I first wrote the code.) 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like, 1-D 
+        dependent or endogenous variable 
+    exog : array_like, 1D or 2D 
+        array of explanatory or exogenous variables 
+    r_matrix : None or array_like, 2D 
+        array of linear restrictions for stochastic constraint. 
+        default is identity matrix that does not penalize constant, if constant 
+        is detected to be in `exog`. 
+    q_matrix : None or array_like 
+        mean of the linear restrictions. If None, the it is set to zeros. 
+    sigma_prior : None or array_like 
+        A fully specified sigma_prior is a square matrix with the same number 
+        of rows and columns as there are constraints (number of rows of r_matrix). 
+        If sigma_prior is None, a scalar or one-dimensional, then a diagonal matrix 
+        is created. 
+    sigma : None or array_like 
+        Sigma is the covariance matrix of the error term that is used in the same 
+        way as in GLS. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">r_matrix=</span><span class="s3">None, </span><span class="s1">q_matrix=</span><span class="s3">None,</span>
+                 <span class="s1">sigma_prior=</span><span class="s3">None, </span><span class="s1">sigma=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s1">super(TheilGLS</span><span class="s3">, </span><span class="s1">self).__init__(endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">sigma=sigma)</span>
+
+        <span class="s3">if </span><span class="s1">r_matrix </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">r_matrix = np.asarray(r_matrix)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">try</span><span class="s1">:</span>
+                <span class="s1">const_idx = self.data.const_idx</span>
+            <span class="s3">except </span><span class="s1">AttributeError:</span>
+                <span class="s1">const_idx = </span><span class="s3">None</span>
+
+            <span class="s1">k_exog = exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">r_matrix = np.eye(k_exog)</span>
+            <span class="s3">if </span><span class="s1">const_idx </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">keep_idx = lrange(k_exog)</span>
+                <span class="s3">del </span><span class="s1">keep_idx[const_idx]</span>
+                <span class="s1">r_matrix = r_matrix[keep_idx]  </span><span class="s0"># delete row for constant</span>
+
+        <span class="s1">k_constraints</span><span class="s3">, </span><span class="s1">k_exog = r_matrix.shape</span>
+        <span class="s1">self.r_matrix = r_matrix</span>
+        <span class="s3">if </span><span class="s1">k_exog != self.exog.shape[</span><span class="s4">1</span><span class="s1">]:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">'r_matrix needs to have the same number of columns'</span>
+                             <span class="s5">'as exog'</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s1">q_matrix </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self.q_matrix = atleast_2dcols(q_matrix)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.q_matrix = np.zeros(k_constraints)[:</span><span class="s3">, None</span><span class="s1">]</span>
+        <span class="s3">if </span><span class="s1">self.q_matrix.shape != (k_constraints</span><span class="s3">, </span><span class="s4">1</span><span class="s1">):</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">'q_matrix has wrong shape'</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s1">sigma_prior </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">sigma_prior = np.asarray(sigma_prior)</span>
+            <span class="s3">if </span><span class="s1">np.size(sigma_prior) == </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">sigma_prior = np.diag(sigma_prior * np.ones(k_constraints))</span>
+                <span class="s0">#no numerical shortcuts are used for this case</span>
+            <span class="s3">elif </span><span class="s1">sigma_prior.ndim == </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">sigma_prior = np.diag(sigma_prior)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">sigma_prior = np.eye(k_constraints)</span>
+
+        <span class="s3">if </span><span class="s1">sigma_prior.shape != (k_constraints</span><span class="s3">, </span><span class="s1">k_constraints):</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">'sigma_prior has wrong shape'</span><span class="s1">)</span>
+
+        <span class="s1">self.sigma_prior = sigma_prior</span>
+        <span class="s1">self.sigma_prior_inv = np.linalg.pinv(sigma_prior) </span><span class="s0">#or inv</span>
+
+    <span class="s3">def </span><span class="s1">fit(self</span><span class="s3">, </span><span class="s1">pen_weight=</span><span class="s4">1.</span><span class="s3">, </span><span class="s1">cov_type=</span><span class="s5">'sandwich'</span><span class="s3">, </span><span class="s1">use_t=</span><span class="s3">True</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Estimate parameters and return results instance 
+ 
+        Parameters 
+        ---------- 
+        pen_weight : float 
+            penalization factor for the restriction, default is 1. 
+        cov_type : str, 'data-prior' or 'sandwich' 
+            'data-prior' assumes that the stochastic restriction reflects a 
+            previous sample. The covariance matrix of the parameter estimate 
+            is in this case the same form as the one of GLS. 
+            The covariance matrix for cov_type='sandwich' treats the stochastic 
+            restriction (R and q) as fixed and has a sandwich form analogously 
+            to M-estimators. 
+ 
+        Returns 
+        ------- 
+        results : TheilRegressionResults instance 
+ 
+        Notes 
+        ----- 
+        cov_params for cov_type data-prior, is calculated as 
+ 
+        .. math:: \\sigma^2 A^{-1} 
+ 
+        cov_params for cov_type sandwich, is calculated as 
+ 
+        .. math:: \\sigma^2 A^{-1} (X'X) A^{-1} 
+ 
+        where :math:`A = X' \\Sigma X + \\lambda \\sigma^2 R' \\Simga_p^{-1} R` 
+ 
+        :math:`\\sigma^2` is an estimate of the error variance. 
+        :math:`\\sigma^2` inside A is replaced by the estimate from the initial 
+        GLS estimate. :math:`\\sigma^2` in cov_params is obtained from the 
+        residuals of the final estimate. 
+ 
+        The sandwich form of the covariance estimator is not robust to 
+        misspecified heteroscedasticity or autocorrelation. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">lambd = pen_weight</span>
+        <span class="s0">#this does duplicate transformation, but I need resid not wresid</span>
+        <span class="s1">res_gls = GLS(self.endog</span><span class="s3">, </span><span class="s1">self.exog</span><span class="s3">, </span><span class="s1">sigma=self.sigma).fit()</span>
+        <span class="s1">self.res_gls = res_gls</span>
+        <span class="s1">sigma2_e = res_gls.mse_resid</span>
+
+        <span class="s1">r_matrix = self.r_matrix</span>
+        <span class="s1">q_matrix = self.q_matrix</span>
+        <span class="s1">sigma_prior_inv = self.sigma_prior_inv</span>
+        <span class="s1">x = self.wexog</span>
+        <span class="s1">y = self.wendog[:</span><span class="s3">,None</span><span class="s1">]</span>
+        <span class="s0">#why are sigma2_e * lambd multiplied, not ratio?</span>
+        <span class="s0">#larger lambd -&gt; stronger prior  (it's not the variance)</span>
+        <span class="s0"># Bayesian: lambd is precision = 1/sigma2_prior</span>
+        <span class="s0">#print('lambd inside fit', lambd</span>
+        <span class="s1">xx = np.dot(x.T</span><span class="s3">, </span><span class="s1">x)</span>
+        <span class="s1">xpx = xx + \</span>
+              <span class="s1">sigma2_e * lambd * np.dot(r_matrix.T</span><span class="s3">, </span><span class="s1">np.dot(sigma_prior_inv</span><span class="s3">, </span><span class="s1">r_matrix))</span>
+        <span class="s1">xpy = np.dot(x.T</span><span class="s3">, </span><span class="s1">y) + \</span>
+              <span class="s1">sigma2_e * lambd * np.dot(r_matrix.T</span><span class="s3">, </span><span class="s1">np.dot(sigma_prior_inv</span><span class="s3">, </span><span class="s1">q_matrix))</span>
+        <span class="s0">#xpy = xpy[:,None]</span>
+
+        <span class="s1">xpxi = np.linalg.pinv(xpx</span><span class="s3">, </span><span class="s1">rcond=</span><span class="s4">1e-15</span><span class="s1">**</span><span class="s4">2</span><span class="s1">)  </span><span class="s0">#to match pinv(x) in OLS case</span>
+        <span class="s1">xpxi_sandwich = xpxi.dot(xx).dot(xpxi)</span>
+        <span class="s1">params = np.dot(xpxi</span><span class="s3">, </span><span class="s1">xpy)    </span><span class="s0">#or solve</span>
+        <span class="s1">params = np.squeeze(params)</span>
+        <span class="s0"># normalized_cov_params should have sandwich form xpxi @ xx @ xpxi</span>
+        <span class="s3">if </span><span class="s1">cov_type == </span><span class="s5">'sandwich'</span><span class="s1">:</span>
+            <span class="s1">normalized_cov_params = xpxi_sandwich</span>
+        <span class="s3">elif </span><span class="s1">cov_type == </span><span class="s5">'data-prior'</span><span class="s1">:</span>
+            <span class="s1">normalized_cov_params = xpxi    </span><span class="s0">#why attach it to self, i.e. model?</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;cov_type has to be 'sandwich' or 'data-prior'&quot;</span><span class="s1">)</span>
+
+        <span class="s1">self.normalized_cov_params = xpxi_sandwich</span>
+        <span class="s1">self.xpxi = xpxi</span>
+        <span class="s1">self.sigma2_e = sigma2_e</span>
+        <span class="s1">lfit = TheilRegressionResults(self</span><span class="s3">, </span><span class="s1">params</span><span class="s3">,</span>
+                       <span class="s1">normalized_cov_params=normalized_cov_params</span><span class="s3">, </span><span class="s1">use_t=use_t)</span>
+
+        <span class="s1">lfit.penalization_factor = lambd</span>
+        <span class="s3">return </span><span class="s1">lfit</span>
+
+    <span class="s3">def </span><span class="s1">select_pen_weight(self</span><span class="s3">, </span><span class="s1">method=</span><span class="s5">'aicc'</span><span class="s3">, </span><span class="s1">start_params=</span><span class="s4">1.</span><span class="s3">, </span><span class="s1">optim_args=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;find penalization factor that minimizes gcv or an information criterion 
+ 
+        Parameters 
+        ---------- 
+        method : str 
+            the name of an attribute of the results class. Currently the following 
+            are available aic, aicc, bic, gc and gcv. 
+        start_params : float 
+            starting values for the minimization to find the penalization factor 
+            `lambd`. Not since there can be local minima, it is best to try 
+            different starting values. 
+        optim_args : None or dict 
+            optimization keyword arguments used with `scipy.optimize.fmin` 
+ 
+        Returns 
+        ------- 
+        min_pen_weight : float 
+            The penalization factor at which the target criterion is (locally) 
+            minimized. 
+ 
+        Notes 
+        ----- 
+        This uses `scipy.optimize.fmin` as optimizer. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">optim_args </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">optim_args = {}</span>
+
+        <span class="s0">#this does not make sense, since number of parameters stays unchanged</span>
+        <span class="s0"># information criteria changes if we use df_model based on trace(hat_matrix)</span>
+        <span class="s0">#need leave-one-out, gcv; or some penalization for weak priors</span>
+        <span class="s0">#added extra penalization for lambd</span>
+        <span class="s3">def </span><span class="s1">get_ic(lambd):</span>
+            <span class="s0"># this can be optimized more</span>
+            <span class="s0"># for pure Ridge we can keep the eigenvector decomposition</span>
+            <span class="s3">return </span><span class="s1">getattr(self.fit(lambd)</span><span class="s3">, </span><span class="s1">method)</span>
+
+        <span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">optimize</span>
+        <span class="s1">lambd = optimize.fmin(get_ic</span><span class="s3">, </span><span class="s1">start_params</span><span class="s3">, </span><span class="s1">**optim_args)</span>
+        <span class="s3">return </span><span class="s1">lambd</span>
+
+
+<span class="s0">#TODO:</span>
+<span class="s0">#I need the hatmatrix in the model if I want to do iterative fitting, e.g. GCV</span>
+<span class="s0">#move to model or use it from a results instance inside the model,</span>
+<span class="s0">#    each call to fit returns results instance</span>
+<span class="s0"># note: we need to recalculate hatmatrix for each lambda, so keep in results is fine</span>
+
+<span class="s3">class </span><span class="s1">TheilRegressionResults(RegressionResults):</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwds):</span>
+        <span class="s1">super(TheilRegressionResults</span><span class="s3">, </span><span class="s1">self).__init__(*args</span><span class="s3">, </span><span class="s1">**kwds)</span>
+
+        <span class="s0"># overwrite df_model and df_resid</span>
+        <span class="s1">self.df_model = self.hatmatrix_trace() - </span><span class="s4">1 </span><span class="s0">#assume constant</span>
+        <span class="s1">self.df_resid = self.model.endog.shape[</span><span class="s4">0</span><span class="s1">] - self.df_model - </span><span class="s4">1</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">hatmatrix_diag(self):</span>
+        <span class="s2">'''diagonal of hat matrix 
+ 
+        diag(X' xpxi X) 
+ 
+        where xpxi = (X'X + sigma2_e * lambd * sigma_prior)^{-1} 
+ 
+        Notes 
+        ----- 
+ 
+        uses wexog, so this includes weights or sigma - check this case 
+ 
+        not clear whether I need to multiply by sigmahalf, i.e. 
+ 
+        (W^{-0.5} X) (X' W X)^{-1} (W^{-0.5} X)'  or 
+        (W X) (X' W X)^{-1} (W X)' 
+ 
+        projection y_hat = H y    or in terms of transformed variables (W^{-0.5} y) 
+ 
+        might be wrong for WLS and GLS case 
+        '''</span>
+        <span class="s0"># TODO is this still correct with sandwich normalized_cov_params, I guess not</span>
+        <span class="s1">xpxi = self.model.normalized_cov_params</span>
+        <span class="s0">#something fishy with self.normalized_cov_params in result, does not update</span>
+        <span class="s0">#print(self.model.wexog.shape, np.dot(xpxi, self.model.wexog.T).shape</span>
+        <span class="s3">return </span><span class="s1">(self.model.wexog * np.dot(xpxi</span><span class="s3">, </span><span class="s1">self.model.wexog.T).T).sum(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s0">#@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">hatmatrix_trace(self):</span>
+        <span class="s2">&quot;&quot;&quot;trace of hat matrix 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self.hatmatrix_diag.sum()</span>
+
+<span class="s0">##    #this does not update df_resid</span>
+<span class="s0">##    @property   #needs to be property or attribute (no call)</span>
+<span class="s0">##    def df_model(self):</span>
+<span class="s0">##        return self.hatmatrix_trace()</span>
+
+    <span class="s0">#Note: mse_resid uses df_resid not nobs-k_vars, which might differ if df_model, tr(H), is used</span>
+    <span class="s0">#in paper for gcv ess/nobs is used instead of mse_resid</span>
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">gcv(self):</span>
+        <span class="s3">return </span><span class="s1">self.mse_resid / (</span><span class="s4">1. </span><span class="s1">- self.hatmatrix_trace() / self.nobs)**</span><span class="s4">2</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">cv(self):</span>
+        <span class="s3">return </span><span class="s1">((self.resid / (</span><span class="s4">1. </span><span class="s1">- self.hatmatrix_diag))**</span><span class="s4">2</span><span class="s1">).sum() / self.nobs</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">aicc(self):</span>
+        <span class="s1">aic = np.log(self.mse_resid) + </span><span class="s4">1</span>
+        <span class="s1">eff_dof = self.nobs - self.hatmatrix_trace() - </span><span class="s4">2</span>
+        <span class="s3">if </span><span class="s1">eff_dof &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">adj = </span><span class="s4">2 </span><span class="s1">* (</span><span class="s4">1. </span><span class="s1">+ self.hatmatrix_trace()) / eff_dof</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">adj = np.inf</span>
+        <span class="s3">return </span><span class="s1">aic + adj</span>
+
+    <span class="s3">def </span><span class="s1">test_compatibility(self):</span>
+        <span class="s2">&quot;&quot;&quot;Hypothesis test for the compatibility of prior mean with data 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># TODO: should we store the OLS results ?  not needed so far, but maybe cache</span>
+        <span class="s0">#params_ols = np.linalg.pinv(self.model.exog).dot(self.model.endog)</span>
+        <span class="s0">#res = self.wald_test(self.model.r_matrix, q_matrix=self.model.q_matrix, use_f=False)</span>
+        <span class="s0">#from scratch</span>
+        <span class="s1">res_ols = OLS(self.model.endog</span><span class="s3">, </span><span class="s1">self.model.exog).fit()</span>
+        <span class="s1">r_mat = self.model.r_matrix</span>
+        <span class="s1">r_diff = self.model.q_matrix - r_mat.dot(res_ols.params)[:</span><span class="s3">,None</span><span class="s1">]</span>
+        <span class="s1">ols_cov_r = res_ols.cov_params(r_matrix=r_mat)</span>
+        <span class="s1">statistic = r_diff.T.dot(np.linalg.solve(ols_cov_r + self.model.sigma_prior</span><span class="s3">, </span><span class="s1">r_diff))</span>
+        <span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">stats</span>
+        <span class="s1">df = np.linalg.matrix_rank(self.model.sigma_prior)   </span><span class="s0"># same as r_mat.shape[0]</span>
+        <span class="s1">pvalue = stats.chi2.sf(statistic</span><span class="s3">, </span><span class="s1">df)</span>
+        <span class="s0"># TODO: return results class</span>
+        <span class="s3">return </span><span class="s1">statistic</span><span class="s3">, </span><span class="s1">pvalue</span><span class="s3">, </span><span class="s1">df</span>
+
+    <span class="s3">def </span><span class="s1">share_data(self):</span>
+        <span class="s2">&quot;&quot;&quot;a measure for the fraction of the data in the estimation result 
+ 
+        The share of the prior information is `1 - share_data`. 
+ 
+        Returns 
+        ------- 
+        share : float between 0 and 1 
+            share of data defined as the ration between effective degrees of 
+            freedom of the model and the number (TODO should be rank) of the 
+            explanatory variables. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0"># this is hatmatrix_trace / self.exog.shape[1]</span>
+        <span class="s0"># This needs to use rank of exog and not shape[1],</span>
+        <span class="s0"># since singular exog is allowed</span>
+        <span class="s3">return </span><span class="s1">(self.df_model + </span><span class="s4">1</span><span class="s1">) / self.model.rank  </span><span class="s0"># + 1 is for constant</span>
+
+
+<span class="s0"># contrast/restriction matrices, temporary location</span>
+
+<span class="s3">def </span><span class="s1">coef_restriction_meandiff(n_coeffs</span><span class="s3">, </span><span class="s1">n_vars=</span><span class="s3">None, </span><span class="s1">position=</span><span class="s4">0</span><span class="s1">):</span>
+
+    <span class="s1">reduced = np.eye(n_coeffs) - </span><span class="s4">1.</span><span class="s1">/n_coeffs</span>
+    <span class="s3">if </span><span class="s1">n_vars </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">reduced</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">full = np.zeros((n_coeffs</span><span class="s3">, </span><span class="s1">n_vars))</span>
+        <span class="s1">full[:</span><span class="s3">, </span><span class="s1">position:position+n_coeffs] = reduced</span>
+        <span class="s3">return </span><span class="s1">full</span>
+
+
+<span class="s3">def </span><span class="s1">coef_restriction_diffbase(n_coeffs</span><span class="s3">, </span><span class="s1">n_vars=</span><span class="s3">None, </span><span class="s1">position=</span><span class="s4">0</span><span class="s3">, </span><span class="s1">base_idx=</span><span class="s4">0</span><span class="s1">):</span>
+
+    <span class="s1">reduced = -np.eye(n_coeffs)  </span><span class="s0">#make all rows, drop one row later</span>
+    <span class="s1">reduced[:</span><span class="s3">, </span><span class="s1">base_idx] = </span><span class="s4">1</span>
+
+    <span class="s1">keep = lrange(n_coeffs)</span>
+    <span class="s3">del </span><span class="s1">keep[base_idx]</span>
+    <span class="s1">reduced = np.take(reduced</span><span class="s3">, </span><span class="s1">keep</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s1">n_vars </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">reduced</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">full = np.zeros((n_coeffs-</span><span class="s4">1</span><span class="s3">, </span><span class="s1">n_vars))</span>
+        <span class="s1">full[:</span><span class="s3">, </span><span class="s1">position:position+n_coeffs] = reduced</span>
+        <span class="s3">return </span><span class="s1">full</span>
+
+
+<span class="s3">def </span><span class="s1">next_odd(d):</span>
+    <span class="s3">return </span><span class="s1">d + (</span><span class="s4">1 </span><span class="s1">- d % </span><span class="s4">2</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">coef_restriction_diffseq(n_coeffs</span><span class="s3">, </span><span class="s1">degree=</span><span class="s4">1</span><span class="s3">, </span><span class="s1">n_vars=</span><span class="s3">None, </span><span class="s1">position=</span><span class="s4">0</span><span class="s3">, </span><span class="s1">base_idx=</span><span class="s4">0</span><span class="s1">):</span>
+    <span class="s0">#check boundaries, returns &quot;valid&quot; ?</span>
+
+    <span class="s3">if </span><span class="s1">degree == </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">diff_coeffs = [-</span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">n_points = </span><span class="s4">2</span>
+    <span class="s3">elif </span><span class="s1">degree &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">misc</span>
+        <span class="s1">n_points = next_odd(degree + </span><span class="s4">1</span><span class="s1">)  </span><span class="s0">#next odd integer after degree+1</span>
+        <span class="s1">diff_coeffs = misc.central_diff_weights(n_points</span><span class="s3">, </span><span class="s1">ndiv=degree)</span>
+
+    <span class="s1">dff = np.concatenate((diff_coeffs</span><span class="s3">, </span><span class="s1">np.zeros(n_coeffs - len(diff_coeffs))))</span>
+    <span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">linalg</span>
+    <span class="s1">reduced = linalg.toeplitz(dff</span><span class="s3">, </span><span class="s1">np.zeros(n_coeffs - len(diff_coeffs) + </span><span class="s4">1</span><span class="s1">)).T</span>
+    <span class="s0">#reduced = np.kron(np.eye(n_coeffs-n_points), diff_coeffs)</span>
+
+    <span class="s3">if </span><span class="s1">n_vars </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">reduced</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">full = np.zeros((n_coeffs-</span><span class="s4">1</span><span class="s3">, </span><span class="s1">n_vars))</span>
+        <span class="s1">full[:</span><span class="s3">, </span><span class="s1">position:position+n_coeffs] = reduced</span>
+        <span class="s3">return </span><span class="s1">full</span>
+
+
+<span class="s0">##</span>
+<span class="s0">##    R = np.c_[np.zeros((n_groups, k_vars-1)), np.eye(n_groups)]</span>
+<span class="s0">##    r = np.zeros(n_groups)</span>
+<span class="s0">##    R = np.c_[np.zeros((n_groups-1, k_vars)),</span>
+<span class="s0">##              np.eye(n_groups-1)-1./n_groups * np.ones((n_groups-1, n_groups-1))]</span>
+</pre>
+</body>
+</html>

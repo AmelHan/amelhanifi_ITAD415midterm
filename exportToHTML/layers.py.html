@@ -1,0 +1,1373 @@
+<html>
+<head>
+<title>layers.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+layers.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">functools</span>
+<span class="s0">import </span><span class="s1">math</span>
+<span class="s0">import </span><span class="s1">operator</span>
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">defaultdict</span>
+<span class="s0">from </span><span class="s1">collections.abc </span><span class="s0">import </span><span class="s1">Callable</span>
+<span class="s0">from </span><span class="s1">itertools </span><span class="s0">import </span><span class="s1">product</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">Any</span>
+
+<span class="s0">import </span><span class="s1">tlz </span><span class="s0">as </span><span class="s1">toolz</span>
+<span class="s0">from </span><span class="s1">tlz.curried </span><span class="s0">import </span><span class="s1">map</span>
+
+<span class="s0">from </span><span class="s1">dask.base </span><span class="s0">import </span><span class="s1">tokenize</span>
+<span class="s0">from </span><span class="s1">dask.blockwise </span><span class="s0">import </span><span class="s1">Blockwise</span><span class="s0">, </span><span class="s1">BlockwiseDep</span><span class="s0">, </span><span class="s1">BlockwiseDepDict</span><span class="s0">, </span><span class="s1">blockwise_token</span>
+<span class="s0">from </span><span class="s1">dask.core </span><span class="s0">import </span><span class="s1">flatten</span>
+<span class="s0">from </span><span class="s1">dask.highlevelgraph </span><span class="s0">import </span><span class="s1">Layer</span>
+<span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">apply</span><span class="s0">, </span><span class="s1">cached_cumsum</span><span class="s0">, </span><span class="s1">concrete</span><span class="s0">, </span><span class="s1">insert</span>
+
+<span class="s2">#</span>
+<span class="s2">##</span>
+<span class="s2">###  General Utilities</span>
+<span class="s2">##</span>
+<span class="s2">#</span>
+
+
+<span class="s0">class </span><span class="s1">CallableLazyImport:</span>
+    <span class="s3">&quot;&quot;&quot;Function Wrapper for Lazy Importing. 
+ 
+    This Class should only be used when materializing a graph 
+    on a distributed scheduler. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">function_path):</span>
+        <span class="s1">self.function_path = function_path</span>
+
+    <span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">from </span><span class="s1">distributed.utils </span><span class="s0">import </span><span class="s1">import_term</span>
+
+        <span class="s0">return </span><span class="s1">import_term(self.function_path)(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s2">#</span>
+<span class="s2">##</span>
+<span class="s2">###  Array Layers &amp; Utilities</span>
+<span class="s2">##</span>
+<span class="s2">#</span>
+
+
+<span class="s0">class </span><span class="s1">ArrayBlockwiseDep(BlockwiseDep):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Blockwise dep for array-likes, which only needs chunking 
+    information to compute its data. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">chunks: tuple[tuple[int</span><span class="s0">, </span><span class="s1">...]</span><span class="s0">, </span><span class="s1">...]</span>
+    <span class="s1">numblocks: tuple[int</span><span class="s0">, </span><span class="s1">...]</span>
+    <span class="s1">produces_tasks: bool = </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">chunks: tuple[tuple[int</span><span class="s0">, </span><span class="s1">...]</span><span class="s0">, </span><span class="s1">...]):</span>
+        <span class="s1">self.chunks = chunks</span>
+        <span class="s1">self.numblocks = tuple(len(chunk) </span><span class="s0">for </span><span class="s1">chunk </span><span class="s0">in </span><span class="s1">chunks)</span>
+        <span class="s1">self.produces_tasks = </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">idx: tuple[int</span><span class="s0">, </span><span class="s1">...]):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError(</span><span class="s4">&quot;Subclasses must implement __getitem__&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">ArrayChunkShapeDep(ArrayBlockwiseDep):</span>
+    <span class="s3">&quot;&quot;&quot;Produce chunk shapes given a chunk index&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">idx: tuple[int</span><span class="s0">, </span><span class="s1">...]):</span>
+        <span class="s0">return </span><span class="s1">tuple(chunk[i] </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">chunk </span><span class="s0">in </span><span class="s1">zip(idx</span><span class="s0">, </span><span class="s1">self.chunks))</span>
+
+
+<span class="s0">class </span><span class="s1">ArraySliceDep(ArrayBlockwiseDep):</span>
+    <span class="s3">&quot;&quot;&quot;Produce slice(s) into the full-sized array given a chunk index&quot;&quot;&quot;</span>
+
+    <span class="s1">starts: tuple[tuple[int</span><span class="s0">, </span><span class="s1">...]</span><span class="s0">, </span><span class="s1">...]</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">chunks: tuple[tuple[int</span><span class="s0">, </span><span class="s1">...]</span><span class="s0">, </span><span class="s1">...]):</span>
+        <span class="s1">super().__init__(chunks)</span>
+        <span class="s1">self.starts = tuple(cached_cumsum(c</span><span class="s0">, </span><span class="s1">initial_zero=</span><span class="s0">True</span><span class="s1">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">chunks)</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">idx: tuple):</span>
+        <span class="s1">loc = tuple((start[i]</span><span class="s0">, </span><span class="s1">start[i + </span><span class="s5">1</span><span class="s1">]) </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">start </span><span class="s0">in </span><span class="s1">zip(idx</span><span class="s0">, </span><span class="s1">self.starts))</span>
+        <span class="s0">return </span><span class="s1">tuple(slice(*s</span><span class="s0">, None</span><span class="s1">) </span><span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">loc)</span>
+
+
+<span class="s0">class </span><span class="s1">ArrayOverlapLayer(Layer):</span>
+    <span class="s3">&quot;&quot;&quot;Simple HighLevelGraph array overlap layer. 
+ 
+    Lazily computed High-level graph layer for a array overlap operations. 
+ 
+    Parameters 
+    ---------- 
+    name : str 
+        Name of new output overlap array. 
+    array : Dask array 
+    axes: Mapping 
+        Axes dictionary indicating overlap in each dimension, 
+        e.g. ``{'0': 1, '1': 1}`` 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">name</span><span class="s0">,</span>
+        <span class="s1">axes</span><span class="s0">,</span>
+        <span class="s1">chunks</span><span class="s0">,</span>
+        <span class="s1">numblocks</span><span class="s0">,</span>
+        <span class="s1">token</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s1">self.name = name</span>
+        <span class="s1">self.axes = axes</span>
+        <span class="s1">self.chunks = chunks</span>
+        <span class="s1">self.numblocks = numblocks</span>
+        <span class="s1">self.token = token</span>
+        <span class="s1">self._cached_keys = </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">__repr__(self):</span>
+        <span class="s0">return </span><span class="s4">f&quot;ArrayOverlapLayer&lt;name='</span><span class="s0">{</span><span class="s1">self.name</span><span class="s0">}</span><span class="s4">'&quot;</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">_dict(self):</span>
+        <span class="s3">&quot;&quot;&quot;Materialize full dict representation&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s4">&quot;_cached_dict&quot;</span><span class="s1">):</span>
+            <span class="s0">return </span><span class="s1">self._cached_dict</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">dsk = self._construct_graph()</span>
+            <span class="s1">self._cached_dict = dsk</span>
+        <span class="s0">return </span><span class="s1">self._cached_dict</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">key):</span>
+        <span class="s0">return </span><span class="s1">self._dict[key]</span>
+
+    <span class="s0">def </span><span class="s1">__iter__(self):</span>
+        <span class="s0">return </span><span class="s1">iter(self._dict)</span>
+
+    <span class="s0">def </span><span class="s1">__len__(self):</span>
+        <span class="s0">return </span><span class="s1">len(self._dict)</span>
+
+    <span class="s0">def </span><span class="s1">is_materialized(self):</span>
+        <span class="s0">return </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s4">&quot;_cached_dict&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">get_output_keys(self):</span>
+        <span class="s0">return </span><span class="s1">self.keys()  </span><span class="s2"># FIXME! this implementation materializes the graph</span>
+
+    <span class="s0">def </span><span class="s1">_dask_keys(self):</span>
+        <span class="s0">if </span><span class="s1">self._cached_keys </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self._cached_keys</span>
+
+        <span class="s1">name</span><span class="s0">, </span><span class="s1">chunks</span><span class="s0">, </span><span class="s1">numblocks = self.name</span><span class="s0">, </span><span class="s1">self.chunks</span><span class="s0">, </span><span class="s1">self.numblocks</span>
+
+        <span class="s0">def </span><span class="s1">keys(*args):</span>
+            <span class="s0">if not </span><span class="s1">chunks:</span>
+                <span class="s0">return </span><span class="s1">[(name</span><span class="s0">,</span><span class="s1">)]</span>
+            <span class="s1">ind = len(args)</span>
+            <span class="s0">if </span><span class="s1">ind + </span><span class="s5">1 </span><span class="s1">== len(numblocks):</span>
+                <span class="s1">result = [(name</span><span class="s0">,</span><span class="s1">) + args + (i</span><span class="s0">,</span><span class="s1">) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numblocks[ind])]</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">result = [keys(*(args + (i</span><span class="s0">,</span><span class="s1">))) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(numblocks[ind])]</span>
+            <span class="s0">return </span><span class="s1">result</span>
+
+        <span class="s1">self._cached_keys = result = keys()</span>
+        <span class="s0">return </span><span class="s1">result</span>
+
+    <span class="s0">def </span><span class="s1">_construct_graph(self</span><span class="s0">, </span><span class="s1">deserializing=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Construct graph for a simple overlap operation.&quot;&quot;&quot;</span>
+        <span class="s1">axes = self.axes</span>
+        <span class="s1">chunks = self.chunks</span>
+        <span class="s1">name = self.name</span>
+        <span class="s1">dask_keys = self._dask_keys()</span>
+
+        <span class="s1">getitem_name = </span><span class="s4">&quot;getitem-&quot; </span><span class="s1">+ self.token</span>
+        <span class="s1">overlap_name = </span><span class="s4">&quot;overlap-&quot; </span><span class="s1">+ self.token</span>
+
+        <span class="s0">if </span><span class="s1">deserializing:</span>
+            <span class="s2"># Use CallableLazyImport objects to avoid importing dataframe</span>
+            <span class="s2"># module on the scheduler</span>
+            <span class="s1">concatenate3 = CallableLazyImport(</span><span class="s4">&quot;dask.array.core.concatenate3&quot;</span><span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># Not running on distributed scheduler - Use explicit functions</span>
+            <span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">concatenate3</span>
+
+        <span class="s1">dims = list(map(len</span><span class="s0">, </span><span class="s1">chunks))</span>
+        <span class="s1">expand_key2 = functools.partial(</span>
+            <span class="s1">_expand_keys_around_center</span><span class="s0">, </span><span class="s1">dims=dims</span><span class="s0">, </span><span class="s1">axes=axes</span>
+        <span class="s1">)</span>
+
+        <span class="s2"># Make keys for each of the surrounding sub-arrays</span>
+        <span class="s1">interior_keys = toolz.pipe(</span>
+            <span class="s1">dask_keys</span><span class="s0">, </span><span class="s1">flatten</span><span class="s0">, </span><span class="s1">map(expand_key2)</span><span class="s0">, </span><span class="s1">map(flatten)</span><span class="s0">, </span><span class="s1">toolz.concat</span><span class="s0">, </span><span class="s1">list</span>
+        <span class="s1">)</span>
+        <span class="s1">interior_slices = {}</span>
+        <span class="s1">overlap_blocks = {}</span>
+        <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">interior_keys:</span>
+            <span class="s1">frac_slice = fractional_slice((name</span><span class="s0">,</span><span class="s1">) + k</span><span class="s0">, </span><span class="s1">axes)</span>
+            <span class="s0">if </span><span class="s1">(name</span><span class="s0">,</span><span class="s1">) + k != frac_slice:</span>
+                <span class="s1">interior_slices[(getitem_name</span><span class="s0">,</span><span class="s1">) + k] = frac_slice</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">interior_slices[(getitem_name</span><span class="s0">,</span><span class="s1">) + k] = (name</span><span class="s0">,</span><span class="s1">) + k</span>
+                <span class="s1">overlap_blocks[(overlap_name</span><span class="s0">,</span><span class="s1">) + k] = (</span>
+                    <span class="s1">concatenate3</span><span class="s0">,</span>
+                    <span class="s1">(concrete</span><span class="s0">, </span><span class="s1">expand_key2((</span><span class="s0">None,</span><span class="s1">) + k</span><span class="s0">, </span><span class="s1">name=getitem_name))</span><span class="s0">,</span>
+                <span class="s1">)</span>
+
+        <span class="s1">dsk = toolz.merge(interior_slices</span><span class="s0">, </span><span class="s1">overlap_blocks)</span>
+        <span class="s0">return </span><span class="s1">dsk</span>
+
+
+<span class="s0">def </span><span class="s1">_expand_keys_around_center(k</span><span class="s0">, </span><span class="s1">dims</span><span class="s0">, </span><span class="s1">name=</span><span class="s0">None, </span><span class="s1">axes=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Get all neighboring keys around center 
+ 
+    Parameters 
+    ---------- 
+    k: Key 
+        The key around which to generate new keys 
+    dims: Sequence[int] 
+        The number of chunks in each dimension 
+    name: Option[str] 
+        The name to include in the output keys, or none to include no name 
+    axes: Dict[int, int] 
+        The axes active in the expansion.  We don't expand on non-active axes 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; _expand_keys_around_center(('x', 2, 3), dims=[5, 5], name='y', axes={0: 1, 1: 1})  # noqa: E501 # doctest: +NORMALIZE_WHITESPACE 
+    [[('y', 1.1, 2.1), ('y', 1.1, 3), ('y', 1.1, 3.9)], 
+     [('y',   2, 2.1), ('y',   2, 3), ('y',   2, 3.9)], 
+     [('y', 2.9, 2.1), ('y', 2.9, 3), ('y', 2.9, 3.9)]] 
+ 
+    &gt;&gt;&gt; _expand_keys_around_center(('x', 0, 4), dims=[5, 5], name='y', axes={0: 1, 1: 1})  # noqa: E501 # doctest: +NORMALIZE_WHITESPACE 
+    [[('y',   0, 3.1), ('y',   0,   4)], 
+     [('y', 0.9, 3.1), ('y', 0.9,   4)]] 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">inds(i</span><span class="s0">, </span><span class="s1">ind):</span>
+        <span class="s1">rv = []</span>
+        <span class="s0">if </span><span class="s1">ind - </span><span class="s5">0.9 </span><span class="s1">&gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">rv.append(ind - </span><span class="s5">0.9</span><span class="s1">)</span>
+        <span class="s1">rv.append(ind)</span>
+        <span class="s0">if </span><span class="s1">ind + </span><span class="s5">0.9 </span><span class="s1">&lt; dims[i] - </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">rv.append(ind + </span><span class="s5">0.9</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">rv</span>
+
+    <span class="s1">shape = []</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">enumerate(k[</span><span class="s5">1</span><span class="s1">:]):</span>
+        <span class="s1">num = </span><span class="s5">1</span>
+        <span class="s0">if </span><span class="s1">ind &gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">num += </span><span class="s5">1</span>
+        <span class="s0">if </span><span class="s1">ind &lt; dims[i] - </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">num += </span><span class="s5">1</span>
+        <span class="s1">shape.append(num)</span>
+
+    <span class="s1">args = [</span>
+        <span class="s1">inds(i</span><span class="s0">, </span><span class="s1">ind) </span><span class="s0">if </span><span class="s1">any((axes.get(i</span><span class="s0">, </span><span class="s5">0</span><span class="s1">)</span><span class="s0">,</span><span class="s1">)) </span><span class="s0">else </span><span class="s1">[ind] </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">enumerate(k[</span><span class="s5">1</span><span class="s1">:])</span>
+    <span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">name </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s1">args = [[name]] + args</span>
+    <span class="s1">seq = list(product(*args))</span>
+    <span class="s1">shape2 = [d </span><span class="s0">if </span><span class="s1">any((axes.get(i</span><span class="s0">, </span><span class="s5">0</span><span class="s1">)</span><span class="s0">,</span><span class="s1">)) </span><span class="s0">else </span><span class="s5">1 </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">d </span><span class="s0">in </span><span class="s1">enumerate(shape)]</span>
+    <span class="s1">result = reshapelist(shape2</span><span class="s0">, </span><span class="s1">seq)</span>
+    <span class="s0">return </span><span class="s1">result</span>
+
+
+<span class="s0">def </span><span class="s1">reshapelist(shape</span><span class="s0">, </span><span class="s1">seq):</span>
+    <span class="s3">&quot;&quot;&quot;Reshape iterator to nested shape 
+ 
+    &gt;&gt;&gt; reshapelist((2, 3), range(6)) 
+    [[0, 1, 2], [3, 4, 5]] 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">len(shape) == </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">list(seq)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">n = int(len(seq) / shape[</span><span class="s5">0</span><span class="s1">])</span>
+        <span class="s0">return </span><span class="s1">[reshapelist(shape[</span><span class="s5">1</span><span class="s1">:]</span><span class="s0">, </span><span class="s1">part) </span><span class="s0">for </span><span class="s1">part </span><span class="s0">in </span><span class="s1">toolz.partition(n</span><span class="s0">, </span><span class="s1">seq)]</span>
+
+
+<span class="s0">def </span><span class="s1">fractional_slice(task</span><span class="s0">, </span><span class="s1">axes):</span>
+    <span class="s3">&quot;&quot;&quot; 
+ 
+    &gt;&gt;&gt; fractional_slice(('x', 5.1), {0: 2}) 
+    (&lt;built-in function getitem&gt;, ('x', 5), (slice(-2, None, None),)) 
+ 
+    &gt;&gt;&gt; fractional_slice(('x', 3, 5.1), {0: 2, 1: 3}) 
+    (&lt;built-in function getitem&gt;, ('x', 3, 5), (slice(None, None, None), slice(-3, None, None))) 
+ 
+    &gt;&gt;&gt; fractional_slice(('x', 2.9, 5.1), {0: 2, 1: 3}) 
+    (&lt;built-in function getitem&gt;, ('x', 3, 5), (slice(0, 2, None), slice(-3, None, None))) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">rounded = (task[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">,</span><span class="s1">) + tuple(int(round(i)) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">task[</span><span class="s5">1</span><span class="s1">:])</span>
+
+    <span class="s1">index = []</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">(t</span><span class="s0">, </span><span class="s1">r) </span><span class="s0">in </span><span class="s1">enumerate(zip(task[</span><span class="s5">1</span><span class="s1">:]</span><span class="s0">, </span><span class="s1">rounded[</span><span class="s5">1</span><span class="s1">:])):</span>
+        <span class="s1">depth = axes.get(i</span><span class="s0">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">isinstance(depth</span><span class="s0">, </span><span class="s1">tuple):</span>
+            <span class="s1">left_depth = depth[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s1">right_depth = depth[</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">left_depth = depth</span>
+            <span class="s1">right_depth = depth</span>
+
+        <span class="s0">if </span><span class="s1">t == r:</span>
+            <span class="s1">index.append(slice(</span><span class="s0">None, None, None</span><span class="s1">))</span>
+        <span class="s0">elif </span><span class="s1">t &lt; r </span><span class="s0">and </span><span class="s1">right_depth:</span>
+            <span class="s1">index.append(slice(</span><span class="s5">0</span><span class="s0">, </span><span class="s1">right_depth))</span>
+        <span class="s0">elif </span><span class="s1">t &gt; r </span><span class="s0">and </span><span class="s1">left_depth:</span>
+            <span class="s1">index.append(slice(-left_depth</span><span class="s0">, None</span><span class="s1">))</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">index.append(slice(</span><span class="s5">0</span><span class="s0">, </span><span class="s5">0</span><span class="s1">))</span>
+    <span class="s1">index = tuple(index)</span>
+
+    <span class="s0">if </span><span class="s1">all(ind == slice(</span><span class="s0">None, None, None</span><span class="s1">) </span><span class="s0">for </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">index):</span>
+        <span class="s0">return </span><span class="s1">task</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">(operator.getitem</span><span class="s0">, </span><span class="s1">rounded</span><span class="s0">, </span><span class="s1">index)</span>
+
+
+<span class="s2">#</span>
+<span class="s2">##</span>
+<span class="s2">###  DataFrame Layers &amp; Utilities</span>
+<span class="s2">##</span>
+<span class="s2">#</span>
+
+
+<span class="s0">class </span><span class="s1">SimpleShuffleLayer(Layer):</span>
+    <span class="s3">&quot;&quot;&quot;Simple HighLevelGraph Shuffle layer 
+ 
+    High-level graph layer for a simple shuffle operation in which 
+    each output partition depends on all input partitions. 
+ 
+    Parameters 
+    ---------- 
+    name : str 
+        Name of new shuffled output collection. 
+    column : str or list of str 
+        Column(s) to be used to map rows to output partitions (by hashing). 
+    npartitions : int 
+        Number of output partitions. 
+    npartitions_input : int 
+        Number of partitions in the original (un-shuffled) DataFrame. 
+    ignore_index: bool, default False 
+        Ignore index during shuffle.  If ``True``, performance may improve, 
+        but index values will not be preserved. 
+    name_input : str 
+        Name of input collection. 
+    meta_input : pd.DataFrame-like object 
+        Empty metadata of input collection. 
+    parts_out : list of int (optional) 
+        List of required output-partition indices. 
+    annotations : dict (optional) 
+        Layer annotations 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">name</span><span class="s0">,</span>
+        <span class="s1">column</span><span class="s0">,</span>
+        <span class="s1">npartitions</span><span class="s0">,</span>
+        <span class="s1">npartitions_input</span><span class="s0">,</span>
+        <span class="s1">ignore_index</span><span class="s0">,</span>
+        <span class="s1">name_input</span><span class="s0">,</span>
+        <span class="s1">meta_input</span><span class="s0">,</span>
+        <span class="s1">parts_out=</span><span class="s0">None,</span>
+        <span class="s1">annotations=</span><span class="s0">None,</span>
+    <span class="s1">):</span>
+        <span class="s1">self.name = name</span>
+        <span class="s1">self.column = column</span>
+        <span class="s1">self.npartitions = npartitions</span>
+        <span class="s1">self.npartitions_input = npartitions_input</span>
+        <span class="s1">self.ignore_index = ignore_index</span>
+        <span class="s1">self.name_input = name_input</span>
+        <span class="s1">self.meta_input = meta_input</span>
+        <span class="s1">self.parts_out = parts_out </span><span class="s0">or </span><span class="s1">range(npartitions)</span>
+        <span class="s1">self.split_name = </span><span class="s4">&quot;split-&quot; </span><span class="s1">+ self.name</span>
+
+        <span class="s2"># The scheduling policy of Dask is generally depth-first,</span>
+        <span class="s2"># which works great in most cases. However, in case of shuffle,</span>
+        <span class="s2"># it increases the memory usage significantly. This is because</span>
+        <span class="s2"># depth-first delays the freeing of the result of `shuffle_group()`</span>
+        <span class="s2"># until the end of the shuffling.</span>
+        <span class="s2">#</span>
+        <span class="s2"># We address this by manually setting a high &quot;priority&quot; to the</span>
+        <span class="s2"># `getitem()` (&quot;split&quot;) tasks, using annotations. This forces a</span>
+        <span class="s2"># breadth-first scheduling of the tasks that directly depend on</span>
+        <span class="s2"># the `shuffle_group()` output, allowing that data to be freed</span>
+        <span class="s2"># much earlier.</span>
+        <span class="s2">#</span>
+        <span class="s2"># See https://github.com/dask/dask/pull/6051 for a detailed discussion.</span>
+        <span class="s1">annotations = annotations </span><span class="s0">or </span><span class="s1">{}</span>
+        <span class="s1">self._split_keys = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s4">&quot;priority&quot; </span><span class="s0">not in </span><span class="s1">annotations:</span>
+            <span class="s1">annotations[</span><span class="s4">&quot;priority&quot;</span><span class="s1">] = self._key_priority</span>
+
+        <span class="s1">super().__init__(annotations=annotations)</span>
+
+    <span class="s0">def </span><span class="s1">_key_priority(self</span><span class="s0">, </span><span class="s1">key):</span>
+        <span class="s0">assert </span><span class="s1">isinstance(key</span><span class="s0">, </span><span class="s1">tuple)</span>
+        <span class="s0">if </span><span class="s1">key[</span><span class="s5">0</span><span class="s1">] == self.split_name:</span>
+            <span class="s0">return </span><span class="s5">1</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s5">0</span>
+
+    <span class="s0">def </span><span class="s1">get_output_keys(self):</span>
+        <span class="s0">return </span><span class="s1">{(self.name</span><span class="s0">, </span><span class="s1">part) </span><span class="s0">for </span><span class="s1">part </span><span class="s0">in </span><span class="s1">self.parts_out}</span>
+
+    <span class="s0">def </span><span class="s1">__repr__(self):</span>
+        <span class="s0">return </span><span class="s4">&quot;SimpleShuffleLayer&lt;name='{}', npartitions={}&gt;&quot;</span><span class="s1">.format(</span>
+            <span class="s1">self.name</span><span class="s0">, </span><span class="s1">self.npartitions</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">is_materialized(self):</span>
+        <span class="s0">return </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s4">&quot;_cached_dict&quot;</span><span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">_dict(self):</span>
+        <span class="s3">&quot;&quot;&quot;Materialize full dict representation&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s4">&quot;_cached_dict&quot;</span><span class="s1">):</span>
+            <span class="s0">return </span><span class="s1">self._cached_dict</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">dsk = self._construct_graph()</span>
+            <span class="s1">self._cached_dict = dsk</span>
+        <span class="s0">return </span><span class="s1">self._cached_dict</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">key):</span>
+        <span class="s0">return </span><span class="s1">self._dict[key]</span>
+
+    <span class="s0">def </span><span class="s1">__iter__(self):</span>
+        <span class="s0">return </span><span class="s1">iter(self._dict)</span>
+
+    <span class="s0">def </span><span class="s1">__len__(self):</span>
+        <span class="s0">return </span><span class="s1">len(self._dict)</span>
+
+    <span class="s0">def </span><span class="s1">_keys_to_parts(self</span><span class="s0">, </span><span class="s1">keys):</span>
+        <span class="s3">&quot;&quot;&quot;Simple utility to convert keys to partition indices.&quot;&quot;&quot;</span>
+        <span class="s1">parts = set()</span>
+        <span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">keys:</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">_name</span><span class="s0">, </span><span class="s1">_part = key</span>
+            <span class="s0">except </span><span class="s1">ValueError:</span>
+                <span class="s0">continue</span>
+            <span class="s0">if </span><span class="s1">_name != self.name:</span>
+                <span class="s0">continue</span>
+            <span class="s1">parts.add(_part)</span>
+        <span class="s0">return </span><span class="s1">parts</span>
+
+    <span class="s0">def </span><span class="s1">_cull_dependencies(self</span><span class="s0">, </span><span class="s1">keys</span><span class="s0">, </span><span class="s1">parts_out=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Determine the necessary dependencies to produce `keys`. 
+ 
+        For a simple shuffle, output partitions always depend on 
+        all input partitions. This method does not require graph 
+        materialization. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">deps = defaultdict(set)</span>
+        <span class="s1">parts_out = parts_out </span><span class="s0">or </span><span class="s1">self._keys_to_parts(keys)</span>
+        <span class="s0">for </span><span class="s1">part </span><span class="s0">in </span><span class="s1">parts_out:</span>
+            <span class="s1">deps[(self.name</span><span class="s0">, </span><span class="s1">part)] |= {</span>
+                <span class="s1">(self.name_input</span><span class="s0">, </span><span class="s1">i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(self.npartitions_input)</span>
+            <span class="s1">}</span>
+        <span class="s0">return </span><span class="s1">deps</span>
+
+    <span class="s0">def </span><span class="s1">_cull(self</span><span class="s0">, </span><span class="s1">parts_out):</span>
+        <span class="s0">return </span><span class="s1">SimpleShuffleLayer(</span>
+            <span class="s1">self.name</span><span class="s0">,</span>
+            <span class="s1">self.column</span><span class="s0">,</span>
+            <span class="s1">self.npartitions</span><span class="s0">,</span>
+            <span class="s1">self.npartitions_input</span><span class="s0">,</span>
+            <span class="s1">self.ignore_index</span><span class="s0">,</span>
+            <span class="s1">self.name_input</span><span class="s0">,</span>
+            <span class="s1">self.meta_input</span><span class="s0">,</span>
+            <span class="s1">parts_out=parts_out</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">cull(self</span><span class="s0">, </span><span class="s1">keys</span><span class="s0">, </span><span class="s1">all_keys):</span>
+        <span class="s3">&quot;&quot;&quot;Cull a SimpleShuffleLayer HighLevelGraph layer. 
+ 
+        The underlying graph will only include the necessary 
+        tasks to produce the keys (indices) included in `parts_out`. 
+        Therefore, &quot;culling&quot; the layer only requires us to reset this 
+        parameter. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">parts_out = self._keys_to_parts(keys)</span>
+        <span class="s1">culled_deps = self._cull_dependencies(keys</span><span class="s0">, </span><span class="s1">parts_out=parts_out)</span>
+        <span class="s0">if </span><span class="s1">parts_out != set(self.parts_out):</span>
+            <span class="s1">culled_layer = self._cull(parts_out)</span>
+            <span class="s0">return </span><span class="s1">culled_layer</span><span class="s0">, </span><span class="s1">culled_deps</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self</span><span class="s0">, </span><span class="s1">culled_deps</span>
+
+    <span class="s0">def </span><span class="s1">_construct_graph(self</span><span class="s0">, </span><span class="s1">deserializing=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Construct graph for a simple shuffle operation.&quot;&quot;&quot;</span>
+
+        <span class="s1">shuffle_group_name = </span><span class="s4">&quot;group-&quot; </span><span class="s1">+ self.name</span>
+
+        <span class="s0">if </span><span class="s1">deserializing:</span>
+            <span class="s2"># Use CallableLazyImport objects to avoid importing dataframe</span>
+            <span class="s2"># module on the scheduler</span>
+            <span class="s1">concat_func = CallableLazyImport(</span><span class="s4">&quot;dask.dataframe.core._concat&quot;</span><span class="s1">)</span>
+            <span class="s1">shuffle_group_func = CallableLazyImport(</span>
+                <span class="s4">&quot;dask.dataframe.shuffle.shuffle_group&quot;</span>
+            <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># Not running on distributed scheduler - Use explicit functions</span>
+            <span class="s0">from </span><span class="s1">dask.dataframe.core </span><span class="s0">import </span><span class="s1">_concat </span><span class="s0">as </span><span class="s1">concat_func</span>
+            <span class="s0">from </span><span class="s1">dask.dataframe.shuffle </span><span class="s0">import </span><span class="s1">shuffle_group </span><span class="s0">as </span><span class="s1">shuffle_group_func</span>
+
+        <span class="s1">dsk = {}</span>
+        <span class="s0">for </span><span class="s1">part_out </span><span class="s0">in </span><span class="s1">self.parts_out:</span>
+            <span class="s1">_concat_list = [</span>
+                <span class="s1">(self.split_name</span><span class="s0">, </span><span class="s1">part_out</span><span class="s0">, </span><span class="s1">part_in)</span>
+                <span class="s0">for </span><span class="s1">part_in </span><span class="s0">in </span><span class="s1">range(self.npartitions_input)</span>
+            <span class="s1">]</span>
+            <span class="s1">dsk[(self.name</span><span class="s0">, </span><span class="s1">part_out)] = (</span>
+                <span class="s1">concat_func</span><span class="s0">,</span>
+                <span class="s1">_concat_list</span><span class="s0">,</span>
+                <span class="s1">self.ignore_index</span><span class="s0">,</span>
+            <span class="s1">)</span>
+            <span class="s0">for </span><span class="s1">_</span><span class="s0">, </span><span class="s1">_part_out</span><span class="s0">, </span><span class="s1">_part_in </span><span class="s0">in </span><span class="s1">_concat_list:</span>
+                <span class="s1">dsk[(self.split_name</span><span class="s0">, </span><span class="s1">_part_out</span><span class="s0">, </span><span class="s1">_part_in)] = (</span>
+                    <span class="s1">operator.getitem</span><span class="s0">,</span>
+                    <span class="s1">(shuffle_group_name</span><span class="s0">, </span><span class="s1">_part_in)</span><span class="s0">,</span>
+                    <span class="s1">_part_out</span><span class="s0">,</span>
+                <span class="s1">)</span>
+                <span class="s0">if </span><span class="s1">(shuffle_group_name</span><span class="s0">, </span><span class="s1">_part_in) </span><span class="s0">not in </span><span class="s1">dsk:</span>
+                    <span class="s1">dsk[(shuffle_group_name</span><span class="s0">, </span><span class="s1">_part_in)] = (</span>
+                        <span class="s1">shuffle_group_func</span><span class="s0">,</span>
+                        <span class="s1">(self.name_input</span><span class="s0">, </span><span class="s1">_part_in)</span><span class="s0">,</span>
+                        <span class="s1">self.column</span><span class="s0">,</span>
+                        <span class="s5">0</span><span class="s0">,</span>
+                        <span class="s1">self.npartitions</span><span class="s0">,</span>
+                        <span class="s1">self.npartitions</span><span class="s0">,</span>
+                        <span class="s1">self.ignore_index</span><span class="s0">,</span>
+                        <span class="s1">self.npartitions</span><span class="s0">,</span>
+                    <span class="s1">)</span>
+
+        <span class="s0">return </span><span class="s1">dsk</span>
+
+
+<span class="s0">class </span><span class="s1">ShuffleLayer(SimpleShuffleLayer):</span>
+    <span class="s3">&quot;&quot;&quot;Shuffle-stage HighLevelGraph layer 
+ 
+    High-level graph layer corresponding to a single stage of 
+    a multi-stage inter-partition shuffle operation. 
+ 
+    Stage: (shuffle-group) -&gt; (shuffle-split) -&gt; (shuffle-join) 
+ 
+    Parameters 
+    ---------- 
+    name : str 
+        Name of new (partially) shuffled collection. 
+    column : str or list of str 
+        Column(s) to be used to map rows to output partitions (by hashing). 
+    inputs : list of tuples 
+        Each tuple dictates the data movement for a specific partition. 
+    stage : int 
+        Index of the current shuffle stage. 
+    npartitions : int 
+        Number of output partitions for the full (multi-stage) shuffle. 
+    npartitions_input : int 
+        Number of partitions in the original (un-shuffled) DataFrame. 
+    k : int 
+        A partition is split into this many groups during each stage. 
+    ignore_index: bool, default False 
+        Ignore index during shuffle.  If ``True``, performance may improve, 
+        but index values will not be preserved. 
+    name_input : str 
+        Name of input collection. 
+    meta_input : pd.DataFrame-like object 
+        Empty metadata of input collection. 
+    parts_out : list of int (optional) 
+        List of required output-partition indices. 
+    annotations : dict (optional) 
+        Layer annotations 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">name</span><span class="s0">,</span>
+        <span class="s1">column</span><span class="s0">,</span>
+        <span class="s1">inputs</span><span class="s0">,</span>
+        <span class="s1">stage</span><span class="s0">,</span>
+        <span class="s1">npartitions</span><span class="s0">,</span>
+        <span class="s1">npartitions_input</span><span class="s0">,</span>
+        <span class="s1">nsplits</span><span class="s0">,</span>
+        <span class="s1">ignore_index</span><span class="s0">,</span>
+        <span class="s1">name_input</span><span class="s0">,</span>
+        <span class="s1">meta_input</span><span class="s0">,</span>
+        <span class="s1">parts_out=</span><span class="s0">None,</span>
+        <span class="s1">annotations=</span><span class="s0">None,</span>
+    <span class="s1">):</span>
+        <span class="s1">self.inputs = inputs</span>
+        <span class="s1">self.stage = stage</span>
+        <span class="s1">self.nsplits = nsplits</span>
+        <span class="s1">super().__init__(</span>
+            <span class="s1">name</span><span class="s0">,</span>
+            <span class="s1">column</span><span class="s0">,</span>
+            <span class="s1">npartitions</span><span class="s0">,</span>
+            <span class="s1">npartitions_input</span><span class="s0">,</span>
+            <span class="s1">ignore_index</span><span class="s0">,</span>
+            <span class="s1">name_input</span><span class="s0">,</span>
+            <span class="s1">meta_input</span><span class="s0">,</span>
+            <span class="s1">parts_out=parts_out </span><span class="s0">or </span><span class="s1">range(len(inputs))</span><span class="s0">,</span>
+            <span class="s1">annotations=annotations</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__repr__(self):</span>
+        <span class="s0">return </span><span class="s4">&quot;ShuffleLayer&lt;name='{}', stage={}, nsplits={}, npartitions={}&gt;&quot;</span><span class="s1">.format(</span>
+            <span class="s1">self.name</span><span class="s0">, </span><span class="s1">self.stage</span><span class="s0">, </span><span class="s1">self.nsplits</span><span class="s0">, </span><span class="s1">self.npartitions</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_cull_dependencies(self</span><span class="s0">, </span><span class="s1">keys</span><span class="s0">, </span><span class="s1">parts_out=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Determine the necessary dependencies to produce `keys`. 
+ 
+        Does not require graph materialization. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">deps = defaultdict(set)</span>
+        <span class="s1">parts_out = parts_out </span><span class="s0">or </span><span class="s1">self._keys_to_parts(keys)</span>
+        <span class="s1">inp_part_map = {inp: i </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">inp </span><span class="s0">in </span><span class="s1">enumerate(self.inputs)}</span>
+        <span class="s0">for </span><span class="s1">part </span><span class="s0">in </span><span class="s1">parts_out:</span>
+            <span class="s1">out = self.inputs[part]</span>
+            <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">range(self.nsplits):</span>
+                <span class="s1">_inp = insert(out</span><span class="s0">, </span><span class="s1">self.stage</span><span class="s0">, </span><span class="s1">k)</span>
+                <span class="s1">_part = inp_part_map[_inp]</span>
+                <span class="s0">if </span><span class="s1">self.stage == </span><span class="s5">0 </span><span class="s0">and </span><span class="s1">_part &gt;= self.npartitions_input:</span>
+                    <span class="s1">deps[(self.name</span><span class="s0">, </span><span class="s1">part)].add((</span><span class="s4">&quot;group-&quot; </span><span class="s1">+ self.name</span><span class="s0">, </span><span class="s1">_inp</span><span class="s0">, </span><span class="s4">&quot;empty&quot;</span><span class="s1">))</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">deps[(self.name</span><span class="s0">, </span><span class="s1">part)].add((self.name_input</span><span class="s0">, </span><span class="s1">_part))</span>
+        <span class="s0">return </span><span class="s1">deps</span>
+
+    <span class="s0">def </span><span class="s1">_cull(self</span><span class="s0">, </span><span class="s1">parts_out):</span>
+        <span class="s0">return </span><span class="s1">ShuffleLayer(</span>
+            <span class="s1">self.name</span><span class="s0">,</span>
+            <span class="s1">self.column</span><span class="s0">,</span>
+            <span class="s1">self.inputs</span><span class="s0">,</span>
+            <span class="s1">self.stage</span><span class="s0">,</span>
+            <span class="s1">self.npartitions</span><span class="s0">,</span>
+            <span class="s1">self.npartitions_input</span><span class="s0">,</span>
+            <span class="s1">self.nsplits</span><span class="s0">,</span>
+            <span class="s1">self.ignore_index</span><span class="s0">,</span>
+            <span class="s1">self.name_input</span><span class="s0">,</span>
+            <span class="s1">self.meta_input</span><span class="s0">,</span>
+            <span class="s1">parts_out=parts_out</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_construct_graph(self</span><span class="s0">, </span><span class="s1">deserializing=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Construct graph for a &quot;rearrange-by-column&quot; stage.&quot;&quot;&quot;</span>
+
+        <span class="s1">shuffle_group_name = </span><span class="s4">&quot;group-&quot; </span><span class="s1">+ self.name</span>
+
+        <span class="s0">if </span><span class="s1">deserializing:</span>
+            <span class="s2"># Use CallableLazyImport objects to avoid importing dataframe</span>
+            <span class="s2"># module on the scheduler</span>
+            <span class="s1">concat_func = CallableLazyImport(</span><span class="s4">&quot;dask.dataframe.core._concat&quot;</span><span class="s1">)</span>
+            <span class="s1">shuffle_group_func = CallableLazyImport(</span>
+                <span class="s4">&quot;dask.dataframe.shuffle.shuffle_group&quot;</span>
+            <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># Not running on distributed scheduler - Use explicit functions</span>
+            <span class="s0">from </span><span class="s1">dask.dataframe.core </span><span class="s0">import </span><span class="s1">_concat </span><span class="s0">as </span><span class="s1">concat_func</span>
+            <span class="s0">from </span><span class="s1">dask.dataframe.shuffle </span><span class="s0">import </span><span class="s1">shuffle_group </span><span class="s0">as </span><span class="s1">shuffle_group_func</span>
+
+        <span class="s1">dsk = {}</span>
+        <span class="s1">inp_part_map = {inp: i </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">inp </span><span class="s0">in </span><span class="s1">enumerate(self.inputs)}</span>
+        <span class="s0">for </span><span class="s1">part </span><span class="s0">in </span><span class="s1">self.parts_out:</span>
+            <span class="s1">out = self.inputs[part]</span>
+
+            <span class="s1">_concat_list = []  </span><span class="s2"># get_item tasks to concat for this output partition</span>
+            <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(self.nsplits):</span>
+                <span class="s2"># Get out each individual dataframe piece from the dicts</span>
+                <span class="s1">_inp = insert(out</span><span class="s0">, </span><span class="s1">self.stage</span><span class="s0">, </span><span class="s1">i)</span>
+                <span class="s1">_idx = out[self.stage]</span>
+                <span class="s1">_concat_list.append((self.split_name</span><span class="s0">, </span><span class="s1">_idx</span><span class="s0">, </span><span class="s1">_inp))</span>
+
+            <span class="s2"># concatenate those pieces together, with their friends</span>
+            <span class="s1">dsk[(self.name</span><span class="s0">, </span><span class="s1">part)] = (</span>
+                <span class="s1">concat_func</span><span class="s0">,</span>
+                <span class="s1">_concat_list</span><span class="s0">,</span>
+                <span class="s1">self.ignore_index</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+            <span class="s0">for </span><span class="s1">_</span><span class="s0">, </span><span class="s1">_idx</span><span class="s0">, </span><span class="s1">_inp </span><span class="s0">in </span><span class="s1">_concat_list:</span>
+                <span class="s1">dsk[(self.split_name</span><span class="s0">, </span><span class="s1">_idx</span><span class="s0">, </span><span class="s1">_inp)] = (</span>
+                    <span class="s1">operator.getitem</span><span class="s0">,</span>
+                    <span class="s1">(shuffle_group_name</span><span class="s0">, </span><span class="s1">_inp)</span><span class="s0">,</span>
+                    <span class="s1">_idx</span><span class="s0">,</span>
+                <span class="s1">)</span>
+
+                <span class="s0">if </span><span class="s1">(shuffle_group_name</span><span class="s0">, </span><span class="s1">_inp) </span><span class="s0">not in </span><span class="s1">dsk:</span>
+                    <span class="s2"># Initial partitions (output of previous stage)</span>
+                    <span class="s1">_part = inp_part_map[_inp]</span>
+                    <span class="s0">if </span><span class="s1">self.stage == </span><span class="s5">0</span><span class="s1">:</span>
+                        <span class="s0">if </span><span class="s1">_part &lt; self.npartitions_input:</span>
+                            <span class="s1">input_key = (self.name_input</span><span class="s0">, </span><span class="s1">_part)</span>
+                        <span class="s0">else</span><span class="s1">:</span>
+                            <span class="s2"># In order to make sure that to_serialize() serialize the</span>
+                            <span class="s2"># empty dataframe input, we add it as a key.</span>
+                            <span class="s1">input_key = (shuffle_group_name</span><span class="s0">, </span><span class="s1">_inp</span><span class="s0">, </span><span class="s4">&quot;empty&quot;</span><span class="s1">)</span>
+                            <span class="s1">dsk[input_key] = self.meta_input</span>
+                    <span class="s0">else</span><span class="s1">:</span>
+                        <span class="s1">input_key = (self.name_input</span><span class="s0">, </span><span class="s1">_part)</span>
+
+                    <span class="s2"># Convert partition into dict of dataframe pieces</span>
+                    <span class="s1">dsk[(shuffle_group_name</span><span class="s0">, </span><span class="s1">_inp)] = (</span>
+                        <span class="s1">shuffle_group_func</span><span class="s0">,</span>
+                        <span class="s1">input_key</span><span class="s0">,</span>
+                        <span class="s1">self.column</span><span class="s0">,</span>
+                        <span class="s1">self.stage</span><span class="s0">,</span>
+                        <span class="s1">self.nsplits</span><span class="s0">,</span>
+                        <span class="s1">self.npartitions_input</span><span class="s0">,</span>
+                        <span class="s1">self.ignore_index</span><span class="s0">,</span>
+                        <span class="s1">self.npartitions</span><span class="s0">,</span>
+                    <span class="s1">)</span>
+
+        <span class="s0">return </span><span class="s1">dsk</span>
+
+
+<span class="s0">class </span><span class="s1">BroadcastJoinLayer(Layer):</span>
+    <span class="s3">&quot;&quot;&quot;Broadcast-based Join Layer 
+ 
+    High-level graph layer for a join operation requiring the 
+    smaller collection to be broadcasted to every partition of 
+    the larger collection. 
+ 
+    Parameters 
+    ---------- 
+    name : str 
+        Name of new (joined) output collection. 
+    lhs_name: string 
+        &quot;Left&quot; DataFrame collection to join. 
+    lhs_npartitions: int 
+        Number of partitions in &quot;left&quot; DataFrame collection. 
+    rhs_name: string 
+        &quot;Right&quot; DataFrame collection to join. 
+    rhs_npartitions: int 
+        Number of partitions in &quot;right&quot; DataFrame collection. 
+    parts_out : list of int (optional) 
+        List of required output-partition indices. 
+    annotations : dict (optional) 
+        Layer annotations. 
+    **merge_kwargs : **dict 
+        Keyword arguments to be passed to chunkwise merge func. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">name</span><span class="s0">,</span>
+        <span class="s1">npartitions</span><span class="s0">,</span>
+        <span class="s1">lhs_name</span><span class="s0">,</span>
+        <span class="s1">lhs_npartitions</span><span class="s0">,</span>
+        <span class="s1">rhs_name</span><span class="s0">,</span>
+        <span class="s1">rhs_npartitions</span><span class="s0">,</span>
+        <span class="s1">parts_out=</span><span class="s0">None,</span>
+        <span class="s1">annotations=</span><span class="s0">None,</span>
+        <span class="s1">left_on=</span><span class="s0">None,</span>
+        <span class="s1">right_on=</span><span class="s0">None,</span>
+        <span class="s1">**merge_kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__(annotations=annotations)</span>
+        <span class="s1">self.name = name</span>
+        <span class="s1">self.npartitions = npartitions</span>
+        <span class="s1">self.lhs_name = lhs_name</span>
+        <span class="s1">self.lhs_npartitions = lhs_npartitions</span>
+        <span class="s1">self.rhs_name = rhs_name</span>
+        <span class="s1">self.rhs_npartitions = rhs_npartitions</span>
+        <span class="s1">self.parts_out = parts_out </span><span class="s0">or </span><span class="s1">set(range(self.npartitions))</span>
+        <span class="s1">self.left_on = tuple(left_on) </span><span class="s0">if </span><span class="s1">isinstance(left_on</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">else </span><span class="s1">left_on</span>
+        <span class="s1">self.right_on = tuple(right_on) </span><span class="s0">if </span><span class="s1">isinstance(right_on</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">else </span><span class="s1">right_on</span>
+        <span class="s1">self.merge_kwargs = merge_kwargs</span>
+        <span class="s1">self.how = self.merge_kwargs.get(</span><span class="s4">&quot;how&quot;</span><span class="s1">)</span>
+        <span class="s1">self.merge_kwargs[</span><span class="s4">&quot;left_on&quot;</span><span class="s1">] = self.left_on</span>
+        <span class="s1">self.merge_kwargs[</span><span class="s4">&quot;right_on&quot;</span><span class="s1">] = self.right_on</span>
+
+    <span class="s0">def </span><span class="s1">get_output_keys(self):</span>
+        <span class="s0">return </span><span class="s1">{(self.name</span><span class="s0">, </span><span class="s1">part) </span><span class="s0">for </span><span class="s1">part </span><span class="s0">in </span><span class="s1">self.parts_out}</span>
+
+    <span class="s0">def </span><span class="s1">__repr__(self):</span>
+        <span class="s0">return </span><span class="s4">&quot;BroadcastJoinLayer&lt;name='{}', how={}, lhs={}, rhs={}&gt;&quot;</span><span class="s1">.format(</span>
+            <span class="s1">self.name</span><span class="s0">, </span><span class="s1">self.how</span><span class="s0">, </span><span class="s1">self.lhs_name</span><span class="s0">, </span><span class="s1">self.rhs_name</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">is_materialized(self):</span>
+        <span class="s0">return </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s4">&quot;_cached_dict&quot;</span><span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">_dict(self):</span>
+        <span class="s3">&quot;&quot;&quot;Materialize full dict representation&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s4">&quot;_cached_dict&quot;</span><span class="s1">):</span>
+            <span class="s0">return </span><span class="s1">self._cached_dict</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">dsk = self._construct_graph()</span>
+            <span class="s1">self._cached_dict = dsk</span>
+        <span class="s0">return </span><span class="s1">self._cached_dict</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">key):</span>
+        <span class="s0">return </span><span class="s1">self._dict[key]</span>
+
+    <span class="s0">def </span><span class="s1">__iter__(self):</span>
+        <span class="s0">return </span><span class="s1">iter(self._dict)</span>
+
+    <span class="s0">def </span><span class="s1">__len__(self):</span>
+        <span class="s0">return </span><span class="s1">len(self._dict)</span>
+
+    <span class="s0">def </span><span class="s1">_keys_to_parts(self</span><span class="s0">, </span><span class="s1">keys):</span>
+        <span class="s3">&quot;&quot;&quot;Simple utility to convert keys to partition indices.&quot;&quot;&quot;</span>
+        <span class="s1">parts = set()</span>
+        <span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">keys:</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">_name</span><span class="s0">, </span><span class="s1">_part = key</span>
+            <span class="s0">except </span><span class="s1">ValueError:</span>
+                <span class="s0">continue</span>
+            <span class="s0">if </span><span class="s1">_name != self.name:</span>
+                <span class="s0">continue</span>
+            <span class="s1">parts.add(_part)</span>
+        <span class="s0">return </span><span class="s1">parts</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">_broadcast_plan(self):</span>
+        <span class="s2"># Return structure (tuple):</span>
+        <span class="s2"># (</span>
+        <span class="s2">#     &lt;broadcasted-collection-name&gt;,</span>
+        <span class="s2">#     &lt;broadcasted-collection-npartitions&gt;,</span>
+        <span class="s2">#     &lt;other-collection-npartitions&gt;,</span>
+        <span class="s2">#     &lt;other-collection-on&gt;,</span>
+        <span class="s2"># )</span>
+        <span class="s0">if </span><span class="s1">self.lhs_npartitions &lt; self.rhs_npartitions:</span>
+            <span class="s2"># Broadcasting the left</span>
+            <span class="s0">return </span><span class="s1">(</span>
+                <span class="s1">self.lhs_name</span><span class="s0">,</span>
+                <span class="s1">self.lhs_npartitions</span><span class="s0">,</span>
+                <span class="s1">self.rhs_name</span><span class="s0">,</span>
+                <span class="s1">self.right_on</span><span class="s0">,</span>
+            <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># Broadcasting the right</span>
+            <span class="s0">return </span><span class="s1">(</span>
+                <span class="s1">self.rhs_name</span><span class="s0">,</span>
+                <span class="s1">self.rhs_npartitions</span><span class="s0">,</span>
+                <span class="s1">self.lhs_name</span><span class="s0">,</span>
+                <span class="s1">self.left_on</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_cull_dependencies(self</span><span class="s0">, </span><span class="s1">keys</span><span class="s0">, </span><span class="s1">parts_out=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Determine the necessary dependencies to produce `keys`. 
+ 
+        For a broadcast join, output partitions always depend on 
+        all partitions of the broadcasted collection, but only one 
+        partition of the &quot;other&quot; collection. 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># Get broadcast info</span>
+        <span class="s1">bcast_name</span><span class="s0">, </span><span class="s1">bcast_size</span><span class="s0">, </span><span class="s1">other_name = self._broadcast_plan[:</span><span class="s5">3</span><span class="s1">]</span>
+
+        <span class="s1">deps = defaultdict(set)</span>
+        <span class="s1">parts_out = parts_out </span><span class="s0">or </span><span class="s1">self._keys_to_parts(keys)</span>
+        <span class="s0">for </span><span class="s1">part </span><span class="s0">in </span><span class="s1">parts_out:</span>
+            <span class="s1">deps[(self.name</span><span class="s0">, </span><span class="s1">part)] |= {(bcast_name</span><span class="s0">, </span><span class="s1">i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(bcast_size)}</span>
+            <span class="s1">deps[(self.name</span><span class="s0">, </span><span class="s1">part)] |= {</span>
+                <span class="s1">(other_name</span><span class="s0">, </span><span class="s1">part)</span><span class="s0">,</span>
+            <span class="s1">}</span>
+        <span class="s0">return </span><span class="s1">deps</span>
+
+    <span class="s0">def </span><span class="s1">_cull(self</span><span class="s0">, </span><span class="s1">parts_out):</span>
+        <span class="s0">return </span><span class="s1">BroadcastJoinLayer(</span>
+            <span class="s1">self.name</span><span class="s0">,</span>
+            <span class="s1">self.npartitions</span><span class="s0">,</span>
+            <span class="s1">self.lhs_name</span><span class="s0">,</span>
+            <span class="s1">self.lhs_npartitions</span><span class="s0">,</span>
+            <span class="s1">self.rhs_name</span><span class="s0">,</span>
+            <span class="s1">self.rhs_npartitions</span><span class="s0">,</span>
+            <span class="s1">annotations=self.annotations</span><span class="s0">,</span>
+            <span class="s1">parts_out=parts_out</span><span class="s0">,</span>
+            <span class="s1">**self.merge_kwargs</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">cull(self</span><span class="s0">, </span><span class="s1">keys</span><span class="s0">, </span><span class="s1">all_keys):</span>
+        <span class="s3">&quot;&quot;&quot;Cull a BroadcastJoinLayer HighLevelGraph layer. 
+ 
+        The underlying graph will only include the necessary 
+        tasks to produce the keys (indices) included in `parts_out`. 
+        Therefore, &quot;culling&quot; the layer only requires us to reset this 
+        parameter. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">parts_out = self._keys_to_parts(keys)</span>
+        <span class="s1">culled_deps = self._cull_dependencies(keys</span><span class="s0">, </span><span class="s1">parts_out=parts_out)</span>
+        <span class="s0">if </span><span class="s1">parts_out != set(self.parts_out):</span>
+            <span class="s1">culled_layer = self._cull(parts_out)</span>
+            <span class="s0">return </span><span class="s1">culled_layer</span><span class="s0">, </span><span class="s1">culled_deps</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self</span><span class="s0">, </span><span class="s1">culled_deps</span>
+
+    <span class="s0">def </span><span class="s1">_construct_graph(self</span><span class="s0">, </span><span class="s1">deserializing=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Construct graph for a broadcast join operation.&quot;&quot;&quot;</span>
+
+        <span class="s1">inter_name = </span><span class="s4">&quot;inter-&quot; </span><span class="s1">+ self.name</span>
+        <span class="s1">split_name = </span><span class="s4">&quot;split-&quot; </span><span class="s1">+ self.name</span>
+
+        <span class="s0">if </span><span class="s1">deserializing:</span>
+            <span class="s2"># Use CallableLazyImport objects to avoid importing dataframe</span>
+            <span class="s2"># module on the scheduler</span>
+            <span class="s1">split_partition_func = CallableLazyImport(</span>
+                <span class="s4">&quot;dask.dataframe.multi._split_partition&quot;</span>
+            <span class="s1">)</span>
+            <span class="s1">concat_func = CallableLazyImport(</span><span class="s4">&quot;dask.dataframe.multi._concat_wrapper&quot;</span><span class="s1">)</span>
+            <span class="s1">merge_chunk_func = CallableLazyImport(</span>
+                <span class="s4">&quot;dask.dataframe.multi._merge_chunk_wrapper&quot;</span>
+            <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># Not running on distributed scheduler - Use explicit functions</span>
+            <span class="s0">from </span><span class="s1">dask.dataframe.multi </span><span class="s0">import </span><span class="s1">_concat_wrapper </span><span class="s0">as </span><span class="s1">concat_func</span>
+            <span class="s0">from </span><span class="s1">dask.dataframe.multi </span><span class="s0">import </span><span class="s1">_merge_chunk_wrapper </span><span class="s0">as </span><span class="s1">merge_chunk_func</span>
+            <span class="s0">from </span><span class="s1">dask.dataframe.multi </span><span class="s0">import </span><span class="s1">_split_partition </span><span class="s0">as </span><span class="s1">split_partition_func</span>
+
+        <span class="s2"># Get broadcast &quot;plan&quot;</span>
+        <span class="s1">bcast_name</span><span class="s0">, </span><span class="s1">bcast_size</span><span class="s0">, </span><span class="s1">other_name</span><span class="s0">, </span><span class="s1">other_on = self._broadcast_plan</span>
+        <span class="s1">bcast_side = </span><span class="s4">&quot;left&quot; </span><span class="s0">if </span><span class="s1">self.lhs_npartitions &lt; self.rhs_npartitions </span><span class="s0">else </span><span class="s4">&quot;right&quot;</span>
+
+        <span class="s2"># Loop over output partitions, which should be a 1:1</span>
+        <span class="s2"># mapping with the input partitions of &quot;other&quot;.</span>
+        <span class="s2"># Culling should allow us to avoid generating tasks for</span>
+        <span class="s2"># any output partitions that are not requested (via `parts_out`)</span>
+        <span class="s1">dsk = {}</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">self.parts_out:</span>
+            <span class="s2"># Split each &quot;other&quot; partition by hash</span>
+            <span class="s0">if </span><span class="s1">self.how != </span><span class="s4">&quot;inner&quot;</span><span class="s1">:</span>
+                <span class="s1">dsk[(split_name</span><span class="s0">, </span><span class="s1">i)] = (</span>
+                    <span class="s1">split_partition_func</span><span class="s0">,</span>
+                    <span class="s1">(other_name</span><span class="s0">, </span><span class="s1">i)</span><span class="s0">,</span>
+                    <span class="s1">other_on</span><span class="s0">,</span>
+                    <span class="s1">bcast_size</span><span class="s0">,</span>
+                <span class="s1">)</span>
+
+            <span class="s2"># For each partition of &quot;other&quot;, we need to join</span>
+            <span class="s2"># to each partition of &quot;bcast&quot;. If it is a &quot;left&quot;</span>
+            <span class="s2"># or &quot;right&quot; join, there should be a unique mapping</span>
+            <span class="s2"># between the local splits of &quot;other&quot; and the</span>
+            <span class="s2"># partitions of &quot;bcast&quot; (which means we need an</span>
+            <span class="s2"># additional `getitem` operation to isolate the</span>
+            <span class="s2"># correct split of each &quot;other&quot; partition).</span>
+            <span class="s1">_concat_list = []</span>
+            <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range(bcast_size):</span>
+                <span class="s2"># Specify arg list for `merge_chunk`</span>
+                <span class="s1">_merge_args = [</span>
+                    <span class="s1">(</span>
+                        <span class="s1">operator.getitem</span><span class="s0">,</span>
+                        <span class="s1">(split_name</span><span class="s0">, </span><span class="s1">i)</span><span class="s0">,</span>
+                        <span class="s1">j</span><span class="s0">,</span>
+                    <span class="s1">)</span>
+                    <span class="s0">if </span><span class="s1">self.how != </span><span class="s4">&quot;inner&quot;</span>
+                    <span class="s0">else </span><span class="s1">(other_name</span><span class="s0">, </span><span class="s1">i)</span><span class="s0">,</span>
+                    <span class="s1">(bcast_name</span><span class="s0">, </span><span class="s1">j)</span><span class="s0">,</span>
+                <span class="s1">]</span>
+                <span class="s0">if </span><span class="s1">bcast_side == </span><span class="s4">&quot;left&quot;</span><span class="s1">:</span>
+                    <span class="s2"># If the left is broadcasted, the</span>
+                    <span class="s2"># arg list needs to be reversed</span>
+                    <span class="s1">_merge_args.reverse()</span>
+                <span class="s1">inter_key = (inter_name</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s1">j)</span>
+                <span class="s1">dsk[inter_key] = (</span>
+                    <span class="s1">apply</span><span class="s0">,</span>
+                    <span class="s1">merge_chunk_func</span><span class="s0">,</span>
+                    <span class="s1">_merge_args</span><span class="s0">,</span>
+                    <span class="s1">self.merge_kwargs</span><span class="s0">,</span>
+                <span class="s1">)</span>
+                <span class="s1">_concat_list.append(inter_key)</span>
+
+            <span class="s2"># Concatenate the merged results for each output partition</span>
+            <span class="s1">dsk[(self.name</span><span class="s0">, </span><span class="s1">i)] = (concat_func</span><span class="s0">, </span><span class="s1">_concat_list)</span>
+
+        <span class="s0">return </span><span class="s1">dsk</span>
+
+
+<span class="s0">class </span><span class="s1">DataFrameIOLayer(Blockwise):</span>
+    <span class="s3">&quot;&quot;&quot;DataFrame-based Blockwise Layer with IO 
+ 
+    Parameters 
+    ---------- 
+    name : str 
+        Name to use for the constructed layer. 
+    columns : str, list or None 
+        Field name(s) to read in as columns in the output. 
+    inputs : list or BlockwiseDep 
+        List of arguments to be passed to ``io_func`` so 
+        that the materialized task to produce partition ``i`` 
+        will be: ``(&lt;io_func&gt;, inputs[i])``.  Note that each 
+        element of ``inputs`` is typically a tuple of arguments. 
+    io_func : callable 
+        A callable function that takes in a single tuple 
+        of arguments, and outputs a DataFrame partition. 
+        Column projection will be supported for functions 
+        that satisfy the ``DataFrameIOFunction`` protocol. 
+    label : str (optional) 
+        String to use as a prefix in the place-holder collection 
+        name. If nothing is specified (default), &quot;subset-&quot; will 
+        be used. 
+    produces_tasks : bool (optional) 
+        Whether one or more elements of `inputs` is expected to 
+        contain a nested task. This argument in only used for 
+        serialization purposes, and will be deprecated in the 
+        future. Default is False. 
+    creation_info: dict (optional) 
+        Dictionary containing the callable function ('func'), 
+        positional arguments ('args'), and key-word arguments 
+        ('kwargs') used to produce the dask collection with 
+        this underlying ``DataFrameIOLayer``. 
+    annotations: dict (optional) 
+        Layer annotations to pass through to Blockwise. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">name</span><span class="s0">,</span>
+        <span class="s1">columns</span><span class="s0">,</span>
+        <span class="s1">inputs</span><span class="s0">,</span>
+        <span class="s1">io_func</span><span class="s0">,</span>
+        <span class="s1">label=</span><span class="s0">None,</span>
+        <span class="s1">produces_tasks=</span><span class="s0">False,</span>
+        <span class="s1">creation_info=</span><span class="s0">None,</span>
+        <span class="s1">annotations=</span><span class="s0">None,</span>
+    <span class="s1">):</span>
+        <span class="s1">self.name = name</span>
+        <span class="s1">self._columns = columns</span>
+        <span class="s1">self.inputs = inputs</span>
+        <span class="s1">self.io_func = io_func</span>
+        <span class="s1">self.label = label</span>
+        <span class="s1">self.produces_tasks = produces_tasks</span>
+        <span class="s1">self.annotations = annotations</span>
+        <span class="s1">self.creation_info = creation_info</span>
+
+        <span class="s0">if not </span><span class="s1">isinstance(inputs</span><span class="s0">, </span><span class="s1">BlockwiseDep):</span>
+            <span class="s2"># Define mapping between key index and &quot;part&quot;</span>
+            <span class="s1">io_arg_map = BlockwiseDepDict(</span>
+                <span class="s1">{(i</span><span class="s0">,</span><span class="s1">): inp </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">inp </span><span class="s0">in </span><span class="s1">enumerate(self.inputs)}</span><span class="s0">,</span>
+                <span class="s1">produces_tasks=self.produces_tasks</span><span class="s0">,</span>
+            <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">io_arg_map = inputs</span>
+
+        <span class="s2"># Use Blockwise initializer</span>
+        <span class="s1">dsk = {self.name: (io_func</span><span class="s0">, </span><span class="s1">blockwise_token(</span><span class="s5">0</span><span class="s1">))}</span>
+        <span class="s1">super().__init__(</span>
+            <span class="s1">output=self.name</span><span class="s0">,</span>
+            <span class="s1">output_indices=</span><span class="s4">&quot;i&quot;</span><span class="s0">,</span>
+            <span class="s1">dsk=dsk</span><span class="s0">,</span>
+            <span class="s1">indices=[(io_arg_map</span><span class="s0">, </span><span class="s4">&quot;i&quot;</span><span class="s1">)]</span><span class="s0">,</span>
+            <span class="s1">numblocks={}</span><span class="s0">,</span>
+            <span class="s1">annotations=annotations</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">columns(self):</span>
+        <span class="s3">&quot;&quot;&quot;Current column projection for this layer&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self._columns</span>
+
+    <span class="s0">def </span><span class="s1">project_columns(self</span><span class="s0">, </span><span class="s1">columns):</span>
+        <span class="s3">&quot;&quot;&quot;Produce a column projection for this IO layer. 
+        Given a list of required output columns, this method 
+        returns the projected layer. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">dask.dataframe.io.utils </span><span class="s0">import </span><span class="s1">DataFrameIOFunction</span>
+
+        <span class="s1">columns = list(columns)</span>
+
+        <span class="s0">if </span><span class="s1">self.columns </span><span class="s0">is None or </span><span class="s1">set(self.columns).issuperset(columns):</span>
+            <span class="s2"># Apply column projection in IO function.</span>
+            <span class="s2"># Must satisfy `DataFrameIOFunction` protocol</span>
+            <span class="s0">if </span><span class="s1">isinstance(self.io_func</span><span class="s0">, </span><span class="s1">DataFrameIOFunction):</span>
+                <span class="s1">io_func = self.io_func.project_columns(columns)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">io_func = self.io_func</span>
+
+            <span class="s1">layer = DataFrameIOLayer(</span>
+                <span class="s1">(self.label </span><span class="s0">or </span><span class="s4">&quot;subset&quot;</span><span class="s1">) + </span><span class="s4">&quot;-&quot; </span><span class="s1">+ tokenize(self.name</span><span class="s0">, </span><span class="s1">columns)</span><span class="s0">,</span>
+                <span class="s1">columns</span><span class="s0">,</span>
+                <span class="s1">self.inputs</span><span class="s0">,</span>
+                <span class="s1">io_func</span><span class="s0">,</span>
+                <span class="s1">label=self.label</span><span class="s0">,</span>
+                <span class="s1">produces_tasks=self.produces_tasks</span><span class="s0">,</span>
+                <span class="s1">annotations=self.annotations</span><span class="s0">,</span>
+            <span class="s1">)</span>
+            <span class="s0">return </span><span class="s1">layer</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># Default behavior</span>
+            <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">__repr__(self):</span>
+        <span class="s0">return </span><span class="s4">&quot;DataFrameIOLayer&lt;name='{}', n_parts={}, columns={}&gt;&quot;</span><span class="s1">.format(</span>
+            <span class="s1">self.name</span><span class="s0">, </span><span class="s1">len(self.inputs)</span><span class="s0">, </span><span class="s1">self.columns</span>
+        <span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">DataFrameTreeReduction(Layer):</span>
+    <span class="s3">&quot;&quot;&quot;DataFrame Tree-Reduction Layer 
+ 
+    Parameters 
+    ---------- 
+    name : str 
+        Name to use for the constructed layer. 
+    name_input : str 
+        Name of the input layer that is being reduced. 
+    npartitions_input : str 
+        Number of partitions in the input layer. 
+    concat_func : callable 
+        Function used by each tree node to reduce a list of inputs 
+        into a single output value. This function must accept only 
+        a list as its first positional argument. 
+    tree_node_func : callable 
+        Function used on the output of ``concat_func`` in each tree 
+        node. This function must accept the output of ``concat_func`` 
+        as its first positional argument. 
+    finalize_func : callable, optional 
+        Function used in place of ``tree_node_func`` on the final tree 
+        node(s) to produce the final output for each split. By default, 
+        ``tree_node_func`` will be used. 
+    split_every : int, optional 
+        This argument specifies the maximum number of input nodes 
+        to be handled by any one task in the tree. Defaults to 32. 
+    split_out : int, optional 
+        This argument specifies the number of output nodes in the 
+        reduction tree. If ``split_out`` is set to an integer &gt;=1, the 
+        input tasks must contain data that can be indexed by a ``getitem`` 
+        operation with a key in the range ``[0, split_out)``. 
+    output_partitions : list, optional 
+        List of required output partitions. This parameter is used 
+        internally by Dask for high-level culling. 
+    tree_node_name : str, optional 
+        Name to use for intermediate tree-node tasks. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">name: str</span>
+    <span class="s1">name_input: str</span>
+    <span class="s1">npartitions_input: int</span>
+    <span class="s1">concat_func: Callable</span>
+    <span class="s1">tree_node_func: Callable</span>
+    <span class="s1">finalize_func: Callable | </span><span class="s0">None</span>
+    <span class="s1">split_every: int</span>
+    <span class="s1">split_out: int</span>
+    <span class="s1">output_partitions: list[int]</span>
+    <span class="s1">tree_node_name: str</span>
+    <span class="s1">widths: list[int]</span>
+    <span class="s1">height: int</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">name: str</span><span class="s0">,</span>
+        <span class="s1">name_input: str</span><span class="s0">,</span>
+        <span class="s1">npartitions_input: int</span><span class="s0">,</span>
+        <span class="s1">concat_func: Callable</span><span class="s0">,</span>
+        <span class="s1">tree_node_func: Callable</span><span class="s0">,</span>
+        <span class="s1">finalize_func: Callable | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+        <span class="s1">split_every: int = </span><span class="s5">32</span><span class="s0">,</span>
+        <span class="s1">split_out: int | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+        <span class="s1">output_partitions: list[int] | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+        <span class="s1">tree_node_name: str | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+        <span class="s1">annotations: dict[str</span><span class="s0">, </span><span class="s1">Any] | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__(annotations=annotations)</span>
+        <span class="s1">self.name = name</span>
+        <span class="s1">self.name_input = name_input</span>
+        <span class="s1">self.npartitions_input = npartitions_input</span>
+        <span class="s1">self.concat_func = concat_func</span>
+        <span class="s1">self.tree_node_func = tree_node_func</span>
+        <span class="s1">self.finalize_func = finalize_func</span>
+        <span class="s1">self.split_every = split_every</span>
+        <span class="s1">self.split_out = split_out  </span><span class="s2"># type: ignore</span>
+        <span class="s1">self.output_partitions = (</span>
+            <span class="s1">list(range(self.split_out </span><span class="s0">or </span><span class="s5">1</span><span class="s1">))</span>
+            <span class="s0">if </span><span class="s1">output_partitions </span><span class="s0">is None</span>
+            <span class="s0">else </span><span class="s1">output_partitions</span>
+        <span class="s1">)</span>
+        <span class="s1">self.tree_node_name = tree_node_name </span><span class="s0">or </span><span class="s4">&quot;tree_node-&quot; </span><span class="s1">+ self.name</span>
+
+        <span class="s2"># Calculate tree widths and height</span>
+        <span class="s2"># (Used to get output keys without materializing)</span>
+        <span class="s1">parts = self.npartitions_input</span>
+        <span class="s1">self.widths = [parts]</span>
+        <span class="s0">while </span><span class="s1">parts &gt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">parts = math.ceil(parts / self.split_every)</span>
+            <span class="s1">self.widths.append(int(parts))</span>
+        <span class="s1">self.height = len(self.widths)</span>
+
+    <span class="s0">def </span><span class="s1">_make_key(self</span><span class="s0">, </span><span class="s1">*name_parts</span><span class="s0">, </span><span class="s1">split=</span><span class="s5">0</span><span class="s1">):</span>
+        <span class="s2"># Helper function construct a key</span>
+        <span class="s2"># with a &quot;split&quot; element when</span>
+        <span class="s2"># bool(split_out) is True</span>
+        <span class="s0">return </span><span class="s1">name_parts + (split</span><span class="s0">,</span><span class="s1">) </span><span class="s0">if </span><span class="s1">self.split_out </span><span class="s0">else </span><span class="s1">name_parts</span>
+
+    <span class="s0">def </span><span class="s1">_define_task(self</span><span class="s0">, </span><span class="s1">input_keys</span><span class="s0">, </span><span class="s1">final_task=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s2"># Define nested concatenation and func task</span>
+        <span class="s0">if </span><span class="s1">final_task </span><span class="s0">and </span><span class="s1">self.finalize_func:</span>
+            <span class="s1">outer_func = self.finalize_func</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">outer_func = self.tree_node_func</span>
+        <span class="s0">return </span><span class="s1">(toolz.pipe</span><span class="s0">, </span><span class="s1">input_keys</span><span class="s0">, </span><span class="s1">self.concat_func</span><span class="s0">, </span><span class="s1">outer_func)</span>
+
+    <span class="s0">def </span><span class="s1">_construct_graph(self):</span>
+        <span class="s3">&quot;&quot;&quot;Construct graph for a tree reduction.&quot;&quot;&quot;</span>
+
+        <span class="s1">dsk = {}</span>
+        <span class="s0">if not </span><span class="s1">self.output_partitions:</span>
+            <span class="s0">return </span><span class="s1">dsk</span>
+
+        <span class="s2"># Deal with `bool(split_out) == True`.</span>
+        <span class="s2"># These cases require that the input tasks</span>
+        <span class="s2"># return a type that enables getitem operation</span>
+        <span class="s2"># with indices: [0, split_out)</span>
+        <span class="s2"># Therefore, we must add &quot;getitem&quot; tasks to</span>
+        <span class="s2"># select the appropriate element for each split</span>
+        <span class="s1">name_input_use = self.name_input</span>
+        <span class="s0">if </span><span class="s1">self.split_out:</span>
+            <span class="s1">name_input_use += </span><span class="s4">&quot;-split&quot;</span>
+            <span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">self.output_partitions:</span>
+                <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">range(self.npartitions_input):</span>
+                    <span class="s1">dsk[self._make_key(name_input_use</span><span class="s0">, </span><span class="s1">p</span><span class="s0">, </span><span class="s1">split=s)] = (</span>
+                        <span class="s1">operator.getitem</span><span class="s0">,</span>
+                        <span class="s1">(self.name_input</span><span class="s0">, </span><span class="s1">p)</span><span class="s0">,</span>
+                        <span class="s1">s</span><span class="s0">,</span>
+                    <span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">self.height &gt;= </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s2"># Loop over output splits</span>
+            <span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">self.output_partitions:</span>
+                <span class="s2"># Loop over reduction levels</span>
+                <span class="s0">for </span><span class="s1">depth </span><span class="s0">in </span><span class="s1">range(</span><span class="s5">1</span><span class="s0">, </span><span class="s1">self.height):</span>
+                    <span class="s2"># Loop over reduction groups</span>
+                    <span class="s0">for </span><span class="s1">group </span><span class="s0">in </span><span class="s1">range(self.widths[depth]):</span>
+                        <span class="s2"># Calculate inputs for the current group</span>
+                        <span class="s1">p_max = self.widths[depth - </span><span class="s5">1</span><span class="s1">]</span>
+                        <span class="s1">lstart = self.split_every * group</span>
+                        <span class="s1">lstop = min(lstart + self.split_every</span><span class="s0">, </span><span class="s1">p_max)</span>
+                        <span class="s0">if </span><span class="s1">depth == </span><span class="s5">1</span><span class="s1">:</span>
+                            <span class="s2"># Input nodes are from input layer</span>
+                            <span class="s1">input_keys = [</span>
+                                <span class="s1">self._make_key(name_input_use</span><span class="s0">, </span><span class="s1">p</span><span class="s0">, </span><span class="s1">split=s)</span>
+                                <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">range(lstart</span><span class="s0">, </span><span class="s1">lstop)</span>
+                            <span class="s1">]</span>
+                        <span class="s0">else</span><span class="s1">:</span>
+                            <span class="s2"># Input nodes are tree-reduction nodes</span>
+                            <span class="s1">input_keys = [</span>
+                                <span class="s1">self._make_key(</span>
+                                    <span class="s1">self.tree_node_name</span><span class="s0">, </span><span class="s1">p</span><span class="s0">, </span><span class="s1">depth - </span><span class="s5">1</span><span class="s0">, </span><span class="s1">split=s</span>
+                                <span class="s1">)</span>
+                                <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">range(lstart</span><span class="s0">, </span><span class="s1">lstop)</span>
+                            <span class="s1">]</span>
+
+                        <span class="s2"># Define task</span>
+                        <span class="s0">if </span><span class="s1">depth == self.height - </span><span class="s5">1</span><span class="s1">:</span>
+                            <span class="s2"># Final Node (Use fused `self.tree_finalize` task)</span>
+                            <span class="s0">assert </span><span class="s1">(</span>
+                                <span class="s1">group == </span><span class="s5">0</span>
+                            <span class="s1">)</span><span class="s0">, </span><span class="s4">f&quot;group = </span><span class="s0">{</span><span class="s1">group</span><span class="s0">}</span><span class="s4">, not 0 for final tree reduction task&quot;</span>
+                            <span class="s1">dsk[(self.name</span><span class="s0">, </span><span class="s1">s)] = self._define_task(</span>
+                                <span class="s1">input_keys</span><span class="s0">, </span><span class="s1">final_task=</span><span class="s0">True</span>
+                            <span class="s1">)</span>
+                        <span class="s0">else</span><span class="s1">:</span>
+                            <span class="s2"># Intermediate Node</span>
+                            <span class="s1">dsk[</span>
+                                <span class="s1">self._make_key(</span>
+                                    <span class="s1">self.tree_node_name</span><span class="s0">, </span><span class="s1">group</span><span class="s0">, </span><span class="s1">depth</span><span class="s0">, </span><span class="s1">split=s</span>
+                                <span class="s1">)</span>
+                            <span class="s1">] = self._define_task(input_keys</span><span class="s0">, </span><span class="s1">final_task=</span><span class="s0">False</span><span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s2"># Deal with single-partition case</span>
+            <span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">self.output_partitions:</span>
+                <span class="s1">input_keys = [self._make_key(name_input_use</span><span class="s0">, </span><span class="s5">0</span><span class="s0">, </span><span class="s1">split=s)]</span>
+                <span class="s1">dsk[(self.name</span><span class="s0">, </span><span class="s1">s)] = self._define_task(input_keys</span><span class="s0">, </span><span class="s1">final_task=</span><span class="s0">True</span><span class="s1">)</span>
+
+        <span class="s0">return </span><span class="s1">dsk</span>
+
+    <span class="s0">def </span><span class="s1">__repr__(self):</span>
+        <span class="s0">return </span><span class="s4">&quot;DataFrameTreeReduction&lt;name='{}', input_name={}, split_out={}&gt;&quot;</span><span class="s1">.format(</span>
+            <span class="s1">self.name</span><span class="s0">, </span><span class="s1">self.name_input</span><span class="s0">, </span><span class="s1">self.split_out</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_output_keys(self):</span>
+        <span class="s0">return </span><span class="s1">{(self.name</span><span class="s0">, </span><span class="s1">s) </span><span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">self.output_partitions}</span>
+
+    <span class="s0">def </span><span class="s1">get_output_keys(self):</span>
+        <span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s4">&quot;_cached_output_keys&quot;</span><span class="s1">):</span>
+            <span class="s0">return </span><span class="s1">self._cached_output_keys</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">output_keys = self._output_keys()</span>
+            <span class="s1">self._cached_output_keys = output_keys</span>
+        <span class="s0">return </span><span class="s1">self._cached_output_keys</span>
+
+    <span class="s0">def </span><span class="s1">is_materialized(self):</span>
+        <span class="s0">return </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s4">&quot;_cached_dict&quot;</span><span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">_dict(self):</span>
+        <span class="s3">&quot;&quot;&quot;Materialize full dict representation&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s4">&quot;_cached_dict&quot;</span><span class="s1">):</span>
+            <span class="s0">return </span><span class="s1">self._cached_dict</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">dsk = self._construct_graph()</span>
+            <span class="s1">self._cached_dict = dsk</span>
+        <span class="s0">return </span><span class="s1">self._cached_dict</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">key):</span>
+        <span class="s0">return </span><span class="s1">self._dict[key]</span>
+
+    <span class="s0">def </span><span class="s1">__iter__(self):</span>
+        <span class="s0">return </span><span class="s1">iter(self._dict)</span>
+
+    <span class="s0">def </span><span class="s1">__len__(self):</span>
+        <span class="s2"># Start with &quot;base&quot; tree-reduction size</span>
+        <span class="s1">tree_size = (sum(self.widths[</span><span class="s5">1</span><span class="s1">:]) </span><span class="s0">or </span><span class="s5">1</span><span class="s1">) * (self.split_out </span><span class="s0">or </span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.split_out:</span>
+            <span class="s2"># Add on &quot;split-*&quot; tasks used for `getitem` ops</span>
+            <span class="s0">return </span><span class="s1">tree_size + self.npartitions_input * len(self.output_partitions)</span>
+        <span class="s0">return </span><span class="s1">tree_size</span>
+
+    <span class="s0">def </span><span class="s1">_keys_to_output_partitions(self</span><span class="s0">, </span><span class="s1">keys):</span>
+        <span class="s3">&quot;&quot;&quot;Simple utility to convert keys to output partition indices.&quot;&quot;&quot;</span>
+        <span class="s1">splits = set()</span>
+        <span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">keys:</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">_name</span><span class="s0">, </span><span class="s1">_split = key</span>
+            <span class="s0">except </span><span class="s1">ValueError:</span>
+                <span class="s0">continue</span>
+            <span class="s0">if </span><span class="s1">_name != self.name:</span>
+                <span class="s0">continue</span>
+            <span class="s1">splits.add(_split)</span>
+        <span class="s0">return </span><span class="s1">splits</span>
+
+    <span class="s0">def </span><span class="s1">_cull(self</span><span class="s0">, </span><span class="s1">output_partitions):</span>
+        <span class="s0">return </span><span class="s1">DataFrameTreeReduction(</span>
+            <span class="s1">self.name</span><span class="s0">,</span>
+            <span class="s1">self.name_input</span><span class="s0">,</span>
+            <span class="s1">self.npartitions_input</span><span class="s0">,</span>
+            <span class="s1">self.concat_func</span><span class="s0">,</span>
+            <span class="s1">self.tree_node_func</span><span class="s0">,</span>
+            <span class="s1">finalize_func=self.finalize_func</span><span class="s0">,</span>
+            <span class="s1">split_every=self.split_every</span><span class="s0">,</span>
+            <span class="s1">split_out=self.split_out</span><span class="s0">,</span>
+            <span class="s1">output_partitions=output_partitions</span><span class="s0">,</span>
+            <span class="s1">tree_node_name=self.tree_node_name</span><span class="s0">,</span>
+            <span class="s1">annotations=self.annotations</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">cull(self</span><span class="s0">, </span><span class="s1">keys</span><span class="s0">, </span><span class="s1">all_keys):</span>
+        <span class="s3">&quot;&quot;&quot;Cull a DataFrameTreeReduction HighLevelGraph layer&quot;&quot;&quot;</span>
+        <span class="s1">deps = {</span>
+            <span class="s1">(self.name</span><span class="s0">, </span><span class="s5">0</span><span class="s1">): {</span>
+                <span class="s1">(self.name_input</span><span class="s0">, </span><span class="s1">i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(self.npartitions_input)</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s1">output_partitions = self._keys_to_output_partitions(keys)</span>
+        <span class="s0">if </span><span class="s1">output_partitions != set(self.output_partitions):</span>
+            <span class="s1">culled_layer = self._cull(output_partitions)</span>
+            <span class="s0">return </span><span class="s1">culled_layer</span><span class="s0">, </span><span class="s1">deps</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self</span><span class="s0">, </span><span class="s1">deps</span>
+</pre>
+</body>
+</html>

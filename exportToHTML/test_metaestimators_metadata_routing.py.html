@@ -1,0 +1,351 @@
+<html>
+<head>
+<title>test_metaestimators_metadata_routing.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6897bb;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #808080;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_metaestimators_metadata_routing.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">copy</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">partial</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">pytest</span>
+
+<span class="s0">from </span><span class="s1">sklearn </span><span class="s0">import </span><span class="s1">config_context</span>
+<span class="s0">from </span><span class="s1">sklearn.base </span><span class="s0">import </span><span class="s1">BaseEstimator</span><span class="s0">, </span><span class="s1">ClassifierMixin</span><span class="s0">, </span><span class="s1">RegressorMixin</span>
+<span class="s0">from </span><span class="s1">sklearn.calibration </span><span class="s0">import </span><span class="s1">CalibratedClassifierCV</span>
+<span class="s0">from </span><span class="s1">sklearn.exceptions </span><span class="s0">import </span><span class="s1">UnsetMetadataPassedError</span>
+<span class="s0">from </span><span class="s1">sklearn.multioutput </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">ClassifierChain</span><span class="s0">,</span>
+    <span class="s1">MultiOutputClassifier</span><span class="s0">,</span>
+    <span class="s1">MultiOutputRegressor</span><span class="s0">,</span>
+    <span class="s1">RegressorChain</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">from </span><span class="s1">sklearn.tests.test_metadata_routing </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">assert_request_is_empty</span><span class="s0">,</span>
+    <span class="s1">check_recorded_metadata</span><span class="s0">,</span>
+    <span class="s1">record_metadata</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">from </span><span class="s1">sklearn.utils.metadata_routing </span><span class="s0">import </span><span class="s1">MetadataRouter</span>
+
+<span class="s1">rng = np.random.RandomState(</span><span class="s2">42</span><span class="s1">)</span>
+<span class="s1">N</span><span class="s0">, </span><span class="s1">M = </span><span class="s2">100</span><span class="s0">, </span><span class="s2">4</span>
+<span class="s1">X = rng.rand(N</span><span class="s0">, </span><span class="s1">M)</span>
+<span class="s1">y = rng.randint(</span><span class="s2">0</span><span class="s0">, </span><span class="s2">2</span><span class="s0">, </span><span class="s1">size=N)</span>
+<span class="s1">y_multi = rng.randint(</span><span class="s2">0</span><span class="s0">, </span><span class="s2">2</span><span class="s0">, </span><span class="s1">size=(N</span><span class="s0">, </span><span class="s2">3</span><span class="s1">))</span>
+<span class="s1">metadata = rng.randint(</span><span class="s2">0</span><span class="s0">, </span><span class="s2">10</span><span class="s0">, </span><span class="s1">size=N)</span>
+<span class="s1">sample_weight = rng.rand(N)</span>
+
+
+<span class="s1">@pytest.fixture(autouse=</span><span class="s0">True</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">enable_slep006():</span>
+    <span class="s3">&quot;&quot;&quot;Enable SLEP006 for all tests.&quot;&quot;&quot;</span>
+    <span class="s0">with </span><span class="s1">config_context(enable_metadata_routing=</span><span class="s0">True</span><span class="s1">):</span>
+        <span class="s0">yield</span>
+
+
+<span class="s1">record_metadata_not_default = partial(record_metadata</span><span class="s0">, </span><span class="s1">record_default=</span><span class="s0">False</span><span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">_Registry(list):</span>
+    <span class="s4"># This list is used to get a reference to the sub-estimators, which are not</span>
+    <span class="s4"># necessarily stored on the metaestimator. We need to override __deepcopy__</span>
+    <span class="s4"># because the sub-estimators are probably cloned, which would result in a</span>
+    <span class="s4"># new copy of the list, but we need copy and deep copy both to return the</span>
+    <span class="s4"># same instance.</span>
+    <span class="s0">def </span><span class="s1">__deepcopy__(self</span><span class="s0">, </span><span class="s1">memo):</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">__copy__(self):</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+
+<span class="s0">class </span><span class="s1">ConsumingRegressor(RegressorMixin</span><span class="s0">, </span><span class="s1">BaseEstimator):</span>
+    <span class="s3">&quot;&quot;&quot;A regressor consuming metadata. 
+ 
+    Parameters 
+    ---------- 
+    registry : list, default=None 
+        If a list, the estimator will append itself to the list in order to have 
+        a reference to the estimator later on. Since that reference is not 
+        required in all tests, registration can be skipped by leaving this value 
+        as None. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">registry=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">self.registry = registry</span>
+
+    <span class="s0">def </span><span class="s1">partial_fit(self</span><span class="s0">, </span><span class="s1">X</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">sample_weight=</span><span class="s5">&quot;default&quot;</span><span class="s0">, </span><span class="s1">metadata=</span><span class="s5">&quot;default&quot;</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">self.registry </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">self.registry.append(self)</span>
+
+        <span class="s1">record_metadata_not_default(</span>
+            <span class="s1">self</span><span class="s0">, </span><span class="s5">&quot;partial_fit&quot;</span><span class="s0">, </span><span class="s1">sample_weight=sample_weight</span><span class="s0">, </span><span class="s1">metadata=metadata</span>
+        <span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">fit(self</span><span class="s0">, </span><span class="s1">X</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">sample_weight=</span><span class="s5">&quot;default&quot;</span><span class="s0">, </span><span class="s1">metadata=</span><span class="s5">&quot;default&quot;</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">self.registry </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">self.registry.append(self)</span>
+
+        <span class="s1">record_metadata_not_default(</span>
+            <span class="s1">self</span><span class="s0">, </span><span class="s5">&quot;fit&quot;</span><span class="s0">, </span><span class="s1">sample_weight=sample_weight</span><span class="s0">, </span><span class="s1">metadata=metadata</span>
+        <span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">predict(self</span><span class="s0">, </span><span class="s1">X</span><span class="s0">, </span><span class="s1">sample_weight=</span><span class="s5">&quot;default&quot;</span><span class="s0">, </span><span class="s1">metadata=</span><span class="s5">&quot;default&quot;</span><span class="s1">):</span>
+        <span class="s0">pass  </span><span class="s4"># pragma: no cover</span>
+
+        <span class="s4"># when needed, uncomment the implementation</span>
+        <span class="s4"># if self.registry is not None:</span>
+        <span class="s4">#     self.registry.append(self)</span>
+
+        <span class="s4"># record_metadata_not_default(</span>
+        <span class="s4">#     self, &quot;predict&quot;, sample_weight=sample_weight, metadata=metadata</span>
+        <span class="s4"># )</span>
+        <span class="s4"># return np.zeros(shape=(len(X),))</span>
+
+
+<span class="s0">class </span><span class="s1">ConsumingClassifier(ClassifierMixin</span><span class="s0">, </span><span class="s1">BaseEstimator):</span>
+    <span class="s3">&quot;&quot;&quot;A classifier consuming metadata. 
+ 
+    Parameters 
+    ---------- 
+    registry : list, default=None 
+        If a list, the estimator will append itself to the list in order to have 
+        a reference to the estimator later on. Since that reference is not 
+        required in all tests, registration can be skipped by leaving this value 
+        as None. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">registry=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">self.registry = registry</span>
+
+    <span class="s0">def </span><span class="s1">partial_fit(self</span><span class="s0">, </span><span class="s1">X</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">sample_weight=</span><span class="s5">&quot;default&quot;</span><span class="s0">, </span><span class="s1">metadata=</span><span class="s5">&quot;default&quot;</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">self.registry </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">self.registry.append(self)</span>
+
+        <span class="s1">record_metadata_not_default(</span>
+            <span class="s1">self</span><span class="s0">, </span><span class="s5">&quot;partial_fit&quot;</span><span class="s0">, </span><span class="s1">sample_weight=sample_weight</span><span class="s0">, </span><span class="s1">metadata=metadata</span>
+        <span class="s1">)</span>
+        <span class="s1">self.classes_ = [</span><span class="s2">0</span><span class="s0">, </span><span class="s2">1</span><span class="s1">]</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">fit(self</span><span class="s0">, </span><span class="s1">X</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">sample_weight=</span><span class="s5">&quot;default&quot;</span><span class="s0">, </span><span class="s1">metadata=</span><span class="s5">&quot;default&quot;</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">self.registry </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">self.registry.append(self)</span>
+
+        <span class="s1">record_metadata_not_default(</span>
+            <span class="s1">self</span><span class="s0">, </span><span class="s5">&quot;fit&quot;</span><span class="s0">, </span><span class="s1">sample_weight=sample_weight</span><span class="s0">, </span><span class="s1">metadata=metadata</span>
+        <span class="s1">)</span>
+        <span class="s1">self.classes_ = [</span><span class="s2">0</span><span class="s0">, </span><span class="s2">1</span><span class="s1">]</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">predict(self</span><span class="s0">, </span><span class="s1">X</span><span class="s0">, </span><span class="s1">sample_weight=</span><span class="s5">&quot;default&quot;</span><span class="s0">, </span><span class="s1">metadata=</span><span class="s5">&quot;default&quot;</span><span class="s1">):</span>
+        <span class="s0">pass  </span><span class="s4"># pragma: no cover</span>
+
+        <span class="s4"># when needed, uncomment the implementation</span>
+        <span class="s4"># if self.registry is not None:</span>
+        <span class="s4">#     self.registry.append(self)</span>
+
+        <span class="s4"># record_metadata_not_default(</span>
+        <span class="s4">#     self, &quot;predict&quot;, sample_weight=sample_weight, metadata=metadata</span>
+        <span class="s4"># )</span>
+        <span class="s4"># return np.zeros(shape=(len(X),))</span>
+
+    <span class="s0">def </span><span class="s1">predict_proba(self</span><span class="s0">, </span><span class="s1">X</span><span class="s0">, </span><span class="s1">sample_weight=</span><span class="s5">&quot;default&quot;</span><span class="s0">, </span><span class="s1">metadata=</span><span class="s5">&quot;default&quot;</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">self.registry </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">self.registry.append(self)</span>
+
+        <span class="s1">record_metadata_not_default(</span>
+            <span class="s1">self</span><span class="s0">, </span><span class="s5">&quot;predict_proba&quot;</span><span class="s0">, </span><span class="s1">sample_weight=sample_weight</span><span class="s0">, </span><span class="s1">metadata=metadata</span>
+        <span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">np.asarray([[</span><span class="s2">0.0</span><span class="s0">, </span><span class="s2">1.0</span><span class="s1">]] * len(X))</span>
+
+    <span class="s0">def </span><span class="s1">predict_log_proba(self</span><span class="s0">, </span><span class="s1">X</span><span class="s0">, </span><span class="s1">sample_weight=</span><span class="s5">&quot;default&quot;</span><span class="s0">, </span><span class="s1">metadata=</span><span class="s5">&quot;default&quot;</span><span class="s1">):</span>
+        <span class="s0">pass  </span><span class="s4"># pragma: no cover</span>
+
+        <span class="s4"># when needed, uncomment the implementation</span>
+        <span class="s4"># if self.registry is not None:</span>
+        <span class="s4">#     self.registry.append(self)</span>
+
+        <span class="s4"># record_metadata_not_default(</span>
+        <span class="s4">#     self, &quot;predict_log_proba&quot;, sample_weight=sample_weight, metadata=metadata</span>
+        <span class="s4"># )</span>
+        <span class="s4"># return np.zeros(shape=(len(X), 2))</span>
+
+
+<span class="s1">METAESTIMATORS: list = [</span>
+    <span class="s1">{</span>
+        <span class="s5">&quot;metaestimator&quot;</span><span class="s1">: MultiOutputRegressor</span><span class="s0">,</span>
+        <span class="s5">&quot;estimator_name&quot;</span><span class="s1">: </span><span class="s5">&quot;estimator&quot;</span><span class="s0">,</span>
+        <span class="s5">&quot;estimator&quot;</span><span class="s1">: ConsumingRegressor</span><span class="s0">,</span>
+        <span class="s5">&quot;X&quot;</span><span class="s1">: X</span><span class="s0">,</span>
+        <span class="s5">&quot;y&quot;</span><span class="s1">: y_multi</span><span class="s0">,</span>
+        <span class="s5">&quot;routing_methods&quot;</span><span class="s1">: [</span><span class="s5">&quot;fit&quot;</span><span class="s0">, </span><span class="s5">&quot;partial_fit&quot;</span><span class="s1">]</span><span class="s0">,</span>
+    <span class="s1">}</span><span class="s0">,</span>
+    <span class="s1">{</span>
+        <span class="s5">&quot;metaestimator&quot;</span><span class="s1">: MultiOutputClassifier</span><span class="s0">,</span>
+        <span class="s5">&quot;estimator_name&quot;</span><span class="s1">: </span><span class="s5">&quot;estimator&quot;</span><span class="s0">,</span>
+        <span class="s5">&quot;estimator&quot;</span><span class="s1">: ConsumingClassifier</span><span class="s0">,</span>
+        <span class="s5">&quot;X&quot;</span><span class="s1">: X</span><span class="s0">,</span>
+        <span class="s5">&quot;y&quot;</span><span class="s1">: y_multi</span><span class="s0">,</span>
+        <span class="s5">&quot;routing_methods&quot;</span><span class="s1">: [</span><span class="s5">&quot;fit&quot;</span><span class="s0">, </span><span class="s5">&quot;partial_fit&quot;</span><span class="s1">]</span><span class="s0">,</span>
+    <span class="s1">}</span><span class="s0">,</span>
+    <span class="s1">{</span>
+        <span class="s5">&quot;metaestimator&quot;</span><span class="s1">: CalibratedClassifierCV</span><span class="s0">,</span>
+        <span class="s5">&quot;estimator_name&quot;</span><span class="s1">: </span><span class="s5">&quot;estimator&quot;</span><span class="s0">,</span>
+        <span class="s5">&quot;estimator&quot;</span><span class="s1">: ConsumingClassifier</span><span class="s0">,</span>
+        <span class="s5">&quot;X&quot;</span><span class="s1">: X</span><span class="s0">,</span>
+        <span class="s5">&quot;y&quot;</span><span class="s1">: y</span><span class="s0">,</span>
+        <span class="s5">&quot;routing_methods&quot;</span><span class="s1">: [</span><span class="s5">&quot;fit&quot;</span><span class="s1">]</span><span class="s0">,</span>
+        <span class="s5">&quot;preserves_metadata&quot;</span><span class="s1">: </span><span class="s0">False,</span>
+    <span class="s1">}</span><span class="s0">,</span>
+    <span class="s1">{</span>
+        <span class="s5">&quot;metaestimator&quot;</span><span class="s1">: ClassifierChain</span><span class="s0">,</span>
+        <span class="s5">&quot;estimator_name&quot;</span><span class="s1">: </span><span class="s5">&quot;base_estimator&quot;</span><span class="s0">,</span>
+        <span class="s5">&quot;estimator&quot;</span><span class="s1">: ConsumingClassifier</span><span class="s0">,</span>
+        <span class="s5">&quot;X&quot;</span><span class="s1">: X</span><span class="s0">,</span>
+        <span class="s5">&quot;y&quot;</span><span class="s1">: y_multi</span><span class="s0">,</span>
+        <span class="s5">&quot;routing_methods&quot;</span><span class="s1">: [</span><span class="s5">&quot;fit&quot;</span><span class="s1">]</span><span class="s0">,</span>
+    <span class="s1">}</span><span class="s0">,</span>
+    <span class="s1">{</span>
+        <span class="s5">&quot;metaestimator&quot;</span><span class="s1">: RegressorChain</span><span class="s0">,</span>
+        <span class="s5">&quot;estimator_name&quot;</span><span class="s1">: </span><span class="s5">&quot;base_estimator&quot;</span><span class="s0">,</span>
+        <span class="s5">&quot;estimator&quot;</span><span class="s1">: ConsumingRegressor</span><span class="s0">,</span>
+        <span class="s5">&quot;X&quot;</span><span class="s1">: X</span><span class="s0">,</span>
+        <span class="s5">&quot;y&quot;</span><span class="s1">: y_multi</span><span class="s0">,</span>
+        <span class="s5">&quot;routing_methods&quot;</span><span class="s1">: [</span><span class="s5">&quot;fit&quot;</span><span class="s1">]</span><span class="s0">,</span>
+    <span class="s1">}</span><span class="s0">,</span>
+<span class="s1">]</span>
+<span class="s5">&quot;&quot;&quot;List containing all metaestimators to be tested and their settings 
+ 
+The keys are as follows: 
+ 
+- metaestimator: The metaestmator to be tested 
+- estimator_name: The name of the argument for the sub-estimator 
+- estimator: The sub-estimator 
+- X: X-data to fit and predict 
+- y: y-data to fit 
+- routing_methods: list of all methods to check for routing 
+- preserves_metadata: Whether the metaestimator passes the metadata to the 
+  sub-estimator without modification or not. If it does, we check that the 
+  values are identical. If it doesn't, no check is performed. TODO Maybe 
+  something smarter could be done if the data is modified. 
+ 
+&quot;&quot;&quot;</span>
+
+<span class="s4"># ids used for pytest fixture</span>
+<span class="s1">METAESTIMATOR_IDS = [str(row[</span><span class="s5">&quot;metaestimator&quot;</span><span class="s1">].__name__) </span><span class="s0">for </span><span class="s1">row </span><span class="s0">in </span><span class="s1">METAESTIMATORS]</span>
+
+
+<span class="s0">def </span><span class="s1">test_registry_copy():</span>
+    <span class="s4"># test that _Registry is not copied into a new instance.</span>
+    <span class="s1">a = _Registry()</span>
+    <span class="s1">b = _Registry()</span>
+    <span class="s0">assert </span><span class="s1">a </span><span class="s0">is not </span><span class="s1">b</span>
+    <span class="s0">assert </span><span class="s1">a </span><span class="s0">is </span><span class="s1">copy.copy(a)</span>
+    <span class="s0">assert </span><span class="s1">a </span><span class="s0">is </span><span class="s1">copy.deepcopy(a)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span>
+    <span class="s5">&quot;metaestimator&quot;</span><span class="s0">,</span>
+    <span class="s1">METAESTIMATORS</span><span class="s0">,</span>
+    <span class="s1">ids=METAESTIMATOR_IDS</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">def </span><span class="s1">test_default_request(metaestimator):</span>
+    <span class="s4"># Check that by default request is empty and the right type</span>
+    <span class="s1">cls = metaestimator[</span><span class="s5">&quot;metaestimator&quot;</span><span class="s1">]</span>
+    <span class="s1">estimator = metaestimator[</span><span class="s5">&quot;estimator&quot;</span><span class="s1">]()</span>
+    <span class="s1">estimator_name = metaestimator[</span><span class="s5">&quot;estimator_name&quot;</span><span class="s1">]</span>
+    <span class="s1">instance = cls(**{estimator_name: estimator})</span>
+    <span class="s1">assert_request_is_empty(instance.get_metadata_routing())</span>
+    <span class="s0">assert </span><span class="s1">isinstance(instance.get_metadata_routing()</span><span class="s0">, </span><span class="s1">MetadataRouter)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span>
+    <span class="s5">&quot;metaestimator&quot;</span><span class="s0">,</span>
+    <span class="s1">METAESTIMATORS</span><span class="s0">,</span>
+    <span class="s1">ids=METAESTIMATOR_IDS</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">def </span><span class="s1">test_error_on_missing_requests(metaestimator):</span>
+    <span class="s4"># Test that a UnsetMetadataPassedError is raised when it should.</span>
+    <span class="s1">cls = metaestimator[</span><span class="s5">&quot;metaestimator&quot;</span><span class="s1">]</span>
+    <span class="s1">estimator = metaestimator[</span><span class="s5">&quot;estimator&quot;</span><span class="s1">]()</span>
+    <span class="s1">estimator_name = metaestimator[</span><span class="s5">&quot;estimator_name&quot;</span><span class="s1">]</span>
+    <span class="s1">X = metaestimator[</span><span class="s5">&quot;X&quot;</span><span class="s1">]</span>
+    <span class="s1">y = metaestimator[</span><span class="s5">&quot;y&quot;</span><span class="s1">]</span>
+    <span class="s1">routing_methods = metaestimator[</span><span class="s5">&quot;routing_methods&quot;</span><span class="s1">]</span>
+
+    <span class="s0">for </span><span class="s1">method_name </span><span class="s0">in </span><span class="s1">routing_methods:</span>
+        <span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">[</span><span class="s5">&quot;sample_weight&quot;</span><span class="s0">, </span><span class="s5">&quot;metadata&quot;</span><span class="s1">]:</span>
+            <span class="s1">val = {</span><span class="s5">&quot;sample_weight&quot;</span><span class="s1">: sample_weight</span><span class="s0">, </span><span class="s5">&quot;metadata&quot;</span><span class="s1">: metadata}[key]</span>
+            <span class="s1">kwargs = {key: val}</span>
+            <span class="s1">msg = (</span>
+                <span class="s5">f&quot;[</span><span class="s0">{</span><span class="s1">key</span><span class="s0">}</span><span class="s5">] are passed but are not explicitly set as requested or not&quot;</span>
+                <span class="s5">f&quot; for </span><span class="s0">{</span><span class="s1">estimator.__class__.__name__</span><span class="s0">}</span><span class="s5">.</span><span class="s0">{</span><span class="s1">method_name</span><span class="s0">}</span><span class="s5">&quot;</span>
+            <span class="s1">)</span>
+
+            <span class="s1">instance = cls(**{estimator_name: estimator})</span>
+            <span class="s0">if </span><span class="s5">&quot;fit&quot; </span><span class="s0">not in </span><span class="s1">method_name:  </span><span class="s4"># instance needs to be fitted first</span>
+                <span class="s1">instance.fit(X</span><span class="s0">, </span><span class="s1">y)  </span><span class="s4"># pragma: no cover</span>
+            <span class="s0">with </span><span class="s1">pytest.raises(UnsetMetadataPassedError</span><span class="s0">, </span><span class="s1">match=re.escape(msg)):</span>
+                <span class="s1">method = getattr(instance</span><span class="s0">, </span><span class="s1">method_name)</span>
+                <span class="s1">method(X</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span>
+    <span class="s5">&quot;metaestimator&quot;</span><span class="s0">,</span>
+    <span class="s1">METAESTIMATORS</span><span class="s0">,</span>
+    <span class="s1">ids=METAESTIMATOR_IDS</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">def </span><span class="s1">test_setting_request_removes_error(metaestimator):</span>
+    <span class="s4"># When the metadata is explicitly requested, there should be no errors.</span>
+    <span class="s0">def </span><span class="s1">set_request(estimator</span><span class="s0">, </span><span class="s1">method_name):</span>
+        <span class="s4"># e.g. call set_fit_request on estimator</span>
+        <span class="s1">set_request_for_method = getattr(estimator</span><span class="s0">, </span><span class="s5">f&quot;set_</span><span class="s0">{</span><span class="s1">method_name</span><span class="s0">}</span><span class="s5">_request&quot;</span><span class="s1">)</span>
+        <span class="s1">set_request_for_method(sample_weight=</span><span class="s0">True, </span><span class="s1">metadata=</span><span class="s0">True</span><span class="s1">)</span>
+
+    <span class="s1">cls = metaestimator[</span><span class="s5">&quot;metaestimator&quot;</span><span class="s1">]</span>
+    <span class="s1">estimator_name = metaestimator[</span><span class="s5">&quot;estimator_name&quot;</span><span class="s1">]</span>
+    <span class="s1">X = metaestimator[</span><span class="s5">&quot;X&quot;</span><span class="s1">]</span>
+    <span class="s1">y = metaestimator[</span><span class="s5">&quot;y&quot;</span><span class="s1">]</span>
+    <span class="s1">routing_methods = metaestimator[</span><span class="s5">&quot;routing_methods&quot;</span><span class="s1">]</span>
+    <span class="s1">preserves_metadata = metaestimator.get(</span><span class="s5">&quot;preserves_metadata&quot;</span><span class="s0">, True</span><span class="s1">)</span>
+
+    <span class="s0">for </span><span class="s1">method_name </span><span class="s0">in </span><span class="s1">routing_methods:</span>
+        <span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">[</span><span class="s5">&quot;sample_weight&quot;</span><span class="s0">, </span><span class="s5">&quot;metadata&quot;</span><span class="s1">]:</span>
+            <span class="s1">val = {</span><span class="s5">&quot;sample_weight&quot;</span><span class="s1">: sample_weight</span><span class="s0">, </span><span class="s5">&quot;metadata&quot;</span><span class="s1">: metadata}[key]</span>
+            <span class="s1">kwargs = {key: val}</span>
+
+            <span class="s1">registry = _Registry()</span>
+            <span class="s1">estimator = metaestimator[</span><span class="s5">&quot;estimator&quot;</span><span class="s1">](registry=registry)</span>
+            <span class="s1">set_request(estimator</span><span class="s0">, </span><span class="s1">method_name)</span>
+            <span class="s1">instance = cls(**{estimator_name: estimator})</span>
+            <span class="s1">method = getattr(instance</span><span class="s0">, </span><span class="s1">method_name)</span>
+            <span class="s1">method(X</span><span class="s0">, </span><span class="s1">y</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+            <span class="s0">if </span><span class="s1">preserves_metadata:</span>
+                <span class="s4"># sanity check that registry is not empty, or else the test</span>
+                <span class="s4"># passes trivially</span>
+                <span class="s0">assert </span><span class="s1">registry</span>
+                <span class="s0">for </span><span class="s1">estimator </span><span class="s0">in </span><span class="s1">registry:</span>
+                    <span class="s1">check_recorded_metadata(estimator</span><span class="s0">, </span><span class="s1">method_name</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+</pre>
+</body>
+</html>

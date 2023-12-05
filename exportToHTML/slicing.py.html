@@ -1,0 +1,2183 @@
+<html>
+<head>
+<title>slicing.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+slicing.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">bisect</span>
+<span class="s0">import </span><span class="s1">functools</span>
+<span class="s0">import </span><span class="s1">math</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+<span class="s0">from </span><span class="s1">itertools </span><span class="s0">import </span><span class="s1">product</span>
+<span class="s0">from </span><span class="s1">numbers </span><span class="s0">import </span><span class="s1">Integral</span><span class="s0">, </span><span class="s1">Number</span>
+<span class="s0">from </span><span class="s1">operator </span><span class="s0">import </span><span class="s1">itemgetter</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">from </span><span class="s1">tlz </span><span class="s0">import </span><span class="s1">concat</span><span class="s0">, </span><span class="s1">memoize</span><span class="s0">, </span><span class="s1">merge</span><span class="s0">, </span><span class="s1">pluck</span>
+
+<span class="s0">from </span><span class="s1">dask </span><span class="s0">import </span><span class="s1">config</span><span class="s0">, </span><span class="s1">core</span><span class="s0">, </span><span class="s1">utils</span>
+<span class="s0">from </span><span class="s1">dask.array.chunk </span><span class="s0">import </span><span class="s1">getitem</span>
+<span class="s0">from </span><span class="s1">dask.base </span><span class="s0">import </span><span class="s1">is_dask_collection</span><span class="s0">, </span><span class="s1">tokenize</span>
+<span class="s0">from </span><span class="s1">dask.highlevelgraph </span><span class="s0">import </span><span class="s1">HighLevelGraph</span>
+<span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">cached_cumsum</span><span class="s0">, </span><span class="s1">is_arraylike</span>
+
+<span class="s1">colon = slice(</span><span class="s0">None, None, None</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">_sanitize_index_element(ind):</span>
+    <span class="s2">&quot;&quot;&quot;Sanitize a one-element index.&quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">Number):</span>
+        <span class="s1">ind2 = int(ind)</span>
+        <span class="s0">if </span><span class="s1">ind2 != ind:</span>
+            <span class="s0">raise </span><span class="s1">IndexError(</span><span class="s3">&quot;Bad index.  Must be integer-like: %s&quot; </span><span class="s1">% ind)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">ind2</span>
+    <span class="s0">elif </span><span class="s1">ind </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">return None</span>
+    <span class="s0">elif </span><span class="s1">is_dask_collection(ind):</span>
+        <span class="s0">if </span><span class="s1">ind.dtype.kind != </span><span class="s3">&quot;i&quot; </span><span class="s0">or </span><span class="s1">ind.size != </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">IndexError(</span><span class="s3">f&quot;Bad index. Must be integer-like: </span><span class="s0">{</span><span class="s1">ind</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">ind</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">TypeError(</span><span class="s3">&quot;Invalid index type&quot;</span><span class="s0">, </span><span class="s1">type(ind)</span><span class="s0">, </span><span class="s1">ind)</span>
+
+
+<span class="s0">def </span><span class="s1">sanitize_index(ind):</span>
+    <span class="s2">&quot;&quot;&quot;Sanitize the elements for indexing along one axis 
+ 
+    &gt;&gt;&gt; sanitize_index([2, 3, 5]) 
+    array([2, 3, 5]) 
+    &gt;&gt;&gt; sanitize_index([True, False, True, False]) 
+    array([0, 2]) 
+    &gt;&gt;&gt; sanitize_index(np.array([1, 2, 3])) 
+    array([1, 2, 3]) 
+    &gt;&gt;&gt; sanitize_index(np.array([False, True, True])) 
+    array([1, 2]) 
+    &gt;&gt;&gt; type(sanitize_index(np.int32(0))) 
+    &lt;class 'int'&gt; 
+    &gt;&gt;&gt; sanitize_index(1.0) 
+    1 
+    &gt;&gt;&gt; sanitize_index(0.5) 
+    Traceback (most recent call last): 
+    ... 
+    IndexError: Bad index.  Must be integer-like: 0.5 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask.array.utils </span><span class="s0">import </span><span class="s1">asanyarray_safe</span>
+
+    <span class="s0">if </span><span class="s1">ind </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">return None</span>
+    <span class="s0">elif </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">slice):</span>
+        <span class="s0">return </span><span class="s1">slice(</span>
+            <span class="s1">_sanitize_index_element(ind.start)</span><span class="s0">,</span>
+            <span class="s1">_sanitize_index_element(ind.stop)</span><span class="s0">,</span>
+            <span class="s1">_sanitize_index_element(ind.step)</span><span class="s0">,</span>
+        <span class="s1">)</span>
+    <span class="s0">elif </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">Number):</span>
+        <span class="s0">return </span><span class="s1">_sanitize_index_element(ind)</span>
+    <span class="s0">elif </span><span class="s1">is_dask_collection(ind):</span>
+        <span class="s0">return </span><span class="s1">ind</span>
+    <span class="s1">index_array = asanyarray_safe(ind</span><span class="s0">, </span><span class="s1">like=ind)</span>
+    <span class="s0">if </span><span class="s1">index_array.dtype == bool:</span>
+        <span class="s1">nonzero = np.nonzero(index_array)</span>
+        <span class="s0">if </span><span class="s1">len(nonzero) == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s5"># If a 1-element tuple, unwrap the element</span>
+            <span class="s1">nonzero = nonzero[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">is_arraylike(nonzero):</span>
+            <span class="s0">return </span><span class="s1">nonzero</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">np.asanyarray(nonzero)</span>
+    <span class="s0">elif </span><span class="s1">np.issubdtype(index_array.dtype</span><span class="s0">, </span><span class="s1">np.integer):</span>
+        <span class="s0">return </span><span class="s1">index_array</span>
+    <span class="s0">elif </span><span class="s1">np.issubdtype(index_array.dtype</span><span class="s0">, </span><span class="s1">np.floating):</span>
+        <span class="s1">int_index = index_array.astype(np.intp)</span>
+        <span class="s0">if </span><span class="s1">np.allclose(index_array</span><span class="s0">, </span><span class="s1">int_index):</span>
+            <span class="s0">return </span><span class="s1">int_index</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">check_int = np.isclose(index_array</span><span class="s0">, </span><span class="s1">int_index)</span>
+            <span class="s1">first_err = index_array.ravel()[np.flatnonzero(~check_int)[</span><span class="s4">0</span><span class="s1">]]</span>
+            <span class="s0">raise </span><span class="s1">IndexError(</span><span class="s3">&quot;Bad index.  Must be integer-like: %s&quot; </span><span class="s1">% first_err)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">TypeError(</span><span class="s3">&quot;Invalid index type&quot;</span><span class="s0">, </span><span class="s1">type(ind)</span><span class="s0">, </span><span class="s1">ind)</span>
+
+
+<span class="s0">def </span><span class="s1">slice_array(out_name</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">blockdims</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">itemsize):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Main function for array slicing 
+ 
+    This function makes a new dask that slices blocks along every 
+    dimension and aggregates (via cartesian product) each dimension's 
+    slices so that the resulting block slices give the same results 
+    as the original slice on the original structure 
+ 
+    Index must be a tuple.  It may contain the following types 
+ 
+        int, slice, list (at most one list), None 
+ 
+    Parameters 
+    ---------- 
+    in_name - string 
+      This is the dask variable name that will be used as input 
+    out_name - string 
+      This is the dask variable output name 
+    blockshape - iterable of integers 
+    index - iterable of integers, slices, lists, or None 
+    itemsize : int 
+        The number of bytes required for each element of the array. 
+ 
+    Returns 
+    ------- 
+    Dict where the keys are tuples of 
+ 
+        (out_name, dim_index[, dim_index[, ...]]) 
+ 
+    and the values are 
+ 
+        (function, (in_name, dim_index, dim_index, ...), 
+                   (slice(...), [slice()[,...]]) 
+ 
+    Also new blockdims with shapes of each block 
+ 
+        ((10, 10, 10, 10), (20, 20)) 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from pprint import pprint 
+    &gt;&gt;&gt; dsk, blockdims = slice_array('y', 'x', [(20, 20, 20, 20, 20)], 
+    ...                              (slice(10, 35),), 8) 
+    &gt;&gt;&gt; pprint(dsk)  # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE 
+    {('y', 0): (&lt;function getitem at ...&gt;, 
+                ('x', 0), 
+                (slice(10, 20, 1),)), 
+     ('y', 1): (&lt;function getitem at ...&gt;, ('x', 1), (slice(0, 15, 1),))} 
+    &gt;&gt;&gt; blockdims 
+    ((10, 15),) 
+ 
+    See Also 
+    -------- 
+    This function works by successively unwrapping cases and passing down 
+    through a sequence of functions. 
+ 
+    slice_with_newaxis : handle None/newaxis case 
+    slice_wrap_lists : handle fancy indexing with lists 
+    slice_slices_and_integers : handle everything else 
+    &quot;&quot;&quot;</span>
+    <span class="s1">blockdims = tuple(map(tuple</span><span class="s0">, </span><span class="s1">blockdims))</span>
+
+    <span class="s5"># x[:, :, :] - Punt and return old value</span>
+    <span class="s0">if </span><span class="s1">all(</span>
+        <span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">slice) </span><span class="s0">and </span><span class="s1">index == slice(</span><span class="s0">None, None, None</span><span class="s1">) </span><span class="s0">for </span><span class="s1">index </span><span class="s0">in </span><span class="s1">index</span>
+    <span class="s1">):</span>
+        <span class="s1">suffixes = product(*[range(len(bd)) </span><span class="s0">for </span><span class="s1">bd </span><span class="s0">in </span><span class="s1">blockdims])</span>
+        <span class="s1">dsk = {(out_name</span><span class="s0">,</span><span class="s1">) + s: (in_name</span><span class="s0">,</span><span class="s1">) + s </span><span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">suffixes}</span>
+        <span class="s0">return </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">blockdims</span>
+
+    <span class="s5"># Add in missing colons at the end as needed.  x[5] -&gt; x[5, :, :]</span>
+    <span class="s1">not_none_count = sum(i </span><span class="s0">is not None for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">index)</span>
+    <span class="s1">missing = len(blockdims) - not_none_count</span>
+    <span class="s1">index += (slice(</span><span class="s0">None, None, None</span><span class="s1">)</span><span class="s0">,</span><span class="s1">) * missing</span>
+
+    <span class="s5"># Pass down to next function</span>
+    <span class="s1">dsk_out</span><span class="s0">, </span><span class="s1">bd_out = slice_with_newaxes(out_name</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">blockdims</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">itemsize)</span>
+
+    <span class="s1">bd_out = tuple(map(tuple</span><span class="s0">, </span><span class="s1">bd_out))</span>
+    <span class="s0">return </span><span class="s1">dsk_out</span><span class="s0">, </span><span class="s1">bd_out</span>
+
+
+<span class="s0">def </span><span class="s1">slice_with_newaxes(out_name</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">blockdims</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">itemsize):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Handle indexing with Nones 
+ 
+    Strips out Nones then hands off to slice_wrap_lists 
+    &quot;&quot;&quot;</span>
+    <span class="s5"># Strip Nones from index</span>
+    <span class="s1">index2 = tuple(ind </span><span class="s0">for </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">index </span><span class="s0">if </span><span class="s1">ind </span><span class="s0">is not None</span><span class="s1">)</span>
+    <span class="s1">where_none = [i </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">enumerate(index) </span><span class="s0">if </span><span class="s1">ind </span><span class="s0">is None</span><span class="s1">]</span>
+    <span class="s1">where_none_orig = list(where_none)</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">x </span><span class="s0">in </span><span class="s1">enumerate(where_none):</span>
+        <span class="s1">n = sum(isinstance(ind</span><span class="s0">, </span><span class="s1">Integral) </span><span class="s0">for </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">index[:x])</span>
+        <span class="s0">if </span><span class="s1">n:</span>
+            <span class="s1">where_none[i] -= n</span>
+
+    <span class="s5"># Pass down and do work</span>
+    <span class="s1">dsk</span><span class="s0">, </span><span class="s1">blockdims2 = slice_wrap_lists(out_name</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">blockdims</span><span class="s0">, </span><span class="s1">index2</span><span class="s0">, </span><span class="s1">itemsize)</span>
+
+    <span class="s0">if </span><span class="s1">where_none:</span>
+        <span class="s1">expand = expander(where_none)</span>
+        <span class="s1">expand_orig = expander(where_none_orig)</span>
+
+        <span class="s5"># Insert &quot;,0&quot; into the key:  ('x', 2, 3) -&gt; ('x', 0, 2, 0, 3)</span>
+        <span class="s1">dsk2 = {</span>
+            <span class="s1">(out_name</span><span class="s0">,</span><span class="s1">) + expand(k[</span><span class="s4">1</span><span class="s1">:]</span><span class="s0">, </span><span class="s4">0</span><span class="s1">): (v[:</span><span class="s4">2</span><span class="s1">] + (expand_orig(v[</span><span class="s4">2</span><span class="s1">]</span><span class="s0">, None</span><span class="s1">)</span><span class="s0">,</span><span class="s1">))</span>
+            <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">dsk.items()</span>
+            <span class="s0">if </span><span class="s1">k[</span><span class="s4">0</span><span class="s1">] == out_name</span>
+        <span class="s1">}</span>
+
+        <span class="s5"># Add back intermediate parts of the dask that weren't the output</span>
+        <span class="s1">dsk3 = merge(dsk2</span><span class="s0">, </span><span class="s1">{k: v </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">dsk.items() </span><span class="s0">if </span><span class="s1">k[</span><span class="s4">0</span><span class="s1">] != out_name})</span>
+
+        <span class="s5"># Insert (1,) into blockdims:  ((2, 2), (3, 3)) -&gt; ((2, 2), (1,), (3, 3))</span>
+        <span class="s1">blockdims3 = expand(blockdims2</span><span class="s0">, </span><span class="s1">(</span><span class="s4">1</span><span class="s0">,</span><span class="s1">))</span>
+
+        <span class="s0">return </span><span class="s1">dsk3</span><span class="s0">, </span><span class="s1">blockdims3</span>
+
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">blockdims2</span>
+
+
+<span class="s0">def </span><span class="s1">slice_wrap_lists(out_name</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">blockdims</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">itemsize):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Fancy indexing along blocked array dasks 
+ 
+    Handles index of type list.  Calls slice_slices_and_integers for the rest 
+ 
+    See Also 
+    -------- 
+ 
+    take : handle slicing with lists (&quot;fancy&quot; indexing) 
+    slice_slices_and_integers : handle slicing with slices and integers 
+    &quot;&quot;&quot;</span>
+    <span class="s0">assert </span><span class="s1">all(isinstance(i</span><span class="s0">, </span><span class="s1">(slice</span><span class="s0">, </span><span class="s1">list</span><span class="s0">, </span><span class="s1">Integral)) </span><span class="s0">or </span><span class="s1">is_arraylike(i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">index)</span>
+    <span class="s0">if not </span><span class="s1">len(blockdims) == len(index):</span>
+        <span class="s0">raise </span><span class="s1">IndexError(</span><span class="s3">&quot;Too many indices for array&quot;</span><span class="s1">)</span>
+
+    <span class="s5"># Do we have more than one list in the index?</span>
+    <span class="s1">where_list = [</span>
+        <span class="s1">i </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">enumerate(index) </span><span class="s0">if </span><span class="s1">is_arraylike(ind) </span><span class="s0">and </span><span class="s1">ind.ndim &gt; </span><span class="s4">0</span>
+    <span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">len(where_list) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError(</span><span class="s3">&quot;Don't yet support nd fancy indexing&quot;</span><span class="s1">)</span>
+    <span class="s5"># Is the single list an empty list? In this case just treat it as a zero</span>
+    <span class="s5"># length slice</span>
+    <span class="s0">if </span><span class="s1">where_list </span><span class="s0">and not </span><span class="s1">index[where_list[</span><span class="s4">0</span><span class="s1">]].size:</span>
+        <span class="s1">index = list(index)</span>
+        <span class="s1">index[where_list.pop()] = slice(</span><span class="s4">0</span><span class="s0">, </span><span class="s4">0</span><span class="s0">, </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">index = tuple(index)</span>
+
+    <span class="s5"># No lists, hooray! just use slice_slices_and_integers</span>
+    <span class="s0">if not </span><span class="s1">where_list:</span>
+        <span class="s0">return </span><span class="s1">slice_slices_and_integers(out_name</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">blockdims</span><span class="s0">, </span><span class="s1">index)</span>
+
+    <span class="s5"># Replace all lists with full slices  [3, 1, 0] -&gt; slice(None, None, None)</span>
+    <span class="s1">index_without_list = tuple(</span>
+        <span class="s1">slice(</span><span class="s0">None, None, None</span><span class="s1">) </span><span class="s0">if </span><span class="s1">is_arraylike(i) </span><span class="s0">else </span><span class="s1">i </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">index</span>
+    <span class="s1">)</span>
+
+    <span class="s5"># lists and full slices.  Just use take</span>
+    <span class="s0">if </span><span class="s1">all(is_arraylike(i) </span><span class="s0">or </span><span class="s1">i == slice(</span><span class="s0">None, None, None</span><span class="s1">) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">index):</span>
+        <span class="s1">axis = where_list[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">blockdims2</span><span class="s0">, </span><span class="s1">dsk3 = take(</span>
+            <span class="s1">out_name</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">blockdims</span><span class="s0">, </span><span class="s1">index[where_list[</span><span class="s4">0</span><span class="s1">]]</span><span class="s0">, </span><span class="s1">itemsize</span><span class="s0">, </span><span class="s1">axis=axis</span>
+        <span class="s1">)</span>
+    <span class="s5"># Mixed case. Both slices/integers and lists. slice/integer then take</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s5"># Do first pass without lists</span>
+        <span class="s1">tmp = </span><span class="s3">&quot;slice-&quot; </span><span class="s1">+ tokenize((out_name</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">blockdims</span><span class="s0">, </span><span class="s1">index))</span>
+        <span class="s1">dsk</span><span class="s0">, </span><span class="s1">blockdims2 = slice_slices_and_integers(</span>
+            <span class="s1">tmp</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">blockdims</span><span class="s0">, </span><span class="s1">index_without_list</span>
+        <span class="s1">)</span>
+
+        <span class="s5"># After collapsing some axes due to int indices, adjust axis parameter</span>
+        <span class="s1">axis = where_list[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">axis2 = axis - sum(</span>
+            <span class="s4">1 </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">enumerate(index) </span><span class="s0">if </span><span class="s1">i &lt; axis </span><span class="s0">and </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">Integral)</span>
+        <span class="s1">)</span>
+
+        <span class="s5"># Do work</span>
+        <span class="s1">blockdims2</span><span class="s0">, </span><span class="s1">dsk2 = take(out_name</span><span class="s0">, </span><span class="s1">tmp</span><span class="s0">, </span><span class="s1">blockdims2</span><span class="s0">, </span><span class="s1">index[axis]</span><span class="s0">, </span><span class="s4">8</span><span class="s0">, </span><span class="s1">axis=axis2)</span>
+        <span class="s1">dsk3 = merge(dsk</span><span class="s0">, </span><span class="s1">dsk2)</span>
+
+    <span class="s0">return </span><span class="s1">dsk3</span><span class="s0">, </span><span class="s1">blockdims2</span>
+
+
+<span class="s0">def </span><span class="s1">slice_slices_and_integers(out_name</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">blockdims</span><span class="s0">, </span><span class="s1">index):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Dask array indexing with slices and integers 
+ 
+    See Also 
+    -------- 
+ 
+    _slice_1d 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">unknown_chunk_message</span>
+
+    <span class="s1">shape = tuple(cached_cumsum(dim</span><span class="s0">, </span><span class="s1">initial_zero=</span><span class="s0">True</span><span class="s1">)[-</span><span class="s4">1</span><span class="s1">] </span><span class="s0">for </span><span class="s1">dim </span><span class="s0">in </span><span class="s1">blockdims)</span>
+
+    <span class="s0">for </span><span class="s1">dim</span><span class="s0">, </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">zip(shape</span><span class="s0">, </span><span class="s1">index):</span>
+        <span class="s0">if </span><span class="s1">np.isnan(dim) </span><span class="s0">and </span><span class="s1">ind != slice(</span><span class="s0">None, None, None</span><span class="s1">):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">f&quot;Arrays chunk sizes are unknown: </span><span class="s0">{</span><span class="s1">shape</span><span class="s0">}{</span><span class="s1">unknown_chunk_message</span><span class="s0">}</span><span class="s3">&quot;</span>
+            <span class="s1">)</span>
+
+    <span class="s0">assert </span><span class="s1">all(isinstance(ind</span><span class="s0">, </span><span class="s1">(slice</span><span class="s0">, </span><span class="s1">Integral)) </span><span class="s0">for </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">index)</span>
+    <span class="s0">assert </span><span class="s1">len(index) == len(blockdims)</span>
+
+    <span class="s5"># Get a list (for each dimension) of dicts{blocknum: slice()}</span>
+    <span class="s1">block_slices = list(map(_slice_1d</span><span class="s0">, </span><span class="s1">shape</span><span class="s0">, </span><span class="s1">blockdims</span><span class="s0">, </span><span class="s1">index))</span>
+    <span class="s1">sorted_block_slices = [sorted(i.items()) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">block_slices]</span>
+
+    <span class="s5"># (in_name, 1, 1, 2), (in_name, 1, 1, 4), (in_name, 2, 1, 2), ...</span>
+    <span class="s1">in_names = list(product([in_name]</span><span class="s0">, </span><span class="s1">*[pluck(</span><span class="s4">0</span><span class="s0">, </span><span class="s1">s) </span><span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">sorted_block_slices]))</span>
+
+    <span class="s5"># (out_name, 0, 0, 0), (out_name, 0, 0, 1), (out_name, 0, 1, 0), ...</span>
+    <span class="s1">out_names = list(</span>
+        <span class="s1">product(</span>
+            <span class="s1">[out_name]</span><span class="s0">,</span>
+            <span class="s1">*[</span>
+                <span class="s1">range(len(d))[::-</span><span class="s4">1</span><span class="s1">] </span><span class="s0">if </span><span class="s1">i.step </span><span class="s0">and </span><span class="s1">i.step &lt; </span><span class="s4">0 </span><span class="s0">else </span><span class="s1">range(len(d))</span>
+                <span class="s0">for </span><span class="s1">d</span><span class="s0">, </span><span class="s1">i </span><span class="s0">in </span><span class="s1">zip(block_slices</span><span class="s0">, </span><span class="s1">index)</span>
+                <span class="s0">if not </span><span class="s1">isinstance(i</span><span class="s0">, </span><span class="s1">Integral)</span>
+            <span class="s1">]</span><span class="s0">,</span>
+        <span class="s1">)</span>
+    <span class="s1">)</span>
+
+    <span class="s1">all_slices = list(product(*[pluck(</span><span class="s4">1</span><span class="s0">, </span><span class="s1">s) </span><span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">sorted_block_slices]))</span>
+
+    <span class="s1">dsk_out = {</span>
+        <span class="s1">out_name: (getitem</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">slices)</span>
+        <span class="s0">for </span><span class="s1">out_name</span><span class="s0">, </span><span class="s1">in_name</span><span class="s0">, </span><span class="s1">slices </span><span class="s0">in </span><span class="s1">zip(out_names</span><span class="s0">, </span><span class="s1">in_names</span><span class="s0">, </span><span class="s1">all_slices)</span>
+    <span class="s1">}</span>
+
+    <span class="s1">new_blockdims = [</span>
+        <span class="s1">new_blockdim(d</span><span class="s0">, </span><span class="s1">db</span><span class="s0">, </span><span class="s1">i)</span>
+        <span class="s0">for </span><span class="s1">d</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s1">db </span><span class="s0">in </span><span class="s1">zip(shape</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">blockdims)</span>
+        <span class="s0">if not </span><span class="s1">isinstance(i</span><span class="s0">, </span><span class="s1">Integral)</span>
+    <span class="s1">]</span>
+
+    <span class="s0">return </span><span class="s1">dsk_out</span><span class="s0">, </span><span class="s1">new_blockdims</span>
+
+
+<span class="s0">def </span><span class="s1">_slice_1d(dim_shape</span><span class="s0">, </span><span class="s1">lengths</span><span class="s0">, </span><span class="s1">index):</span>
+    <span class="s2">&quot;&quot;&quot;Returns a dict of {blocknum: slice} 
+ 
+    This function figures out where each slice should start in each 
+    block for a single dimension. If the slice won't return any elements 
+    in the block, that block will not be in the output. 
+ 
+    Parameters 
+    ---------- 
+ 
+    dim_shape - the number of elements in this dimension. 
+      This should be a positive, non-zero integer 
+    blocksize - the number of elements per block in this dimension 
+      This should be a positive, non-zero integer 
+    index - a description of the elements in this dimension that we want 
+      This might be an integer, a slice(), or an Ellipsis 
+ 
+    Returns 
+    ------- 
+ 
+    dictionary where the keys are the integer index of the blocks that 
+      should be sliced and the values are the slices 
+ 
+    Examples 
+    -------- 
+ 
+    Trivial slicing 
+ 
+    &gt;&gt;&gt; _slice_1d(100, [60, 40], slice(None, None, None)) 
+    {0: slice(None, None, None), 1: slice(None, None, None)} 
+ 
+    100 length array cut into length 20 pieces, slice 0:35 
+ 
+    &gt;&gt;&gt; _slice_1d(100, [20, 20, 20, 20, 20], slice(0, 35)) 
+    {0: slice(None, None, None), 1: slice(0, 15, 1)} 
+ 
+    Support irregular blocks and various slices 
+ 
+    &gt;&gt;&gt; _slice_1d(100, [20, 10, 10, 10, 25, 25], slice(10, 35)) 
+    {0: slice(10, 20, 1), 1: slice(None, None, None), 2: slice(0, 5, 1)} 
+ 
+    Support step sizes 
+ 
+    &gt;&gt;&gt; _slice_1d(100, [15, 14, 13], slice(10, 41, 3)) 
+    {0: slice(10, 15, 3), 1: slice(1, 14, 3), 2: slice(2, 12, 3)} 
+ 
+    &gt;&gt;&gt; _slice_1d(100, [20, 20, 20, 20, 20], slice(0, 100, 40))  # step &gt; blocksize 
+    {0: slice(0, 20, 40), 2: slice(0, 20, 40), 4: slice(0, 20, 40)} 
+ 
+    Also support indexing single elements 
+ 
+    &gt;&gt;&gt; _slice_1d(100, [20, 20, 20, 20, 20], 25) 
+    {1: 5} 
+ 
+    And negative slicing 
+ 
+    &gt;&gt;&gt; _slice_1d(100, [20, 20, 20, 20, 20], slice(100, 0, -3)) # doctest: +NORMALIZE_WHITESPACE 
+    {4: slice(-1, -21, -3), 
+     3: slice(-2, -21, -3), 
+     2: slice(-3, -21, -3), 
+     1: slice(-1, -21, -3), 
+     0: slice(-2, -20, -3)} 
+ 
+    &gt;&gt;&gt; _slice_1d(100, [20, 20, 20, 20, 20], slice(100, 12, -3)) # doctest: +NORMALIZE_WHITESPACE 
+    {4: slice(-1, -21, -3), 
+     3: slice(-2, -21, -3), 
+     2: slice(-3, -21, -3), 
+     1: slice(-1, -21, -3), 
+     0: slice(-2, -8, -3)} 
+ 
+    &gt;&gt;&gt; _slice_1d(100, [20, 20, 20, 20, 20], slice(100, -12, -3)) 
+    {4: slice(-1, -12, -3)} 
+    &quot;&quot;&quot;</span>
+    <span class="s1">chunk_boundaries = cached_cumsum(lengths)</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">Integral):</span>
+        <span class="s5"># use right-side search to be consistent with previous result</span>
+        <span class="s1">i = bisect.bisect_right(chunk_boundaries</span><span class="s0">, </span><span class="s1">index)</span>
+        <span class="s0">if </span><span class="s1">i &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s5"># the very first chunk has no relative shift</span>
+            <span class="s1">ind = index - chunk_boundaries[i - </span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">ind = index</span>
+        <span class="s0">return </span><span class="s1">{int(i): int(ind)}</span>
+
+    <span class="s0">assert </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">slice)</span>
+
+    <span class="s0">if </span><span class="s1">index == colon:</span>
+        <span class="s0">return </span><span class="s1">{k: colon </span><span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">range(len(lengths))}</span>
+
+    <span class="s1">step = index.step </span><span class="s0">or </span><span class="s4">1</span>
+    <span class="s0">if </span><span class="s1">step &gt; </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">start = index.start </span><span class="s0">or </span><span class="s4">0</span>
+        <span class="s1">stop = index.stop </span><span class="s0">if </span><span class="s1">index.stop </span><span class="s0">is not None else </span><span class="s1">dim_shape</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">start = index.start </span><span class="s0">if </span><span class="s1">index.start </span><span class="s0">is not None else </span><span class="s1">dim_shape - </span><span class="s4">1</span>
+        <span class="s1">start = dim_shape - </span><span class="s4">1 </span><span class="s0">if </span><span class="s1">start &gt;= dim_shape </span><span class="s0">else </span><span class="s1">start</span>
+        <span class="s1">stop = -(dim_shape + </span><span class="s4">1</span><span class="s1">) </span><span class="s0">if </span><span class="s1">index.stop </span><span class="s0">is None else </span><span class="s1">index.stop</span>
+
+    <span class="s5"># posify start and stop</span>
+    <span class="s0">if </span><span class="s1">start &lt; </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">start += dim_shape</span>
+    <span class="s0">if </span><span class="s1">stop &lt; </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">stop += dim_shape</span>
+
+    <span class="s1">d = dict()</span>
+    <span class="s0">if </span><span class="s1">step &gt; </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">istart = bisect.bisect_right(chunk_boundaries</span><span class="s0">, </span><span class="s1">start)</span>
+        <span class="s1">istop = bisect.bisect_left(chunk_boundaries</span><span class="s0">, </span><span class="s1">stop)</span>
+
+        <span class="s5"># the bound is not exactly tight; make it tighter?</span>
+        <span class="s1">istop = min(istop + </span><span class="s4">1</span><span class="s0">, </span><span class="s1">len(lengths))</span>
+
+        <span class="s5"># jump directly to istart</span>
+        <span class="s0">if </span><span class="s1">istart &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">start = start - chunk_boundaries[istart - </span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">stop = stop - chunk_boundaries[istart - </span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(istart</span><span class="s0">, </span><span class="s1">istop):</span>
+            <span class="s1">length = lengths[i]</span>
+            <span class="s0">if </span><span class="s1">start &lt; length </span><span class="s0">and </span><span class="s1">stop &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">d[i] = slice(start</span><span class="s0">, </span><span class="s1">min(stop</span><span class="s0">, </span><span class="s1">length)</span><span class="s0">, </span><span class="s1">step)</span>
+                <span class="s1">start = (start - length) % step</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">start = start - length</span>
+            <span class="s1">stop -= length</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">rstart = start  </span><span class="s5"># running start</span>
+
+        <span class="s1">istart = bisect.bisect_left(chunk_boundaries</span><span class="s0">, </span><span class="s1">start)</span>
+        <span class="s1">istop = bisect.bisect_right(chunk_boundaries</span><span class="s0">, </span><span class="s1">stop)</span>
+
+        <span class="s5"># the bound is not exactly tight; make it tighter?</span>
+        <span class="s1">istart = min(istart + </span><span class="s4">1</span><span class="s0">, </span><span class="s1">len(chunk_boundaries) - </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">istop = max(istop - </span><span class="s4">1</span><span class="s0">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(istart</span><span class="s0">, </span><span class="s1">istop</span><span class="s0">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">):</span>
+            <span class="s1">chunk_stop = chunk_boundaries[i]</span>
+            <span class="s5"># create a chunk start and stop</span>
+            <span class="s0">if </span><span class="s1">i == </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">chunk_start = </span><span class="s4">0</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">chunk_start = chunk_boundaries[i - </span><span class="s4">1</span><span class="s1">]</span>
+
+            <span class="s5"># if our slice is in this chunk</span>
+            <span class="s0">if </span><span class="s1">(chunk_start &lt;= rstart &lt; chunk_stop) </span><span class="s0">and </span><span class="s1">(rstart &gt; stop):</span>
+                <span class="s1">d[i] = slice(</span>
+                    <span class="s1">rstart - chunk_stop</span><span class="s0">,</span>
+                    <span class="s1">max(chunk_start - chunk_stop - </span><span class="s4">1</span><span class="s0">, </span><span class="s1">stop - chunk_stop)</span><span class="s0">,</span>
+                    <span class="s1">step</span><span class="s0">,</span>
+                <span class="s1">)</span>
+
+                <span class="s5"># compute the next running start point,</span>
+                <span class="s1">offset = (rstart - (chunk_start - </span><span class="s4">1</span><span class="s1">)) % step</span>
+                <span class="s1">rstart = chunk_start + offset - </span><span class="s4">1</span>
+
+    <span class="s5"># replace 0:20:1 with : if appropriate</span>
+    <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">d.items():</span>
+        <span class="s0">if </span><span class="s1">v == slice(</span><span class="s4">0</span><span class="s0">, </span><span class="s1">lengths[k]</span><span class="s0">, </span><span class="s4">1</span><span class="s1">):</span>
+            <span class="s1">d[k] = slice(</span><span class="s0">None, None, None</span><span class="s1">)</span>
+
+    <span class="s0">if not </span><span class="s1">d:  </span><span class="s5"># special case x[:0]</span>
+        <span class="s1">d[</span><span class="s4">0</span><span class="s1">] = slice(</span><span class="s4">0</span><span class="s0">, </span><span class="s4">0</span><span class="s0">, </span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s0">return </span><span class="s1">d</span>
+
+
+<span class="s0">def </span><span class="s1">partition_by_size(sizes</span><span class="s0">, </span><span class="s1">seq):</span>
+    <span class="s2">&quot;&quot;&quot; 
+ 
+    &gt;&gt;&gt; partition_by_size([10, 20, 10], [1, 5, 9, 12, 29, 35]) 
+    [array([1, 5, 9]), array([ 2, 19]), array([5])] 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if not </span><span class="s1">is_arraylike(seq):</span>
+        <span class="s1">seq = np.asanyarray(seq)</span>
+    <span class="s1">left = np.empty(len(sizes) + </span><span class="s4">1</span><span class="s0">, </span><span class="s1">dtype=int)</span>
+    <span class="s1">left[</span><span class="s4">0</span><span class="s1">] = </span><span class="s4">0</span>
+
+    <span class="s1">right = np.cumsum(sizes</span><span class="s0">, </span><span class="s1">out=left[</span><span class="s4">1</span><span class="s1">:])</span>
+    <span class="s1">locations = np.empty(len(sizes) + </span><span class="s4">1</span><span class="s0">, </span><span class="s1">dtype=int)</span>
+    <span class="s1">locations[</span><span class="s4">0</span><span class="s1">] = </span><span class="s4">0</span>
+    <span class="s1">locations[</span><span class="s4">1</span><span class="s1">:] = np.searchsorted(seq</span><span class="s0">, </span><span class="s1">right)</span>
+    <span class="s0">return </span><span class="s1">[(seq[j:k] - l) </span><span class="s0">for </span><span class="s1">j</span><span class="s0">, </span><span class="s1">k</span><span class="s0">, </span><span class="s1">l </span><span class="s0">in </span><span class="s1">zip(locations[:-</span><span class="s4">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">locations[</span><span class="s4">1</span><span class="s1">:]</span><span class="s0">, </span><span class="s1">left)]</span>
+
+
+<span class="s0">def </span><span class="s1">issorted(seq):</span>
+    <span class="s2">&quot;&quot;&quot;Is sequence sorted? 
+ 
+    &gt;&gt;&gt; issorted([1, 2, 3]) 
+    True 
+    &gt;&gt;&gt; issorted([3, 1, 2]) 
+    False 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">len(seq) == </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s0">return True</span>
+    <span class="s0">return </span><span class="s1">np.all(seq[:-</span><span class="s4">1</span><span class="s1">] &lt;= seq[</span><span class="s4">1</span><span class="s1">:])</span>
+
+
+<span class="s0">def </span><span class="s1">slicing_plan(chunks</span><span class="s0">, </span><span class="s1">index):</span>
+    <span class="s2">&quot;&quot;&quot;Construct a plan to slice chunks with the given index 
+ 
+    Parameters 
+    ---------- 
+    chunks : Tuple[int] 
+        One dimensions worth of chunking information 
+    index : np.ndarray[int] 
+        The index passed to slice on that dimension 
+ 
+    Returns 
+    ------- 
+    out : List[Tuple[int, np.ndarray]] 
+        A list of chunk/sub-index pairs corresponding to each output chunk 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask.array.utils </span><span class="s0">import </span><span class="s1">asarray_safe</span>
+
+    <span class="s0">if not </span><span class="s1">is_arraylike(index):</span>
+        <span class="s1">index = np.asanyarray(index)</span>
+    <span class="s1">cum_chunks = cached_cumsum(chunks)</span>
+
+    <span class="s1">cum_chunks = asarray_safe(cum_chunks</span><span class="s0">, </span><span class="s1">like=index)</span>
+    <span class="s5"># this dispactches to the array library</span>
+    <span class="s1">chunk_locations = np.searchsorted(cum_chunks</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">side=</span><span class="s3">&quot;right&quot;</span><span class="s1">)</span>
+
+    <span class="s5"># but we need chunk_locations as python ints for getitem calls downstream</span>
+    <span class="s1">chunk_locations = chunk_locations.tolist()</span>
+    <span class="s1">where = np.where(np.diff(chunk_locations))[</span><span class="s4">0</span><span class="s1">] + </span><span class="s4">1</span>
+
+    <span class="s1">extra = asarray_safe([</span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">like=where)</span>
+    <span class="s1">c_loc = asarray_safe([len(chunk_locations)]</span><span class="s0">, </span><span class="s1">like=where)</span>
+    <span class="s1">where = np.concatenate([extra</span><span class="s0">, </span><span class="s1">where</span><span class="s0">, </span><span class="s1">c_loc])</span>
+
+    <span class="s1">out = []</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(where) - </span><span class="s4">1</span><span class="s1">):</span>
+        <span class="s1">sub_index = index[where[i] : where[i + </span><span class="s4">1</span><span class="s1">]]</span>
+        <span class="s1">chunk = chunk_locations[where[i]]</span>
+        <span class="s0">if </span><span class="s1">chunk &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">sub_index = sub_index - cum_chunks[chunk - </span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">out.append((chunk</span><span class="s0">, </span><span class="s1">sub_index))</span>
+
+    <span class="s0">return </span><span class="s1">out</span>
+
+
+<span class="s0">def </span><span class="s1">take(outname</span><span class="s0">, </span><span class="s1">inname</span><span class="s0">, </span><span class="s1">chunks</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">itemsize</span><span class="s0">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Index array with an iterable of index 
+ 
+    Handles a single index by a single list 
+ 
+    Mimics ``np.take`` 
+ 
+    &gt;&gt;&gt; from pprint import pprint 
+    &gt;&gt;&gt; chunks, dsk = take('y', 'x', [(20, 20, 20, 20)], [5, 1, 47, 3], 8, axis=0) 
+    &gt;&gt;&gt; chunks 
+    ((2, 1, 1),) 
+    &gt;&gt;&gt; pprint(dsk)   # doctest: +ELLIPSIS 
+    {('y', 0): (&lt;function getitem at ...&gt;, ('x', 0), (array([5, 1]),)), 
+     ('y', 1): (&lt;function getitem at ...&gt;, ('x', 2), (array([7]),)), 
+     ('y', 2): (&lt;function getitem at ...&gt;, ('x', 0), (array([3]),))} 
+ 
+    When list is sorted we retain original block structure 
+ 
+    &gt;&gt;&gt; chunks, dsk = take('y', 'x', [(20, 20, 20, 20)], [1, 3, 5, 47], 8, axis=0) 
+    &gt;&gt;&gt; chunks 
+    ((3, 1),) 
+    &gt;&gt;&gt; pprint(dsk)     # doctest: +ELLIPSIS +NORMALIZE_WHITESPACE 
+    {('y', 0): (&lt;function getitem at ...&gt;, 
+                ('x', 0), 
+                (array([1, 3, 5]),)), 
+     ('y', 1): (&lt;function getitem at ...&gt;, ('x', 2), (array([7]),))} 
+ 
+    When any indexed blocks would otherwise grow larger than 
+    dask.config.array.chunk-size, we might split them, 
+    depending on the value of ``dask.config.slicing.split-large-chunks``. 
+ 
+    &gt;&gt;&gt; import dask 
+    &gt;&gt;&gt; with dask.config.set({&quot;array.slicing.split-large-chunks&quot;: True}): 
+    ...      chunks, dsk = take('y', 'x', [(1, 1, 1), (2000, 2000), (2000, 2000)], 
+    ...                        [0] + [1] * 6 + [2], axis=0, itemsize=8) 
+    &gt;&gt;&gt; chunks 
+    ((1, 3, 3, 1), (2000, 2000), (2000, 2000)) 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">PerformanceWarning</span>
+
+    <span class="s1">plan = slicing_plan(chunks[axis]</span><span class="s0">, </span><span class="s1">index)</span>
+    <span class="s0">if </span><span class="s1">len(plan) &gt;= len(chunks[axis]) * </span><span class="s4">10</span><span class="s1">:</span>
+        <span class="s1">factor = math.ceil(len(plan) / len(chunks[axis]))</span>
+
+        <span class="s1">warnings.warn(</span>
+            <span class="s3">&quot;Slicing with an out-of-order index is generating %d &quot;</span>
+            <span class="s3">&quot;times more chunks&quot; </span><span class="s1">% factor</span><span class="s0">,</span>
+            <span class="s1">PerformanceWarning</span><span class="s0">,</span>
+            <span class="s1">stacklevel=</span><span class="s4">6</span><span class="s0">,</span>
+        <span class="s1">)</span>
+    <span class="s0">if not </span><span class="s1">is_arraylike(index):</span>
+        <span class="s1">index = np.asarray(index)</span>
+
+    <span class="s5"># Check for chunks from the plan that would violate the user's</span>
+    <span class="s5"># configured chunk size.</span>
+    <span class="s1">nbytes = utils.parse_bytes(config.get(</span><span class="s3">&quot;array.chunk-size&quot;</span><span class="s1">))</span>
+    <span class="s1">other_chunks = [chunks[i] </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(chunks)) </span><span class="s0">if </span><span class="s1">i != axis]</span>
+    <span class="s1">other_numel = math.prod(max(x) </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">other_chunks)</span>
+
+    <span class="s0">if </span><span class="s1">math.isnan(other_numel) </span><span class="s0">or </span><span class="s1">other_numel == </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">warnsize = maxsize = math.inf</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">maxsize = math.ceil(nbytes / (other_numel * itemsize))</span>
+        <span class="s1">warnsize = maxsize * </span><span class="s4">5</span>
+
+    <span class="s1">split = config.get(</span><span class="s3">&quot;array.slicing.split-large-chunks&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+
+    <span class="s5"># Warn only when the default is not specified.</span>
+    <span class="s1">warned = split </span><span class="s0">is not None</span>
+
+    <span class="s0">for </span><span class="s1">_</span><span class="s0">, </span><span class="s1">index_list </span><span class="s0">in </span><span class="s1">plan:</span>
+        <span class="s0">if not </span><span class="s1">warned </span><span class="s0">and </span><span class="s1">len(index_list) &gt; warnsize:</span>
+            <span class="s1">msg = (</span>
+                <span class="s3">&quot;Slicing is producing a large chunk. To accept the large</span><span class="s0">\n</span><span class="s3">&quot;</span>
+                <span class="s3">&quot;chunk and silence this warning, set the option</span><span class="s0">\n</span><span class="s3">&quot;</span>
+                <span class="s3">&quot;    &gt;&gt;&gt; with dask.config.set(**{'array.slicing.split_large_chunks': False}):</span><span class="s0">\n</span><span class="s3">&quot;</span>
+                <span class="s3">&quot;    ...     array[indexer]</span><span class="s0">\n\n</span><span class="s3">&quot;</span>
+                <span class="s3">&quot;To avoid creating the large chunks, set the option</span><span class="s0">\n</span><span class="s3">&quot;</span>
+                <span class="s3">&quot;    &gt;&gt;&gt; with dask.config.set(**{'array.slicing.split_large_chunks': True}):</span><span class="s0">\n</span><span class="s3">&quot;</span>
+                <span class="s3">&quot;    ...     array[indexer]&quot;</span>
+            <span class="s1">)</span>
+            <span class="s1">warnings.warn(msg</span><span class="s0">, </span><span class="s1">PerformanceWarning</span><span class="s0">, </span><span class="s1">stacklevel=</span><span class="s4">6</span><span class="s1">)</span>
+            <span class="s1">warned = </span><span class="s0">True</span>
+
+    <span class="s1">where_index = []</span>
+    <span class="s1">index_lists = []</span>
+    <span class="s0">for </span><span class="s1">where_idx</span><span class="s0">, </span><span class="s1">index_list </span><span class="s0">in </span><span class="s1">plan:</span>
+        <span class="s1">index_length = len(index_list)</span>
+        <span class="s0">if </span><span class="s1">split </span><span class="s0">and </span><span class="s1">index_length &gt; maxsize:</span>
+            <span class="s1">index_sublist = np.array_split(</span>
+                <span class="s1">index_list</span><span class="s0">, </span><span class="s1">math.ceil(index_length / maxsize)</span>
+            <span class="s1">)</span>
+            <span class="s1">index_lists.extend(index_sublist)</span>
+            <span class="s1">where_index.extend([where_idx] * len(index_sublist))</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">if not </span><span class="s1">is_arraylike(index_list):</span>
+                <span class="s1">index_list = np.array(index_list)</span>
+            <span class="s1">index_lists.append(index_list)</span>
+            <span class="s1">where_index.append(where_idx)</span>
+
+    <span class="s1">dims = [range(len(bd)) </span><span class="s0">for </span><span class="s1">bd </span><span class="s0">in </span><span class="s1">chunks]</span>
+
+    <span class="s1">indims = list(dims)</span>
+    <span class="s1">indims[axis] = list(range(len(where_index)))</span>
+    <span class="s1">keys = list(product([outname]</span><span class="s0">, </span><span class="s1">*indims))</span>
+
+    <span class="s1">outdims = list(dims)</span>
+    <span class="s1">outdims[axis] = where_index</span>
+    <span class="s1">slices = [[colon] * len(bd) </span><span class="s0">for </span><span class="s1">bd </span><span class="s0">in </span><span class="s1">chunks]</span>
+    <span class="s1">slices[axis] = index_lists</span>
+    <span class="s1">slices = list(product(*slices))</span>
+    <span class="s1">inkeys = list(product([inname]</span><span class="s0">, </span><span class="s1">*outdims))</span>
+    <span class="s1">values = [(getitem</span><span class="s0">, </span><span class="s1">inkey</span><span class="s0">, </span><span class="s1">slc) </span><span class="s0">for </span><span class="s1">inkey</span><span class="s0">, </span><span class="s1">slc </span><span class="s0">in </span><span class="s1">zip(inkeys</span><span class="s0">, </span><span class="s1">slices)]</span>
+
+    <span class="s1">chunks2 = list(chunks)</span>
+    <span class="s1">chunks2[axis] = tuple(map(len</span><span class="s0">, </span><span class="s1">index_lists))</span>
+    <span class="s1">dsk = dict(zip(keys</span><span class="s0">, </span><span class="s1">values))</span>
+
+    <span class="s0">return </span><span class="s1">tuple(chunks2)</span><span class="s0">, </span><span class="s1">dsk</span>
+
+
+<span class="s0">def </span><span class="s1">posify_index(shape</span><span class="s0">, </span><span class="s1">ind):</span>
+    <span class="s2">&quot;&quot;&quot;Flip negative indices around to positive ones 
+ 
+    &gt;&gt;&gt; posify_index(10, 3) 
+    3 
+    &gt;&gt;&gt; posify_index(10, -3) 
+    7 
+    &gt;&gt;&gt; posify_index(10, [3, -3]) 
+    array([3, 7]) 
+ 
+    &gt;&gt;&gt; posify_index((10, 20), (3, -3)) 
+    (3, 17) 
+    &gt;&gt;&gt; posify_index((10, 20), (3, [3, 4, -3]))  # doctest: +NORMALIZE_WHITESPACE 
+    (3, array([ 3,  4, 17])) 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">tuple):</span>
+        <span class="s0">return </span><span class="s1">tuple(map(posify_index</span><span class="s0">, </span><span class="s1">shape</span><span class="s0">, </span><span class="s1">ind))</span>
+    <span class="s0">if </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">Integral):</span>
+        <span class="s0">if </span><span class="s1">ind &lt; </span><span class="s4">0 </span><span class="s0">and not </span><span class="s1">math.isnan(shape):</span>
+            <span class="s0">return </span><span class="s1">ind + shape</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">ind</span>
+    <span class="s0">if </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">(np.ndarray</span><span class="s0">, </span><span class="s1">list)) </span><span class="s0">and not </span><span class="s1">math.isnan(shape):</span>
+        <span class="s1">ind = np.asanyarray(ind)</span>
+        <span class="s0">return </span><span class="s1">np.where(ind &lt; </span><span class="s4">0</span><span class="s0">, </span><span class="s1">ind + shape</span><span class="s0">, </span><span class="s1">ind)</span>
+    <span class="s0">return </span><span class="s1">ind</span>
+
+
+<span class="s1">@memoize</span>
+<span class="s0">def </span><span class="s1">_expander(where):</span>
+    <span class="s0">if not </span><span class="s1">where:</span>
+
+        <span class="s0">def </span><span class="s1">expand(seq</span><span class="s0">, </span><span class="s1">val):</span>
+            <span class="s0">return </span><span class="s1">seq</span>
+
+        <span class="s0">return </span><span class="s1">expand</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">decl = </span><span class="s3">&quot;&quot;&quot;def expand(seq, val): 
+            return ({left}) + tuple({right}) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">left = []</span>
+        <span class="s1">j = </span><span class="s4">0</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(max(where) + </span><span class="s4">1</span><span class="s1">):</span>
+            <span class="s0">if </span><span class="s1">i </span><span class="s0">in </span><span class="s1">where:</span>
+                <span class="s1">left.append(</span><span class="s3">&quot;val, &quot;</span><span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">left.append(</span><span class="s3">&quot;seq[%d], &quot; </span><span class="s1">% j)</span>
+                <span class="s1">j += </span><span class="s4">1</span>
+        <span class="s1">right = </span><span class="s3">&quot;seq[%d:]&quot; </span><span class="s1">% j</span>
+        <span class="s1">left = </span><span class="s3">&quot;&quot;</span><span class="s1">.join(left)</span>
+        <span class="s1">decl = decl.format(**locals())</span>
+        <span class="s1">ns = {}</span>
+        <span class="s1">exec(compile(decl</span><span class="s0">, </span><span class="s3">&quot;&lt;dynamic&gt;&quot;</span><span class="s0">, </span><span class="s3">&quot;exec&quot;</span><span class="s1">)</span><span class="s0">, </span><span class="s1">ns</span><span class="s0">, </span><span class="s1">ns)</span>
+        <span class="s0">return </span><span class="s1">ns[</span><span class="s3">&quot;expand&quot;</span><span class="s1">]</span>
+
+
+<span class="s0">def </span><span class="s1">expander(where):</span>
+    <span class="s2">&quot;&quot;&quot;Create a function to insert value at many locations in sequence. 
+ 
+    &gt;&gt;&gt; expander([0, 2])(['a', 'b', 'c'], 'z') 
+    ('z', 'a', 'z', 'b', 'c') 
+    &quot;&quot;&quot;</span>
+    <span class="s0">return </span><span class="s1">_expander(tuple(where))</span>
+
+
+<span class="s0">def </span><span class="s1">new_blockdim(dim_shape</span><span class="s0">, </span><span class="s1">lengths</span><span class="s0">, </span><span class="s1">index):</span>
+    <span class="s2">&quot;&quot;&quot; 
+ 
+    &gt;&gt;&gt; new_blockdim(100, [20, 10, 20, 10, 40], slice(0, 90, 2)) 
+    [10, 5, 10, 5, 15] 
+ 
+    &gt;&gt;&gt; new_blockdim(100, [20, 10, 20, 10, 40], [5, 1, 30, 22]) 
+    [4] 
+ 
+    &gt;&gt;&gt; new_blockdim(100, [20, 10, 20, 10, 40], slice(90, 10, -2)) 
+    [16, 5, 10, 5, 4] 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">index == slice(</span><span class="s0">None, None, None</span><span class="s1">):</span>
+        <span class="s0">return </span><span class="s1">lengths</span>
+    <span class="s0">if </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">list):</span>
+        <span class="s0">return </span><span class="s1">[len(index)]</span>
+    <span class="s0">assert not </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">Integral)</span>
+    <span class="s1">pairs = sorted(_slice_1d(dim_shape</span><span class="s0">, </span><span class="s1">lengths</span><span class="s0">, </span><span class="s1">index).items()</span><span class="s0">, </span><span class="s1">key=itemgetter(</span><span class="s4">0</span><span class="s1">))</span>
+    <span class="s1">slices = [</span>
+        <span class="s1">slice(</span><span class="s4">0</span><span class="s0">, </span><span class="s1">lengths[i]</span><span class="s0">, </span><span class="s4">1</span><span class="s1">) </span><span class="s0">if </span><span class="s1">slc == slice(</span><span class="s0">None, None, None</span><span class="s1">) </span><span class="s0">else </span><span class="s1">slc</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">slc </span><span class="s0">in </span><span class="s1">pairs</span>
+    <span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">slice) </span><span class="s0">and </span><span class="s1">index.step </span><span class="s0">and </span><span class="s1">index.step &lt; </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">slices = slices[::-</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s0">return </span><span class="s1">[int(math.ceil((</span><span class="s4">1.0 </span><span class="s1">* slc.stop - slc.start) / slc.step)) </span><span class="s0">for </span><span class="s1">slc </span><span class="s0">in </span><span class="s1">slices]</span>
+
+
+<span class="s0">def </span><span class="s1">replace_ellipsis(n</span><span class="s0">, </span><span class="s1">index):</span>
+    <span class="s2">&quot;&quot;&quot;Replace ... with slices, :, : ,: 
+ 
+    &gt;&gt;&gt; replace_ellipsis(4, (3, Ellipsis, 2)) 
+    (3, slice(None, None, None), slice(None, None, None), 2) 
+ 
+    &gt;&gt;&gt; replace_ellipsis(2, (Ellipsis, None)) 
+    (slice(None, None, None), slice(None, None, None), None) 
+    &quot;&quot;&quot;</span>
+    <span class="s5"># Careful about using in or index because index may contain arrays</span>
+    <span class="s1">isellipsis = [i </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">enumerate(index) </span><span class="s0">if </span><span class="s1">ind </span><span class="s0">is </span><span class="s1">Ellipsis]</span>
+    <span class="s0">if not </span><span class="s1">isellipsis:</span>
+        <span class="s0">return </span><span class="s1">index</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">loc = isellipsis[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s1">extra_dimensions = n - (len(index) - sum(i </span><span class="s0">is None for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">index) - </span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">(</span>
+        <span class="s1">index[:loc] + (slice(</span><span class="s0">None, None, None</span><span class="s1">)</span><span class="s0">,</span><span class="s1">) * extra_dimensions + index[loc + </span><span class="s4">1 </span><span class="s1">:]</span>
+    <span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">normalize_slice(idx</span><span class="s0">, </span><span class="s1">dim):</span>
+    <span class="s2">&quot;&quot;&quot;Normalize slices to canonical form 
+ 
+    Parameters 
+    ---------- 
+    idx: slice or other index 
+    dim: dimension length 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; normalize_slice(slice(0, 10, 1), 10) 
+    slice(None, None, None) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(idx</span><span class="s0">, </span><span class="s1">slice):</span>
+        <span class="s0">if </span><span class="s1">math.isnan(dim):</span>
+            <span class="s0">return </span><span class="s1">idx</span>
+        <span class="s1">start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step = idx.indices(dim)</span>
+        <span class="s0">if </span><span class="s1">step &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">start == </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">start = </span><span class="s0">None</span>
+            <span class="s0">if </span><span class="s1">stop &gt;= dim:</span>
+                <span class="s1">stop = </span><span class="s0">None</span>
+            <span class="s0">if </span><span class="s1">step == </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">step = </span><span class="s0">None</span>
+            <span class="s0">if </span><span class="s1">stop </span><span class="s0">is not None and </span><span class="s1">start </span><span class="s0">is not None and </span><span class="s1">stop &lt; start:</span>
+                <span class="s1">stop = start</span>
+        <span class="s0">elif </span><span class="s1">step &lt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">start &gt;= dim - </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">start = </span><span class="s0">None</span>
+            <span class="s0">if </span><span class="s1">stop &lt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">stop = </span><span class="s0">None</span>
+        <span class="s0">return </span><span class="s1">slice(start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step)</span>
+    <span class="s0">return </span><span class="s1">idx</span>
+
+
+<span class="s0">def </span><span class="s1">normalize_index(idx</span><span class="s0">, </span><span class="s1">shape):</span>
+    <span class="s2">&quot;&quot;&quot;Normalize slicing indexes 
+ 
+    1.  Replaces ellipses with many full slices 
+    2.  Adds full slices to end of index 
+    3.  Checks bounding conditions 
+    4.  Replace multidimensional numpy arrays with dask arrays 
+    5.  Replaces numpy arrays with lists 
+    6.  Posify's integers and lists 
+    7.  Normalizes slices to canonical form 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; normalize_index(1, (10,)) 
+    (1,) 
+    &gt;&gt;&gt; normalize_index(-1, (10,)) 
+    (9,) 
+    &gt;&gt;&gt; normalize_index([-1], (10,)) 
+    (array([9]),) 
+    &gt;&gt;&gt; normalize_index(slice(-3, 10, 1), (10,)) 
+    (slice(7, None, None),) 
+    &gt;&gt;&gt; normalize_index((Ellipsis, None), (10,)) 
+    (slice(None, None, None), None) 
+    &gt;&gt;&gt; normalize_index(np.array([[True, False], [False, True], [True, True]]), (3, 2)) 
+    (dask.array&lt;array, shape=(3, 2), dtype=bool, chunksize=(3, 2), chunktype=numpy.ndarray&gt;,) 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">Array</span><span class="s0">, </span><span class="s1">from_array</span>
+
+    <span class="s0">if not </span><span class="s1">isinstance(idx</span><span class="s0">, </span><span class="s1">tuple):</span>
+        <span class="s1">idx = (idx</span><span class="s0">,</span><span class="s1">)</span>
+
+    <span class="s5"># if a &gt; 1D numpy.array is provided, cast it to a dask array</span>
+    <span class="s0">if </span><span class="s1">len(idx) &gt; </span><span class="s4">0 </span><span class="s0">and </span><span class="s1">len(shape) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">i = idx[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">is_arraylike(i) </span><span class="s0">and not </span><span class="s1">isinstance(i</span><span class="s0">, </span><span class="s1">Array) </span><span class="s0">and </span><span class="s1">i.shape == shape:</span>
+            <span class="s1">idx = (from_array(i)</span><span class="s0">, </span><span class="s1">*idx[</span><span class="s4">1</span><span class="s1">:])</span>
+
+    <span class="s1">idx = replace_ellipsis(len(shape)</span><span class="s0">, </span><span class="s1">idx)</span>
+    <span class="s1">n_sliced_dims = </span><span class="s4">0</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">idx:</span>
+        <span class="s0">if </span><span class="s1">hasattr(i</span><span class="s0">, </span><span class="s3">&quot;ndim&quot;</span><span class="s1">) </span><span class="s0">and </span><span class="s1">i.ndim &gt;= </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">n_sliced_dims += i.ndim</span>
+        <span class="s0">elif </span><span class="s1">i </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">continue</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">n_sliced_dims += </span><span class="s4">1</span>
+
+    <span class="s1">idx = idx + (slice(</span><span class="s0">None</span><span class="s1">)</span><span class="s0">,</span><span class="s1">) * (len(shape) - n_sliced_dims)</span>
+    <span class="s0">if </span><span class="s1">len([i </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">idx </span><span class="s0">if </span><span class="s1">i </span><span class="s0">is not None</span><span class="s1">]) &gt; len(shape):</span>
+        <span class="s0">raise </span><span class="s1">IndexError(</span><span class="s3">&quot;Too many indices for array&quot;</span><span class="s1">)</span>
+
+    <span class="s1">none_shape = []</span>
+    <span class="s1">i = </span><span class="s4">0</span>
+    <span class="s0">for </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">idx:</span>
+        <span class="s0">if </span><span class="s1">ind </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">none_shape.append(shape[i])</span>
+            <span class="s1">i += </span><span class="s4">1</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">none_shape.append(</span><span class="s0">None</span><span class="s1">)</span>
+
+    <span class="s0">for </span><span class="s1">axis</span><span class="s0">, </span><span class="s1">(i</span><span class="s0">, </span><span class="s1">d) </span><span class="s0">in </span><span class="s1">enumerate(zip(idx</span><span class="s0">, </span><span class="s1">none_shape)):</span>
+        <span class="s0">if </span><span class="s1">d </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">check_index(axis</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s1">d)</span>
+    <span class="s1">idx = tuple(map(sanitize_index</span><span class="s0">, </span><span class="s1">idx))</span>
+    <span class="s1">idx = tuple(map(normalize_slice</span><span class="s0">, </span><span class="s1">idx</span><span class="s0">, </span><span class="s1">none_shape))</span>
+    <span class="s1">idx = posify_index(none_shape</span><span class="s0">, </span><span class="s1">idx)</span>
+    <span class="s0">return </span><span class="s1">idx</span>
+
+
+<span class="s0">def </span><span class="s1">check_index(axis</span><span class="s0">, </span><span class="s1">ind</span><span class="s0">, </span><span class="s1">dimension):</span>
+    <span class="s2">&quot;&quot;&quot;Check validity of index for a given dimension 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; check_index(0, 3, 5) 
+    &gt;&gt;&gt; check_index(0, 5, 5) 
+    Traceback (most recent call last): 
+    ... 
+    IndexError: Index 5 is out of bounds for axis 0 with size 5 
+ 
+    &gt;&gt;&gt; check_index(1, 6, 5) 
+    Traceback (most recent call last): 
+    ... 
+    IndexError: Index 6 is out of bounds for axis 1 with size 5 
+ 
+    &gt;&gt;&gt; check_index(1, -1, 5) 
+    &gt;&gt;&gt; check_index(1, -6, 5) 
+    Traceback (most recent call last): 
+    ... 
+    IndexError: Index -6 is out of bounds for axis 1 with size 5 
+ 
+    &gt;&gt;&gt; check_index(0, [1, 2], 5) 
+    &gt;&gt;&gt; check_index(0, [6, 3], 5) 
+    Traceback (most recent call last): 
+    ... 
+    IndexError: Index is out of bounds for axis 0 with size 5 
+ 
+    &gt;&gt;&gt; check_index(1, slice(0, 3), 5) 
+ 
+    &gt;&gt;&gt; check_index(0, [True], 1) 
+    &gt;&gt;&gt; check_index(0, [True, True], 3) 
+    Traceback (most recent call last): 
+    ... 
+    IndexError: Boolean array with size 2 is not long enough for axis 0 with size 3 
+    &gt;&gt;&gt; check_index(0, [True, True, True], 1) 
+    Traceback (most recent call last): 
+    ... 
+    IndexError: Boolean array with size 3 is not long enough for axis 0 with size 1 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">list):</span>
+        <span class="s1">ind = np.asanyarray(ind)</span>
+
+    <span class="s5"># unknown dimension, assumed to be in bounds</span>
+    <span class="s0">if </span><span class="s1">np.isnan(dimension):</span>
+        <span class="s0">return</span>
+    <span class="s0">elif </span><span class="s1">is_dask_collection(ind):</span>
+        <span class="s0">return</span>
+    <span class="s0">elif </span><span class="s1">is_arraylike(ind):</span>
+        <span class="s0">if </span><span class="s1">ind.dtype == bool:</span>
+            <span class="s0">if </span><span class="s1">ind.size != dimension:</span>
+                <span class="s0">raise </span><span class="s1">IndexError(</span>
+                    <span class="s3">f&quot;Boolean array with size </span><span class="s0">{</span><span class="s1">ind.size</span><span class="s0">} </span><span class="s3">is not long enough &quot;</span>
+                    <span class="s3">f&quot;for axis </span><span class="s0">{</span><span class="s1">axis</span><span class="s0">} </span><span class="s3">with size </span><span class="s0">{</span><span class="s1">dimension</span><span class="s0">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+        <span class="s0">elif </span><span class="s1">(ind &gt;= dimension).any() </span><span class="s0">or </span><span class="s1">(ind &lt; -dimension).any():</span>
+            <span class="s0">raise </span><span class="s1">IndexError(</span>
+                <span class="s3">f&quot;Index is out of bounds for axis </span><span class="s0">{</span><span class="s1">axis</span><span class="s0">} </span><span class="s3">with size </span><span class="s0">{</span><span class="s1">dimension</span><span class="s0">}</span><span class="s3">&quot;</span>
+            <span class="s1">)</span>
+    <span class="s0">elif </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">slice):</span>
+        <span class="s0">return</span>
+    <span class="s0">elif </span><span class="s1">ind </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">return</span>
+
+    <span class="s0">elif </span><span class="s1">ind &gt;= dimension </span><span class="s0">or </span><span class="s1">ind &lt; -dimension:</span>
+        <span class="s0">raise </span><span class="s1">IndexError(</span>
+            <span class="s3">f&quot;Index </span><span class="s0">{</span><span class="s1">ind</span><span class="s0">} </span><span class="s3">is out of bounds for axis </span><span class="s0">{</span><span class="s1">axis</span><span class="s0">} </span><span class="s3">with size </span><span class="s0">{</span><span class="s1">dimension</span><span class="s0">}</span><span class="s3">&quot;</span>
+        <span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">slice_with_int_dask_array(x</span><span class="s0">, </span><span class="s1">index):</span>
+    <span class="s2">&quot;&quot;&quot;Slice x with at most one 1D dask arrays of ints. 
+ 
+    This is a helper function of :meth:`Array.__getitem__`. 
+ 
+    Parameters 
+    ---------- 
+    x: Array 
+    index: tuple with as many elements as x.ndim, among which there are 
+           one or more Array's with dtype=int 
+ 
+    Returns 
+    ------- 
+    tuple of (sliced x, new index) 
+ 
+    where the new index is the same as the input, but with slice(None) 
+    replaced to the original slicer where a 1D filter has been applied and 
+    one less element where a zero-dimensional filter has been applied. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">Array</span>
+
+    <span class="s0">assert </span><span class="s1">len(index) == x.ndim</span>
+    <span class="s1">fancy_indexes = [</span>
+        <span class="s1">isinstance(idx</span><span class="s0">, </span><span class="s1">(tuple</span><span class="s0">, </span><span class="s1">list))</span>
+        <span class="s0">or </span><span class="s1">(isinstance(idx</span><span class="s0">, </span><span class="s1">(np.ndarray</span><span class="s0">, </span><span class="s1">Array)) </span><span class="s0">and </span><span class="s1">idx.ndim &gt; </span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s0">for </span><span class="s1">idx </span><span class="s0">in </span><span class="s1">index</span>
+    <span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">sum(fancy_indexes) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError(</span><span class="s3">&quot;Don't yet support nd fancy indexing&quot;</span><span class="s1">)</span>
+
+    <span class="s1">out_index = []</span>
+    <span class="s1">dropped_axis_cnt = </span><span class="s4">0</span>
+    <span class="s0">for </span><span class="s1">in_axis</span><span class="s0">, </span><span class="s1">idx </span><span class="s0">in </span><span class="s1">enumerate(index):</span>
+        <span class="s1">out_axis = in_axis - dropped_axis_cnt</span>
+        <span class="s0">if </span><span class="s1">isinstance(idx</span><span class="s0">, </span><span class="s1">Array) </span><span class="s0">and </span><span class="s1">idx.dtype.kind </span><span class="s0">in </span><span class="s3">&quot;iu&quot;</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">idx.ndim == </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">idx = idx[np.newaxis]</span>
+                <span class="s1">x = slice_with_int_dask_array_on_axis(x</span><span class="s0">, </span><span class="s1">idx</span><span class="s0">, </span><span class="s1">out_axis)</span>
+                <span class="s1">x = x[tuple(</span><span class="s4">0 </span><span class="s0">if </span><span class="s1">i == out_axis </span><span class="s0">else </span><span class="s1">slice(</span><span class="s0">None</span><span class="s1">) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(x.ndim))]</span>
+                <span class="s1">dropped_axis_cnt += </span><span class="s4">1</span>
+            <span class="s0">elif </span><span class="s1">idx.ndim == </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">x = slice_with_int_dask_array_on_axis(x</span><span class="s0">, </span><span class="s1">idx</span><span class="s0">, </span><span class="s1">out_axis)</span>
+                <span class="s1">out_index.append(slice(</span><span class="s0">None</span><span class="s1">))</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">NotImplementedError(</span>
+                    <span class="s3">&quot;Slicing with dask.array of ints only permitted when &quot;</span>
+                    <span class="s3">&quot;the indexer has zero or one dimensions&quot;</span>
+                <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">out_index.append(idx)</span>
+    <span class="s0">return </span><span class="s1">x</span><span class="s0">, </span><span class="s1">tuple(out_index)</span>
+
+
+<span class="s0">def </span><span class="s1">slice_with_int_dask_array_on_axis(x</span><span class="s0">, </span><span class="s1">idx</span><span class="s0">, </span><span class="s1">axis):</span>
+    <span class="s2">&quot;&quot;&quot;Slice a ND dask array with a 1D dask arrays of ints along the given 
+    axis. 
+ 
+    This is a helper function of :func:`slice_with_int_dask_array`. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask.array </span><span class="s0">import </span><span class="s1">chunk</span>
+    <span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">Array</span><span class="s0">, </span><span class="s1">blockwise</span><span class="s0">, </span><span class="s1">from_array</span>
+    <span class="s0">from </span><span class="s1">dask.array.utils </span><span class="s0">import </span><span class="s1">asarray_safe</span>
+
+    <span class="s0">assert </span><span class="s4">0 </span><span class="s1">&lt;= axis &lt; x.ndim</span>
+
+    <span class="s0">if </span><span class="s1">np.isnan(x.chunks[axis]).any():</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError(</span>
+            <span class="s3">&quot;Slicing an array with unknown chunks with &quot;</span>
+            <span class="s3">&quot;a dask.array of ints is not supported&quot;</span>
+        <span class="s1">)</span>
+
+    <span class="s5"># Calculate the offset at which each chunk starts along axis</span>
+    <span class="s5"># e.g. chunks=(..., (5, 3, 4), ...) -&gt; offset=[0, 5, 8]</span>
+    <span class="s1">offset = np.roll(np.cumsum(asarray_safe(x.chunks[axis]</span><span class="s0">, </span><span class="s1">like=x._meta))</span><span class="s0">, </span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">offset[</span><span class="s4">0</span><span class="s1">] = </span><span class="s4">0</span>
+    <span class="s1">offset = from_array(offset</span><span class="s0">, </span><span class="s1">chunks=</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s5"># Tamper with the declared chunks of offset to make blockwise align it with</span>
+    <span class="s5"># x[axis]</span>
+    <span class="s1">offset = Array(</span>
+        <span class="s1">offset.dask</span><span class="s0">, </span><span class="s1">offset.name</span><span class="s0">, </span><span class="s1">(x.chunks[axis]</span><span class="s0">,</span><span class="s1">)</span><span class="s0">, </span><span class="s1">offset.dtype</span><span class="s0">, </span><span class="s1">meta=x._meta</span>
+    <span class="s1">)</span>
+
+    <span class="s5"># Define axis labels for blockwise</span>
+    <span class="s1">x_axes = tuple(range(x.ndim))</span>
+    <span class="s1">idx_axes = (x.ndim</span><span class="s0">,</span><span class="s1">)  </span><span class="s5"># arbitrary index not already in x_axes</span>
+    <span class="s1">offset_axes = (axis</span><span class="s0">,</span><span class="s1">)</span>
+    <span class="s1">p_axes = x_axes[: axis + </span><span class="s4">1</span><span class="s1">] + idx_axes + x_axes[axis + </span><span class="s4">1 </span><span class="s1">:]</span>
+    <span class="s1">y_axes = x_axes[:axis] + idx_axes + x_axes[axis + </span><span class="s4">1 </span><span class="s1">:]</span>
+
+    <span class="s5"># Calculate the cartesian product of every chunk of x vs every chunk of idx</span>
+    <span class="s1">p = blockwise(</span>
+        <span class="s1">chunk.slice_with_int_dask_array</span><span class="s0">,</span>
+        <span class="s1">p_axes</span><span class="s0">,</span>
+        <span class="s1">x</span><span class="s0">,</span>
+        <span class="s1">x_axes</span><span class="s0">,</span>
+        <span class="s1">idx</span><span class="s0">,</span>
+        <span class="s1">idx_axes</span><span class="s0">,</span>
+        <span class="s1">offset</span><span class="s0">,</span>
+        <span class="s1">offset_axes</span><span class="s0">,</span>
+        <span class="s1">x_size=x.shape[axis]</span><span class="s0">,</span>
+        <span class="s1">axis=axis</span><span class="s0">,</span>
+        <span class="s1">dtype=x.dtype</span><span class="s0">,</span>
+        <span class="s1">meta=x._meta</span><span class="s0">,</span>
+    <span class="s1">)</span>
+
+    <span class="s5"># Aggregate on the chunks of x along axis</span>
+    <span class="s1">y = blockwise(</span>
+        <span class="s1">chunk.slice_with_int_dask_array_aggregate</span><span class="s0">,</span>
+        <span class="s1">y_axes</span><span class="s0">,</span>
+        <span class="s1">idx</span><span class="s0">,</span>
+        <span class="s1">idx_axes</span><span class="s0">,</span>
+        <span class="s1">p</span><span class="s0">,</span>
+        <span class="s1">p_axes</span><span class="s0">,</span>
+        <span class="s1">concatenate=</span><span class="s0">True,</span>
+        <span class="s1">x_chunks=x.chunks[axis]</span><span class="s0">,</span>
+        <span class="s1">axis=axis</span><span class="s0">,</span>
+        <span class="s1">dtype=x.dtype</span><span class="s0">,</span>
+        <span class="s1">meta=x._meta</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">y</span>
+
+
+<span class="s0">def </span><span class="s1">slice_with_bool_dask_array(x</span><span class="s0">, </span><span class="s1">index):</span>
+    <span class="s2">&quot;&quot;&quot;Slice x with one or more dask arrays of bools 
+ 
+    This is a helper function of `Array.__getitem__`. 
+ 
+    Parameters 
+    ---------- 
+    x: Array 
+    index: tuple with as many elements as x.ndim, among which there are 
+           one or more Array's with dtype=bool 
+ 
+    Returns 
+    ------- 
+    tuple of (sliced x, new index) 
+ 
+    where the new index is the same as the input, but with slice(None) 
+    replaced to the original slicer when a filter has been applied. 
+ 
+    Note: The sliced x will have nan chunks on the sliced axes. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">Array</span><span class="s0">, </span><span class="s1">blockwise</span><span class="s0">, </span><span class="s1">elemwise</span>
+
+    <span class="s1">out_index = [</span>
+        <span class="s1">slice(</span><span class="s0">None</span><span class="s1">) </span><span class="s0">if </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">Array) </span><span class="s0">and </span><span class="s1">ind.dtype == bool </span><span class="s0">else </span><span class="s1">ind</span>
+        <span class="s0">for </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">index</span>
+    <span class="s1">]</span>
+
+    <span class="s0">if </span><span class="s1">len(index) == </span><span class="s4">1 </span><span class="s0">and </span><span class="s1">index[</span><span class="s4">0</span><span class="s1">].ndim == x.ndim:</span>
+        <span class="s0">if not </span><span class="s1">np.isnan(x.shape).any() </span><span class="s0">and not </span><span class="s1">np.isnan(index[</span><span class="s4">0</span><span class="s1">].shape).any():</span>
+            <span class="s1">x = x.ravel()</span>
+            <span class="s1">index = tuple(i.ravel() </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">index)</span>
+        <span class="s0">elif </span><span class="s1">x.ndim &gt; </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">warnings.warn(</span>
+                <span class="s3">&quot;When slicing a Dask array of unknown chunks with a boolean mask &quot;</span>
+                <span class="s3">&quot;Dask array, the output array may have a different ordering &quot;</span>
+                <span class="s3">&quot;compared to the equivalent NumPy operation. This will raise an &quot;</span>
+                <span class="s3">&quot;error in a future release of Dask.&quot;</span><span class="s0">,</span>
+                <span class="s1">stacklevel=</span><span class="s4">3</span><span class="s0">,</span>
+            <span class="s1">)</span>
+        <span class="s1">y = elemwise(getitem</span><span class="s0">, </span><span class="s1">x</span><span class="s0">, </span><span class="s1">*index</span><span class="s0">, </span><span class="s1">dtype=x.dtype)</span>
+        <span class="s1">name = </span><span class="s3">&quot;getitem-&quot; </span><span class="s1">+ tokenize(x</span><span class="s0">, </span><span class="s1">index)</span>
+        <span class="s1">dsk = {(name</span><span class="s0">, </span><span class="s1">i): k </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">k </span><span class="s0">in </span><span class="s1">enumerate(core.flatten(y.__dask_keys__()))}</span>
+        <span class="s1">chunks = ((np.nan</span><span class="s0">,</span><span class="s1">) * y.npartitions</span><span class="s0">,</span><span class="s1">)</span>
+        <span class="s1">graph = HighLevelGraph.from_collections(name</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">dependencies=[y])</span>
+        <span class="s0">return </span><span class="s1">Array(graph</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">chunks</span><span class="s0">, </span><span class="s1">x.dtype)</span><span class="s0">, </span><span class="s1">out_index</span>
+
+    <span class="s0">if </span><span class="s1">any(</span>
+        <span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">Array) </span><span class="s0">and </span><span class="s1">ind.dtype == bool </span><span class="s0">and </span><span class="s1">ind.ndim != </span><span class="s4">1 </span><span class="s0">for </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">index</span>
+    <span class="s1">):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError(</span>
+            <span class="s3">&quot;Slicing with dask.array of bools only permitted when &quot;</span>
+            <span class="s3">&quot;the indexer has only one dimension or when &quot;</span>
+            <span class="s3">&quot;it has the same dimension as the sliced &quot;</span>
+            <span class="s3">&quot;array&quot;</span>
+        <span class="s1">)</span>
+    <span class="s1">indexes = [</span>
+        <span class="s1">ind </span><span class="s0">if </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">Array) </span><span class="s0">and </span><span class="s1">ind.dtype == bool </span><span class="s0">else </span><span class="s1">slice(</span><span class="s0">None</span><span class="s1">)</span>
+        <span class="s0">for </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">index</span>
+    <span class="s1">]</span>
+
+    <span class="s1">arginds = []</span>
+    <span class="s1">i = </span><span class="s4">0</span>
+    <span class="s0">for </span><span class="s1">ind </span><span class="s0">in </span><span class="s1">indexes:</span>
+        <span class="s0">if </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">Array) </span><span class="s0">and </span><span class="s1">ind.dtype == bool:</span>
+            <span class="s1">new = (ind</span><span class="s0">, </span><span class="s1">tuple(range(i</span><span class="s0">, </span><span class="s1">i + ind.ndim)))</span>
+            <span class="s1">i += x.ndim</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">new = (slice(</span><span class="s0">None</span><span class="s1">)</span><span class="s0">, None</span><span class="s1">)</span>
+            <span class="s1">i += </span><span class="s4">1</span>
+        <span class="s1">arginds.append(new)</span>
+
+    <span class="s1">arginds = list(concat(arginds))</span>
+
+    <span class="s1">out = blockwise(</span>
+        <span class="s1">getitem_variadic</span><span class="s0">,</span>
+        <span class="s1">tuple(range(x.ndim))</span><span class="s0">,</span>
+        <span class="s1">x</span><span class="s0">,</span>
+        <span class="s1">tuple(range(x.ndim))</span><span class="s0">,</span>
+        <span class="s1">*arginds</span><span class="s0">,</span>
+        <span class="s1">dtype=x.dtype</span><span class="s0">,</span>
+    <span class="s1">)</span>
+
+    <span class="s1">chunks = []</span>
+    <span class="s0">for </span><span class="s1">ind</span><span class="s0">, </span><span class="s1">chunk </span><span class="s0">in </span><span class="s1">zip(index</span><span class="s0">, </span><span class="s1">out.chunks):</span>
+        <span class="s0">if </span><span class="s1">isinstance(ind</span><span class="s0">, </span><span class="s1">Array) </span><span class="s0">and </span><span class="s1">ind.dtype == bool:</span>
+            <span class="s1">chunks.append((np.nan</span><span class="s0">,</span><span class="s1">) * len(chunk))</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">chunks.append(chunk)</span>
+    <span class="s1">out._chunks = tuple(chunks)</span>
+    <span class="s0">return </span><span class="s1">out</span><span class="s0">, </span><span class="s1">tuple(out_index)</span>
+
+
+<span class="s0">def </span><span class="s1">getitem_variadic(x</span><span class="s0">, </span><span class="s1">*index):</span>
+    <span class="s0">return </span><span class="s1">x[index]</span>
+
+
+<span class="s0">def </span><span class="s1">make_block_sorted_slices(index</span><span class="s0">, </span><span class="s1">chunks):</span>
+    <span class="s2">&quot;&quot;&quot;Generate blockwise-sorted index pairs for shuffling an array. 
+ 
+    Parameters 
+    ---------- 
+    index : ndarray 
+        An array of index positions. 
+    chunks : tuple 
+        Chunks from the original dask array 
+ 
+    Returns 
+    ------- 
+    index2 : ndarray 
+        Same values as `index`, but each block has been sorted 
+    index3 : ndarray 
+        The location of the values of `index` in `index2` 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; index = np.array([6, 0, 4, 2, 7, 1, 5, 3]) 
+    &gt;&gt;&gt; chunks = ((4, 4),) 
+    &gt;&gt;&gt; a, b = make_block_sorted_slices(index, chunks) 
+ 
+    Notice that the first set of 4 items are sorted, and the 
+    second set of 4 items are sorted. 
+ 
+    &gt;&gt;&gt; a 
+    array([0, 2, 4, 6, 1, 3, 5, 7]) 
+    &gt;&gt;&gt; b 
+    array([3, 0, 2, 1, 7, 4, 6, 5]) 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">slices_from_chunks</span>
+
+    <span class="s1">slices = slices_from_chunks(chunks)</span>
+
+    <span class="s0">if </span><span class="s1">len(slices[</span><span class="s4">0</span><span class="s1">]) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">slices = [slice_[</span><span class="s4">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">slice_ </span><span class="s0">in </span><span class="s1">slices]</span>
+
+    <span class="s1">offsets = np.roll(np.cumsum(chunks[</span><span class="s4">0</span><span class="s1">])</span><span class="s0">, </span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">offsets[</span><span class="s4">0</span><span class="s1">] = </span><span class="s4">0</span>
+
+    <span class="s1">index2 = np.empty_like(index)</span>
+    <span class="s1">index3 = np.empty_like(index)</span>
+
+    <span class="s0">for </span><span class="s1">slice_</span><span class="s0">, </span><span class="s1">offset </span><span class="s0">in </span><span class="s1">zip(slices</span><span class="s0">, </span><span class="s1">offsets):</span>
+        <span class="s1">a = index[slice_]</span>
+        <span class="s1">b = np.sort(a)</span>
+        <span class="s1">c = offset + np.argsort(b.take(np.argsort(a)))</span>
+        <span class="s1">index2[slice_] = b</span>
+        <span class="s1">index3[slice_] = c</span>
+
+    <span class="s0">return </span><span class="s1">index2</span><span class="s0">, </span><span class="s1">index3</span>
+
+
+<span class="s0">def </span><span class="s1">shuffle_slice(x</span><span class="s0">, </span><span class="s1">index):</span>
+    <span class="s2">&quot;&quot;&quot;A relatively efficient way to shuffle `x` according to `index`. 
+ 
+    Parameters 
+    ---------- 
+    x : Array 
+    index : ndarray 
+        This should be an ndarray the same length as `x` containing 
+        each index position in ``range(0, len(x))``. 
+ 
+    Returns 
+    ------- 
+    Array 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">PerformanceWarning</span>
+
+    <span class="s1">chunks1 = chunks2 = x.chunks</span>
+    <span class="s0">if </span><span class="s1">x.ndim &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">chunks1 = (chunks1[</span><span class="s4">0</span><span class="s1">]</span><span class="s0">,</span><span class="s1">)</span>
+    <span class="s1">index2</span><span class="s0">, </span><span class="s1">index3 = make_block_sorted_slices(index</span><span class="s0">, </span><span class="s1">chunks1)</span>
+    <span class="s0">with </span><span class="s1">warnings.catch_warnings():</span>
+        <span class="s1">warnings.simplefilter(</span><span class="s3">&quot;ignore&quot;</span><span class="s0">, </span><span class="s1">PerformanceWarning)</span>
+        <span class="s0">return </span><span class="s1">x[index2].rechunk(chunks2)[index3]</span>
+
+
+<span class="s0">def </span><span class="s1">parse_assignment_indices(indices</span><span class="s0">, </span><span class="s1">shape):</span>
+    <span class="s2">&quot;&quot;&quot;Reformat the indices for assignment. 
+ 
+    The aim of this is to convert the indices to a standardised form 
+    so that it is easier to ascertain which chunks are touched by the 
+    indices. 
+ 
+    This function is intended to be called by `setitem_array`. 
+ 
+    A slice object that is decreasing (i.e. with a negative step), is 
+    recast as an increasing slice (i.e. with a postive step. For 
+    example ``slice(7,3,-1)`` would be cast as ``slice(4,8,1)``. This 
+    is to facilitate finding which blocks are touched by the 
+    index. The dimensions for which this has occured are returned by 
+    the function. 
+ 
+    Parameters 
+    ---------- 
+    indices : numpy-style indices 
+        Indices to array defining the elements to be assigned. 
+    shape : sequence of `int` 
+        The shape of the array. 
+ 
+    Returns 
+    ------- 
+    parsed_indices : `list` 
+        The reformated indices that are equivalent to the input 
+        indices. 
+    implied_shape : `list` 
+        The shape implied by the parsed indices. For instance, indices 
+        of ``(slice(0,2), 5, [4,1,-1])`` will have implied shape 
+        ``[2,3]``. 
+    reverse : `list` 
+        The positions of the dimensions whose indices in the 
+        parsed_indices output are reversed slices. 
+    implied_shape_positions: `list` 
+        The positions of the dimensions whose indices contribute to 
+        the implied_shape. For instance, indices of ``(slice(0,2), 5, 
+        [4,1,-1])`` will have implied_shape ``[2,3]`` and 
+        implied_shape_positions ``[0,2]``. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; parse_assignment_indices((slice(1, -1),), (8,)) 
+    ([slice(1, 7, 1)], [6], [], [0]) 
+ 
+    &gt;&gt;&gt; parse_assignment_indices(([1, 2, 6, 5],), (8,)) 
+    ([array([1, 2, 6, 5])], [4], [], [0]) 
+ 
+    &gt;&gt;&gt; parse_assignment_indices((3, slice(-1, 2, -1)), (7, 8)) 
+    ([3, slice(3, 8, 1)], [5], [1], [1]) 
+ 
+    &gt;&gt;&gt; parse_assignment_indices((slice(-1, 2, -1), 3, [1, 2]), (7, 8, 9)) 
+    ([slice(3, 7, 1), 3, array([1, 2])], [4, 2], [0], [0, 2]) 
+ 
+    &gt;&gt;&gt; parse_assignment_indices((slice(0, 5), slice(3, None, 2)), (5, 4)) 
+    ([slice(0, 5, 1), slice(3, 4, 2)], [5, 1], [], [0, 1]) 
+ 
+    &gt;&gt;&gt; parse_assignment_indices((slice(0, 5), slice(3, 3, 2)), (5, 4)) 
+    ([slice(0, 5, 1), slice(3, 3, 2)], [5, 0], [], [0]) 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if not </span><span class="s1">isinstance(indices</span><span class="s0">, </span><span class="s1">tuple):</span>
+        <span class="s1">indices = (indices</span><span class="s0">,</span><span class="s1">)</span>
+
+    <span class="s5"># Disallow scalar boolean indexing, and also indexing by scalar</span>
+    <span class="s5"># numpy or dask array.</span>
+    <span class="s5">#</span>
+    <span class="s5"># numpy allows these, but Array.__getitem__ does not yet implement</span>
+    <span class="s5"># them properly, so disallow it for now in __setitem__</span>
+    <span class="s0">for </span><span class="s1">index </span><span class="s0">in </span><span class="s1">indices:</span>
+        <span class="s0">if </span><span class="s1">index </span><span class="s0">is True or </span><span class="s1">index </span><span class="s0">is False</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError(</span>
+                <span class="s3">&quot;dask does not yet implement assignment to a scalar &quot;</span>
+                <span class="s3">f&quot;boolean index: </span><span class="s0">{</span><span class="s1">index</span><span class="s0">!r}</span><span class="s3">&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">(is_arraylike(index) </span><span class="s0">or </span><span class="s1">is_dask_collection(index)) </span><span class="s0">and not </span><span class="s1">index.ndim:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError(</span>
+                <span class="s3">&quot;dask does not yet implement assignment to a scalar &quot;</span>
+                <span class="s3">f&quot;numpy or dask array index: </span><span class="s0">{</span><span class="s1">index</span><span class="s0">!r}</span><span class="s3">&quot;</span>
+            <span class="s1">)</span>
+
+    <span class="s5"># Inititalize output variables</span>
+    <span class="s1">implied_shape = []</span>
+    <span class="s1">implied_shape_positions = []</span>
+    <span class="s1">reverse = []</span>
+    <span class="s1">parsed_indices = list(normalize_index(indices</span><span class="s0">, </span><span class="s1">shape))</span>
+
+    <span class="s1">n_lists = </span><span class="s4">0</span>
+
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">(index</span><span class="s0">, </span><span class="s1">size) </span><span class="s0">in </span><span class="s1">enumerate(zip(parsed_indices</span><span class="s0">, </span><span class="s1">shape)):</span>
+        <span class="s1">is_slice = isinstance(index</span><span class="s0">, </span><span class="s1">slice)</span>
+        <span class="s0">if </span><span class="s1">is_slice:</span>
+            <span class="s5"># Index is a slice</span>
+            <span class="s1">start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step = index.indices(size)</span>
+            <span class="s0">if </span><span class="s1">step &lt; </span><span class="s4">0 </span><span class="s0">and </span><span class="s1">stop == -</span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">stop = </span><span class="s0">None</span>
+
+            <span class="s1">index = slice(start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step)</span>
+
+            <span class="s0">if </span><span class="s1">step &lt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s5"># When the slice step is negative, transform the</span>
+                <span class="s5"># original slice to a new slice with a positive step</span>
+                <span class="s5"># such that the result of the new slice is the reverse</span>
+                <span class="s5"># of the result of the original slice.</span>
+                <span class="s5">#</span>
+                <span class="s5"># For example, if the original slice is slice(6,0,-2)</span>
+                <span class="s5"># then the new slice will be slice(2,7,2).</span>
+                <span class="s5">#</span>
+                <span class="s5"># &gt;&gt;&gt; a = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]</span>
+                <span class="s5"># &gt;&gt;&gt; a[slice(6, 0, -2)]</span>
+                <span class="s5"># [6, 4, 2]</span>
+                <span class="s5"># &gt;&gt;&gt; a[slice(2, 7, 2)]</span>
+                <span class="s5"># [2, 4, 6]</span>
+                <span class="s5"># &gt;&gt;&gt; a[slice(6, 0, -2)] == list(reversed(a[slice(2, 7, 2)]))</span>
+                <span class="s5"># True</span>
+                <span class="s1">start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step = index.indices(size)</span>
+                <span class="s1">step *= -</span><span class="s4">1</span>
+                <span class="s1">div</span><span class="s0">, </span><span class="s1">mod = divmod(start - stop - </span><span class="s4">1</span><span class="s0">, </span><span class="s1">step)</span>
+                <span class="s1">div_step = div * step</span>
+                <span class="s1">start -= div_step</span>
+                <span class="s1">stop = start + div_step + </span><span class="s4">1</span>
+
+                <span class="s1">index = slice(start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step)</span>
+                <span class="s1">reverse.append(i)</span>
+
+            <span class="s1">start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step = index.indices(size)</span>
+
+            <span class="s5"># Note: We now have stop &gt;= start and step &gt;= 0</span>
+
+            <span class="s1">div</span><span class="s0">, </span><span class="s1">mod = divmod(stop - start</span><span class="s0">, </span><span class="s1">step)</span>
+            <span class="s0">if not </span><span class="s1">div </span><span class="s0">and not </span><span class="s1">mod:</span>
+                <span class="s5"># stop equals start =&gt; zero-sized slice for this</span>
+                <span class="s5"># dimension</span>
+                <span class="s1">implied_shape.append(</span><span class="s4">0</span><span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">if </span><span class="s1">mod != </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">div += </span><span class="s4">1</span>
+
+                <span class="s1">implied_shape.append(div)</span>
+                <span class="s1">implied_shape_positions.append(i)</span>
+
+        <span class="s0">elif </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">(int</span><span class="s0">, </span><span class="s1">np.integer)):</span>
+            <span class="s5"># Index is an integer</span>
+            <span class="s1">index = int(index)</span>
+
+        <span class="s0">elif </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">np.ndarray) </span><span class="s0">or </span><span class="s1">is_dask_collection(index):</span>
+            <span class="s5"># Index is 1-d array</span>
+            <span class="s1">n_lists += </span><span class="s4">1</span>
+            <span class="s0">if </span><span class="s1">n_lists &gt; </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">NotImplementedError(</span>
+                    <span class="s3">&quot;dask is currently limited to at most one &quot;</span>
+                    <span class="s3">&quot;dimension's assignment index being a &quot;</span>
+                    <span class="s3">&quot;1-d array of integers or booleans. &quot;</span>
+                    <span class="s3">f&quot;Got: </span><span class="s0">{</span><span class="s1">indices</span><span class="s0">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+
+            <span class="s0">if </span><span class="s1">index.ndim != </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">IndexError(</span>
+                    <span class="s3">f&quot;Incorrect shape (</span><span class="s0">{</span><span class="s1">index.shape</span><span class="s0">}</span><span class="s3">) of integer &quot;</span>
+                    <span class="s3">f&quot;indices for dimension with size </span><span class="s0">{</span><span class="s1">size</span><span class="s0">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+
+            <span class="s1">index_size = index.size</span>
+            <span class="s0">if </span><span class="s1">(</span>
+                <span class="s1">index.dtype == bool</span>
+                <span class="s0">and not </span><span class="s1">math.isnan(index_size)</span>
+                <span class="s0">and </span><span class="s1">index_size != size</span>
+            <span class="s1">):</span>
+                <span class="s0">raise </span><span class="s1">IndexError(</span>
+                    <span class="s3">&quot;boolean index did not match indexed array along &quot;</span>
+                    <span class="s3">f&quot;dimension </span><span class="s0">{</span><span class="s1">i</span><span class="s0">}</span><span class="s3">; dimension is </span><span class="s0">{</span><span class="s1">size</span><span class="s0">} </span><span class="s3">but &quot;</span>
+                    <span class="s3">f&quot;corresponding boolean dimension is </span><span class="s0">{</span><span class="s1">index_size</span><span class="s0">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+
+            <span class="s5"># Posify an integer dask array (integer numpy arrays were</span>
+            <span class="s5"># posified in `normalize_index`)</span>
+            <span class="s0">if </span><span class="s1">is_dask_collection(index):</span>
+                <span class="s0">if </span><span class="s1">index.dtype == bool:</span>
+                    <span class="s1">index_size = np.nan</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">index = np.where(index &lt; </span><span class="s4">0</span><span class="s0">, </span><span class="s1">index + size</span><span class="s0">, </span><span class="s1">index)</span>
+
+            <span class="s1">implied_shape.append(index_size)</span>
+            <span class="s1">implied_shape_positions.append(i)</span>
+
+        <span class="s1">parsed_indices[i] = index</span>
+
+    <span class="s0">return </span><span class="s1">parsed_indices</span><span class="s0">, </span><span class="s1">implied_shape</span><span class="s0">, </span><span class="s1">reverse</span><span class="s0">, </span><span class="s1">implied_shape_positions</span>
+
+
+<span class="s0">def </span><span class="s1">concatenate_array_chunks(x):</span>
+    <span class="s2">&quot;&quot;&quot;Concatenate the multidimensional chunks of an array. 
+ 
+    Can be used on chunks with unknown sizes. 
+ 
+    Parameters 
+    ---------- 
+    x : dask array 
+ 
+    Returns 
+    ------- 
+    dask array 
+        The concatenated dask array with one chunk. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">Array</span><span class="s0">, </span><span class="s1">concatenate3</span>
+
+    <span class="s0">if </span><span class="s1">x.npartitions == </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">x</span>
+
+    <span class="s1">name = </span><span class="s3">&quot;concatenate3-&quot; </span><span class="s1">+ tokenize(x)</span>
+    <span class="s1">d = {(name</span><span class="s0">, </span><span class="s4">0</span><span class="s1">): (concatenate3</span><span class="s0">, </span><span class="s1">x.__dask_keys__())}</span>
+    <span class="s1">graph = HighLevelGraph.from_collections(name</span><span class="s0">, </span><span class="s1">d</span><span class="s0">, </span><span class="s1">dependencies=[x])</span>
+    <span class="s1">chunks = x.shape</span>
+    <span class="s0">if not </span><span class="s1">chunks:</span>
+        <span class="s1">chunks = (</span><span class="s4">1</span><span class="s0">,</span><span class="s1">)</span>
+
+    <span class="s0">return </span><span class="s1">Array(graph</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">chunks=(chunks</span><span class="s0">,</span><span class="s1">)</span><span class="s0">, </span><span class="s1">dtype=x.dtype)</span>
+
+
+<span class="s0">def </span><span class="s1">setitem_array(out_name</span><span class="s0">, </span><span class="s1">array</span><span class="s0">, </span><span class="s1">indices</span><span class="s0">, </span><span class="s1">value):</span>
+    <span class="s2">&quot;&quot;&quot;Master function for array assignment. 
+ 
+    This function, that is intended to be called by 
+    `Array.__setitem__`, creates a new dask that assigns values to 
+    each block that is touched by the indices, leaving other blocks 
+    unchanged. 
+ 
+    Each block that overlaps the indices is assigned from the 
+    approriate part of the assignment value. The dasks of these value 
+    parts are included in the output dask dictionary, as are the dasks 
+    of any 1-d dask array indices. This ensures that the dask array 
+    assignment value and any dask array indices are not computed until 
+    the `Array.__setitem__` operation is computed. 
+ 
+    The part of the assignment value applies to block is created as a 
+    &quot;getitem&quot; slice of the full asignment value. 
+ 
+    Parameters 
+    ---------- 
+    out_name : `str` 
+        The dask variable output name. 
+    array : dask array 
+        The dask array that is being assigned to. 
+    indices : numpy-style indices 
+        Indices to array defining the elements to be assigned. 
+    value : dask array 
+        The assignment value, i.e. the values which will be assigned 
+        to elements of array. 
+ 
+    Returns 
+    ------- 
+    dsk : `dict` 
+        A dictionary where the keys are new unique tokens for each 
+        block of the form 
+ 
+            (out_name, dim_index[, dim_index[, ...]]) 
+ 
+       and the values are either 
+ 
+            (key,) 
+ 
+        or 
+ 
+            (setitem, key, v_key, block_indices) 
+ 
+        where key is an existing top-level dask key of array. 
+ 
+        The first case occurs when the block represented by key does 
+        not overlap the indices. 
+ 
+        The second case occurs when the block represented by key does 
+        overlap the indices. setitem is the chunk assignment function; 
+        v_key is the dask key of the the part of the assignment value 
+        that corresponds to the block; and block_indices are the 
+        assigment indices that apply to the block. 
+ 
+        The dictionary also includes any additional key/value pairs 
+        needed to define v_key, as well as any any additional 
+        key/value pairs needed to define dask keys contained in the 
+        block_indices list as references to dask array indices. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">@functools.lru_cache</span>
+    <span class="s0">def </span><span class="s1">block_index_from_1d_index(dim</span><span class="s0">, </span><span class="s1">loc0</span><span class="s0">, </span><span class="s1">loc1</span><span class="s0">, </span><span class="s1">is_bool):</span>
+        <span class="s2">&quot;&quot;&quot;The positions of index elements in the range values loc0 and loc1. 
+ 
+        The index is the input assignment index that is defined in the 
+        namespace of the caller. It is assumed that negative elements 
+        of an integer array have already been posified. 
+ 
+        The non-hashable dsk is the output dask dictionary that is 
+        defined in the namespace of the caller. 
+ 
+        Parameters 
+        ---------- 
+        dim : `int` 
+           The dimension position of the index that is used as a proxy 
+           for the non-hashable index to define the LRU cache key. 
+        loc0 : `int` 
+            The start index of the block along the dimension. 
+        loc1 : `int` 
+            The stop index of the block along the dimension. 
+        is_bool : `bool` 
+            Whether or not the index is of boolean data type. 
+ 
+        Returns 
+        ------- 
+        numpy array or `str` 
+            If index is a numpy array then a numpy array is 
+            returned. 
+ 
+            If index is a dask array then the dask of the block index 
+            is inserted into the output dask dictionary, and its 
+            unique top-layer key is returned. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">is_bool:</span>
+            <span class="s5"># Boolean array (dask or numpy)</span>
+            <span class="s1">i = index[loc0:loc1]</span>
+        <span class="s0">elif </span><span class="s1">is_dask_collection(index):</span>
+            <span class="s5"># Integer dask array</span>
+            <span class="s5">#</span>
+            <span class="s5"># Check for values in [loc0,loc1).</span>
+            <span class="s5">#</span>
+            <span class="s5"># Use the 3-argument &quot;where&quot; to insert place-holder</span>
+            <span class="s5"># elements that will be searched for and removed in the</span>
+            <span class="s5"># `setitem` function at compute time. The place-holder</span>
+            <span class="s5"># value must be the size of the block, i.e. loc1-loc0. We</span>
+            <span class="s5"># can't use a 1-argument &quot;where&quot; here because that won't</span>
+            <span class="s5"># work if index has unknown chunk sizes.</span>
+            <span class="s1">i = np.where((loc0 &lt;= index) &amp; (index &lt; loc1)</span><span class="s0">, </span><span class="s1">index</span><span class="s0">, </span><span class="s1">loc1)</span>
+            <span class="s1">i -= loc0</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s5"># Integer numpy array</span>
+            <span class="s5">#</span>
+            <span class="s5"># Check for positive values in [loc0,loc1).</span>
+            <span class="s1">i = np.where((loc0 &lt;= index) &amp; (index &lt; loc1))[</span><span class="s4">0</span><span class="s1">]</span>
+            <span class="s1">i = index[i] - loc0</span>
+
+        <span class="s0">if </span><span class="s1">is_dask_collection(i):</span>
+            <span class="s5"># Return dask key intead of dask array</span>
+            <span class="s1">i = concatenate_array_chunks(i)</span>
+            <span class="s1">dsk.update(dict(i.dask))</span>
+            <span class="s1">i = next(flatten(i.__dask_keys__()))</span>
+
+        <span class="s0">return </span><span class="s1">i</span>
+
+    <span class="s1">@functools.lru_cache</span>
+    <span class="s0">def </span><span class="s1">block_index_shape_from_1d_bool_index(dim</span><span class="s0">, </span><span class="s1">loc0</span><span class="s0">, </span><span class="s1">loc1):</span>
+        <span class="s2">&quot;&quot;&quot;Number of True index elements between positions loc0 and loc1. 
+ 
+        The index is the input assignment index that is defined in the 
+        namespace of the caller. 
+ 
+        Parameters 
+        ---------- 
+        dim : `int` 
+           The dimension position of the index that is used as a proxy 
+           for the non-hashable index to define the LRU cache key. 
+        loc0 : `int` 
+            The start index of the block along the dimension. 
+        loc1 : `int` 
+            The stop index of the block along the dimension. 
+ 
+        Returns 
+        ------- 
+        numpy array or dask array 
+            If index is a numpy array then a numpy array is 
+            returned. 
+ 
+            If index is dask array then a dask array is returned. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">np.sum(index[loc0:loc1])</span>
+
+    <span class="s1">@functools.lru_cache</span>
+    <span class="s0">def </span><span class="s1">n_preceeding_from_1d_bool_index(dim</span><span class="s0">, </span><span class="s1">loc0):</span>
+        <span class="s2">&quot;&quot;&quot;Number of True index elements preceeding position loc0. 
+ 
+        The index is the input assignment index that is defined in the 
+        namespace of the caller. 
+ 
+        Parameters 
+        ---------- 
+        dim : `int` 
+           The dimension position of the index that is used as a proxy 
+           for the non-hashable index to define the LRU cache key. 
+        loc0 : `int` 
+            The start index of the block along the dimension. 
+ 
+        Returns 
+        ------- 
+        numpy array or dask array 
+            If index is a numpy array then a numpy array is 
+            returned. 
+ 
+            If index is dask array then a dask array is returned. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">np.sum(index[:loc0])</span>
+
+    <span class="s1">@functools.lru_cache</span>
+    <span class="s0">def </span><span class="s1">value_indices_from_1d_int_index(dim</span><span class="s0">, </span><span class="s1">vsize</span><span class="s0">, </span><span class="s1">loc0</span><span class="s0">, </span><span class="s1">loc1):</span>
+        <span class="s2">&quot;&quot;&quot;Value indices for index elements between loc0 and loc1. 
+ 
+        The index is the input assignment index that is defined in the 
+        namespace of the caller. It is assumed that negative elements 
+        have already been posified. 
+ 
+        Parameters 
+        ---------- 
+        dim : `int` 
+           The dimension position of the index that is used as a proxy 
+           for the non-hashable index to define the LRU cache key. 
+        vsize : `int` 
+            The full size of the dimension of the assignment value. 
+        loc0 : `int` 
+            The start index of the block along the dimension. 
+        loc1 : `int` 
+            The stop index of the block along the dimension. 
+ 
+        Returns 
+        ------- 
+        numpy array or dask array 
+            If index is a numpy array then a numpy array is 
+            returned. 
+ 
+            If index is dask array then a dask array is returned. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># Check for values in [loc0,loc1)</span>
+        <span class="s0">if </span><span class="s1">is_dask_collection(index):</span>
+            <span class="s0">if </span><span class="s1">np.isnan(index.size):</span>
+                <span class="s5"># Integer dask array with unknown size.</span>
+                <span class="s5">#</span>
+                <span class="s5"># The 1-argument &quot;where&quot; won't work, so use the</span>
+                <span class="s5"># 3-argument &quot;where&quot; and convert to a boolean</span>
+                <span class="s5"># array. We concatenate the resulting boolean index</span>
+                <span class="s5"># and set the chunk size (which must be the full size</span>
+                <span class="s5"># of the dimension of the assignment value) which</span>
+                <span class="s5"># allows the returned array to be used as a</span>
+                <span class="s5"># __getitem__ index to the assignment value.</span>
+                <span class="s1">i = np.where((loc0 &lt;= index) &amp; (index &lt; loc1)</span><span class="s0">, True, False</span><span class="s1">)</span>
+                <span class="s1">i = concatenate_array_chunks(i)</span>
+                <span class="s1">i._chunks = ((vsize</span><span class="s0">,</span><span class="s1">)</span><span class="s0">,</span><span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s5"># Integer dask array with known size</span>
+                <span class="s1">i = np.where((loc0 &lt;= index) &amp; (index &lt; loc1))[</span><span class="s4">0</span><span class="s1">]</span>
+                <span class="s1">i = concatenate_array_chunks(i)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s5"># Integer numpy array.</span>
+            <span class="s1">i = np.where((loc0 &lt;= index) &amp; (index &lt; loc1))[</span><span class="s4">0</span><span class="s1">]</span>
+
+        <span class="s0">return </span><span class="s1">i</span>
+
+    <span class="s0">from </span><span class="s1">dask.core </span><span class="s0">import </span><span class="s1">flatten</span>
+
+    <span class="s1">array_shape = array.shape</span>
+    <span class="s1">value_shape = value.shape</span>
+    <span class="s1">value_ndim = len(value_shape)</span>
+
+    <span class="s5"># Reformat input indices</span>
+    <span class="s1">indices</span><span class="s0">, </span><span class="s1">implied_shape</span><span class="s0">, </span><span class="s1">reverse</span><span class="s0">, </span><span class="s1">implied_shape_positions = parse_assignment_indices(</span>
+        <span class="s1">indices</span><span class="s0">, </span><span class="s1">array_shape</span>
+    <span class="s1">)</span>
+
+    <span class="s5"># Empty slices can only be assigned size 1 values</span>
+    <span class="s0">if </span><span class="s4">0 </span><span class="s0">in </span><span class="s1">implied_shape </span><span class="s0">and </span><span class="s1">value_shape </span><span class="s0">and </span><span class="s1">max(value_shape) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s3">f&quot;shape mismatch: value array of shape </span><span class="s0">{</span><span class="s1">value_shape</span><span class="s0">} </span><span class="s3">&quot;</span>
+            <span class="s3">&quot;could not be broadcast to indexing result &quot;</span>
+            <span class="s3">f&quot;of shape </span><span class="s0">{</span><span class="s1">tuple(implied_shape)</span><span class="s0">}</span><span class="s3">&quot;</span>
+        <span class="s1">)</span>
+
+    <span class="s5"># Set variables needed when creating the part of the assignment</span>
+    <span class="s5"># value that applies to each block.</span>
+    <span class="s5">#</span>
+    <span class="s5">#  offset: The additive offset to the assignment value dimension</span>
+    <span class="s5">#          positions that results in the positions of the</span>
+    <span class="s5">#          corresponding dimensions in the array. offset is a</span>
+    <span class="s5">#          non-negative integer, and a positive value means that</span>
+    <span class="s5">#          the array has more dimensions than the assignment</span>
+    <span class="s5">#          value.</span>
+    <span class="s5">#</span>
+    <span class="s5">#  value_offset: The additive offset to the array dimension</span>
+    <span class="s5">#                positions that results in the positions of the</span>
+    <span class="s5">#                corresponding dimensions in the assignment</span>
+    <span class="s5">#                value. value_offset is a non-negative integer,</span>
+    <span class="s5">#                and a positive value means that the assignment</span>
+    <span class="s5">#                value has more dimensions than the array.</span>
+    <span class="s5">#</span>
+    <span class="s5">#          For example:</span>
+    <span class="s5">#</span>
+    <span class="s5">#          array.shape   value.shape   offset  value_offset</span>
+    <span class="s5">#          ------------  ------------  ------  ------------</span>
+    <span class="s5">#          (3, 4)        (3, 4)        0       0</span>
+    <span class="s5">#          (1, 1, 3, 4)  (3, 4)        2       0</span>
+    <span class="s5">#          (3, 4)        (1, 1, 3, 4)  0       2</span>
+    <span class="s5">#          ------------  ------------  ------  ------------</span>
+    <span class="s5">#</span>
+    <span class="s5">#  array_common_shape: The shape of those dimensions of array</span>
+    <span class="s5">#                      which correspond to dimensions of the</span>
+    <span class="s5">#                      assignment value.</span>
+    <span class="s5">#</span>
+    <span class="s5">#  value_common_shape: The shape of those dimensions of the</span>
+    <span class="s5">#                      assignment value which correspond to</span>
+    <span class="s5">#                      dimensions of the array.</span>
+    <span class="s5">#</span>
+    <span class="s5">#  base_value_indices: The indices used for initialising the</span>
+    <span class="s5">#                      selection of the part of the assignment</span>
+    <span class="s5">#                      value that applies to each block of</span>
+    <span class="s5">#                      array. An element of `None` will end up</span>
+    <span class="s5">#                      being replaced by an appropriate slice on a</span>
+    <span class="s5">#                      block-by-block basis.</span>
+    <span class="s5">#</span>
+    <span class="s5"># non_broadcast_dimensions: The integer positions of</span>
+    <span class="s5">#                           array_common_shape which do not</span>
+    <span class="s5">#                           correspond to broadcast dimensions in</span>
+    <span class="s5">#                           the assignment value.</span>
+    <span class="s5">#</span>
+    <span class="s5"># Note that array_common_shape and value_common_shape may be</span>
+    <span class="s5"># different if there are any size 1 dimensions being brodacast.</span>
+    <span class="s1">offset = len(implied_shape) - value_ndim</span>
+    <span class="s0">if </span><span class="s1">offset &gt;= </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s5"># The array has the same number or more dimensions than the</span>
+        <span class="s5"># assignment value</span>
+        <span class="s1">array_common_shape = implied_shape[offset:]</span>
+        <span class="s1">value_common_shape = value_shape</span>
+        <span class="s1">value_offset = </span><span class="s4">0</span>
+        <span class="s1">reverse = [i - offset </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">reverse </span><span class="s0">if </span><span class="s1">i &gt;= offset]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s5"># The assigmment value has more dimensions than the array</span>
+        <span class="s1">value_offset = -offset</span>
+        <span class="s1">array_common_shape = implied_shape</span>
+        <span class="s1">value_common_shape = value_shape[value_offset:]</span>
+        <span class="s1">offset = </span><span class="s4">0</span>
+
+        <span class="s5"># All of the extra leading dimensions must have size 1</span>
+        <span class="s0">if </span><span class="s1">value_shape[:value_offset] != (</span><span class="s4">1</span><span class="s0">,</span><span class="s1">) * value_offset:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">&quot;could not broadcast input array from shape&quot;</span>
+                <span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">value_shape</span><span class="s0">} </span><span class="s3">into shape </span><span class="s0">{</span><span class="s1">tuple(implied_shape)</span><span class="s0">}</span><span class="s3">&quot;</span>
+            <span class="s1">)</span>
+
+    <span class="s1">base_value_indices = []</span>
+    <span class="s1">non_broadcast_dimensions = []</span>
+
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">(a</span><span class="s0">, </span><span class="s1">b</span><span class="s0">, </span><span class="s1">j) </span><span class="s0">in </span><span class="s1">enumerate(</span>
+        <span class="s1">zip(array_common_shape</span><span class="s0">, </span><span class="s1">value_common_shape</span><span class="s0">, </span><span class="s1">implied_shape_positions)</span>
+    <span class="s1">):</span>
+        <span class="s1">index = indices[j]</span>
+        <span class="s0">if </span><span class="s1">is_dask_collection(index) </span><span class="s0">and </span><span class="s1">index.dtype == bool:</span>
+            <span class="s0">if </span><span class="s1">math.isnan(b) </span><span class="s0">or </span><span class="s1">b &lt;= index.size:</span>
+                <span class="s1">base_value_indices.append(</span><span class="s0">None</span><span class="s1">)</span>
+                <span class="s1">non_broadcast_dimensions.append(i)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">f&quot;shape mismatch: value array dimension size of </span><span class="s0">{</span><span class="s1">b</span><span class="s0">} </span><span class="s3">is &quot;</span>
+                    <span class="s3">&quot;greater then corresponding boolean index size of &quot;</span>
+                    <span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">index.size</span><span class="s0">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+
+            <span class="s0">continue</span>
+
+        <span class="s0">if </span><span class="s1">b == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">base_value_indices.append(slice(</span><span class="s0">None</span><span class="s1">))</span>
+        <span class="s0">elif </span><span class="s1">a == b:</span>
+            <span class="s1">base_value_indices.append(</span><span class="s0">None</span><span class="s1">)</span>
+            <span class="s1">non_broadcast_dimensions.append(i)</span>
+        <span class="s0">elif </span><span class="s1">math.isnan(a):</span>
+            <span class="s1">base_value_indices.append(</span><span class="s0">None</span><span class="s1">)</span>
+            <span class="s1">non_broadcast_dimensions.append(i)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">f&quot;shape mismatch: value array of shape </span><span class="s0">{</span><span class="s1">value_shape</span><span class="s0">} </span><span class="s3">&quot;</span>
+                <span class="s3">&quot;could not be broadcast to indexing result of shape &quot;</span>
+                <span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">tuple(implied_shape)</span><span class="s0">}</span><span class="s3">&quot;</span>
+            <span class="s1">)</span>
+
+    <span class="s5"># Translate chunks tuple to a set of array locations in product</span>
+    <span class="s5"># order</span>
+    <span class="s1">chunks = array.chunks</span>
+    <span class="s1">cumdims = [cached_cumsum(bds</span><span class="s0">, </span><span class="s1">initial_zero=</span><span class="s0">True</span><span class="s1">) </span><span class="s0">for </span><span class="s1">bds </span><span class="s0">in </span><span class="s1">chunks]</span>
+    <span class="s1">array_locations = [</span>
+        <span class="s1">[(s</span><span class="s0">, </span><span class="s1">s + dim) </span><span class="s0">for </span><span class="s1">s</span><span class="s0">, </span><span class="s1">dim </span><span class="s0">in </span><span class="s1">zip(starts</span><span class="s0">, </span><span class="s1">shapes)]</span>
+        <span class="s0">for </span><span class="s1">starts</span><span class="s0">, </span><span class="s1">shapes </span><span class="s0">in </span><span class="s1">zip(cumdims</span><span class="s0">, </span><span class="s1">chunks)</span>
+    <span class="s1">]</span>
+    <span class="s1">array_locations = product(*array_locations)</span>
+
+    <span class="s5"># Get the dask keys of the most recent layer in the same order as</span>
+    <span class="s5"># the array locations.</span>
+    <span class="s1">in_keys = list(flatten(array.__dask_keys__()))</span>
+
+    <span class="s5"># Create a new &quot;setitem&quot; dask entry for each block in the array</span>
+    <span class="s1">dsk = {}</span>
+    <span class="s1">out_name = (out_name</span><span class="s0">,</span><span class="s1">)</span>
+    <span class="s0">for </span><span class="s1">in_key</span><span class="s0">, </span><span class="s1">locations </span><span class="s0">in </span><span class="s1">zip(in_keys</span><span class="s0">, </span><span class="s1">array_locations):</span>
+        <span class="s5"># Now loop round each block dimension.</span>
+        <span class="s5">#</span>
+        <span class="s5"># If the block overlaps the indices then set the following</span>
+        <span class="s5"># (which will be used to define a new dask entry):</span>
+        <span class="s5">#</span>
+        <span class="s5"># block_indices: The indices that will be used to assign to</span>
+        <span class="s5">#                this block.</span>
+        <span class="s5">#</span>
+        <span class="s5"># block_indices_shape: The shape implied by block_indices.</span>
+        <span class="s5">#</span>
+        <span class="s5"># block_preceeding_sizes: How many assigned elements precede</span>
+        <span class="s5">#                         this block along each dimension that</span>
+        <span class="s5">#                         doesn't have an integer. It is</span>
+        <span class="s5">#                         assumed that a slice will have a</span>
+        <span class="s5">#                         positive step, as will be the case</span>
+        <span class="s5">#                         for reformatted indices. `None` is</span>
+        <span class="s5">#                         used for dimensions with 1-d integer</span>
+        <span class="s5">#                         arrays.</span>
+        <span class="s1">block_indices = []</span>
+        <span class="s1">block_indices_shape = []</span>
+        <span class="s1">block_preceeding_sizes = []</span>
+
+        <span class="s1">local_offset = offset</span>
+
+        <span class="s5"># Assume, until demonstrated otherwise, that this block</span>
+        <span class="s5"># overlaps the assignment indices.</span>
+        <span class="s1">overlaps = </span><span class="s0">True</span>
+
+        <span class="s5"># Note which dimension, if any, has 1-d integer array index</span>
+        <span class="s1">dim_1d_int_index = </span><span class="s0">None</span>
+
+        <span class="s0">for </span><span class="s1">dim</span><span class="s0">, </span><span class="s1">(index</span><span class="s0">, </span><span class="s1">(loc0</span><span class="s0">, </span><span class="s1">loc1)) </span><span class="s0">in </span><span class="s1">enumerate(zip(indices</span><span class="s0">, </span><span class="s1">locations)):</span>
+            <span class="s1">integer_index = isinstance(index</span><span class="s0">, </span><span class="s1">int)</span>
+            <span class="s0">if </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">slice):</span>
+                <span class="s5"># Index is a slice</span>
+                <span class="s1">stop = loc1 - loc0</span>
+                <span class="s0">if </span><span class="s1">index.stop &lt; loc1:</span>
+                    <span class="s1">stop -= loc1 - index.stop</span>
+
+                <span class="s1">start = index.start - loc0</span>
+                <span class="s0">if </span><span class="s1">start &lt; </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s5"># Make start positive</span>
+                    <span class="s1">start %= index.step</span>
+
+                <span class="s0">if </span><span class="s1">start &gt;= stop:</span>
+                    <span class="s5"># This block does not overlap the slice index</span>
+                    <span class="s1">overlaps = </span><span class="s0">False</span>
+                    <span class="s0">break</span>
+
+                <span class="s1">step = index.step</span>
+                <span class="s1">block_index = slice(start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step)</span>
+                <span class="s1">block_index_size</span><span class="s0">, </span><span class="s1">rem = divmod(stop - start</span><span class="s0">, </span><span class="s1">step)</span>
+                <span class="s0">if </span><span class="s1">rem:</span>
+                    <span class="s1">block_index_size += </span><span class="s4">1</span>
+
+                <span class="s1">pre = index.indices(loc0)</span>
+                <span class="s1">n_preceeding</span><span class="s0">, </span><span class="s1">rem = divmod(pre[</span><span class="s4">1</span><span class="s1">] - pre[</span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">step)</span>
+                <span class="s0">if </span><span class="s1">rem:</span>
+                    <span class="s1">n_preceeding += </span><span class="s4">1</span>
+
+            <span class="s0">elif </span><span class="s1">integer_index:</span>
+                <span class="s5"># Index is an integer</span>
+                <span class="s1">local_offset += </span><span class="s4">1</span>
+                <span class="s0">if not </span><span class="s1">loc0 &lt;= index &lt; loc1:</span>
+                    <span class="s5"># This block does not overlap the integer index</span>
+                    <span class="s1">overlaps = </span><span class="s0">False</span>
+                    <span class="s0">break</span>
+
+                <span class="s1">block_index = index - loc0</span>
+
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s5"># Index is a 1-d array</span>
+                <span class="s1">is_bool = index.dtype == bool</span>
+                <span class="s1">block_index = block_index_from_1d_index(dim</span><span class="s0">, </span><span class="s1">loc0</span><span class="s0">, </span><span class="s1">loc1</span><span class="s0">, </span><span class="s1">is_bool)</span>
+                <span class="s0">if </span><span class="s1">is_bool:</span>
+                    <span class="s1">block_index_size = block_index_shape_from_1d_bool_index(</span>
+                        <span class="s1">dim</span><span class="s0">, </span><span class="s1">loc0</span><span class="s0">, </span><span class="s1">loc1</span>
+                    <span class="s1">)</span>
+                    <span class="s1">n_preceeding = n_preceeding_from_1d_bool_index(dim</span><span class="s0">, </span><span class="s1">loc0)</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">block_index_size = </span><span class="s0">None</span>
+                    <span class="s1">n_preceeding = </span><span class="s0">None</span>
+                    <span class="s1">dim_1d_int_index = dim</span>
+                    <span class="s1">loc0_loc1 = loc0</span><span class="s0">, </span><span class="s1">loc1</span>
+
+                <span class="s0">if not </span><span class="s1">is_dask_collection(index) </span><span class="s0">and not </span><span class="s1">block_index.size:</span>
+                    <span class="s5"># This block does not overlap the 1-d numpy array</span>
+                    <span class="s5"># index</span>
+                    <span class="s1">overlaps = </span><span class="s0">False</span>
+                    <span class="s0">break</span>
+
+                <span class="s5"># Note: When the 1-d array index is a dask array then</span>
+                <span class="s5">#       we can't tell if this block overlaps it, so we</span>
+                <span class="s5">#       assume that it does. If it in fact doesn't</span>
+                <span class="s5">#       overlap then the part of the assignment value</span>
+                <span class="s5">#       that cooresponds to this block will have zero</span>
+                <span class="s5">#       size which, at compute time, will indicate to</span>
+                <span class="s5">#       the `setitem` function to pass the block</span>
+                <span class="s5">#       through unchanged.</span>
+
+            <span class="s5"># Still here? This block overlaps the index for this</span>
+            <span class="s5"># dimension.</span>
+            <span class="s1">block_indices.append(block_index)</span>
+            <span class="s0">if not </span><span class="s1">integer_index:</span>
+                <span class="s1">block_indices_shape.append(block_index_size)</span>
+                <span class="s1">block_preceeding_sizes.append(n_preceeding)</span>
+
+        <span class="s5"># The new dask key</span>
+        <span class="s1">out_key = out_name + in_key[</span><span class="s4">1</span><span class="s1">:]</span>
+
+        <span class="s0">if not </span><span class="s1">overlaps:</span>
+            <span class="s5"># This block does not overlap the indices for all</span>
+            <span class="s5"># dimensions, so pass the block through unchanged.</span>
+            <span class="s1">dsk[out_key] = in_key</span>
+            <span class="s0">continue</span>
+
+        <span class="s5"># Still here? Then this block overlaps the indices for all</span>
+        <span class="s5"># dimensions and so needs to have some of its elements</span>
+        <span class="s5"># assigned.</span>
+
+        <span class="s5"># Initialise the indices of the assignment value that define</span>
+        <span class="s5"># the parts of it which are to be assigned to this block</span>
+        <span class="s1">value_indices = base_value_indices[:]</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">non_broadcast_dimensions:</span>
+            <span class="s1">j = i + offset</span>
+            <span class="s0">if </span><span class="s1">j == dim_1d_int_index:</span>
+                <span class="s5"># Index is a 1-d integer array</span>
+                <span class="s5">#</span>
+                <span class="s5"># Define index in the current namespace for use in</span>
+                <span class="s5"># `value_indices_from_1d_int_index`</span>
+                <span class="s1">index = indices[j]</span>
+
+                <span class="s1">value_indices[i] = value_indices_from_1d_int_index(</span>
+                    <span class="s1">dim_1d_int_index</span><span class="s0">, </span><span class="s1">value_shape[i + value_offset]</span><span class="s0">, </span><span class="s1">*loc0_loc1</span>
+                <span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s5"># Index is a slice or 1-d boolean array</span>
+                <span class="s1">start = block_preceeding_sizes[j]</span>
+                <span class="s1">value_indices[i] = slice(start</span><span class="s0">, </span><span class="s1">start + block_indices_shape[j])</span>
+
+        <span class="s5"># If required as a consequence of reformatting any slice</span>
+        <span class="s5"># objects of the original indices to have a positive steps,</span>
+        <span class="s5"># reverse the indices to assignment value.</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">reverse:</span>
+            <span class="s1">size = value_common_shape[i]</span>
+            <span class="s1">start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step = value_indices[i].indices(size)</span>
+            <span class="s1">size -= </span><span class="s4">1</span>
+            <span class="s1">start = size - start</span>
+            <span class="s1">stop = size - stop</span>
+            <span class="s0">if </span><span class="s1">stop &lt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">stop = </span><span class="s0">None</span>
+
+            <span class="s1">value_indices[i] = slice(start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">value_ndim &gt; len(indices):</span>
+            <span class="s5"># The assignment value has more dimensions than array, so</span>
+            <span class="s5"># add a leading Ellipsis to the indices of value.</span>
+            <span class="s1">value_indices.insert(</span><span class="s4">0</span><span class="s0">, </span><span class="s1">Ellipsis)</span>
+
+        <span class="s5"># Create the part of the full assignment value that is to be</span>
+        <span class="s5"># assigned to elements of this block and make sure that it has</span>
+        <span class="s5"># just one chunk (so we can represent it with a single key in</span>
+        <span class="s5"># the argument list of setitem).</span>
+        <span class="s1">v = value[tuple(value_indices)]</span>
+        <span class="s1">v = concatenate_array_chunks(v)</span>
+        <span class="s1">v_key = next(flatten(v.__dask_keys__()))</span>
+
+        <span class="s5"># Insert into the output dask dictionary the dask of the part</span>
+        <span class="s5"># of assignment value for this block (not minding when we</span>
+        <span class="s5"># overwrite any existing keys as the values will be the same).</span>
+        <span class="s1">dsk = merge(dict(v.dask)</span><span class="s0">, </span><span class="s1">dsk)</span>
+
+        <span class="s5"># Define the assignment function for this block.</span>
+        <span class="s1">dsk[out_key] = (setitem</span><span class="s0">, </span><span class="s1">in_key</span><span class="s0">, </span><span class="s1">v_key</span><span class="s0">, </span><span class="s1">block_indices)</span>
+
+    <span class="s1">block_index_from_1d_index.cache_clear()</span>
+    <span class="s1">block_index_shape_from_1d_bool_index.cache_clear()</span>
+    <span class="s1">n_preceeding_from_1d_bool_index.cache_clear()</span>
+    <span class="s1">value_indices_from_1d_int_index.cache_clear()</span>
+
+    <span class="s0">return </span><span class="s1">dsk</span>
+
+
+<span class="s0">def </span><span class="s1">setitem(x</span><span class="s0">, </span><span class="s1">v</span><span class="s0">, </span><span class="s1">indices):</span>
+    <span class="s2">&quot;&quot;&quot;Chunk function of `setitem_array`. 
+ 
+    Assign v to indices of x. 
+ 
+    Parameters 
+    ---------- 
+    x : numpy array 
+        The array to be assigned to. 
+    v : numpy array 
+        The values which will be assigned. 
+    indices : list of `slice`, `int`, or numpy array 
+        The indices describing the elements of x to be assigned from 
+        v. One index per axis. 
+ 
+        Note that an individual index can not be a `list`, use a 1-d 
+        numpy array instead. 
+ 
+        If a 1-d numpy array index contains the non-valid value of the 
+        size of the corresponding dimension of x, then those index 
+        elements will be removed prior to the assignment (see 
+        `block_index_from_1d_index` function). 
+ 
+    Returns 
+    ------- 
+    numpy array 
+        A new independent array with assigned elements, unless v is 
+        empty (i.e. has zero size) in which case then the input array 
+        is returned and the indices are ignored. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; x = np.arange(8).reshape(2, 4) 
+    &gt;&gt;&gt; setitem(x, np.array(-99), [np.array([False, True])]) 
+    array([[  0,   1,   2,   3], 
+           [-99, -99, -99, -99]]) 
+    &gt;&gt;&gt; x 
+    array([[0, 1, 2, 3], 
+           [4, 5, 6, 7]]) 
+    &gt;&gt;&gt; setitem(x, np.array([-88, -99]), [slice(None), np.array([1, 3])]) 
+    array([[  0, -88,   2, -99], 
+           [  4, -88,   6, -99]]) 
+    &gt;&gt;&gt; setitem(x, -x, [slice(None)]) 
+    array([[ 0, -1, -2, -3], 
+           [-4, -5, -6, -7]]) 
+    &gt;&gt;&gt; x 
+    array([[0, 1, 2, 3], 
+           [4, 5, 6, 7]]) 
+    &gt;&gt;&gt; setitem(x, np.array([-88, -99]), [slice(None), np.array([4, 4, 3, 4, 1, 4])]) 
+    array([[  0, -99,   2, -88], 
+           [  4, -99,   6, -88]]) 
+    &gt;&gt;&gt; value = np.where(x &lt; 0)[0] 
+    &gt;&gt;&gt; value.size 
+    0 
+    &gt;&gt;&gt; y = setitem(x, value, [Ellipsis]) 
+    &gt;&gt;&gt; y is x 
+    True 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if not </span><span class="s1">v.size:</span>
+        <span class="s0">return </span><span class="s1">x</span>
+
+    <span class="s5"># Normalize integer array indices</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">(index</span><span class="s0">, </span><span class="s1">block_size) </span><span class="s0">in </span><span class="s1">enumerate(zip(indices</span><span class="s0">, </span><span class="s1">x.shape)):</span>
+        <span class="s0">if </span><span class="s1">isinstance(index</span><span class="s0">, </span><span class="s1">np.ndarray) </span><span class="s0">and </span><span class="s1">index.dtype != bool:</span>
+            <span class="s5"># Strip out any non-valid place-holder values</span>
+            <span class="s1">index = index[np.where(index &lt; block_size)[</span><span class="s4">0</span><span class="s1">]]</span>
+            <span class="s1">indices[i] = index</span>
+
+    <span class="s5"># If x is not masked but v is, then turn the x into a masked</span>
+    <span class="s5"># array.</span>
+    <span class="s0">if not </span><span class="s1">np.ma.isMA(x) </span><span class="s0">and </span><span class="s1">np.ma.isMA(v):</span>
+        <span class="s1">x = x.view(np.ma.MaskedArray)</span>
+
+    <span class="s5"># Copy the array to guarantee no other objects are corrupted</span>
+    <span class="s1">x = x.copy()</span>
+
+    <span class="s5"># Do the assignment</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">x[tuple(indices)] = v</span>
+    <span class="s0">except </span><span class="s1">ValueError </span><span class="s0">as </span><span class="s1">e:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s3">&quot;shape mismatch: value array could &quot; &quot;not be broadcast to indexing result&quot;</span>
+        <span class="s1">) </span><span class="s0">from </span><span class="s1">e</span>
+
+    <span class="s0">return </span><span class="s1">x</span>
+</pre>
+</body>
+</html>

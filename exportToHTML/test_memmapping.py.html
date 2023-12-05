@@ -1,0 +1,1214 @@
+<html>
+<head>
+<title>test_memmapping.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6897bb;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6a8759;}
+.s5 { color: #808080;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_memmapping.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">mmap</span>
+<span class="s0">import </span><span class="s1">sys</span>
+<span class="s0">import </span><span class="s1">platform</span>
+<span class="s0">import </span><span class="s1">gc</span>
+<span class="s0">import </span><span class="s1">pickle</span>
+<span class="s0">import </span><span class="s1">itertools</span>
+<span class="s0">from </span><span class="s1">time </span><span class="s0">import </span><span class="s1">sleep</span>
+<span class="s0">import </span><span class="s1">subprocess</span>
+<span class="s0">import </span><span class="s1">threading</span>
+<span class="s0">import </span><span class="s1">faulthandler</span>
+
+<span class="s0">import </span><span class="s1">pytest</span>
+
+<span class="s0">from </span><span class="s1">joblib.test.common </span><span class="s0">import </span><span class="s1">with_numpy</span><span class="s0">, </span><span class="s1">np</span>
+<span class="s0">from </span><span class="s1">joblib.test.common </span><span class="s0">import </span><span class="s1">with_multiprocessing</span>
+<span class="s0">from </span><span class="s1">joblib.test.common </span><span class="s0">import </span><span class="s1">with_dev_shm</span>
+<span class="s0">from </span><span class="s1">joblib.testing </span><span class="s0">import </span><span class="s1">raises</span><span class="s0">, </span><span class="s1">parametrize</span><span class="s0">, </span><span class="s1">skipif</span>
+<span class="s0">from </span><span class="s1">joblib.backports </span><span class="s0">import </span><span class="s1">make_memmap</span>
+<span class="s0">from </span><span class="s1">joblib.parallel </span><span class="s0">import </span><span class="s1">Parallel</span><span class="s0">, </span><span class="s1">delayed</span>
+
+<span class="s0">from </span><span class="s1">joblib.pool </span><span class="s0">import </span><span class="s1">MemmappingPool</span>
+<span class="s0">from </span><span class="s1">joblib.executor </span><span class="s0">import </span><span class="s1">_TestingMemmappingExecutor </span><span class="s0">as </span><span class="s1">TestExecutor</span>
+<span class="s0">from </span><span class="s1">joblib._memmapping_reducer </span><span class="s0">import </span><span class="s1">has_shareable_memory</span>
+<span class="s0">from </span><span class="s1">joblib._memmapping_reducer </span><span class="s0">import </span><span class="s1">ArrayMemmapForwardReducer</span>
+<span class="s0">from </span><span class="s1">joblib._memmapping_reducer </span><span class="s0">import </span><span class="s1">_strided_from_memmap</span>
+<span class="s0">from </span><span class="s1">joblib._memmapping_reducer </span><span class="s0">import </span><span class="s1">_get_temp_dir</span>
+<span class="s0">from </span><span class="s1">joblib._memmapping_reducer </span><span class="s0">import </span><span class="s1">_WeakArrayKeyMap</span>
+<span class="s0">from </span><span class="s1">joblib._memmapping_reducer </span><span class="s0">import </span><span class="s1">_get_backing_memmap</span>
+<span class="s0">import </span><span class="s1">joblib._memmapping_reducer </span><span class="s0">as </span><span class="s1">jmr</span>
+
+
+<span class="s0">def </span><span class="s1">setup_module():</span>
+    <span class="s1">faulthandler.dump_traceback_later(timeout=</span><span class="s2">300</span><span class="s0">, </span><span class="s1">exit=</span><span class="s0">True</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">teardown_module():</span>
+    <span class="s1">faulthandler.cancel_dump_traceback_later()</span>
+
+
+<span class="s0">def </span><span class="s1">check_memmap_and_send_back(array):</span>
+    <span class="s0">assert </span><span class="s1">_get_backing_memmap(array) </span><span class="s0">is not None</span>
+    <span class="s0">return </span><span class="s1">array</span>
+
+
+<span class="s0">def </span><span class="s1">check_array(args):</span>
+    <span class="s3">&quot;&quot;&quot;Dummy helper function to be executed in subprocesses 
+ 
+    Check that the provided array has the expected values in the provided 
+    range. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">data</span><span class="s0">, </span><span class="s1">position</span><span class="s0">, </span><span class="s1">expected = args</span>
+    <span class="s1">np.testing.assert_array_equal(data[position]</span><span class="s0">, </span><span class="s1">expected)</span>
+
+
+<span class="s0">def </span><span class="s1">inplace_double(args):</span>
+    <span class="s3">&quot;&quot;&quot;Dummy helper function to be executed in subprocesses 
+ 
+ 
+    Check that the input array has the right values in the provided range 
+    and perform an inplace modification to double the values in the range by 
+    two. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">data</span><span class="s0">, </span><span class="s1">position</span><span class="s0">, </span><span class="s1">expected = args</span>
+    <span class="s0">assert </span><span class="s1">data[position] == expected</span>
+    <span class="s1">data[position] *= </span><span class="s2">2</span>
+    <span class="s1">np.testing.assert_array_equal(data[position]</span><span class="s0">, </span><span class="s2">2 </span><span class="s1">* expected)</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s0">def </span><span class="s1">test_memmap_based_array_reducing(tmpdir):</span>
+    <span class="s3">&quot;&quot;&quot;Check that it is possible to reduce a memmap backed array&quot;&quot;&quot;</span>
+    <span class="s1">assert_array_equal = np.testing.assert_array_equal</span>
+    <span class="s1">filename = tmpdir.join(</span><span class="s4">'test.mmap'</span><span class="s1">).strpath</span>
+
+    <span class="s5"># Create a file larger than what will be used by a</span>
+    <span class="s1">buffer = np.memmap(filename</span><span class="s0">, </span><span class="s1">dtype=np.float64</span><span class="s0">, </span><span class="s1">shape=</span><span class="s2">500</span><span class="s0">, </span><span class="s1">mode=</span><span class="s4">'w+'</span><span class="s1">)</span>
+
+    <span class="s5"># Fill the original buffer with negative markers to detect over of</span>
+    <span class="s5"># underflow in case of test failures</span>
+    <span class="s1">buffer[:] = - </span><span class="s2">1.0 </span><span class="s1">* np.arange(buffer.shape[</span><span class="s2">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">dtype=buffer.dtype)</span>
+    <span class="s1">buffer.flush()</span>
+
+    <span class="s5"># Memmap a 2D fortran array on a offsetted subsection of the previous</span>
+    <span class="s5"># buffer</span>
+    <span class="s1">a = np.memmap(filename</span><span class="s0">, </span><span class="s1">dtype=np.float64</span><span class="s0">, </span><span class="s1">shape=(</span><span class="s2">3</span><span class="s0">, </span><span class="s2">5</span><span class="s0">, </span><span class="s2">4</span><span class="s1">)</span><span class="s0">,</span>
+                  <span class="s1">mode=</span><span class="s4">'r+'</span><span class="s0">, </span><span class="s1">order=</span><span class="s4">'F'</span><span class="s0">, </span><span class="s1">offset=</span><span class="s2">4</span><span class="s1">)</span>
+    <span class="s1">a[:] = np.arange(</span><span class="s2">60</span><span class="s1">).reshape(a.shape)</span>
+
+    <span class="s5"># Build various views that share the buffer with the original memmap</span>
+
+    <span class="s5"># b is an memmap sliced view on an memmap instance</span>
+    <span class="s1">b = a[</span><span class="s2">1</span><span class="s1">:-</span><span class="s2">1</span><span class="s0">, </span><span class="s2">2</span><span class="s1">:-</span><span class="s2">1</span><span class="s0">, </span><span class="s2">2</span><span class="s1">:</span><span class="s2">4</span><span class="s1">]</span>
+
+    <span class="s5"># c and d are array views</span>
+    <span class="s1">c = np.asarray(b)</span>
+    <span class="s1">d = c.T</span>
+
+    <span class="s5"># Array reducer with auto dumping disabled</span>
+    <span class="s1">reducer = ArrayMemmapForwardReducer(</span><span class="s0">None, </span><span class="s1">tmpdir.strpath</span><span class="s0">, </span><span class="s4">'c'</span><span class="s0">, True</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">reconstruct_array_or_memmap(x):</span>
+        <span class="s1">cons</span><span class="s0">, </span><span class="s1">args = reducer(x)</span>
+        <span class="s0">return </span><span class="s1">cons(*args)</span>
+
+    <span class="s5"># Reconstruct original memmap</span>
+    <span class="s1">a_reconstructed = reconstruct_array_or_memmap(a)</span>
+    <span class="s0">assert </span><span class="s1">has_shareable_memory(a_reconstructed)</span>
+    <span class="s0">assert </span><span class="s1">isinstance(a_reconstructed</span><span class="s0">, </span><span class="s1">np.memmap)</span>
+    <span class="s1">assert_array_equal(a_reconstructed</span><span class="s0">, </span><span class="s1">a)</span>
+
+    <span class="s5"># Reconstruct strided memmap view</span>
+    <span class="s1">b_reconstructed = reconstruct_array_or_memmap(b)</span>
+    <span class="s0">assert </span><span class="s1">has_shareable_memory(b_reconstructed)</span>
+    <span class="s1">assert_array_equal(b_reconstructed</span><span class="s0">, </span><span class="s1">b)</span>
+
+    <span class="s5"># Reconstruct arrays views on memmap base</span>
+    <span class="s1">c_reconstructed = reconstruct_array_or_memmap(c)</span>
+    <span class="s0">assert not </span><span class="s1">isinstance(c_reconstructed</span><span class="s0">, </span><span class="s1">np.memmap)</span>
+    <span class="s0">assert </span><span class="s1">has_shareable_memory(c_reconstructed)</span>
+    <span class="s1">assert_array_equal(c_reconstructed</span><span class="s0">, </span><span class="s1">c)</span>
+
+    <span class="s1">d_reconstructed = reconstruct_array_or_memmap(d)</span>
+    <span class="s0">assert not </span><span class="s1">isinstance(d_reconstructed</span><span class="s0">, </span><span class="s1">np.memmap)</span>
+    <span class="s0">assert </span><span class="s1">has_shareable_memory(d_reconstructed)</span>
+    <span class="s1">assert_array_equal(d_reconstructed</span><span class="s0">, </span><span class="s1">d)</span>
+
+    <span class="s5"># Test graceful degradation on fake memmap instances with in-memory</span>
+    <span class="s5"># buffers</span>
+    <span class="s1">a3 = a * </span><span class="s2">3</span>
+    <span class="s0">assert not </span><span class="s1">has_shareable_memory(a3)</span>
+    <span class="s1">a3_reconstructed = reconstruct_array_or_memmap(a3)</span>
+    <span class="s0">assert not </span><span class="s1">has_shareable_memory(a3_reconstructed)</span>
+    <span class="s0">assert not </span><span class="s1">isinstance(a3_reconstructed</span><span class="s0">, </span><span class="s1">np.memmap)</span>
+    <span class="s1">assert_array_equal(a3_reconstructed</span><span class="s0">, </span><span class="s1">a * </span><span class="s2">3</span><span class="s1">)</span>
+
+    <span class="s5"># Test graceful degradation on arrays derived from fake memmap instances</span>
+    <span class="s1">b3 = np.asarray(a3)</span>
+    <span class="s0">assert not </span><span class="s1">has_shareable_memory(b3)</span>
+
+    <span class="s1">b3_reconstructed = reconstruct_array_or_memmap(b3)</span>
+    <span class="s0">assert </span><span class="s1">isinstance(b3_reconstructed</span><span class="s0">, </span><span class="s1">np.ndarray)</span>
+    <span class="s0">assert not </span><span class="s1">has_shareable_memory(b3_reconstructed)</span>
+    <span class="s1">assert_array_equal(b3_reconstructed</span><span class="s0">, </span><span class="s1">b3)</span>
+
+
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@skipif((sys.platform != </span><span class="s4">&quot;win32&quot;</span><span class="s1">) </span><span class="s0">or </span><span class="s1">()</span><span class="s0">,</span>
+        <span class="s1">reason=</span><span class="s4">&quot;PermissionError only easily triggerable on Windows&quot;</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">test_resource_tracker_retries_when_permissionerror(tmpdir):</span>
+    <span class="s5"># Test resource_tracker retry mechanism when unlinking memmaps.  See more</span>
+    <span class="s5"># thorough information in the ``unlink_file`` documentation of joblib.</span>
+    <span class="s1">filename = tmpdir.join(</span><span class="s4">'test.mmap'</span><span class="s1">).strpath</span>
+    <span class="s1">cmd = </span><span class="s4">&quot;&quot;&quot;if 1: 
+    import os 
+    import numpy as np 
+    import time 
+    from joblib.externals.loky.backend import resource_tracker 
+    resource_tracker.VERBOSE = 1 
+ 
+    # Start the resource tracker 
+    resource_tracker.ensure_running() 
+    time.sleep(1) 
+ 
+    # Create a file containing numpy data 
+    memmap = np.memmap(r&quot;{filename}&quot;, dtype=np.float64, shape=10, mode='w+') 
+    memmap[:] = np.arange(10).astype(np.int8).data 
+    memmap.flush() 
+    assert os.path.exists(r&quot;{filename}&quot;) 
+    del memmap 
+ 
+    # Create a np.memmap backed by this file 
+    memmap = np.memmap(r&quot;{filename}&quot;, dtype=np.float64, shape=10, mode='w+') 
+    resource_tracker.register(r&quot;{filename}&quot;, &quot;file&quot;) 
+ 
+    # Ask the resource_tracker to delete the file backing the np.memmap , this 
+    # should raise PermissionError that the resource_tracker will log. 
+    resource_tracker.maybe_unlink(r&quot;{filename}&quot;, &quot;file&quot;) 
+ 
+    # Wait for the resource_tracker to process the maybe_unlink before cleaning 
+    # up the memmap 
+    time.sleep(2) 
+    &quot;&quot;&quot;</span><span class="s1">.format(filename=filename)</span>
+    <span class="s1">p = subprocess.Popen([sys.executable</span><span class="s0">, </span><span class="s4">'-c'</span><span class="s0">, </span><span class="s1">cmd]</span><span class="s0">, </span><span class="s1">stderr=subprocess.PIPE</span><span class="s0">,</span>
+                         <span class="s1">stdout=subprocess.PIPE)</span>
+    <span class="s1">p.wait()</span>
+    <span class="s1">out</span><span class="s0">, </span><span class="s1">err = p.communicate()</span>
+    <span class="s0">assert </span><span class="s1">p.returncode == </span><span class="s2">0</span>
+    <span class="s0">assert </span><span class="s1">out == </span><span class="s6">b''</span>
+    <span class="s1">msg = </span><span class="s4">'tried to unlink {}, got PermissionError'</span><span class="s1">.format(filename)</span>
+    <span class="s0">assert </span><span class="s1">msg </span><span class="s0">in </span><span class="s1">err.decode()</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s0">def </span><span class="s1">test_high_dimension_memmap_array_reducing(tmpdir):</span>
+    <span class="s1">assert_array_equal = np.testing.assert_array_equal</span>
+
+    <span class="s1">filename = tmpdir.join(</span><span class="s4">'test.mmap'</span><span class="s1">).strpath</span>
+
+    <span class="s5"># Create a high dimensional memmap</span>
+    <span class="s1">a = np.memmap(filename</span><span class="s0">, </span><span class="s1">dtype=np.float64</span><span class="s0">, </span><span class="s1">shape=(</span><span class="s2">100</span><span class="s0">, </span><span class="s2">15</span><span class="s0">, </span><span class="s2">15</span><span class="s0">, </span><span class="s2">3</span><span class="s1">)</span><span class="s0">,</span>
+                  <span class="s1">mode=</span><span class="s4">'w+'</span><span class="s1">)</span>
+    <span class="s1">a[:] = np.arange(</span><span class="s2">100 </span><span class="s1">* </span><span class="s2">15 </span><span class="s1">* </span><span class="s2">15 </span><span class="s1">* </span><span class="s2">3</span><span class="s1">).reshape(a.shape)</span>
+
+    <span class="s5"># Create some slices/indices at various dimensions</span>
+    <span class="s1">b = a[</span><span class="s2">0</span><span class="s1">:</span><span class="s2">10</span><span class="s1">]</span>
+    <span class="s1">c = a[:</span><span class="s0">, </span><span class="s2">5</span><span class="s1">:</span><span class="s2">10</span><span class="s1">]</span>
+    <span class="s1">d = a[:</span><span class="s0">, </span><span class="s1">:</span><span class="s0">, </span><span class="s1">:</span><span class="s0">, </span><span class="s2">0</span><span class="s1">]</span>
+    <span class="s1">e = a[</span><span class="s2">1</span><span class="s1">:</span><span class="s2">3</span><span class="s1">:</span><span class="s2">4</span><span class="s1">]</span>
+
+    <span class="s5"># Array reducer with auto dumping disabled</span>
+    <span class="s1">reducer = ArrayMemmapForwardReducer(</span><span class="s0">None, </span><span class="s1">tmpdir.strpath</span><span class="s0">, </span><span class="s4">'c'</span><span class="s0">, True</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">reconstruct_array_or_memmap(x):</span>
+        <span class="s1">cons</span><span class="s0">, </span><span class="s1">args = reducer(x)</span>
+        <span class="s0">return </span><span class="s1">cons(*args)</span>
+
+    <span class="s1">a_reconstructed = reconstruct_array_or_memmap(a)</span>
+    <span class="s0">assert </span><span class="s1">has_shareable_memory(a_reconstructed)</span>
+    <span class="s0">assert </span><span class="s1">isinstance(a_reconstructed</span><span class="s0">, </span><span class="s1">np.memmap)</span>
+    <span class="s1">assert_array_equal(a_reconstructed</span><span class="s0">, </span><span class="s1">a)</span>
+
+    <span class="s1">b_reconstructed = reconstruct_array_or_memmap(b)</span>
+    <span class="s0">assert </span><span class="s1">has_shareable_memory(b_reconstructed)</span>
+    <span class="s1">assert_array_equal(b_reconstructed</span><span class="s0">, </span><span class="s1">b)</span>
+
+    <span class="s1">c_reconstructed = reconstruct_array_or_memmap(c)</span>
+    <span class="s0">assert </span><span class="s1">has_shareable_memory(c_reconstructed)</span>
+    <span class="s1">assert_array_equal(c_reconstructed</span><span class="s0">, </span><span class="s1">c)</span>
+
+    <span class="s1">d_reconstructed = reconstruct_array_or_memmap(d)</span>
+    <span class="s0">assert </span><span class="s1">has_shareable_memory(d_reconstructed)</span>
+    <span class="s1">assert_array_equal(d_reconstructed</span><span class="s0">, </span><span class="s1">d)</span>
+
+    <span class="s1">e_reconstructed = reconstruct_array_or_memmap(e)</span>
+    <span class="s0">assert </span><span class="s1">has_shareable_memory(e_reconstructed)</span>
+    <span class="s1">assert_array_equal(e_reconstructed</span><span class="s0">, </span><span class="s1">e)</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s0">def </span><span class="s1">test__strided_from_memmap(tmpdir):</span>
+    <span class="s1">fname = tmpdir.join(</span><span class="s4">'test.mmap'</span><span class="s1">).strpath</span>
+    <span class="s1">size = </span><span class="s2">5 </span><span class="s1">* mmap.ALLOCATIONGRANULARITY</span>
+    <span class="s1">offset = mmap.ALLOCATIONGRANULARITY + </span><span class="s2">1</span>
+    <span class="s5"># This line creates the mmap file that is reused later</span>
+    <span class="s1">memmap_obj = np.memmap(fname</span><span class="s0">, </span><span class="s1">mode=</span><span class="s4">'w+'</span><span class="s0">, </span><span class="s1">shape=size + offset)</span>
+    <span class="s5"># filename, dtype, mode, offset, order, shape, strides, total_buffer_len</span>
+    <span class="s1">memmap_obj = _strided_from_memmap(fname</span><span class="s0">, </span><span class="s1">dtype=</span><span class="s4">'uint8'</span><span class="s0">, </span><span class="s1">mode=</span><span class="s4">'r'</span><span class="s0">,</span>
+                                      <span class="s1">offset=offset</span><span class="s0">, </span><span class="s1">order=</span><span class="s4">'C'</span><span class="s0">, </span><span class="s1">shape=size</span><span class="s0">,</span>
+                                      <span class="s1">strides=</span><span class="s0">None, </span><span class="s1">total_buffer_len=</span><span class="s0">None,</span>
+                                      <span class="s1">unlink_on_gc_collect=</span><span class="s0">False</span><span class="s1">)</span>
+    <span class="s0">assert </span><span class="s1">isinstance(memmap_obj</span><span class="s0">, </span><span class="s1">np.memmap)</span>
+    <span class="s0">assert </span><span class="s1">memmap_obj.offset == offset</span>
+    <span class="s1">memmap_backed_obj = _strided_from_memmap(</span>
+        <span class="s1">fname</span><span class="s0">, </span><span class="s1">dtype=</span><span class="s4">'uint8'</span><span class="s0">, </span><span class="s1">mode=</span><span class="s4">'r'</span><span class="s0">, </span><span class="s1">offset=offset</span><span class="s0">, </span><span class="s1">order=</span><span class="s4">'C'</span><span class="s0">,</span>
+        <span class="s1">shape=(size // </span><span class="s2">2</span><span class="s0">,</span><span class="s1">)</span><span class="s0">, </span><span class="s1">strides=(</span><span class="s2">2</span><span class="s0">,</span><span class="s1">)</span><span class="s0">, </span><span class="s1">total_buffer_len=size</span><span class="s0">,</span>
+        <span class="s1">unlink_on_gc_collect=</span><span class="s0">False</span>
+    <span class="s1">)</span>
+    <span class="s0">assert </span><span class="s1">_get_backing_memmap(memmap_backed_obj).offset == offset</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;factory&quot;</span><span class="s0">, </span><span class="s1">[MemmappingPool</span><span class="s0">, </span><span class="s1">TestExecutor.get_memmapping_executor]</span><span class="s0">,</span>
+             <span class="s1">ids=[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_pool_with_memmap(factory</span><span class="s0">, </span><span class="s1">tmpdir):</span>
+    <span class="s3">&quot;&quot;&quot;Check that subprocess can access and update shared memory memmap&quot;&quot;&quot;</span>
+    <span class="s1">assert_array_equal = np.testing.assert_array_equal</span>
+
+    <span class="s5"># Fork the subprocess before allocating the objects to be passed</span>
+    <span class="s1">pool_temp_folder = tmpdir.mkdir(</span><span class="s4">'pool'</span><span class="s1">).strpath</span>
+    <span class="s1">p = factory(</span><span class="s2">10</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">2</span><span class="s0">, </span><span class="s1">temp_folder=pool_temp_folder)</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">filename = tmpdir.join(</span><span class="s4">'test.mmap'</span><span class="s1">).strpath</span>
+        <span class="s1">a = np.memmap(filename</span><span class="s0">, </span><span class="s1">dtype=np.float32</span><span class="s0">, </span><span class="s1">shape=(</span><span class="s2">3</span><span class="s0">, </span><span class="s2">5</span><span class="s1">)</span><span class="s0">, </span><span class="s1">mode=</span><span class="s4">'w+'</span><span class="s1">)</span>
+        <span class="s1">a.fill(</span><span class="s2">1.0</span><span class="s1">)</span>
+
+        <span class="s1">p.map(inplace_double</span><span class="s0">, </span><span class="s1">[(a</span><span class="s0">, </span><span class="s1">(i</span><span class="s0">, </span><span class="s1">j)</span><span class="s0">, </span><span class="s2">1.0</span><span class="s1">)</span>
+                               <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(a.shape[</span><span class="s2">0</span><span class="s1">])</span>
+                               <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range(a.shape[</span><span class="s2">1</span><span class="s1">])])</span>
+
+        <span class="s1">assert_array_equal(a</span><span class="s0">, </span><span class="s2">2 </span><span class="s1">* np.ones(a.shape))</span>
+
+        <span class="s5"># Open a copy-on-write view on the previous data</span>
+        <span class="s1">b = np.memmap(filename</span><span class="s0">, </span><span class="s1">dtype=np.float32</span><span class="s0">, </span><span class="s1">shape=(</span><span class="s2">5</span><span class="s0">, </span><span class="s2">3</span><span class="s1">)</span><span class="s0">, </span><span class="s1">mode=</span><span class="s4">'c'</span><span class="s1">)</span>
+
+        <span class="s1">p.map(inplace_double</span><span class="s0">, </span><span class="s1">[(b</span><span class="s0">, </span><span class="s1">(i</span><span class="s0">, </span><span class="s1">j)</span><span class="s0">, </span><span class="s2">2.0</span><span class="s1">)</span>
+                               <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(b.shape[</span><span class="s2">0</span><span class="s1">])</span>
+                               <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range(b.shape[</span><span class="s2">1</span><span class="s1">])])</span>
+
+        <span class="s5"># Passing memmap instances to the pool should not trigger the creation</span>
+        <span class="s5"># of new files on the FS</span>
+        <span class="s0">assert </span><span class="s1">os.listdir(pool_temp_folder) == []</span>
+
+        <span class="s5"># the original data is untouched</span>
+        <span class="s1">assert_array_equal(a</span><span class="s0">, </span><span class="s2">2 </span><span class="s1">* np.ones(a.shape))</span>
+        <span class="s1">assert_array_equal(b</span><span class="s0">, </span><span class="s2">2 </span><span class="s1">* np.ones(b.shape))</span>
+
+        <span class="s5"># readonly maps can be read but not updated</span>
+        <span class="s1">c = np.memmap(filename</span><span class="s0">, </span><span class="s1">dtype=np.float32</span><span class="s0">, </span><span class="s1">shape=(</span><span class="s2">10</span><span class="s0">,</span><span class="s1">)</span><span class="s0">, </span><span class="s1">mode=</span><span class="s4">'r'</span><span class="s0">,</span>
+                      <span class="s1">offset=</span><span class="s2">5 </span><span class="s1">* </span><span class="s2">4</span><span class="s1">)</span>
+
+        <span class="s0">with </span><span class="s1">raises(AssertionError):</span>
+            <span class="s1">p.map(check_array</span><span class="s0">, </span><span class="s1">[(c</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s2">3.0</span><span class="s1">) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(c.shape[</span><span class="s2">0</span><span class="s1">])])</span>
+
+        <span class="s5"># depending on the version of numpy one can either get a RuntimeError</span>
+        <span class="s5"># or a ValueError</span>
+        <span class="s0">with </span><span class="s1">raises((RuntimeError</span><span class="s0">, </span><span class="s1">ValueError)):</span>
+            <span class="s1">p.map(inplace_double</span><span class="s0">, </span><span class="s1">[(c</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s2">2.0</span><span class="s1">) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(c.shape[</span><span class="s2">0</span><span class="s1">])])</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s5"># Clean all filehandlers held by the pool</span>
+        <span class="s1">p.terminate()</span>
+        <span class="s0">del </span><span class="s1">p</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;factory&quot;</span><span class="s0">, </span><span class="s1">[MemmappingPool</span><span class="s0">, </span><span class="s1">TestExecutor.get_memmapping_executor]</span><span class="s0">,</span>
+             <span class="s1">ids=[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_pool_with_memmap_array_view(factory</span><span class="s0">, </span><span class="s1">tmpdir):</span>
+    <span class="s3">&quot;&quot;&quot;Check that subprocess can access and update shared memory array&quot;&quot;&quot;</span>
+    <span class="s1">assert_array_equal = np.testing.assert_array_equal</span>
+
+    <span class="s5"># Fork the subprocess before allocating the objects to be passed</span>
+    <span class="s1">pool_temp_folder = tmpdir.mkdir(</span><span class="s4">'pool'</span><span class="s1">).strpath</span>
+    <span class="s1">p = factory(</span><span class="s2">10</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">2</span><span class="s0">, </span><span class="s1">temp_folder=pool_temp_folder)</span>
+    <span class="s0">try</span><span class="s1">:</span>
+
+        <span class="s1">filename = tmpdir.join(</span><span class="s4">'test.mmap'</span><span class="s1">).strpath</span>
+        <span class="s1">a = np.memmap(filename</span><span class="s0">, </span><span class="s1">dtype=np.float32</span><span class="s0">, </span><span class="s1">shape=(</span><span class="s2">3</span><span class="s0">, </span><span class="s2">5</span><span class="s1">)</span><span class="s0">, </span><span class="s1">mode=</span><span class="s4">'w+'</span><span class="s1">)</span>
+        <span class="s1">a.fill(</span><span class="s2">1.0</span><span class="s1">)</span>
+
+        <span class="s5"># Create an ndarray view on the memmap instance</span>
+        <span class="s1">a_view = np.asarray(a)</span>
+        <span class="s0">assert not </span><span class="s1">isinstance(a_view</span><span class="s0">, </span><span class="s1">np.memmap)</span>
+        <span class="s0">assert </span><span class="s1">has_shareable_memory(a_view)</span>
+
+        <span class="s1">p.map(inplace_double</span><span class="s0">, </span><span class="s1">[(a_view</span><span class="s0">, </span><span class="s1">(i</span><span class="s0">, </span><span class="s1">j)</span><span class="s0">, </span><span class="s2">1.0</span><span class="s1">)</span>
+                               <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(a.shape[</span><span class="s2">0</span><span class="s1">])</span>
+                               <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range(a.shape[</span><span class="s2">1</span><span class="s1">])])</span>
+
+        <span class="s5"># Both a and the a_view have been updated</span>
+        <span class="s1">assert_array_equal(a</span><span class="s0">, </span><span class="s2">2 </span><span class="s1">* np.ones(a.shape))</span>
+        <span class="s1">assert_array_equal(a_view</span><span class="s0">, </span><span class="s2">2 </span><span class="s1">* np.ones(a.shape))</span>
+
+        <span class="s5"># Passing memmap array view to the pool should not trigger the</span>
+        <span class="s5"># creation of new files on the FS</span>
+        <span class="s0">assert </span><span class="s1">os.listdir(pool_temp_folder) == []</span>
+
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">p.terminate()</span>
+        <span class="s0">del </span><span class="s1">p</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;backend&quot;</span><span class="s0">, </span><span class="s1">[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_permission_error_windows_reference_cycle(backend):</span>
+    <span class="s5"># Non regression test for:</span>
+    <span class="s5"># https://github.com/joblib/joblib/issues/806</span>
+    <span class="s5">#</span>
+    <span class="s5"># The issue happens when trying to delete a memory mapped file that has</span>
+    <span class="s5"># not yet been closed by one of the worker processes.</span>
+    <span class="s1">cmd = </span><span class="s4">&quot;&quot;&quot;if 1: 
+        import numpy as np 
+        from joblib import Parallel, delayed 
+ 
+ 
+        data = np.random.rand(int(2e6)).reshape((int(1e6), 2)) 
+ 
+        # Build a complex cyclic reference that is likely to delay garbage 
+        # collection of the memmapped array in the worker processes. 
+        first_list = current_list = [data] 
+        for i in range(10): 
+            current_list = [current_list] 
+        first_list.append(current_list) 
+ 
+        if __name__ == &quot;__main__&quot;: 
+            results = Parallel(n_jobs=2, backend=&quot;{b}&quot;)( 
+                delayed(len)(current_list) for i in range(10)) 
+            assert results == [1] * 10 
+    &quot;&quot;&quot;</span><span class="s1">.format(b=backend)</span>
+    <span class="s1">p = subprocess.Popen([sys.executable</span><span class="s0">, </span><span class="s4">'-c'</span><span class="s0">, </span><span class="s1">cmd]</span><span class="s0">, </span><span class="s1">stderr=subprocess.PIPE</span><span class="s0">,</span>
+                         <span class="s1">stdout=subprocess.PIPE)</span>
+    <span class="s1">p.wait()</span>
+    <span class="s1">out</span><span class="s0">, </span><span class="s1">err = p.communicate()</span>
+    <span class="s0">assert </span><span class="s1">p.returncode == </span><span class="s2">0</span><span class="s0">, </span><span class="s1">out.decode() + </span><span class="s4">&quot;</span><span class="s0">\n\n</span><span class="s4">&quot; </span><span class="s1">+ err.decode()</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;backend&quot;</span><span class="s0">, </span><span class="s1">[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_permission_error_windows_memmap_sent_to_parent(backend):</span>
+    <span class="s5"># Second non-regression test for:</span>
+    <span class="s5"># https://github.com/joblib/joblib/issues/806</span>
+    <span class="s5"># previously, child process would not convert temporary memmaps to numpy</span>
+    <span class="s5"># arrays when sending the data back to the parent process. This would lead</span>
+    <span class="s5"># to permission errors on windows when deleting joblib's temporary folder,</span>
+    <span class="s5"># as the memmaped files handles would still opened in the parent process.</span>
+    <span class="s1">cmd = </span><span class="s4">'''if 1: 
+        import os 
+        import time 
+ 
+        import numpy as np 
+ 
+        from joblib import Parallel, delayed 
+        from testutils import return_slice_of_data 
+ 
+        data = np.ones(int(2e6)) 
+ 
+        if __name__ == '__main__': 
+            # warm-up call to launch the workers and start the resource_tracker 
+            _ = Parallel(n_jobs=2, verbose=5, backend='{b}')( 
+                delayed(id)(i) for i in range(20)) 
+ 
+            time.sleep(0.5) 
+ 
+            slice_of_data = Parallel(n_jobs=2, verbose=5, backend='{b}')( 
+                delayed(return_slice_of_data)(data, 0, 20) for _ in range(10)) 
+    '''</span><span class="s1">.format(b=backend)</span>
+
+    <span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">3</span><span class="s1">):</span>
+        <span class="s1">env = os.environ.copy()</span>
+        <span class="s1">env[</span><span class="s4">'PYTHONPATH'</span><span class="s1">] = os.path.dirname(__file__)</span>
+        <span class="s1">p = subprocess.Popen([sys.executable</span><span class="s0">, </span><span class="s4">'-c'</span><span class="s0">, </span><span class="s1">cmd]</span><span class="s0">,</span>
+                             <span class="s1">stderr=subprocess.PIPE</span><span class="s0">,</span>
+                             <span class="s1">stdout=subprocess.PIPE</span><span class="s0">, </span><span class="s1">env=env)</span>
+        <span class="s1">p.wait()</span>
+        <span class="s1">out</span><span class="s0">, </span><span class="s1">err = p.communicate()</span>
+        <span class="s0">assert </span><span class="s1">p.returncode == </span><span class="s2">0</span><span class="s0">, </span><span class="s1">err</span>
+        <span class="s0">assert </span><span class="s1">out == </span><span class="s6">b''</span>
+        <span class="s0">if </span><span class="s1">sys.version_info[:</span><span class="s2">3</span><span class="s1">] </span><span class="s0">not in </span><span class="s1">[(</span><span class="s2">3</span><span class="s0">, </span><span class="s2">8</span><span class="s0">, </span><span class="s2">0</span><span class="s1">)</span><span class="s0">, </span><span class="s1">(</span><span class="s2">3</span><span class="s0">, </span><span class="s2">8</span><span class="s0">, </span><span class="s2">1</span><span class="s1">)]:</span>
+            <span class="s5"># In early versions of Python 3.8, a reference leak</span>
+            <span class="s5"># https://github.com/cloudpipe/cloudpickle/issues/327, holds</span>
+            <span class="s5"># references to pickled objects, generating race condition during</span>
+            <span class="s5"># cleanup finalizers of joblib and noisy resource_tracker outputs.</span>
+            <span class="s0">assert </span><span class="s6">b'resource_tracker' </span><span class="s0">not in </span><span class="s1">err</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;backend&quot;</span><span class="s0">, </span><span class="s1">[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_parallel_isolated_temp_folders(backend):</span>
+    <span class="s5"># Test that consecutive Parallel call use isolated subfolders, even</span>
+    <span class="s5"># for the loky backend that reuses its executor instance across calls.</span>
+    <span class="s1">array = np.arange(int(</span><span class="s2">1e2</span><span class="s1">))</span>
+    <span class="s1">[filename_1] = Parallel(n_jobs=</span><span class="s2">2</span><span class="s0">, </span><span class="s1">backend=backend</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">10</span><span class="s1">)(</span>
+        <span class="s1">delayed(getattr)(array</span><span class="s0">, </span><span class="s4">'filename'</span><span class="s1">) </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">1</span><span class="s1">)</span>
+    <span class="s1">)</span>
+    <span class="s1">[filename_2] = Parallel(n_jobs=</span><span class="s2">2</span><span class="s0">, </span><span class="s1">backend=backend</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">10</span><span class="s1">)(</span>
+        <span class="s1">delayed(getattr)(array</span><span class="s0">, </span><span class="s4">'filename'</span><span class="s1">) </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">1</span><span class="s1">)</span>
+    <span class="s1">)</span>
+    <span class="s0">assert </span><span class="s1">os.path.dirname(filename_2) != os.path.dirname(filename_1)</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;backend&quot;</span><span class="s0">, </span><span class="s1">[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_managed_backend_reuse_temp_folder(backend):</span>
+    <span class="s5"># Test that calls to a managed parallel object reuse the same memmaps.</span>
+    <span class="s1">array = np.arange(int(</span><span class="s2">1e2</span><span class="s1">))</span>
+    <span class="s0">with </span><span class="s1">Parallel(n_jobs=</span><span class="s2">2</span><span class="s0">, </span><span class="s1">backend=backend</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">10</span><span class="s1">) </span><span class="s0">as </span><span class="s1">p:</span>
+        <span class="s1">[filename_1] = p(</span>
+            <span class="s1">delayed(getattr)(array</span><span class="s0">, </span><span class="s4">'filename'</span><span class="s1">) </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">1</span><span class="s1">)</span>
+        <span class="s1">)</span>
+        <span class="s1">[filename_2] = p(</span>
+            <span class="s1">delayed(getattr)(array</span><span class="s0">, </span><span class="s4">'filename'</span><span class="s1">) </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">1</span><span class="s1">)</span>
+        <span class="s1">)</span>
+    <span class="s0">assert </span><span class="s1">os.path.dirname(filename_2) == os.path.dirname(filename_1)</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s0">def </span><span class="s1">test_memmapping_temp_folder_thread_safety():</span>
+    <span class="s5"># Concurrent calls to Parallel with the loky backend will use the same</span>
+    <span class="s5"># executor, and thus the same reducers. Make sure that those reducers use</span>
+    <span class="s5"># different temporary folders depending on which Parallel objects called</span>
+    <span class="s5"># them, which is necessary to limit potential race conditions during the</span>
+    <span class="s5"># garbage collection of temporary memmaps.</span>
+    <span class="s1">array = np.arange(int(</span><span class="s2">1e2</span><span class="s1">))</span>
+
+    <span class="s1">temp_dirs_thread_1 = set()</span>
+    <span class="s1">temp_dirs_thread_2 = set()</span>
+
+    <span class="s0">def </span><span class="s1">concurrent_get_filename(array</span><span class="s0">, </span><span class="s1">temp_dirs):</span>
+        <span class="s0">with </span><span class="s1">Parallel(backend=</span><span class="s4">'loky'</span><span class="s0">, </span><span class="s1">n_jobs=</span><span class="s2">2</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">10</span><span class="s1">) </span><span class="s0">as </span><span class="s1">p:</span>
+            <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">10</span><span class="s1">):</span>
+                <span class="s1">[filename] = p(</span>
+                    <span class="s1">delayed(getattr)(array</span><span class="s0">, </span><span class="s4">'filename'</span><span class="s1">) </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">1</span><span class="s1">)</span>
+                <span class="s1">)</span>
+                <span class="s1">temp_dirs.add(os.path.dirname(filename))</span>
+
+    <span class="s1">t1 = threading.Thread(</span>
+        <span class="s1">target=concurrent_get_filename</span><span class="s0">, </span><span class="s1">args=(array</span><span class="s0">, </span><span class="s1">temp_dirs_thread_1)</span>
+    <span class="s1">)</span>
+    <span class="s1">t2 = threading.Thread(</span>
+        <span class="s1">target=concurrent_get_filename</span><span class="s0">, </span><span class="s1">args=(array</span><span class="s0">, </span><span class="s1">temp_dirs_thread_2)</span>
+    <span class="s1">)</span>
+
+    <span class="s1">t1.start()</span>
+    <span class="s1">t2.start()</span>
+
+    <span class="s1">t1.join()</span>
+    <span class="s1">t2.join()</span>
+
+    <span class="s0">assert </span><span class="s1">len(temp_dirs_thread_1) == </span><span class="s2">1</span>
+    <span class="s0">assert </span><span class="s1">len(temp_dirs_thread_2) == </span><span class="s2">1</span>
+
+    <span class="s0">assert </span><span class="s1">temp_dirs_thread_1 != temp_dirs_thread_2</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s0">def </span><span class="s1">test_multithreaded_parallel_termination_resource_tracker_silent():</span>
+    <span class="s5"># test that concurrent termination attempts of a same executor does not</span>
+    <span class="s5"># emit any spurious error from the resource_tracker. We test various</span>
+    <span class="s5"># situations making 0, 1 or both parallel call sending a task that will</span>
+    <span class="s5"># make the worker (and thus the whole Parallel call) error out.</span>
+    <span class="s1">cmd = </span><span class="s4">'''if 1: 
+        import os 
+        import numpy as np 
+        from joblib import Parallel, delayed 
+        from joblib.externals.loky.backend import resource_tracker 
+        from concurrent.futures import ThreadPoolExecutor, wait 
+ 
+        resource_tracker.VERBOSE = 0 
+ 
+        array = np.arange(int(1e2)) 
+ 
+        temp_dirs_thread_1 = set() 
+        temp_dirs_thread_2 = set() 
+ 
+ 
+        def raise_error(array): 
+            raise ValueError 
+ 
+ 
+        def parallel_get_filename(array, temp_dirs): 
+            with Parallel(backend=&quot;loky&quot;, n_jobs=2, max_nbytes=10) as p: 
+                for i in range(10): 
+                    [filename] = p( 
+                        delayed(getattr)(array, &quot;filename&quot;) for _ in range(1) 
+                    ) 
+                    temp_dirs.add(os.path.dirname(filename)) 
+ 
+ 
+        def parallel_raise(array, temp_dirs): 
+            with Parallel(backend=&quot;loky&quot;, n_jobs=2, max_nbytes=10) as p: 
+                for i in range(10): 
+                    [filename] = p( 
+                        delayed(raise_error)(array) for _ in range(1) 
+                    ) 
+                    temp_dirs.add(os.path.dirname(filename)) 
+ 
+ 
+        executor = ThreadPoolExecutor(max_workers=2) 
+ 
+        # both function calls will use the same loky executor, but with a 
+        # different Parallel object. 
+        future_1 = executor.submit({f1}, array, temp_dirs_thread_1) 
+        future_2 = executor.submit({f2}, array, temp_dirs_thread_2) 
+ 
+        # Wait for both threads to terminate their backend 
+        wait([future_1, future_2]) 
+ 
+        future_1.result() 
+        future_2.result() 
+    '''</span>
+    <span class="s1">functions_and_returncodes = [</span>
+        <span class="s1">(</span><span class="s4">&quot;parallel_get_filename&quot;</span><span class="s0">, </span><span class="s4">&quot;parallel_get_filename&quot;</span><span class="s0">, </span><span class="s2">0</span><span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">(</span><span class="s4">&quot;parallel_get_filename&quot;</span><span class="s0">, </span><span class="s4">&quot;parallel_raise&quot;</span><span class="s0">, </span><span class="s2">1</span><span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">(</span><span class="s4">&quot;parallel_raise&quot;</span><span class="s0">, </span><span class="s4">&quot;parallel_raise&quot;</span><span class="s0">, </span><span class="s2">1</span><span class="s1">)</span>
+    <span class="s1">]</span>
+
+    <span class="s0">for </span><span class="s1">f1</span><span class="s0">, </span><span class="s1">f2</span><span class="s0">, </span><span class="s1">returncode </span><span class="s0">in </span><span class="s1">functions_and_returncodes:</span>
+        <span class="s1">p = subprocess.Popen([sys.executable</span><span class="s0">, </span><span class="s4">'-c'</span><span class="s0">, </span><span class="s1">cmd.format(f1=f1</span><span class="s0">, </span><span class="s1">f2=f2)]</span><span class="s0">,</span>
+                             <span class="s1">stderr=subprocess.PIPE</span><span class="s0">, </span><span class="s1">stdout=subprocess.PIPE)</span>
+        <span class="s1">p.wait()</span>
+        <span class="s1">out</span><span class="s0">, </span><span class="s1">err = p.communicate()</span>
+        <span class="s0">assert </span><span class="s1">p.returncode == returncode</span><span class="s0">, </span><span class="s1">out.decode()</span>
+        <span class="s0">assert </span><span class="s6">b&quot;resource_tracker&quot; </span><span class="s0">not in </span><span class="s1">err</span><span class="s0">, </span><span class="s1">err.decode()</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;backend&quot;</span><span class="s0">, </span><span class="s1">[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_many_parallel_calls_on_same_object(backend):</span>
+    <span class="s5"># After #966 got merged, consecutive Parallel objects were sharing temp</span>
+    <span class="s5"># folder, which would lead to race conditions happening during the</span>
+    <span class="s5"># temporary resources management with the resource_tracker. This is a</span>
+    <span class="s5"># non-regression test that makes sure that consecutive Parallel operations</span>
+    <span class="s5"># on the same object do not error out.</span>
+    <span class="s1">cmd = </span><span class="s4">'''if 1: 
+        import os 
+        import time 
+ 
+        import numpy as np 
+ 
+        from joblib import Parallel, delayed 
+        from testutils import return_slice_of_data 
+ 
+        data = np.ones(100) 
+ 
+        if __name__ == '__main__': 
+            for i in range(5): 
+                slice_of_data = Parallel( 
+                    n_jobs=2, max_nbytes=1, backend='{b}')( 
+                        delayed(return_slice_of_data)(data, 0, 20) 
+                        for _ in range(10) 
+                    ) 
+    '''</span><span class="s1">.format(b=backend)</span>
+    <span class="s1">env = os.environ.copy()</span>
+    <span class="s1">env[</span><span class="s4">'PYTHONPATH'</span><span class="s1">] = os.path.dirname(__file__)</span>
+    <span class="s1">p = subprocess.Popen(</span>
+        <span class="s1">[sys.executable</span><span class="s0">, </span><span class="s4">'-c'</span><span class="s0">, </span><span class="s1">cmd]</span><span class="s0">,</span>
+        <span class="s1">stderr=subprocess.PIPE</span><span class="s0">,</span>
+        <span class="s1">stdout=subprocess.PIPE</span><span class="s0">,</span>
+        <span class="s1">env=env</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">p.wait()</span>
+    <span class="s1">out</span><span class="s0">, </span><span class="s1">err = p.communicate()</span>
+    <span class="s0">assert </span><span class="s1">p.returncode == </span><span class="s2">0</span><span class="s0">, </span><span class="s1">err</span>
+    <span class="s0">assert </span><span class="s1">out == </span><span class="s6">b''</span>
+    <span class="s0">if </span><span class="s1">sys.version_info[:</span><span class="s2">3</span><span class="s1">] </span><span class="s0">not in </span><span class="s1">[(</span><span class="s2">3</span><span class="s0">, </span><span class="s2">8</span><span class="s0">, </span><span class="s2">0</span><span class="s1">)</span><span class="s0">, </span><span class="s1">(</span><span class="s2">3</span><span class="s0">, </span><span class="s2">8</span><span class="s0">, </span><span class="s2">1</span><span class="s1">)]:</span>
+        <span class="s5"># In early versions of Python 3.8, a reference leak</span>
+        <span class="s5"># https://github.com/cloudpipe/cloudpickle/issues/327, holds</span>
+        <span class="s5"># references to pickled objects, generating race condition during</span>
+        <span class="s5"># cleanup finalizers of joblib and noisy resource_tracker outputs.</span>
+        <span class="s0">assert </span><span class="s6">b'resource_tracker' </span><span class="s0">not in </span><span class="s1">err</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;backend&quot;</span><span class="s0">, </span><span class="s1">[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_memmap_returned_as_regular_array(backend):</span>
+    <span class="s1">data = np.ones(int(</span><span class="s2">1e3</span><span class="s1">))</span>
+    <span class="s5"># Check that child processes send temporary memmaps back as numpy arrays.</span>
+    <span class="s1">[result] = Parallel(n_jobs=</span><span class="s2">2</span><span class="s0">, </span><span class="s1">backend=backend</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">100</span><span class="s1">)(</span>
+        <span class="s1">delayed(check_memmap_and_send_back)(data) </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">1</span><span class="s1">))</span>
+    <span class="s0">assert </span><span class="s1">_get_backing_memmap(result) </span><span class="s0">is None</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;backend&quot;</span><span class="s0">, </span><span class="s1">[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_resource_tracker_silent_when_reference_cycles(backend):</span>
+    <span class="s5"># There is a variety of reasons that can make joblib with loky backend</span>
+    <span class="s5"># output noisy warnings when a reference cycle is preventing a memmap from</span>
+    <span class="s5"># being garbage collected. Especially, joblib's main process finalizer</span>
+    <span class="s5"># deletes the temporary folder if it was not done before, which can</span>
+    <span class="s5"># interact badly with the resource_tracker. We don't risk leaking any</span>
+    <span class="s5"># resources, but this will likely make joblib output a lot of low-level</span>
+    <span class="s5"># confusing messages.</span>
+    <span class="s5">#</span>
+    <span class="s5"># This test makes sure that the resource_tracker is silent when a reference</span>
+    <span class="s5"># has been collected concurrently on non-Windows platforms.</span>
+    <span class="s5">#</span>
+    <span class="s5"># Note that the script in ``cmd`` is the exact same script as in</span>
+    <span class="s5"># test_permission_error_windows_reference_cycle.</span>
+    <span class="s0">if </span><span class="s1">backend == </span><span class="s4">&quot;loky&quot; </span><span class="s0">and </span><span class="s1">sys.platform.startswith(</span><span class="s4">'win'</span><span class="s1">):</span>
+        <span class="s5"># XXX: on Windows, reference cycles can delay timely garbage collection</span>
+        <span class="s5"># and make it impossible to properly delete the temporary folder in the</span>
+        <span class="s5"># main process because of permission errors.</span>
+        <span class="s1">pytest.xfail(</span>
+            <span class="s4">&quot;The temporary folder cannot be deleted on Windows in the &quot;</span>
+            <span class="s4">&quot;presence of a reference cycle&quot;</span>
+        <span class="s1">)</span>
+
+    <span class="s1">cmd = </span><span class="s4">&quot;&quot;&quot;if 1: 
+        import numpy as np 
+        from joblib import Parallel, delayed 
+ 
+ 
+        data = np.random.rand(int(2e6)).reshape((int(1e6), 2)) 
+ 
+        # Build a complex cyclic reference that is likely to delay garbage 
+        # collection of the memmapped array in the worker processes. 
+        first_list = current_list = [data] 
+        for i in range(10): 
+            current_list = [current_list] 
+        first_list.append(current_list) 
+ 
+        if __name__ == &quot;__main__&quot;: 
+            results = Parallel(n_jobs=2, backend=&quot;{b}&quot;)( 
+                delayed(len)(current_list) for i in range(10)) 
+            assert results == [1] * 10 
+    &quot;&quot;&quot;</span><span class="s1">.format(b=backend)</span>
+    <span class="s1">p = subprocess.Popen([sys.executable</span><span class="s0">, </span><span class="s4">'-c'</span><span class="s0">, </span><span class="s1">cmd]</span><span class="s0">, </span><span class="s1">stderr=subprocess.PIPE</span><span class="s0">,</span>
+                         <span class="s1">stdout=subprocess.PIPE)</span>
+    <span class="s1">p.wait()</span>
+    <span class="s1">out</span><span class="s0">, </span><span class="s1">err = p.communicate()</span>
+    <span class="s1">out = out.decode()</span>
+    <span class="s1">err = err.decode()</span>
+    <span class="s0">assert </span><span class="s1">p.returncode == </span><span class="s2">0</span><span class="s0">, </span><span class="s1">out + </span><span class="s4">&quot;</span><span class="s0">\n\n</span><span class="s4">&quot; </span><span class="s1">+ err</span>
+    <span class="s0">assert </span><span class="s4">&quot;resource_tracker&quot; </span><span class="s0">not in </span><span class="s1">err</span><span class="s0">, </span><span class="s1">err</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;factory&quot;</span><span class="s0">, </span><span class="s1">[MemmappingPool</span><span class="s0">, </span><span class="s1">TestExecutor.get_memmapping_executor]</span><span class="s0">,</span>
+             <span class="s1">ids=[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_memmapping_pool_for_large_arrays(factory</span><span class="s0">, </span><span class="s1">tmpdir):</span>
+    <span class="s3">&quot;&quot;&quot;Check that large arrays are not copied in memory&quot;&quot;&quot;</span>
+
+    <span class="s5"># Check that the tempfolder is empty</span>
+    <span class="s0">assert </span><span class="s1">os.listdir(tmpdir.strpath) == []</span>
+
+    <span class="s5"># Build an array reducers that automatically dump large array content</span>
+    <span class="s5"># to filesystem backed memmap instances to avoid memory explosion</span>
+    <span class="s1">p = factory(</span><span class="s2">3</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">40</span><span class="s0">, </span><span class="s1">temp_folder=tmpdir.strpath</span><span class="s0">, </span><span class="s1">verbose=</span><span class="s2">2</span><span class="s1">)</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s5"># The temporary folder for the pool is not provisioned in advance</span>
+        <span class="s0">assert </span><span class="s1">os.listdir(tmpdir.strpath) == []</span>
+        <span class="s0">assert not </span><span class="s1">os.path.exists(p._temp_folder)</span>
+
+        <span class="s1">small = np.ones(</span><span class="s2">5</span><span class="s0">, </span><span class="s1">dtype=np.float32)</span>
+        <span class="s0">assert </span><span class="s1">small.nbytes == </span><span class="s2">20</span>
+        <span class="s1">p.map(check_array</span><span class="s0">, </span><span class="s1">[(small</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s2">1.0</span><span class="s1">) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(small.shape[</span><span class="s2">0</span><span class="s1">])])</span>
+
+        <span class="s5"># Memory has been copied, the pool filesystem folder is unused</span>
+        <span class="s0">assert </span><span class="s1">os.listdir(tmpdir.strpath) == []</span>
+
+        <span class="s5"># Try with a file larger than the memmap threshold of 40 bytes</span>
+        <span class="s1">large = np.ones(</span><span class="s2">100</span><span class="s0">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s0">assert </span><span class="s1">large.nbytes == </span><span class="s2">800</span>
+        <span class="s1">p.map(check_array</span><span class="s0">, </span><span class="s1">[(large</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s2">1.0</span><span class="s1">) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(large.shape[</span><span class="s2">0</span><span class="s1">])])</span>
+
+        <span class="s5"># The data has been dumped in a temp folder for subprocess to share it</span>
+        <span class="s5"># without per-child memory copies</span>
+        <span class="s0">assert </span><span class="s1">os.path.isdir(p._temp_folder)</span>
+        <span class="s1">dumped_filenames = os.listdir(p._temp_folder)</span>
+        <span class="s0">assert </span><span class="s1">len(dumped_filenames) == </span><span class="s2">1</span>
+
+        <span class="s5"># Check that memory mapping is not triggered for arrays with</span>
+        <span class="s5"># dtype='object'</span>
+        <span class="s1">objects = np.array([</span><span class="s4">'abc'</span><span class="s1">] * </span><span class="s2">100</span><span class="s0">, </span><span class="s1">dtype=</span><span class="s4">'object'</span><span class="s1">)</span>
+        <span class="s1">results = p.map(has_shareable_memory</span><span class="s0">, </span><span class="s1">[objects])</span>
+        <span class="s0">assert not </span><span class="s1">results[</span><span class="s2">0</span><span class="s1">]</span>
+
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s5"># check FS garbage upon pool termination</span>
+        <span class="s1">p.terminate()</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">10</span><span class="s1">):</span>
+            <span class="s1">sleep(</span><span class="s2">.1</span><span class="s1">)</span>
+            <span class="s0">if not </span><span class="s1">os.path.exists(p._temp_folder):</span>
+                <span class="s0">break</span>
+        <span class="s0">else</span><span class="s1">:  </span><span class="s5"># pragma: no cover</span>
+            <span class="s0">raise </span><span class="s1">AssertionError(</span>
+                <span class="s4">'temporary folder {} was not deleted'</span><span class="s1">.format(p._temp_folder)</span>
+            <span class="s1">)</span>
+        <span class="s0">del </span><span class="s1">p</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span>
+    <span class="s4">&quot;backend&quot;</span><span class="s0">,</span>
+    <span class="s1">[</span>
+        <span class="s1">pytest.param(</span>
+            <span class="s4">&quot;multiprocessing&quot;</span><span class="s0">,</span>
+            <span class="s1">marks=pytest.mark.xfail(</span>
+                <span class="s1">reason=</span><span class="s4">'https://github.com/joblib/joblib/issues/1086'</span>
+            <span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">)</span><span class="s0">,</span>
+        <span class="s4">&quot;loky&quot;</span><span class="s0">,</span>
+    <span class="s1">]</span>
+<span class="s1">)</span>
+<span class="s0">def </span><span class="s1">test_child_raises_parent_exits_cleanly(backend):</span>
+    <span class="s5"># When a task executed by a child process raises an error, the parent</span>
+    <span class="s5"># process's backend is notified, and calls abort_everything.</span>
+    <span class="s5"># In loky, abort_everything itself calls shutdown(kill_workers=True) which</span>
+    <span class="s5"># sends SIGKILL to the worker, preventing it from running the finalizers</span>
+    <span class="s5"># supposed to signal the resource_tracker when the worker is done using</span>
+    <span class="s5"># objects relying on a shared resource (e.g np.memmaps). Because this</span>
+    <span class="s5"># behavior is prone to :</span>
+    <span class="s5"># - cause a resource leak</span>
+    <span class="s5"># - make the resource tracker emit noisy resource warnings</span>
+    <span class="s5"># we explicitly test that, when the said situation occurs:</span>
+    <span class="s5"># - no resources are actually leaked</span>
+    <span class="s5"># - the temporary resources are deleted as soon as possible (typically, at</span>
+    <span class="s5">#   the end of the failing Parallel call)</span>
+    <span class="s5"># - the resource_tracker does not emit any warnings.</span>
+    <span class="s1">cmd = </span><span class="s4">&quot;&quot;&quot;if 1: 
+        import os 
+        from pathlib import Path 
+        from time import sleep 
+ 
+        import numpy as np 
+        from joblib import Parallel, delayed 
+        from testutils import print_filename_and_raise 
+ 
+        data = np.random.rand(1000) 
+ 
+        def get_temp_folder(parallel_obj, backend): 
+            if &quot;{b}&quot; == &quot;loky&quot;: 
+                return Path(parallel_obj._backend._workers._temp_folder) 
+            else: 
+                return Path(parallel_obj._backend._pool._temp_folder) 
+ 
+ 
+        if __name__ == &quot;__main__&quot;: 
+            try: 
+                with Parallel(n_jobs=2, backend=&quot;{b}&quot;, max_nbytes=100) as p: 
+                    temp_folder = get_temp_folder(p, &quot;{b}&quot;) 
+                    p(delayed(print_filename_and_raise)(data) 
+                              for i in range(1)) 
+            except ValueError as e: 
+                # the temporary folder should be deleted by the end of this 
+                # call but apparently on some file systems, this takes 
+                # some time to be visible. 
+                # 
+                # We attempt to write into the temporary folder to test for 
+                # its existence and we wait for a maximum of 10 seconds. 
+                for i in range(100): 
+                    try: 
+                        with open(temp_folder / &quot;some_file.txt&quot;, &quot;w&quot;) as f: 
+                            f.write(&quot;some content&quot;) 
+                    except FileNotFoundError: 
+                        # temp_folder has been deleted, all is fine 
+                        break 
+ 
+                    # ... else, wait a bit and try again 
+                    sleep(.1) 
+                else: 
+                    raise AssertionError( 
+                        str(temp_folder) + &quot; was not deleted&quot; 
+                    ) from e 
+    &quot;&quot;&quot;</span><span class="s1">.format(b=backend)</span>
+    <span class="s1">env = os.environ.copy()</span>
+    <span class="s1">env[</span><span class="s4">'PYTHONPATH'</span><span class="s1">] = os.path.dirname(__file__)</span>
+    <span class="s1">p = subprocess.Popen([sys.executable</span><span class="s0">, </span><span class="s4">'-c'</span><span class="s0">, </span><span class="s1">cmd]</span><span class="s0">, </span><span class="s1">stderr=subprocess.PIPE</span><span class="s0">,</span>
+                         <span class="s1">stdout=subprocess.PIPE</span><span class="s0">, </span><span class="s1">env=env)</span>
+    <span class="s1">p.wait()</span>
+    <span class="s1">out</span><span class="s0">, </span><span class="s1">err = p.communicate()</span>
+    <span class="s1">out</span><span class="s0">, </span><span class="s1">err = out.decode()</span><span class="s0">, </span><span class="s1">err.decode()</span>
+    <span class="s1">filename = out.split(</span><span class="s4">'</span><span class="s0">\n</span><span class="s4">'</span><span class="s1">)[</span><span class="s2">0</span><span class="s1">]</span>
+    <span class="s0">assert </span><span class="s1">p.returncode == </span><span class="s2">0</span><span class="s0">, </span><span class="s1">err </span><span class="s0">or </span><span class="s1">out</span>
+    <span class="s0">assert </span><span class="s1">err == </span><span class="s4">''  </span><span class="s5"># no resource_tracker warnings.</span>
+    <span class="s0">assert not </span><span class="s1">os.path.exists(filename)</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;factory&quot;</span><span class="s0">, </span><span class="s1">[MemmappingPool</span><span class="s0">, </span><span class="s1">TestExecutor.get_memmapping_executor]</span><span class="s0">,</span>
+             <span class="s1">ids=[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_memmapping_pool_for_large_arrays_disabled(factory</span><span class="s0">, </span><span class="s1">tmpdir):</span>
+    <span class="s3">&quot;&quot;&quot;Check that large arrays memmapping can be disabled&quot;&quot;&quot;</span>
+    <span class="s5"># Set max_nbytes to None to disable the auto memmapping feature</span>
+    <span class="s1">p = factory(</span><span class="s2">3</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s0">None, </span><span class="s1">temp_folder=tmpdir.strpath)</span>
+    <span class="s0">try</span><span class="s1">:</span>
+
+        <span class="s5"># Check that the tempfolder is empty</span>
+        <span class="s0">assert </span><span class="s1">os.listdir(tmpdir.strpath) == []</span>
+
+        <span class="s5"># Try with a file largish than the memmap threshold of 40 bytes</span>
+        <span class="s1">large = np.ones(</span><span class="s2">100</span><span class="s0">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s0">assert </span><span class="s1">large.nbytes == </span><span class="s2">800</span>
+        <span class="s1">p.map(check_array</span><span class="s0">, </span><span class="s1">[(large</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s2">1.0</span><span class="s1">) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(large.shape[</span><span class="s2">0</span><span class="s1">])])</span>
+
+        <span class="s5"># Check that the tempfolder is still empty</span>
+        <span class="s0">assert </span><span class="s1">os.listdir(tmpdir.strpath) == []</span>
+
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s5"># Cleanup open file descriptors</span>
+        <span class="s1">p.terminate()</span>
+        <span class="s0">del </span><span class="s1">p</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@with_dev_shm</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;factory&quot;</span><span class="s0">, </span><span class="s1">[MemmappingPool</span><span class="s0">, </span><span class="s1">TestExecutor.get_memmapping_executor]</span><span class="s0">,</span>
+             <span class="s1">ids=[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_memmapping_on_large_enough_dev_shm(factory):</span>
+    <span class="s3">&quot;&quot;&quot;Check that memmapping uses /dev/shm when possible&quot;&quot;&quot;</span>
+    <span class="s1">orig_size = jmr.SYSTEM_SHARED_MEM_FS_MIN_SIZE</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s5"># Make joblib believe that it can use /dev/shm even when running on a</span>
+        <span class="s5"># CI container where the size of the /dev/shm is not very large (that</span>
+        <span class="s5"># is at least 32 MB instead of 2 GB by default).</span>
+        <span class="s1">jmr.SYSTEM_SHARED_MEM_FS_MIN_SIZE = int(</span><span class="s2">32e6</span><span class="s1">)</span>
+        <span class="s1">p = factory(</span><span class="s2">3</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">10</span><span class="s1">)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s5"># Check that the pool has correctly detected the presence of the</span>
+            <span class="s5"># shared memory filesystem.</span>
+            <span class="s1">pool_temp_folder = p._temp_folder</span>
+            <span class="s1">folder_prefix = </span><span class="s4">'/dev/shm/joblib_memmapping_folder_'</span>
+            <span class="s0">assert </span><span class="s1">pool_temp_folder.startswith(folder_prefix)</span>
+            <span class="s0">assert </span><span class="s1">os.path.exists(pool_temp_folder)</span>
+
+            <span class="s5"># Try with a file larger than the memmap threshold of 10 bytes</span>
+            <span class="s1">a = np.ones(</span><span class="s2">100</span><span class="s0">, </span><span class="s1">dtype=np.float64)</span>
+            <span class="s0">assert </span><span class="s1">a.nbytes == </span><span class="s2">800</span>
+            <span class="s1">p.map(id</span><span class="s0">, </span><span class="s1">[a] * </span><span class="s2">10</span><span class="s1">)</span>
+            <span class="s5"># a should have been memmapped to the pool temp folder: the joblib</span>
+            <span class="s5"># pickling procedure generate one .pkl file:</span>
+            <span class="s0">assert </span><span class="s1">len(os.listdir(pool_temp_folder)) == </span><span class="s2">1</span>
+
+            <span class="s5"># create a new array with content that is different from 'a' so</span>
+            <span class="s5"># that it is mapped to a different file in the temporary folder of</span>
+            <span class="s5"># the pool.</span>
+            <span class="s1">b = np.ones(</span><span class="s2">100</span><span class="s0">, </span><span class="s1">dtype=np.float64) * </span><span class="s2">2</span>
+            <span class="s0">assert </span><span class="s1">b.nbytes == </span><span class="s2">800</span>
+            <span class="s1">p.map(id</span><span class="s0">, </span><span class="s1">[b] * </span><span class="s2">10</span><span class="s1">)</span>
+            <span class="s5"># A copy of both a and b are now stored in the shared memory folder</span>
+            <span class="s0">assert </span><span class="s1">len(os.listdir(pool_temp_folder)) == </span><span class="s2">2</span>
+        <span class="s0">finally</span><span class="s1">:</span>
+            <span class="s5"># Cleanup open file descriptors</span>
+            <span class="s1">p.terminate()</span>
+            <span class="s0">del </span><span class="s1">p</span>
+
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">100</span><span class="s1">):</span>
+            <span class="s5"># The temp folder is cleaned up upon pool termination</span>
+            <span class="s0">if not </span><span class="s1">os.path.exists(pool_temp_folder):</span>
+                <span class="s0">break</span>
+            <span class="s1">sleep(</span><span class="s2">.1</span><span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:  </span><span class="s5"># pragma: no cover</span>
+            <span class="s0">raise </span><span class="s1">AssertionError(</span><span class="s4">'temporary folder of pool was not deleted'</span><span class="s1">)</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">jmr.SYSTEM_SHARED_MEM_FS_MIN_SIZE = orig_size</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@with_dev_shm</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;factory&quot;</span><span class="s0">, </span><span class="s1">[MemmappingPool</span><span class="s0">, </span><span class="s1">TestExecutor.get_memmapping_executor]</span><span class="s0">,</span>
+             <span class="s1">ids=[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_memmapping_on_too_small_dev_shm(factory):</span>
+    <span class="s1">orig_size = jmr.SYSTEM_SHARED_MEM_FS_MIN_SIZE</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s5"># Make joblib believe that it cannot use /dev/shm unless there is</span>
+        <span class="s5"># 42 exabytes of available shared memory in /dev/shm</span>
+        <span class="s1">jmr.SYSTEM_SHARED_MEM_FS_MIN_SIZE = int(</span><span class="s2">42e18</span><span class="s1">)</span>
+
+        <span class="s1">p = factory(</span><span class="s2">3</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">10</span><span class="s1">)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s5"># Check that the pool has correctly detected the presence of the</span>
+            <span class="s5"># shared memory filesystem.</span>
+            <span class="s1">pool_temp_folder = p._temp_folder</span>
+            <span class="s0">assert not </span><span class="s1">pool_temp_folder.startswith(</span><span class="s4">'/dev/shm'</span><span class="s1">)</span>
+        <span class="s0">finally</span><span class="s1">:</span>
+            <span class="s5"># Cleanup open file descriptors</span>
+            <span class="s1">p.terminate()</span>
+            <span class="s0">del </span><span class="s1">p</span>
+
+        <span class="s5"># The temp folder is cleaned up upon pool termination</span>
+        <span class="s0">assert not </span><span class="s1">os.path.exists(pool_temp_folder)</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">jmr.SYSTEM_SHARED_MEM_FS_MIN_SIZE = orig_size</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;factory&quot;</span><span class="s0">, </span><span class="s1">[MemmappingPool</span><span class="s0">, </span><span class="s1">TestExecutor.get_memmapping_executor]</span><span class="s0">,</span>
+             <span class="s1">ids=[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_memmapping_pool_for_large_arrays_in_return(factory</span><span class="s0">, </span><span class="s1">tmpdir):</span>
+    <span class="s3">&quot;&quot;&quot;Check that large arrays are not copied in memory in return&quot;&quot;&quot;</span>
+    <span class="s1">assert_array_equal = np.testing.assert_array_equal</span>
+
+    <span class="s5"># Build an array reducers that automatically dump large array content</span>
+    <span class="s5"># but check that the returned datastructure are regular arrays to avoid</span>
+    <span class="s5"># passing a memmap array pointing to a pool controlled temp folder that</span>
+    <span class="s5"># might be confusing to the user</span>
+
+    <span class="s5"># The MemmappingPool user can always return numpy.memmap object explicitly</span>
+    <span class="s5"># to avoid memory copy</span>
+    <span class="s1">p = factory(</span><span class="s2">3</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">10</span><span class="s0">, </span><span class="s1">temp_folder=tmpdir.strpath)</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">res = p.apply_async(np.ones</span><span class="s0">, </span><span class="s1">args=(</span><span class="s2">1000</span><span class="s0">,</span><span class="s1">))</span>
+        <span class="s1">large = res.get()</span>
+        <span class="s0">assert not </span><span class="s1">has_shareable_memory(large)</span>
+        <span class="s1">assert_array_equal(large</span><span class="s0">, </span><span class="s1">np.ones(</span><span class="s2">1000</span><span class="s1">))</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">p.terminate()</span>
+        <span class="s0">del </span><span class="s1">p</span>
+
+
+<span class="s0">def </span><span class="s1">_worker_multiply(a</span><span class="s0">, </span><span class="s1">n_times):</span>
+    <span class="s3">&quot;&quot;&quot;Multiplication function to be executed by subprocess&quot;&quot;&quot;</span>
+    <span class="s0">assert </span><span class="s1">has_shareable_memory(a)</span>
+    <span class="s0">return </span><span class="s1">a * n_times</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;factory&quot;</span><span class="s0">, </span><span class="s1">[MemmappingPool</span><span class="s0">, </span><span class="s1">TestExecutor.get_memmapping_executor]</span><span class="s0">,</span>
+             <span class="s1">ids=[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_workaround_against_bad_memmap_with_copied_buffers(factory</span><span class="s0">, </span><span class="s1">tmpdir):</span>
+    <span class="s3">&quot;&quot;&quot;Check that memmaps with a bad buffer are returned as regular arrays 
+ 
+    Unary operations and ufuncs on memmap instances return a new memmap 
+    instance with an in-memory buffer (probably a numpy bug). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">assert_array_equal = np.testing.assert_array_equal</span>
+
+    <span class="s1">p = factory(</span><span class="s2">3</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">10</span><span class="s0">, </span><span class="s1">temp_folder=tmpdir.strpath)</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s5"># Send a complex, large-ish view on a array that will be converted to</span>
+        <span class="s5"># a memmap in the worker process</span>
+        <span class="s1">a = np.asarray(np.arange(</span><span class="s2">6000</span><span class="s1">).reshape((</span><span class="s2">1000</span><span class="s0">, </span><span class="s2">2</span><span class="s0">, </span><span class="s2">3</span><span class="s1">))</span><span class="s0">,</span>
+                       <span class="s1">order=</span><span class="s4">'F'</span><span class="s1">)[:</span><span class="s0">, </span><span class="s1">:</span><span class="s2">1</span><span class="s0">, </span><span class="s1">:]</span>
+
+        <span class="s5"># Call a non-inplace multiply operation on the worker and memmap and</span>
+        <span class="s5"># send it back to the parent.</span>
+        <span class="s1">b = p.apply_async(_worker_multiply</span><span class="s0">, </span><span class="s1">args=(a</span><span class="s0">, </span><span class="s2">3</span><span class="s1">)).get()</span>
+        <span class="s0">assert not </span><span class="s1">has_shareable_memory(b)</span>
+        <span class="s1">assert_array_equal(b</span><span class="s0">, </span><span class="s2">3 </span><span class="s1">* a)</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s1">p.terminate()</span>
+        <span class="s0">del </span><span class="s1">p</span>
+
+
+<span class="s0">def </span><span class="s1">identity(arg):</span>
+    <span class="s0">return </span><span class="s1">arg</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s1">@parametrize(</span>
+    <span class="s4">&quot;factory,retry_no&quot;</span><span class="s0">,</span>
+    <span class="s1">list(itertools.product(</span>
+        <span class="s1">[MemmappingPool</span><span class="s0">, </span><span class="s1">TestExecutor.get_memmapping_executor]</span><span class="s0">, </span><span class="s1">range(</span><span class="s2">3</span><span class="s1">)))</span><span class="s0">,</span>
+    <span class="s1">ids=[</span><span class="s4">'{}, {}'</span><span class="s1">.format(x</span><span class="s0">, </span><span class="s1">y) </span><span class="s0">for </span><span class="s1">x</span><span class="s0">, </span><span class="s1">y </span><span class="s0">in </span><span class="s1">itertools.product(</span>
+        <span class="s1">[</span><span class="s4">&quot;multiprocessing&quot;</span><span class="s0">, </span><span class="s4">&quot;loky&quot;</span><span class="s1">]</span><span class="s0">, </span><span class="s1">map(str</span><span class="s0">, </span><span class="s1">range(</span><span class="s2">3</span><span class="s1">)))])</span>
+<span class="s0">def </span><span class="s1">test_pool_memmap_with_big_offset(factory</span><span class="s0">, </span><span class="s1">retry_no</span><span class="s0">, </span><span class="s1">tmpdir):</span>
+    <span class="s5"># Test that numpy memmap offset is set correctly if greater than</span>
+    <span class="s5"># mmap.ALLOCATIONGRANULARITY, see</span>
+    <span class="s5"># https://github.com/joblib/joblib/issues/451 and</span>
+    <span class="s5"># https://github.com/numpy/numpy/pull/8443 for more details.</span>
+    <span class="s1">fname = tmpdir.join(</span><span class="s4">'test.mmap'</span><span class="s1">).strpath</span>
+    <span class="s1">size = </span><span class="s2">5 </span><span class="s1">* mmap.ALLOCATIONGRANULARITY</span>
+    <span class="s1">offset = mmap.ALLOCATIONGRANULARITY + </span><span class="s2">1</span>
+    <span class="s1">obj = make_memmap(fname</span><span class="s0">, </span><span class="s1">mode=</span><span class="s4">'w+'</span><span class="s0">, </span><span class="s1">shape=size</span><span class="s0">, </span><span class="s1">dtype=</span><span class="s4">'uint8'</span><span class="s0">,</span>
+                      <span class="s1">offset=offset)</span>
+
+    <span class="s1">p = factory(</span><span class="s2">2</span><span class="s0">, </span><span class="s1">temp_folder=tmpdir.strpath)</span>
+    <span class="s1">result = p.apply_async(identity</span><span class="s0">, </span><span class="s1">args=(obj</span><span class="s0">,</span><span class="s1">)).get()</span>
+    <span class="s0">assert </span><span class="s1">isinstance(result</span><span class="s0">, </span><span class="s1">np.memmap)</span>
+    <span class="s0">assert </span><span class="s1">result.offset == offset</span>
+    <span class="s1">np.testing.assert_array_equal(obj</span><span class="s0">, </span><span class="s1">result)</span>
+    <span class="s1">p.terminate()</span>
+
+
+<span class="s0">def </span><span class="s1">test_pool_get_temp_dir(tmpdir):</span>
+    <span class="s1">pool_folder_name = </span><span class="s4">'test.tmpdir'</span>
+    <span class="s1">pool_folder</span><span class="s0">, </span><span class="s1">shared_mem = _get_temp_dir(pool_folder_name</span><span class="s0">, </span><span class="s1">tmpdir.strpath)</span>
+    <span class="s0">assert </span><span class="s1">shared_mem </span><span class="s0">is False</span>
+    <span class="s0">assert </span><span class="s1">pool_folder == tmpdir.join(</span><span class="s4">'test.tmpdir'</span><span class="s1">).strpath</span>
+
+    <span class="s1">pool_folder</span><span class="s0">, </span><span class="s1">shared_mem = _get_temp_dir(pool_folder_name</span><span class="s0">, </span><span class="s1">temp_folder=</span><span class="s0">None</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">sys.platform.startswith(</span><span class="s4">'win'</span><span class="s1">):</span>
+        <span class="s0">assert </span><span class="s1">shared_mem </span><span class="s0">is False</span>
+    <span class="s0">assert </span><span class="s1">pool_folder.endswith(pool_folder_name)</span>
+
+
+<span class="s0">def </span><span class="s1">test_pool_get_temp_dir_no_statvfs(tmpdir</span><span class="s0">, </span><span class="s1">monkeypatch):</span>
+    <span class="s3">&quot;&quot;&quot;Check that _get_temp_dir works when os.statvfs is not defined 
+ 
+    Regression test for #902 
+    &quot;&quot;&quot;</span>
+    <span class="s1">pool_folder_name = </span><span class="s4">'test.tmpdir'</span>
+    <span class="s0">import </span><span class="s1">joblib._memmapping_reducer</span>
+    <span class="s0">if </span><span class="s1">hasattr(joblib._memmapping_reducer.os</span><span class="s0">, </span><span class="s4">'statvfs'</span><span class="s1">):</span>
+        <span class="s5"># We are on Unix, since Windows doesn't have this function</span>
+        <span class="s1">monkeypatch.delattr(joblib._memmapping_reducer.os</span><span class="s0">, </span><span class="s4">'statvfs'</span><span class="s1">)</span>
+
+    <span class="s1">pool_folder</span><span class="s0">, </span><span class="s1">shared_mem = _get_temp_dir(pool_folder_name</span><span class="s0">, </span><span class="s1">temp_folder=</span><span class="s0">None</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">sys.platform.startswith(</span><span class="s4">'win'</span><span class="s1">):</span>
+        <span class="s0">assert </span><span class="s1">shared_mem </span><span class="s0">is False</span>
+    <span class="s0">assert </span><span class="s1">pool_folder.endswith(pool_folder_name)</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@skipif(sys.platform == </span><span class="s4">'win32'</span><span class="s0">, </span><span class="s1">reason=</span><span class="s4">'This test fails with a '</span>
+        <span class="s4">'PermissionError on Windows'</span><span class="s1">)</span>
+<span class="s1">@parametrize(</span><span class="s4">&quot;mmap_mode&quot;</span><span class="s0">, </span><span class="s1">[</span><span class="s4">&quot;r+&quot;</span><span class="s0">, </span><span class="s4">&quot;w+&quot;</span><span class="s1">])</span>
+<span class="s0">def </span><span class="s1">test_numpy_arrays_use_different_memory(mmap_mode):</span>
+    <span class="s0">def </span><span class="s1">func(arr</span><span class="s0">, </span><span class="s1">value):</span>
+        <span class="s1">arr[:] = value</span>
+        <span class="s0">return </span><span class="s1">arr</span>
+
+    <span class="s1">arrays = [np.zeros((</span><span class="s2">10</span><span class="s0">, </span><span class="s2">10</span><span class="s1">)</span><span class="s0">, </span><span class="s1">dtype=</span><span class="s4">'float64'</span><span class="s1">) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">10</span><span class="s1">)]</span>
+
+    <span class="s1">results = Parallel(mmap_mode=mmap_mode</span><span class="s0">, </span><span class="s1">max_nbytes=</span><span class="s2">0</span><span class="s0">, </span><span class="s1">n_jobs=</span><span class="s2">2</span><span class="s1">)(</span>
+        <span class="s1">delayed(func)(arr</span><span class="s0">, </span><span class="s1">i) </span><span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">arr </span><span class="s0">in </span><span class="s1">enumerate(arrays))</span>
+
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">arr </span><span class="s0">in </span><span class="s1">enumerate(results):</span>
+        <span class="s1">np.testing.assert_array_equal(arr</span><span class="s0">, </span><span class="s1">i)</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s0">def </span><span class="s1">test_weak_array_key_map():</span>
+
+    <span class="s0">def </span><span class="s1">assert_empty_after_gc_collect(container</span><span class="s0">, </span><span class="s1">retries=</span><span class="s2">100</span><span class="s1">):</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(retries):</span>
+            <span class="s0">if </span><span class="s1">len(container) == </span><span class="s2">0</span><span class="s1">:</span>
+                <span class="s0">return</span>
+            <span class="s1">gc.collect()</span>
+            <span class="s1">sleep(</span><span class="s2">.1</span><span class="s1">)</span>
+        <span class="s0">assert </span><span class="s1">len(container) == </span><span class="s2">0</span>
+
+    <span class="s1">a = np.ones(</span><span class="s2">42</span><span class="s1">)</span>
+    <span class="s1">m = _WeakArrayKeyMap()</span>
+    <span class="s1">m.set(a</span><span class="s0">, </span><span class="s4">'a'</span><span class="s1">)</span>
+    <span class="s0">assert </span><span class="s1">m.get(a) == </span><span class="s4">'a'</span>
+
+    <span class="s1">b = a</span>
+    <span class="s0">assert </span><span class="s1">m.get(b) == </span><span class="s4">'a'</span>
+    <span class="s1">m.set(b</span><span class="s0">, </span><span class="s4">'b'</span><span class="s1">)</span>
+    <span class="s0">assert </span><span class="s1">m.get(a) == </span><span class="s4">'b'</span>
+
+    <span class="s0">del </span><span class="s1">a</span>
+    <span class="s1">gc.collect()</span>
+    <span class="s0">assert </span><span class="s1">len(m._data) == </span><span class="s2">1</span>
+    <span class="s0">assert </span><span class="s1">m.get(b) == </span><span class="s4">'b'</span>
+
+    <span class="s0">del </span><span class="s1">b</span>
+    <span class="s1">assert_empty_after_gc_collect(m._data)</span>
+
+    <span class="s1">c = np.ones(</span><span class="s2">42</span><span class="s1">)</span>
+    <span class="s1">m.set(c</span><span class="s0">, </span><span class="s4">'c'</span><span class="s1">)</span>
+    <span class="s0">assert </span><span class="s1">len(m._data) == </span><span class="s2">1</span>
+    <span class="s0">assert </span><span class="s1">m.get(c) == </span><span class="s4">'c'</span>
+
+    <span class="s0">with </span><span class="s1">raises(KeyError):</span>
+        <span class="s1">m.get(np.ones(</span><span class="s2">42</span><span class="s1">))</span>
+
+    <span class="s0">del </span><span class="s1">c</span>
+    <span class="s1">assert_empty_after_gc_collect(m._data)</span>
+
+    <span class="s5"># Check that creating and dropping numpy arrays with potentially the same</span>
+    <span class="s5"># object id will not cause the map to get confused.</span>
+    <span class="s0">def </span><span class="s1">get_set_get_collect(m</span><span class="s0">, </span><span class="s1">i):</span>
+        <span class="s1">a = np.ones(</span><span class="s2">42</span><span class="s1">)</span>
+        <span class="s0">with </span><span class="s1">raises(KeyError):</span>
+            <span class="s1">m.get(a)</span>
+        <span class="s1">m.set(a</span><span class="s0">, </span><span class="s1">i)</span>
+        <span class="s0">assert </span><span class="s1">m.get(a) == i</span>
+        <span class="s0">return </span><span class="s1">id(a)</span>
+
+    <span class="s1">unique_ids = set([get_set_get_collect(m</span><span class="s0">, </span><span class="s1">i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">1000</span><span class="s1">)])</span>
+    <span class="s0">if </span><span class="s1">platform.python_implementation() == </span><span class="s4">'CPython'</span><span class="s1">:</span>
+        <span class="s5"># On CPython (at least) the same id is often reused many times for the</span>
+        <span class="s5"># temporary arrays created under the local scope of the</span>
+        <span class="s5"># get_set_get_collect function without causing any spurious lookups /</span>
+        <span class="s5"># insertions in the map. Apparently on Python nogil, the id is not</span>
+        <span class="s5"># reused as often.</span>
+        <span class="s1">max_len_unique_ids = </span><span class="s2">400 </span><span class="s0">if </span><span class="s1">getattr(sys.flags</span><span class="s0">, </span><span class="s4">'nogil'</span><span class="s0">, False</span><span class="s1">) </span><span class="s0">else </span><span class="s2">100</span>
+        <span class="s0">assert </span><span class="s1">len(unique_ids) &lt; max_len_unique_ids</span>
+
+
+<span class="s0">def </span><span class="s1">test_weak_array_key_map_no_pickling():</span>
+    <span class="s1">m = _WeakArrayKeyMap()</span>
+    <span class="s0">with </span><span class="s1">raises(pickle.PicklingError):</span>
+        <span class="s1">pickle.dumps(m)</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@with_multiprocessing</span>
+<span class="s0">def </span><span class="s1">test_direct_mmap(tmpdir):</span>
+    <span class="s1">testfile = str(tmpdir.join(</span><span class="s4">'arr.dat'</span><span class="s1">))</span>
+    <span class="s1">a = np.arange(</span><span class="s2">10</span><span class="s0">, </span><span class="s1">dtype=</span><span class="s4">'uint8'</span><span class="s1">)</span>
+    <span class="s1">a.tofile(testfile)</span>
+
+    <span class="s0">def </span><span class="s1">_read_array():</span>
+        <span class="s0">with </span><span class="s1">open(testfile) </span><span class="s0">as </span><span class="s1">fd:</span>
+            <span class="s1">mm = mmap.mmap(fd.fileno()</span><span class="s0">, </span><span class="s2">0</span><span class="s0">, </span><span class="s1">access=mmap.ACCESS_READ</span><span class="s0">, </span><span class="s1">offset=</span><span class="s2">0</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">np.ndarray((</span><span class="s2">10</span><span class="s0">,</span><span class="s1">)</span><span class="s0">, </span><span class="s1">dtype=np.uint8</span><span class="s0">, </span><span class="s1">buffer=mm</span><span class="s0">, </span><span class="s1">offset=</span><span class="s2">0</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">func(x):</span>
+        <span class="s0">return </span><span class="s1">x**</span><span class="s2">2</span>
+
+    <span class="s1">arr = _read_array()</span>
+
+    <span class="s5"># this is expected to work and gives the reference</span>
+    <span class="s1">ref = Parallel(n_jobs=</span><span class="s2">2</span><span class="s1">)(delayed(func)(x) </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">[a])</span>
+
+    <span class="s5"># now test that it work with the mmap array</span>
+    <span class="s1">results = Parallel(n_jobs=</span><span class="s2">2</span><span class="s1">)(delayed(func)(x) </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">[arr])</span>
+    <span class="s1">np.testing.assert_array_equal(results</span><span class="s0">, </span><span class="s1">ref)</span>
+
+    <span class="s5"># also test with a mmap array read in the subprocess</span>
+    <span class="s0">def </span><span class="s1">worker():</span>
+        <span class="s0">return </span><span class="s1">_read_array()</span>
+
+    <span class="s1">results = Parallel(n_jobs=</span><span class="s2">2</span><span class="s1">)(delayed(worker)() </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">range(</span><span class="s2">1</span><span class="s1">))</span>
+    <span class="s1">np.testing.assert_array_equal(results[</span><span class="s2">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">arr)</span>
+</pre>
+</body>
+</html>

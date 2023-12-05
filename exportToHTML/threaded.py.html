@@ -1,0 +1,132 @@
+<html>
+<head>
+<title>threaded.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+threaded.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A threaded shared-memory scheduler 
+ 
+See local.py 
+&quot;&quot;&quot;</span>
+<span class="s2">from </span><span class="s1">__future__ </span><span class="s2">import </span><span class="s1">annotations</span>
+
+<span class="s2">import </span><span class="s1">atexit</span>
+<span class="s2">import </span><span class="s1">multiprocessing.pool</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">threading</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">defaultdict</span>
+<span class="s2">from </span><span class="s1">collections.abc </span><span class="s2">import </span><span class="s1">Mapping</span><span class="s2">, </span><span class="s1">Sequence</span>
+<span class="s2">from </span><span class="s1">concurrent.futures </span><span class="s2">import </span><span class="s1">Executor</span><span class="s2">, </span><span class="s1">ThreadPoolExecutor</span>
+<span class="s2">from </span><span class="s1">threading </span><span class="s2">import </span><span class="s1">Lock</span><span class="s2">, </span><span class="s1">current_thread</span>
+
+<span class="s2">from </span><span class="s1">dask </span><span class="s2">import </span><span class="s1">config</span>
+<span class="s2">from </span><span class="s1">dask.local </span><span class="s2">import </span><span class="s1">MultiprocessingPoolExecutor</span><span class="s2">, </span><span class="s1">get_async</span>
+<span class="s2">from </span><span class="s1">dask.system </span><span class="s2">import </span><span class="s1">CPU_COUNT</span>
+<span class="s2">from </span><span class="s1">dask.typing </span><span class="s2">import </span><span class="s1">Key</span>
+
+
+<span class="s2">def </span><span class="s1">_thread_get_id():</span>
+    <span class="s2">return </span><span class="s1">current_thread().ident</span>
+
+
+<span class="s1">main_thread = current_thread()</span>
+<span class="s1">default_pool: Executor | </span><span class="s2">None </span><span class="s1">= </span><span class="s2">None</span>
+<span class="s1">pools: defaultdict[threading.Thread</span><span class="s2">, </span><span class="s1">dict[int</span><span class="s2">, </span><span class="s1">Executor]] = defaultdict(dict)</span>
+<span class="s1">pools_lock = Lock()</span>
+
+
+<span class="s2">def </span><span class="s1">pack_exception(e</span><span class="s2">, </span><span class="s1">dumps):</span>
+    <span class="s2">return </span><span class="s1">e</span><span class="s2">, </span><span class="s1">sys.exc_info()[</span><span class="s3">2</span><span class="s1">]</span>
+
+
+<span class="s2">def </span><span class="s1">get(</span>
+    <span class="s1">dsk: Mapping</span><span class="s2">,</span>
+    <span class="s1">keys: Sequence[Key] | Key</span><span class="s2">,</span>
+    <span class="s1">cache=</span><span class="s2">None,</span>
+    <span class="s1">num_workers=</span><span class="s2">None,</span>
+    <span class="s1">pool=</span><span class="s2">None,</span>
+    <span class="s1">**kwargs</span><span class="s2">,</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Threaded cached implementation of dask.get 
+ 
+    Parameters 
+    ---------- 
+ 
+    dsk: dict 
+        A dask dictionary specifying a workflow 
+    keys: key or list of keys 
+        Keys corresponding to desired data 
+    num_workers: integer of thread count 
+        The number of threads to use in the ThreadPool that will actually execute tasks 
+    cache: dict-like (optional) 
+        Temporary storage of results 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; inc = lambda x: x + 1 
+    &gt;&gt;&gt; add = lambda x, y: x + y 
+    &gt;&gt;&gt; dsk = {'x': 1, 'y': 2, 'z': (inc, 'x'), 'w': (add, 'z', 'y')} 
+    &gt;&gt;&gt; get(dsk, 'w') 
+    4 
+    &gt;&gt;&gt; get(dsk, ['w', 'y']) 
+    (4, 2) 
+    &quot;&quot;&quot;</span>
+    <span class="s2">global </span><span class="s1">default_pool</span>
+    <span class="s1">pool = pool </span><span class="s2">or </span><span class="s1">config.get(</span><span class="s4">&quot;pool&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+    <span class="s1">num_workers = num_workers </span><span class="s2">or </span><span class="s1">config.get(</span><span class="s4">&quot;num_workers&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+    <span class="s1">thread = current_thread()</span>
+
+    <span class="s2">with </span><span class="s1">pools_lock:</span>
+        <span class="s2">if </span><span class="s1">pool </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">num_workers </span><span class="s2">is None and </span><span class="s1">thread </span><span class="s2">is </span><span class="s1">main_thread:</span>
+                <span class="s2">if </span><span class="s1">default_pool </span><span class="s2">is None</span><span class="s1">:</span>
+                    <span class="s1">default_pool = ThreadPoolExecutor(CPU_COUNT)</span>
+                    <span class="s1">atexit.register(default_pool.shutdown)</span>
+                <span class="s1">pool = default_pool</span>
+            <span class="s2">elif </span><span class="s1">thread </span><span class="s2">in </span><span class="s1">pools </span><span class="s2">and </span><span class="s1">num_workers </span><span class="s2">in </span><span class="s1">pools[thread]:</span>
+                <span class="s1">pool = pools[thread][num_workers]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">pool = ThreadPoolExecutor(num_workers)</span>
+                <span class="s1">atexit.register(pool.shutdown)</span>
+                <span class="s1">pools[thread][num_workers] = pool</span>
+        <span class="s2">elif </span><span class="s1">isinstance(pool</span><span class="s2">, </span><span class="s1">multiprocessing.pool.Pool):</span>
+            <span class="s1">pool = MultiprocessingPoolExecutor(pool)</span>
+
+    <span class="s1">results = get_async(</span>
+        <span class="s1">pool.submit</span><span class="s2">,</span>
+        <span class="s1">pool._max_workers</span><span class="s2">,</span>
+        <span class="s1">dsk</span><span class="s2">,</span>
+        <span class="s1">keys</span><span class="s2">,</span>
+        <span class="s1">cache=cache</span><span class="s2">,</span>
+        <span class="s1">get_id=_thread_get_id</span><span class="s2">,</span>
+        <span class="s1">pack_exception=pack_exception</span><span class="s2">,</span>
+        <span class="s1">**kwargs</span><span class="s2">,</span>
+    <span class="s1">)</span>
+
+    <span class="s5"># Cleanup pools associated to dead threads</span>
+    <span class="s2">with </span><span class="s1">pools_lock:</span>
+        <span class="s1">active_threads = set(threading.enumerate())</span>
+        <span class="s2">if </span><span class="s1">thread </span><span class="s2">is not </span><span class="s1">main_thread:</span>
+            <span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">list(pools):</span>
+                <span class="s2">if </span><span class="s1">t </span><span class="s2">not in </span><span class="s1">active_threads:</span>
+                    <span class="s2">for </span><span class="s1">p </span><span class="s2">in </span><span class="s1">pools.pop(t).values():</span>
+                        <span class="s1">p.shutdown()</span>
+
+    <span class="s2">return </span><span class="s1">results</span>
+</pre>
+</body>
+</html>

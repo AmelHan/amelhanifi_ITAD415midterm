@@ -1,0 +1,1141 @@
+<html>
+<head>
+<title>test_axis_nan_policy.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_axis_nan_policy.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Many scipy.stats functions support `axis` and `nan_policy` parameters.</span>
+<span class="s0"># When the two are combined, it can be tricky to get all the behavior just</span>
+<span class="s0"># right. This file contains a suite of common tests for scipy.stats functions</span>
+<span class="s0"># that support `axis` and `nan_policy` and additional tests for some associated</span>
+<span class="s0"># functions in stats._util.</span>
+
+<span class="s2">from </span><span class="s1">itertools </span><span class="s2">import </span><span class="s1">product</span><span class="s2">, </span><span class="s1">combinations_with_replacement</span><span class="s2">, </span><span class="s1">permutations</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">pickle</span>
+<span class="s2">import </span><span class="s1">pytest</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numpy.testing </span><span class="s2">import </span><span class="s1">assert_allclose</span><span class="s2">, </span><span class="s1">assert_equal</span><span class="s2">, </span><span class="s1">suppress_warnings</span>
+<span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">stats</span>
+<span class="s2">from </span><span class="s1">scipy.stats._axis_nan_policy </span><span class="s2">import </span><span class="s1">_masked_arrays_2_sentinel_arrays</span>
+
+
+<span class="s2">def </span><span class="s1">unpack_ttest_result(res):</span>
+    <span class="s1">low</span><span class="s2">, </span><span class="s1">high = res.confidence_interval()</span>
+    <span class="s2">return </span><span class="s1">(res.statistic</span><span class="s2">, </span><span class="s1">res.pvalue</span><span class="s2">, </span><span class="s1">res.df</span><span class="s2">, </span><span class="s1">res._standard_error</span><span class="s2">,</span>
+            <span class="s1">res._estimate</span><span class="s2">, </span><span class="s1">low</span><span class="s2">, </span><span class="s1">high)</span>
+
+
+<span class="s2">def </span><span class="s1">_get_ttest_ci(ttest):</span>
+    <span class="s0"># get a function that returns the CI bounds of provided `ttest`</span>
+    <span class="s2">def </span><span class="s1">ttest_ci(*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">res = ttest(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s2">return </span><span class="s1">res.confidence_interval()</span>
+    <span class="s2">return </span><span class="s1">ttest_ci</span>
+
+
+<span class="s1">axis_nan_policy_cases = [</span>
+    <span class="s0"># function, args, kwds, number of samples, number of outputs,</span>
+    <span class="s0"># ... paired, unpacker function</span>
+    <span class="s0"># args, kwds typically aren't needed; just showing that they work</span>
+    <span class="s1">(stats.kruskal</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">3</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, False, None</span><span class="s1">)</span><span class="s2">,  </span><span class="s0"># 4 samples is slow</span>
+    <span class="s1">(stats.ranksums</span><span class="s2">, </span><span class="s1">(</span><span class="s4">'less'</span><span class="s2">,</span><span class="s1">)</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, False, None</span><span class="s1">)</span><span class="s2">,</span>
+    <span class="s1">(stats.mannwhitneyu</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">{</span><span class="s4">'method'</span><span class="s1">: </span><span class="s4">'asymptotic'</span><span class="s1">}</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, False, None</span><span class="s1">)</span><span class="s2">,</span>
+    <span class="s1">(stats.wilcoxon</span><span class="s2">, </span><span class="s1">(</span><span class="s4">'pratt'</span><span class="s2">,</span><span class="s1">)</span><span class="s2">, </span><span class="s1">{</span><span class="s4">'mode'</span><span class="s1">: </span><span class="s4">'auto'</span><span class="s1">}</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, True,</span>
+     <span class="s2">lambda </span><span class="s1">res: (res.statistic</span><span class="s2">, </span><span class="s1">res.pvalue))</span><span class="s2">,</span>
+    <span class="s1">(stats.wilcoxon</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, True,</span>
+     <span class="s2">lambda </span><span class="s1">res: (res.statistic</span><span class="s2">, </span><span class="s1">res.pvalue))</span><span class="s2">,</span>
+    <span class="s1">(stats.wilcoxon</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">{</span><span class="s4">'mode'</span><span class="s1">: </span><span class="s4">'approx'</span><span class="s1">}</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">3</span><span class="s2">, True,</span>
+     <span class="s2">lambda </span><span class="s1">res: (res.statistic</span><span class="s2">, </span><span class="s1">res.pvalue</span><span class="s2">, </span><span class="s1">res.zstatistic))</span><span class="s2">,</span>
+    <span class="s1">(stats.gmean</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, False, lambda </span><span class="s1">x: (x</span><span class="s2">,</span><span class="s1">))</span><span class="s2">,</span>
+    <span class="s1">(stats.hmean</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, False, lambda </span><span class="s1">x: (x</span><span class="s2">,</span><span class="s1">))</span><span class="s2">,</span>
+    <span class="s1">(stats.pmean</span><span class="s2">, </span><span class="s1">(</span><span class="s3">1.42</span><span class="s2">,</span><span class="s1">)</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, False, lambda </span><span class="s1">x: (x</span><span class="s2">,</span><span class="s1">))</span><span class="s2">,</span>
+    <span class="s1">(stats.sem</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, False, lambda </span><span class="s1">x: (x</span><span class="s2">,</span><span class="s1">))</span><span class="s2">,</span>
+    <span class="s1">(stats.iqr</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, False, lambda </span><span class="s1">x: (x</span><span class="s2">,</span><span class="s1">))</span><span class="s2">,</span>
+    <span class="s1">(stats.kurtosis</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, False, lambda </span><span class="s1">x: (x</span><span class="s2">,</span><span class="s1">))</span><span class="s2">,</span>
+    <span class="s1">(stats.skew</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, False, lambda </span><span class="s1">x: (x</span><span class="s2">,</span><span class="s1">))</span><span class="s2">,</span>
+    <span class="s1">(stats.kstat</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, False, lambda </span><span class="s1">x: (x</span><span class="s2">,</span><span class="s1">))</span><span class="s2">,</span>
+    <span class="s1">(stats.kstatvar</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, False, lambda </span><span class="s1">x: (x</span><span class="s2">,</span><span class="s1">))</span><span class="s2">,</span>
+    <span class="s1">(stats.moment</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, False, lambda </span><span class="s1">x: (x</span><span class="s2">,</span><span class="s1">))</span><span class="s2">,</span>
+    <span class="s1">(stats.moment</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict(moment=[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s1">])</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, False, None</span><span class="s1">)</span><span class="s2">,</span>
+    <span class="s1">(stats.jarque_bera</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, False, None</span><span class="s1">)</span><span class="s2">,</span>
+    <span class="s1">(stats.ttest_1samp</span><span class="s2">, </span><span class="s1">(np.array([</span><span class="s3">0</span><span class="s1">])</span><span class="s2">,</span><span class="s1">)</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">7</span><span class="s2">, False,</span>
+     <span class="s1">unpack_ttest_result)</span><span class="s2">,</span>
+    <span class="s1">(stats.ttest_rel</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">7</span><span class="s2">, True, </span><span class="s1">unpack_ttest_result)</span><span class="s2">,</span>
+    <span class="s1">(stats.ttest_ind</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">7</span><span class="s2">, False, </span><span class="s1">unpack_ttest_result)</span><span class="s2">,</span>
+    <span class="s1">(_get_ttest_ci(stats.ttest_1samp)</span><span class="s2">, </span><span class="s1">(</span><span class="s3">0</span><span class="s2">,</span><span class="s1">)</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, False, None</span><span class="s1">)</span><span class="s2">,</span>
+    <span class="s1">(_get_ttest_ci(stats.ttest_rel)</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, True, None</span><span class="s1">)</span><span class="s2">,</span>
+    <span class="s1">(_get_ttest_ci(stats.ttest_ind)</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, False, None</span><span class="s1">)</span><span class="s2">,</span>
+    <span class="s1">(stats.mode</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, True, lambda </span><span class="s1">x: (x.mode</span><span class="s2">, </span><span class="s1">x.count))</span>
+<span class="s1">]</span>
+
+<span class="s0"># If the message is one of those expected, put nans in</span>
+<span class="s0"># appropriate places of `statistics` and `pvalues`</span>
+<span class="s1">too_small_messages = {</span><span class="s4">&quot;The input contains nan&quot;</span><span class="s2">,  </span><span class="s0"># for nan_policy=&quot;raise&quot;</span>
+                      <span class="s4">&quot;Degrees of freedom &lt;= 0 for slice&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;x and y should have at least 5 elements&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;Data must be at least length 3&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;The sample must contain at least two&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;x and y must contain at least two&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;division by zero&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;Mean of empty slice&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;Data passed to ks_2samp must not be empty&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;Not enough test observations&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;Not enough other observations&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;At least one observation is required&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;zero-size array to reduction operation maximum&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;`x` and `y` must be of nonzero size.&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;The exact distribution of the Wilcoxon test&quot;</span><span class="s2">,</span>
+                      <span class="s4">&quot;Data input must not be empty&quot;</span><span class="s1">}</span>
+
+<span class="s0"># If the message is one of these, results of the function may be inaccurate,</span>
+<span class="s0"># but NaNs are not to be placed</span>
+<span class="s1">inaccuracy_messages = {</span><span class="s4">&quot;Precision loss occurred in moment calculation&quot;</span><span class="s2">,</span>
+                       <span class="s4">&quot;Sample size too small for normal approximation.&quot;</span><span class="s1">}</span>
+
+<span class="s0"># For some functions, nan_policy='propagate' should not just return NaNs</span>
+<span class="s1">override_propagate_funcs = {stats.mode}</span>
+
+
+<span class="s2">def </span><span class="s1">_mixed_data_generator(n_samples</span><span class="s2">, </span><span class="s1">n_repetitions</span><span class="s2">, </span><span class="s1">axis</span><span class="s2">, </span><span class="s1">rng</span><span class="s2">,</span>
+                          <span class="s1">paired=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s0"># generate random samples to check the response of hypothesis tests to</span>
+    <span class="s0"># samples with different (but broadcastable) shapes and various</span>
+    <span class="s0"># nan patterns (e.g. all nans, some nans, no nans) along axis-slices</span>
+
+    <span class="s1">data = []</span>
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(n_samples):</span>
+        <span class="s1">n_patterns = </span><span class="s3">6  </span><span class="s0"># number of distinct nan patterns</span>
+        <span class="s1">n_obs = </span><span class="s3">20 </span><span class="s2">if </span><span class="s1">paired </span><span class="s2">else </span><span class="s3">20 </span><span class="s1">+ i  </span><span class="s0"># observations per axis-slice</span>
+        <span class="s1">x = np.ones((n_repetitions</span><span class="s2">, </span><span class="s1">n_patterns</span><span class="s2">, </span><span class="s1">n_obs)) * np.nan</span>
+
+        <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(n_repetitions):</span>
+            <span class="s1">samples = x[j</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:]</span>
+
+            <span class="s0"># case 0: axis-slice with all nans (0 reals)</span>
+            <span class="s0"># cases 1-3: axis-slice with 1-3 reals (the rest nans)</span>
+            <span class="s0"># case 4: axis-slice with mostly (all but two) reals</span>
+            <span class="s0"># case 5: axis slice with all reals</span>
+            <span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">n_reals </span><span class="s2">in </span><span class="s1">enumerate([</span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">3</span><span class="s2">, </span><span class="s1">n_obs-</span><span class="s3">2</span><span class="s2">, </span><span class="s1">n_obs]):</span>
+                <span class="s0"># for cases 1-3, need paired nansw  to be in the same place</span>
+                <span class="s1">indices = rng.permutation(n_obs)[:n_reals]</span>
+                <span class="s1">samples[k</span><span class="s2">, </span><span class="s1">indices] = rng.random(size=n_reals)</span>
+
+            <span class="s0"># permute the axis-slices just to show that order doesn't matter</span>
+            <span class="s1">samples[:] = rng.permutation(samples</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+
+        <span class="s0"># For multi-sample tests, we want to test broadcasting and check</span>
+        <span class="s0"># that nan policy works correctly for each nan pattern for each input.</span>
+        <span class="s0"># This takes care of both simultaneosly.</span>
+        <span class="s1">new_shape = [n_repetitions] + [</span><span class="s3">1</span><span class="s1">]*n_samples + [n_obs]</span>
+        <span class="s1">new_shape[</span><span class="s3">1 </span><span class="s1">+ i] = </span><span class="s3">6</span>
+        <span class="s1">x = x.reshape(new_shape)</span>
+
+        <span class="s1">x = np.moveaxis(x</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s2">, </span><span class="s1">axis)</span>
+        <span class="s1">data.append(x)</span>
+    <span class="s2">return </span><span class="s1">data</span>
+
+
+<span class="s2">def </span><span class="s1">_homogeneous_data_generator(n_samples</span><span class="s2">, </span><span class="s1">n_repetitions</span><span class="s2">, </span><span class="s1">axis</span><span class="s2">, </span><span class="s1">rng</span><span class="s2">,</span>
+                                <span class="s1">paired=</span><span class="s2">False, </span><span class="s1">all_nans=</span><span class="s2">True</span><span class="s1">):</span>
+    <span class="s0"># generate random samples to check the response of hypothesis tests to</span>
+    <span class="s0"># samples with different (but broadcastable) shapes and homogeneous</span>
+    <span class="s0"># data (all nans or all finite)</span>
+    <span class="s1">data = []</span>
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(n_samples):</span>
+        <span class="s1">n_obs = </span><span class="s3">20 </span><span class="s2">if </span><span class="s1">paired </span><span class="s2">else </span><span class="s3">20 </span><span class="s1">+ i  </span><span class="s0"># observations per axis-slice</span>
+        <span class="s1">shape = [n_repetitions] + [</span><span class="s3">1</span><span class="s1">]*n_samples + [n_obs]</span>
+        <span class="s1">shape[</span><span class="s3">1 </span><span class="s1">+ i] = </span><span class="s3">2</span>
+        <span class="s1">x = np.ones(shape) * np.nan </span><span class="s2">if </span><span class="s1">all_nans </span><span class="s2">else </span><span class="s1">rng.random(shape)</span>
+        <span class="s1">x = np.moveaxis(x</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s2">, </span><span class="s1">axis)</span>
+        <span class="s1">data.append(x)</span>
+    <span class="s2">return </span><span class="s1">data</span>
+
+
+<span class="s2">def </span><span class="s1">nan_policy_1d(hypotest</span><span class="s2">, </span><span class="s1">data1d</span><span class="s2">, </span><span class="s1">unpacker</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">n_outputs=</span><span class="s3">2</span><span class="s2">,</span>
+                  <span class="s1">nan_policy=</span><span class="s4">'raise'</span><span class="s2">, </span><span class="s1">paired=</span><span class="s2">False, </span><span class="s1">_no_deco=</span><span class="s2">True, </span><span class="s1">**kwds):</span>
+    <span class="s0"># Reference implementation for how `nan_policy` should work for 1d samples</span>
+
+    <span class="s2">if </span><span class="s1">nan_policy == </span><span class="s4">'raise'</span><span class="s1">:</span>
+        <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">data1d:</span>
+            <span class="s2">if </span><span class="s1">np.any(np.isnan(sample)):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;The input contains nan values&quot;</span><span class="s1">)</span>
+
+    <span class="s2">elif </span><span class="s1">(nan_policy == </span><span class="s4">'propagate'</span>
+          <span class="s2">and </span><span class="s1">hypotest </span><span class="s2">not in </span><span class="s1">override_propagate_funcs):</span>
+        <span class="s0"># For all hypothesis tests tested, returning nans is the right thing.</span>
+        <span class="s0"># But many hypothesis tests don't propagate correctly (e.g. they treat</span>
+        <span class="s0"># np.nan the same as np.inf, which doesn't make sense when ranks are</span>
+        <span class="s0"># involved) so override that behavior here.</span>
+        <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">data1d:</span>
+            <span class="s2">if </span><span class="s1">np.any(np.isnan(sample)):</span>
+                <span class="s2">return </span><span class="s1">np.full(n_outputs</span><span class="s2">, </span><span class="s1">np.nan)</span>
+
+    <span class="s2">elif </span><span class="s1">nan_policy == </span><span class="s4">'omit'</span><span class="s1">:</span>
+        <span class="s0"># manually omit nans (or pairs in which at least one element is nan)</span>
+        <span class="s2">if not </span><span class="s1">paired:</span>
+            <span class="s1">data1d = [sample[~np.isnan(sample)] </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">data1d]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">nan_mask = np.isnan(data1d[</span><span class="s3">0</span><span class="s1">])</span>
+            <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">data1d[</span><span class="s3">1</span><span class="s1">:]:</span>
+                <span class="s1">nan_mask = np.logical_or(nan_mask</span><span class="s2">, </span><span class="s1">np.isnan(sample))</span>
+            <span class="s1">data1d = [sample[~nan_mask] </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">data1d]</span>
+
+    <span class="s2">return </span><span class="s1">unpacker(hypotest(*data1d</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">_no_deco=_no_deco</span><span class="s2">, </span><span class="s1">**kwds))</span>
+
+
+<span class="s1">@pytest.mark.filterwarnings(</span><span class="s4">'ignore::RuntimeWarning'</span><span class="s1">)</span>
+<span class="s1">@pytest.mark.filterwarnings(</span><span class="s4">'ignore::UserWarning'</span><span class="s1">)</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;hypotest&quot;</span><span class="s2">, </span><span class="s4">&quot;args&quot;</span><span class="s2">, </span><span class="s4">&quot;kwds&quot;</span><span class="s2">, </span><span class="s4">&quot;n_samples&quot;</span><span class="s2">, </span><span class="s4">&quot;n_outputs&quot;</span><span class="s2">,</span>
+                          <span class="s4">&quot;paired&quot;</span><span class="s2">, </span><span class="s4">&quot;unpacker&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">axis_nan_policy_cases)</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;nan_policy&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s4">&quot;propagate&quot;</span><span class="s2">, </span><span class="s4">&quot;omit&quot;</span><span class="s2">, </span><span class="s4">&quot;raise&quot;</span><span class="s1">))</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;axis&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s3">1</span><span class="s2">,</span><span class="s1">))</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;data_generator&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s4">&quot;mixed&quot;</span><span class="s2">,</span><span class="s1">))</span>
+<span class="s2">def </span><span class="s1">test_axis_nan_policy_fast(hypotest</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwds</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_outputs</span><span class="s2">,</span>
+                              <span class="s1">paired</span><span class="s2">, </span><span class="s1">unpacker</span><span class="s2">, </span><span class="s1">nan_policy</span><span class="s2">, </span><span class="s1">axis</span><span class="s2">,</span>
+                              <span class="s1">data_generator):</span>
+    <span class="s1">_axis_nan_policy_test(hypotest</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwds</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_outputs</span><span class="s2">, </span><span class="s1">paired</span><span class="s2">,</span>
+                          <span class="s1">unpacker</span><span class="s2">, </span><span class="s1">nan_policy</span><span class="s2">, </span><span class="s1">axis</span><span class="s2">, </span><span class="s1">data_generator)</span>
+
+
+<span class="s1">@pytest.mark.slow</span>
+<span class="s1">@pytest.mark.filterwarnings(</span><span class="s4">'ignore::RuntimeWarning'</span><span class="s1">)</span>
+<span class="s1">@pytest.mark.filterwarnings(</span><span class="s4">'ignore::UserWarning'</span><span class="s1">)</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;hypotest&quot;</span><span class="s2">, </span><span class="s4">&quot;args&quot;</span><span class="s2">, </span><span class="s4">&quot;kwds&quot;</span><span class="s2">, </span><span class="s4">&quot;n_samples&quot;</span><span class="s2">, </span><span class="s4">&quot;n_outputs&quot;</span><span class="s2">,</span>
+                          <span class="s4">&quot;paired&quot;</span><span class="s2">, </span><span class="s4">&quot;unpacker&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">axis_nan_policy_cases)</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;nan_policy&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s4">&quot;propagate&quot;</span><span class="s2">, </span><span class="s4">&quot;omit&quot;</span><span class="s2">, </span><span class="s4">&quot;raise&quot;</span><span class="s1">))</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;axis&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">range(-</span><span class="s3">3</span><span class="s2">, </span><span class="s3">3</span><span class="s1">))</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;data_generator&quot;</span><span class="s1">)</span><span class="s2">,</span>
+                         <span class="s1">(</span><span class="s4">&quot;all_nans&quot;</span><span class="s2">, </span><span class="s4">&quot;all_finite&quot;</span><span class="s2">, </span><span class="s4">&quot;mixed&quot;</span><span class="s1">))</span>
+<span class="s2">def </span><span class="s1">test_axis_nan_policy_full(hypotest</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwds</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_outputs</span><span class="s2">,</span>
+                              <span class="s1">paired</span><span class="s2">, </span><span class="s1">unpacker</span><span class="s2">, </span><span class="s1">nan_policy</span><span class="s2">, </span><span class="s1">axis</span><span class="s2">,</span>
+                              <span class="s1">data_generator):</span>
+    <span class="s1">_axis_nan_policy_test(hypotest</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwds</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_outputs</span><span class="s2">, </span><span class="s1">paired</span><span class="s2">,</span>
+                          <span class="s1">unpacker</span><span class="s2">, </span><span class="s1">nan_policy</span><span class="s2">, </span><span class="s1">axis</span><span class="s2">, </span><span class="s1">data_generator)</span>
+
+
+<span class="s2">def </span><span class="s1">_axis_nan_policy_test(hypotest</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwds</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_outputs</span><span class="s2">, </span><span class="s1">paired</span><span class="s2">,</span>
+                          <span class="s1">unpacker</span><span class="s2">, </span><span class="s1">nan_policy</span><span class="s2">, </span><span class="s1">axis</span><span class="s2">, </span><span class="s1">data_generator):</span>
+    <span class="s0"># Tests the 1D and vectorized behavior of hypothesis tests against a</span>
+    <span class="s0"># reference implementation (nan_policy_1d with np.ndenumerate)</span>
+
+    <span class="s0"># Some hypothesis tests return a non-iterable that needs an `unpacker` to</span>
+    <span class="s0"># extract the statistic and p-value. For those that don't:</span>
+    <span class="s2">if not </span><span class="s1">unpacker:</span>
+        <span class="s2">def </span><span class="s1">unpacker(res):</span>
+            <span class="s2">return </span><span class="s1">res</span>
+
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">0</span><span class="s1">)</span>
+
+    <span class="s0"># Generate multi-dimensional test data with all important combinations</span>
+    <span class="s0"># of patterns of nans along `axis`</span>
+    <span class="s1">n_repetitions = </span><span class="s3">3  </span><span class="s0"># number of repetitions of each pattern</span>
+    <span class="s1">data_gen_kwds = {</span><span class="s4">'n_samples'</span><span class="s1">: n_samples</span><span class="s2">, </span><span class="s4">'n_repetitions'</span><span class="s1">: n_repetitions</span><span class="s2">,</span>
+                     <span class="s4">'axis'</span><span class="s1">: axis</span><span class="s2">, </span><span class="s4">'rng'</span><span class="s1">: rng</span><span class="s2">, </span><span class="s4">'paired'</span><span class="s1">: paired}</span>
+    <span class="s2">if </span><span class="s1">data_generator == </span><span class="s4">'mixed'</span><span class="s1">:</span>
+        <span class="s1">inherent_size = </span><span class="s3">6  </span><span class="s0"># number of distinct types of patterns</span>
+        <span class="s1">data = _mixed_data_generator(**data_gen_kwds)</span>
+    <span class="s2">elif </span><span class="s1">data_generator == </span><span class="s4">'all_nans'</span><span class="s1">:</span>
+        <span class="s1">inherent_size = </span><span class="s3">2  </span><span class="s0"># hard-coded in _homogeneous_data_generator</span>
+        <span class="s1">data_gen_kwds[</span><span class="s4">'all_nans'</span><span class="s1">] = </span><span class="s2">True</span>
+        <span class="s1">data = _homogeneous_data_generator(**data_gen_kwds)</span>
+    <span class="s2">elif </span><span class="s1">data_generator == </span><span class="s4">'all_finite'</span><span class="s1">:</span>
+        <span class="s1">inherent_size = </span><span class="s3">2  </span><span class="s0"># hard-coded in _homogeneous_data_generator</span>
+        <span class="s1">data_gen_kwds[</span><span class="s4">'all_nans'</span><span class="s1">] = </span><span class="s2">False</span>
+        <span class="s1">data = _homogeneous_data_generator(**data_gen_kwds)</span>
+
+    <span class="s1">output_shape = [n_repetitions] + [inherent_size]*n_samples</span>
+
+    <span class="s0"># To generate reference behavior to compare against, loop over the axis-</span>
+    <span class="s0"># slices in data. Make indexing easier by moving `axis` to the end and</span>
+    <span class="s0"># broadcasting all samples to the same shape.</span>
+    <span class="s1">data_b = [np.moveaxis(sample</span><span class="s2">, </span><span class="s1">axis</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s1">) </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">data]</span>
+    <span class="s1">data_b = [np.broadcast_to(sample</span><span class="s2">, </span><span class="s1">output_shape + [sample.shape[-</span><span class="s3">1</span><span class="s1">]])</span>
+              <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">data_b]</span>
+    <span class="s1">statistics = np.zeros(output_shape)</span>
+    <span class="s1">pvalues = np.zeros(output_shape)</span>
+
+    <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">np.ndenumerate(statistics):</span>
+        <span class="s1">data1d = [sample[i] </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">data_b]</span>
+        <span class="s2">with </span><span class="s1">np.errstate(divide=</span><span class="s4">'ignore'</span><span class="s2">, </span><span class="s1">invalid=</span><span class="s4">'ignore'</span><span class="s1">):</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">res1d = nan_policy_1d(hypotest</span><span class="s2">, </span><span class="s1">data1d</span><span class="s2">, </span><span class="s1">unpacker</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">,</span>
+                                      <span class="s1">n_outputs=n_outputs</span><span class="s2">,</span>
+                                      <span class="s1">nan_policy=nan_policy</span><span class="s2">,</span>
+                                      <span class="s1">paired=paired</span><span class="s2">, </span><span class="s1">_no_deco=</span><span class="s2">True, </span><span class="s1">**kwds)</span>
+
+                <span class="s0"># Eventually we'll check the results of a single, vectorized</span>
+                <span class="s0"># call of `hypotest` against the arrays `statistics` and</span>
+                <span class="s0"># `pvalues` populated using the reference `nan_policy_1d`.</span>
+                <span class="s0"># But while we're at it, check the results of a 1D call to</span>
+                <span class="s0"># `hypotest` against the reference `nan_policy_1d`.</span>
+                <span class="s1">res1db = unpacker(hypotest(*data1d</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">,</span>
+                                           <span class="s1">nan_policy=nan_policy</span><span class="s2">, </span><span class="s1">**kwds))</span>
+                <span class="s1">assert_equal(res1db[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">res1d[</span><span class="s3">0</span><span class="s1">])</span>
+                <span class="s2">if </span><span class="s1">len(res1db) == </span><span class="s3">2</span><span class="s1">:</span>
+                    <span class="s1">assert_equal(res1db[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">res1d[</span><span class="s3">1</span><span class="s1">])</span>
+
+            <span class="s0"># When there is not enough data in 1D samples, many existing</span>
+            <span class="s0"># hypothesis tests raise errors instead of returning nans .</span>
+            <span class="s0"># For vectorized calls, we put nans in the corresponding elements</span>
+            <span class="s0"># of the output.</span>
+            <span class="s2">except </span><span class="s1">(RuntimeWarning</span><span class="s2">, </span><span class="s1">UserWarning</span><span class="s2">, </span><span class="s1">ValueError</span><span class="s2">,</span>
+                    <span class="s1">ZeroDivisionError) </span><span class="s2">as </span><span class="s1">e:</span>
+
+                <span class="s0"># whatever it is, make sure same error is raised by both</span>
+                <span class="s0"># `nan_policy_1d` and `hypotest`</span>
+                <span class="s2">with </span><span class="s1">pytest.raises(type(e)</span><span class="s2">, </span><span class="s1">match=re.escape(str(e))):</span>
+                    <span class="s1">nan_policy_1d(hypotest</span><span class="s2">, </span><span class="s1">data1d</span><span class="s2">, </span><span class="s1">unpacker</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">,</span>
+                                  <span class="s1">n_outputs=n_outputs</span><span class="s2">, </span><span class="s1">nan_policy=nan_policy</span><span class="s2">,</span>
+                                  <span class="s1">paired=paired</span><span class="s2">, </span><span class="s1">_no_deco=</span><span class="s2">True, </span><span class="s1">**kwds)</span>
+                <span class="s2">with </span><span class="s1">pytest.raises(type(e)</span><span class="s2">, </span><span class="s1">match=re.escape(str(e))):</span>
+                    <span class="s1">hypotest(*data1d</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">nan_policy=nan_policy</span><span class="s2">, </span><span class="s1">**kwds)</span>
+
+                <span class="s2">if </span><span class="s1">any([str(e).startswith(message)</span>
+                        <span class="s2">for </span><span class="s1">message </span><span class="s2">in </span><span class="s1">too_small_messages]):</span>
+                    <span class="s1">res1d = np.full(n_outputs</span><span class="s2">, </span><span class="s1">np.nan)</span>
+                <span class="s2">elif </span><span class="s1">any([str(e).startswith(message)</span>
+                          <span class="s2">for </span><span class="s1">message </span><span class="s2">in </span><span class="s1">inaccuracy_messages]):</span>
+                    <span class="s2">with </span><span class="s1">suppress_warnings() </span><span class="s2">as </span><span class="s1">sup:</span>
+                        <span class="s1">sup.filter(RuntimeWarning)</span>
+                        <span class="s1">sup.filter(UserWarning)</span>
+                        <span class="s1">res1d = nan_policy_1d(hypotest</span><span class="s2">, </span><span class="s1">data1d</span><span class="s2">, </span><span class="s1">unpacker</span><span class="s2">,</span>
+                                              <span class="s1">*args</span><span class="s2">, </span><span class="s1">n_outputs=n_outputs</span><span class="s2">,</span>
+                                              <span class="s1">nan_policy=nan_policy</span><span class="s2">,</span>
+                                              <span class="s1">paired=paired</span><span class="s2">, </span><span class="s1">_no_deco=</span><span class="s2">True,</span>
+                                              <span class="s1">**kwds)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">raise </span><span class="s1">e</span>
+        <span class="s1">statistics[i] = res1d[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">len(res1d) == </span><span class="s3">2</span><span class="s1">:</span>
+            <span class="s1">pvalues[i] = res1d[</span><span class="s3">1</span><span class="s1">]</span>
+
+    <span class="s0"># Perform a vectorized call to the hypothesis test.</span>
+    <span class="s0"># If `nan_policy == 'raise'`, check that it raises the appropriate error.</span>
+    <span class="s0"># If not, compare against the output against `statistics` and `pvalues`</span>
+    <span class="s2">if </span><span class="s1">nan_policy == </span><span class="s4">'raise' </span><span class="s2">and not </span><span class="s1">data_generator == </span><span class="s4">&quot;all_finite&quot;</span><span class="s1">:</span>
+        <span class="s1">message = </span><span class="s4">'The input contains nan values'</span>
+        <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=message):</span>
+            <span class="s1">hypotest(*data</span><span class="s2">, </span><span class="s1">axis=axis</span><span class="s2">, </span><span class="s1">nan_policy=nan_policy</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwds)</span>
+
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">with </span><span class="s1">suppress_warnings() </span><span class="s2">as </span><span class="s1">sup</span><span class="s2">, </span><span class="s1">\</span>
+             <span class="s1">np.errstate(divide=</span><span class="s4">'ignore'</span><span class="s2">, </span><span class="s1">invalid=</span><span class="s4">'ignore'</span><span class="s1">):</span>
+            <span class="s1">sup.filter(RuntimeWarning</span><span class="s2">, </span><span class="s4">&quot;Precision loss occurred in moment&quot;</span><span class="s1">)</span>
+            <span class="s1">sup.filter(UserWarning</span><span class="s2">, </span><span class="s4">&quot;Sample size too small for normal &quot;</span>
+                                    <span class="s4">&quot;approximation.&quot;</span><span class="s1">)</span>
+            <span class="s1">res = unpacker(hypotest(*data</span><span class="s2">, </span><span class="s1">axis=axis</span><span class="s2">, </span><span class="s1">nan_policy=nan_policy</span><span class="s2">,</span>
+                                    <span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwds))</span>
+        <span class="s1">assert_allclose(res[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">statistics</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s3">1e-15</span><span class="s1">)</span>
+        <span class="s1">assert_equal(res[</span><span class="s3">0</span><span class="s1">].dtype</span><span class="s2">, </span><span class="s1">statistics.dtype)</span>
+
+        <span class="s2">if </span><span class="s1">len(res) == </span><span class="s3">2</span><span class="s1">:</span>
+            <span class="s1">assert_allclose(res[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">pvalues</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s3">1e-15</span><span class="s1">)</span>
+            <span class="s1">assert_equal(res[</span><span class="s3">1</span><span class="s1">].dtype</span><span class="s2">, </span><span class="s1">pvalues.dtype)</span>
+
+
+<span class="s1">@pytest.mark.filterwarnings(</span><span class="s4">'ignore::RuntimeWarning'</span><span class="s1">)</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;hypotest&quot;</span><span class="s2">, </span><span class="s4">&quot;args&quot;</span><span class="s2">, </span><span class="s4">&quot;kwds&quot;</span><span class="s2">, </span><span class="s4">&quot;n_samples&quot;</span><span class="s2">, </span><span class="s4">&quot;n_outputs&quot;</span><span class="s2">,</span>
+                          <span class="s4">&quot;paired&quot;</span><span class="s2">, </span><span class="s4">&quot;unpacker&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">axis_nan_policy_cases)</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;nan_policy&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s4">&quot;propagate&quot;</span><span class="s2">, </span><span class="s4">&quot;omit&quot;</span><span class="s2">, </span><span class="s4">&quot;raise&quot;</span><span class="s1">))</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;data_generator&quot;</span><span class="s1">)</span><span class="s2">,</span>
+                         <span class="s1">(</span><span class="s4">&quot;all_nans&quot;</span><span class="s2">, </span><span class="s4">&quot;all_finite&quot;</span><span class="s2">, </span><span class="s4">&quot;mixed&quot;</span><span class="s2">, </span><span class="s4">&quot;empty&quot;</span><span class="s1">))</span>
+<span class="s2">def </span><span class="s1">test_axis_nan_policy_axis_is_None(hypotest</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwds</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">,</span>
+                                      <span class="s1">n_outputs</span><span class="s2">, </span><span class="s1">paired</span><span class="s2">, </span><span class="s1">unpacker</span><span class="s2">, </span><span class="s1">nan_policy</span><span class="s2">,</span>
+                                      <span class="s1">data_generator):</span>
+    <span class="s0"># check for correct behavior when `axis=None`</span>
+
+    <span class="s2">if not </span><span class="s1">unpacker:</span>
+        <span class="s2">def </span><span class="s1">unpacker(res):</span>
+            <span class="s2">return </span><span class="s1">res</span>
+
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">0</span><span class="s1">)</span>
+
+    <span class="s2">if </span><span class="s1">data_generator == </span><span class="s4">&quot;empty&quot;</span><span class="s1">:</span>
+        <span class="s1">data = [rng.random((</span><span class="s3">2</span><span class="s2">, </span><span class="s3">0</span><span class="s1">)) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(n_samples)]</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">data = [rng.random((</span><span class="s3">2</span><span class="s2">, </span><span class="s3">20</span><span class="s1">)) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(n_samples)]</span>
+
+    <span class="s2">if </span><span class="s1">data_generator == </span><span class="s4">&quot;mixed&quot;</span><span class="s1">:</span>
+        <span class="s1">masks = [rng.random((</span><span class="s3">2</span><span class="s2">, </span><span class="s3">20</span><span class="s1">)) &gt; </span><span class="s3">0.9 </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(n_samples)]</span>
+        <span class="s2">for </span><span class="s1">sample</span><span class="s2">, </span><span class="s1">mask </span><span class="s2">in </span><span class="s1">zip(data</span><span class="s2">, </span><span class="s1">masks):</span>
+            <span class="s1">sample[mask] = np.nan</span>
+    <span class="s2">elif </span><span class="s1">data_generator == </span><span class="s4">&quot;all_nans&quot;</span><span class="s1">:</span>
+        <span class="s1">data = [sample * np.nan </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">data]</span>
+
+    <span class="s1">data_raveled = [sample.ravel() </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">data]</span>
+
+    <span class="s2">if </span><span class="s1">nan_policy == </span><span class="s4">'raise' </span><span class="s2">and </span><span class="s1">data_generator </span><span class="s2">not in </span><span class="s1">{</span><span class="s4">&quot;all_finite&quot;</span><span class="s2">, </span><span class="s4">&quot;empty&quot;</span><span class="s1">}:</span>
+        <span class="s1">message = </span><span class="s4">'The input contains nan values'</span>
+
+        <span class="s0"># check for correct behavior whether or not data is 1d to begin with</span>
+        <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=message):</span>
+            <span class="s1">hypotest(*data</span><span class="s2">, </span><span class="s1">axis=</span><span class="s2">None, </span><span class="s1">nan_policy=nan_policy</span><span class="s2">,</span>
+                     <span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwds)</span>
+        <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=message):</span>
+            <span class="s1">hypotest(*data_raveled</span><span class="s2">, </span><span class="s1">axis=</span><span class="s2">None, </span><span class="s1">nan_policy=nan_policy</span><span class="s2">,</span>
+                     <span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwds)</span>
+
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s0"># behavior of reference implementation with 1d input, hypotest with 1d</span>
+        <span class="s0"># input, and hypotest with Nd input should match, whether that means</span>
+        <span class="s0"># that outputs are equal or they raise the same exception</span>
+
+        <span class="s1">ea_str</span><span class="s2">, </span><span class="s1">eb_str</span><span class="s2">, </span><span class="s1">ec_str = </span><span class="s2">None, None, None</span>
+        <span class="s2">with </span><span class="s1">np.errstate(divide=</span><span class="s4">'ignore'</span><span class="s2">, </span><span class="s1">invalid=</span><span class="s4">'ignore'</span><span class="s1">):</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">res1da = nan_policy_1d(hypotest</span><span class="s2">, </span><span class="s1">data_raveled</span><span class="s2">, </span><span class="s1">unpacker</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">,</span>
+                                       <span class="s1">n_outputs=n_outputs</span><span class="s2">,</span>
+                                       <span class="s1">nan_policy=nan_policy</span><span class="s2">, </span><span class="s1">paired=paired</span><span class="s2">,</span>
+                                       <span class="s1">_no_deco=</span><span class="s2">True, </span><span class="s1">**kwds)</span>
+            <span class="s2">except </span><span class="s1">(RuntimeWarning</span><span class="s2">, </span><span class="s1">ValueError</span><span class="s2">, </span><span class="s1">ZeroDivisionError) </span><span class="s2">as </span><span class="s1">ea:</span>
+                <span class="s1">ea_str = str(ea)</span>
+
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">res1db = unpacker(hypotest(*data_raveled</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">,</span>
+                                           <span class="s1">nan_policy=nan_policy</span><span class="s2">, </span><span class="s1">**kwds))</span>
+            <span class="s2">except </span><span class="s1">(RuntimeWarning</span><span class="s2">, </span><span class="s1">ValueError</span><span class="s2">, </span><span class="s1">ZeroDivisionError) </span><span class="s2">as </span><span class="s1">eb:</span>
+                <span class="s1">eb_str = str(eb)</span>
+
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">res1dc = unpacker(hypotest(*data</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">axis=</span><span class="s2">None,</span>
+                                           <span class="s1">nan_policy=nan_policy</span><span class="s2">, </span><span class="s1">**kwds))</span>
+            <span class="s2">except </span><span class="s1">(RuntimeWarning</span><span class="s2">, </span><span class="s1">ValueError</span><span class="s2">, </span><span class="s1">ZeroDivisionError) </span><span class="s2">as </span><span class="s1">ec:</span>
+                <span class="s1">ec_str = str(ec)</span>
+
+            <span class="s2">if </span><span class="s1">ea_str </span><span class="s2">or </span><span class="s1">eb_str </span><span class="s2">or </span><span class="s1">ec_str:</span>
+                <span class="s2">assert </span><span class="s1">any([str(ea_str).startswith(message)</span>
+                            <span class="s2">for </span><span class="s1">message </span><span class="s2">in </span><span class="s1">too_small_messages])</span>
+                <span class="s2">assert </span><span class="s1">ea_str == eb_str == ec_str</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">assert_equal(res1db</span><span class="s2">, </span><span class="s1">res1da)</span>
+                <span class="s1">assert_equal(res1dc</span><span class="s2">, </span><span class="s1">res1da)</span>
+                <span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">list(res1da) + list(res1db) + list(res1dc):</span>
+                    <span class="s0"># Most functions naturally return NumPy numbers, which</span>
+                    <span class="s0"># are drop-in replacements for the Python versions but with</span>
+                    <span class="s0"># desirable attributes. Make sure this is consistent.</span>
+                    <span class="s2">assert </span><span class="s1">np.issubdtype(item.dtype</span><span class="s2">, </span><span class="s1">np.number)</span>
+
+<span class="s0"># Test keepdims for:</span>
+<span class="s0">#     - single-output and multi-output functions (gmean and mannwhitneyu)</span>
+<span class="s0">#     - Axis negative, positive, None, and tuple</span>
+<span class="s0">#     - 1D with no NaNs</span>
+<span class="s0">#     - 1D with NaN propagation</span>
+<span class="s0">#     - Zero-sized output</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">&quot;nan_policy&quot;</span><span class="s2">, </span><span class="s1">(</span><span class="s4">&quot;omit&quot;</span><span class="s2">, </span><span class="s4">&quot;propagate&quot;</span><span class="s1">))</span>
+<span class="s1">@pytest.mark.parametrize(</span>
+    <span class="s1">(</span><span class="s4">&quot;hypotest&quot;</span><span class="s2">, </span><span class="s4">&quot;args&quot;</span><span class="s2">, </span><span class="s4">&quot;kwds&quot;</span><span class="s2">, </span><span class="s4">&quot;n_samples&quot;</span><span class="s2">, </span><span class="s4">&quot;unpacker&quot;</span><span class="s1">)</span><span class="s2">,</span>
+    <span class="s1">((stats.gmean</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">dict()</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, lambda </span><span class="s1">x: (x</span><span class="s2">,</span><span class="s1">))</span><span class="s2">,</span>
+     <span class="s1">(stats.mannwhitneyu</span><span class="s2">, </span><span class="s1">tuple()</span><span class="s2">, </span><span class="s1">{</span><span class="s4">'method'</span><span class="s1">: </span><span class="s4">'asymptotic'</span><span class="s1">}</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, None</span><span class="s1">))</span>
+<span class="s1">)</span>
+<span class="s1">@pytest.mark.parametrize(</span>
+    <span class="s1">(</span><span class="s4">&quot;sample_shape&quot;</span><span class="s2">, </span><span class="s4">&quot;axis_cases&quot;</span><span class="s1">)</span><span class="s2">,</span>
+    <span class="s1">(((</span><span class="s3">2</span><span class="s2">, </span><span class="s3">3</span><span class="s2">, </span><span class="s3">3</span><span class="s2">, </span><span class="s3">4</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s2">None, </span><span class="s3">0</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s2">, </span><span class="s1">(</span><span class="s3">0</span><span class="s2">, </span><span class="s3">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s3">3</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">0</span><span class="s1">)))</span><span class="s2">,</span>
+     <span class="s1">((</span><span class="s3">10</span><span class="s2">, </span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s3">0</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s1">))</span><span class="s2">,</span>
+     <span class="s1">((</span><span class="s3">20</span><span class="s2">, </span><span class="s3">0</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s1">)))</span>
+<span class="s1">)</span>
+<span class="s2">def </span><span class="s1">test_keepdims(hypotest</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwds</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, </span><span class="s1">unpacker</span><span class="s2">,</span>
+                  <span class="s1">sample_shape</span><span class="s2">, </span><span class="s1">axis_cases</span><span class="s2">, </span><span class="s1">nan_policy):</span>
+    <span class="s0"># test if keepdims parameter works correctly</span>
+    <span class="s2">if not </span><span class="s1">unpacker:</span>
+        <span class="s2">def </span><span class="s1">unpacker(res):</span>
+            <span class="s2">return </span><span class="s1">res</span>
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">data = [rng.random(sample_shape) </span><span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range(n_samples)]</span>
+    <span class="s1">nan_data = [sample.copy() </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">data]</span>
+    <span class="s1">nan_mask = [rng.random(sample_shape) &lt; </span><span class="s3">0.2 </span><span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range(n_samples)]</span>
+    <span class="s2">for </span><span class="s1">sample</span><span class="s2">, </span><span class="s1">mask </span><span class="s2">in </span><span class="s1">zip(nan_data</span><span class="s2">, </span><span class="s1">nan_mask):</span>
+        <span class="s1">sample[mask] = np.nan</span>
+    <span class="s2">for </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">axis_cases:</span>
+        <span class="s1">expected_shape = list(sample_shape)</span>
+        <span class="s2">if </span><span class="s1">axis </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">expected_shape = np.ones(len(sample_shape))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">isinstance(axis</span><span class="s2">, </span><span class="s1">int):</span>
+                <span class="s1">expected_shape[axis] = </span><span class="s3">1</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">axis:</span>
+                    <span class="s1">expected_shape[ax] = </span><span class="s3">1</span>
+        <span class="s1">expected_shape = tuple(expected_shape)</span>
+        <span class="s1">res = unpacker(hypotest(*data</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">axis=axis</span><span class="s2">, </span><span class="s1">keepdims=</span><span class="s2">True,</span>
+                                <span class="s1">**kwds))</span>
+        <span class="s1">res_base = unpacker(hypotest(*data</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">axis=axis</span><span class="s2">, </span><span class="s1">keepdims=</span><span class="s2">False,</span>
+                                     <span class="s1">**kwds))</span>
+        <span class="s1">nan_res = unpacker(hypotest(*nan_data</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">axis=axis</span><span class="s2">,</span>
+                                    <span class="s1">keepdims=</span><span class="s2">True, </span><span class="s1">nan_policy=nan_policy</span><span class="s2">,</span>
+                                    <span class="s1">**kwds))</span>
+        <span class="s1">nan_res_base = unpacker(hypotest(*nan_data</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">axis=axis</span><span class="s2">,</span>
+                                         <span class="s1">keepdims=</span><span class="s2">False,</span>
+                                         <span class="s1">nan_policy=nan_policy</span><span class="s2">, </span><span class="s1">**kwds))</span>
+        <span class="s2">for </span><span class="s1">r</span><span class="s2">, </span><span class="s1">r_base</span><span class="s2">, </span><span class="s1">rn</span><span class="s2">, </span><span class="s1">rn_base </span><span class="s2">in </span><span class="s1">zip(res</span><span class="s2">, </span><span class="s1">res_base</span><span class="s2">, </span><span class="s1">nan_res</span><span class="s2">,</span>
+                                          <span class="s1">nan_res_base):</span>
+            <span class="s2">assert </span><span class="s1">r.shape == expected_shape</span>
+            <span class="s1">r = np.squeeze(r</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+            <span class="s1">assert_equal(r</span><span class="s2">, </span><span class="s1">r_base)</span>
+            <span class="s2">assert </span><span class="s1">rn.shape == expected_shape</span>
+            <span class="s1">rn = np.squeeze(rn</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+            <span class="s1">assert_equal(rn</span><span class="s2">, </span><span class="s1">rn_base)</span>
+
+
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;fun&quot;</span><span class="s2">, </span><span class="s4">&quot;nsamp&quot;</span><span class="s1">)</span><span class="s2">,</span>
+                         <span class="s1">[(stats.kstat</span><span class="s2">, </span><span class="s3">1</span><span class="s1">)</span><span class="s2">,</span>
+                          <span class="s1">(stats.kstatvar</span><span class="s2">, </span><span class="s3">1</span><span class="s1">)])</span>
+<span class="s2">def </span><span class="s1">test_hypotest_back_compat_no_axis(fun</span><span class="s2">, </span><span class="s1">nsamp):</span>
+    <span class="s1">m</span><span class="s2">, </span><span class="s1">n = </span><span class="s3">8</span><span class="s2">, </span><span class="s3">9</span>
+
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">x = rng.random((nsamp</span><span class="s2">, </span><span class="s1">m</span><span class="s2">, </span><span class="s1">n))</span>
+    <span class="s1">res = fun(*x)</span>
+    <span class="s1">res2 = fun(*x</span><span class="s2">, </span><span class="s1">_no_deco=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s1">res3 = fun([xi.ravel() </span><span class="s2">for </span><span class="s1">xi </span><span class="s2">in </span><span class="s1">x])</span>
+    <span class="s1">assert_equal(res</span><span class="s2">, </span><span class="s1">res2)</span>
+    <span class="s1">assert_equal(res</span><span class="s2">, </span><span class="s1">res3)</span>
+
+
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;axis&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(</span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s1">))</span>
+<span class="s2">def </span><span class="s1">test_axis_nan_policy_decorated_positional_axis(axis):</span>
+    <span class="s0"># Test for correct behavior of function decorated with</span>
+    <span class="s0"># _axis_nan_policy_decorator whether `axis` is provided as positional or</span>
+    <span class="s0"># keyword argument</span>
+
+    <span class="s1">shape = (</span><span class="s3">8</span><span class="s2">, </span><span class="s3">9</span><span class="s2">, </span><span class="s3">10</span><span class="s1">)</span>
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">x = rng.random(shape)</span>
+    <span class="s1">y = rng.random(shape)</span>
+    <span class="s1">res1 = stats.mannwhitneyu(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, True, </span><span class="s4">'two-sided'</span><span class="s2">, </span><span class="s1">axis)</span>
+    <span class="s1">res2 = stats.mannwhitneyu(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, True, </span><span class="s4">'two-sided'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+    <span class="s1">assert_equal(res1</span><span class="s2">, </span><span class="s1">res2)</span>
+
+    <span class="s1">message = </span><span class="s4">&quot;mannwhitneyu() got multiple values for argument 'axis'&quot;</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(TypeError</span><span class="s2">, </span><span class="s1">match=re.escape(message)):</span>
+        <span class="s1">stats.mannwhitneyu(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, True, </span><span class="s4">'two-sided'</span><span class="s2">, </span><span class="s1">axis</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+
+
+<span class="s2">def </span><span class="s1">test_axis_nan_policy_decorated_positional_args():</span>
+    <span class="s0"># Test for correct behavior of function decorated with</span>
+    <span class="s0"># _axis_nan_policy_decorator when function accepts *args</span>
+
+    <span class="s1">shape = (</span><span class="s3">3</span><span class="s2">, </span><span class="s3">8</span><span class="s2">, </span><span class="s3">9</span><span class="s2">, </span><span class="s3">10</span><span class="s1">)</span>
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">x = rng.random(shape)</span>
+    <span class="s1">x[</span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = np.nan</span>
+    <span class="s1">stats.kruskal(*x)</span>
+
+    <span class="s1">message = </span><span class="s4">&quot;kruskal() got an unexpected keyword argument 'samples'&quot;</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(TypeError</span><span class="s2">, </span><span class="s1">match=re.escape(message)):</span>
+        <span class="s1">stats.kruskal(samples=x)</span>
+
+    <span class="s2">with </span><span class="s1">pytest.raises(TypeError</span><span class="s2">, </span><span class="s1">match=re.escape(message)):</span>
+        <span class="s1">stats.kruskal(*x</span><span class="s2">, </span><span class="s1">samples=x)</span>
+
+
+<span class="s2">def </span><span class="s1">test_axis_nan_policy_decorated_keyword_samples():</span>
+    <span class="s0"># Test for correct behavior of function decorated with</span>
+    <span class="s0"># _axis_nan_policy_decorator whether samples are provided as positional or</span>
+    <span class="s0"># keyword arguments</span>
+
+    <span class="s1">shape = (</span><span class="s3">2</span><span class="s2">, </span><span class="s3">8</span><span class="s2">, </span><span class="s3">9</span><span class="s2">, </span><span class="s3">10</span><span class="s1">)</span>
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">x = rng.random(shape)</span>
+    <span class="s1">x[</span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = np.nan</span>
+    <span class="s1">res1 = stats.mannwhitneyu(*x)</span>
+    <span class="s1">res2 = stats.mannwhitneyu(x=x[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">y=x[</span><span class="s3">1</span><span class="s1">])</span>
+    <span class="s1">assert_equal(res1</span><span class="s2">, </span><span class="s1">res2)</span>
+
+    <span class="s1">message = </span><span class="s4">&quot;mannwhitneyu() got multiple values for argument&quot;</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(TypeError</span><span class="s2">, </span><span class="s1">match=re.escape(message)):</span>
+        <span class="s1">stats.mannwhitneyu(*x</span><span class="s2">, </span><span class="s1">x=x[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">y=x[</span><span class="s3">1</span><span class="s1">])</span>
+
+
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;hypotest&quot;</span><span class="s2">, </span><span class="s4">&quot;args&quot;</span><span class="s2">, </span><span class="s4">&quot;kwds&quot;</span><span class="s2">, </span><span class="s4">&quot;n_samples&quot;</span><span class="s2">, </span><span class="s4">&quot;n_outputs&quot;</span><span class="s2">,</span>
+                          <span class="s4">&quot;paired&quot;</span><span class="s2">, </span><span class="s4">&quot;unpacker&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">axis_nan_policy_cases)</span>
+<span class="s2">def </span><span class="s1">test_axis_nan_policy_decorated_pickled(hypotest</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwds</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">,</span>
+                                           <span class="s1">n_outputs</span><span class="s2">, </span><span class="s1">paired</span><span class="s2">, </span><span class="s1">unpacker):</span>
+    <span class="s2">if </span><span class="s4">&quot;ttest_ci&quot; </span><span class="s2">in </span><span class="s1">hypotest.__name__:</span>
+        <span class="s1">pytest.skip(</span><span class="s4">&quot;Can't pickle functions defined within functions.&quot;</span><span class="s1">)</span>
+
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">0</span><span class="s1">)</span>
+
+    <span class="s0"># Some hypothesis tests return a non-iterable that needs an `unpacker` to</span>
+    <span class="s0"># extract the statistic and p-value. For those that don't:</span>
+    <span class="s2">if not </span><span class="s1">unpacker:</span>
+        <span class="s2">def </span><span class="s1">unpacker(res):</span>
+            <span class="s2">return </span><span class="s1">res</span>
+
+    <span class="s1">data = rng.uniform(size=(n_samples</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">30</span><span class="s1">))</span>
+    <span class="s1">pickled_hypotest = pickle.dumps(hypotest)</span>
+    <span class="s1">unpickled_hypotest = pickle.loads(pickled_hypotest)</span>
+    <span class="s1">res1 = unpacker(hypotest(*data</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">axis=-</span><span class="s3">1</span><span class="s2">, </span><span class="s1">**kwds))</span>
+    <span class="s1">res2 = unpacker(unpickled_hypotest(*data</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">axis=-</span><span class="s3">1</span><span class="s2">, </span><span class="s1">**kwds))</span>
+    <span class="s1">assert_allclose(res1</span><span class="s2">, </span><span class="s1">res2</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s3">1e-12</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">test_check_empty_inputs():</span>
+    <span class="s0"># Test that _check_empty_inputs is doing its job, at least for single-</span>
+    <span class="s0"># sample inputs. (Multi-sample functionality is tested below.)</span>
+    <span class="s0"># If the input sample is not empty, it should return None.</span>
+    <span class="s0"># If the input sample is empty, it should return an array of NaNs or an</span>
+    <span class="s0"># empty array of appropriate shape. np.mean is used as a reference for the</span>
+    <span class="s0"># output because, like the statistics calculated by these functions,</span>
+    <span class="s0"># it works along and &quot;consumes&quot; `axis` but preserves the other axes.</span>
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">5</span><span class="s1">):</span>
+        <span class="s2">for </span><span class="s1">combo </span><span class="s2">in </span><span class="s1">combinations_with_replacement([</span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">i):</span>
+            <span class="s2">for </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">range(len(combo)):</span>
+                <span class="s1">samples = (np.zeros(combo)</span><span class="s2">,</span><span class="s1">)</span>
+                <span class="s1">output = stats._axis_nan_policy._check_empty_inputs(samples</span><span class="s2">,</span>
+                                                                    <span class="s1">axis)</span>
+                <span class="s2">if </span><span class="s1">output </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s2">with </span><span class="s1">np.testing.suppress_warnings() </span><span class="s2">as </span><span class="s1">sup:</span>
+                        <span class="s1">sup.filter(RuntimeWarning</span><span class="s2">, </span><span class="s4">&quot;Mean of empty slice.&quot;</span><span class="s1">)</span>
+                        <span class="s1">sup.filter(RuntimeWarning</span><span class="s2">, </span><span class="s4">&quot;invalid value encountered&quot;</span><span class="s1">)</span>
+                        <span class="s1">reference = samples[</span><span class="s3">0</span><span class="s1">].mean(axis=axis)</span>
+                    <span class="s1">np.testing.assert_equal(output</span><span class="s2">, </span><span class="s1">reference)</span>
+
+
+<span class="s2">def </span><span class="s1">_check_arrays_broadcastable(arrays</span><span class="s2">, </span><span class="s1">axis):</span>
+    <span class="s0"># https://numpy.org/doc/stable/user/basics.broadcasting.html</span>
+    <span class="s0"># &quot;When operating on two arrays, NumPy compares their shapes element-wise.</span>
+    <span class="s0"># It starts with the trailing (i.e. rightmost) dimensions and works its</span>
+    <span class="s0"># way left.</span>
+    <span class="s0"># Two dimensions are compatible when</span>
+    <span class="s0"># 1. they are equal, or</span>
+    <span class="s0"># 2. one of them is 1</span>
+    <span class="s0"># ...</span>
+    <span class="s0"># Arrays do not need to have the same number of dimensions.&quot;</span>
+    <span class="s0"># (Clarification: if the arrays are compatible according to the criteria</span>
+    <span class="s0">#  above and an array runs out of dimensions, it is still compatible.)</span>
+    <span class="s0"># Below, we follow the rules above except ignoring `axis`</span>
+
+    <span class="s1">n_dims = max([arr.ndim </span><span class="s2">for </span><span class="s1">arr </span><span class="s2">in </span><span class="s1">arrays])</span>
+    <span class="s2">if </span><span class="s1">axis </span><span class="s2">is not None</span><span class="s1">:</span>
+        <span class="s0"># convert to negative axis</span>
+        <span class="s1">axis = (-n_dims + axis) </span><span class="s2">if </span><span class="s1">axis &gt;= </span><span class="s3">0 </span><span class="s2">else </span><span class="s1">axis</span>
+
+    <span class="s2">for </span><span class="s1">dim </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">n_dims+</span><span class="s3">1</span><span class="s1">):  </span><span class="s0"># we'll index from -1 to -n_dims, inclusive</span>
+        <span class="s2">if </span><span class="s1">-dim == axis:</span>
+            <span class="s2">continue  </span><span class="s0"># ignore lengths along `axis`</span>
+
+        <span class="s1">dim_lengths = set()</span>
+        <span class="s2">for </span><span class="s1">arr </span><span class="s2">in </span><span class="s1">arrays:</span>
+            <span class="s2">if </span><span class="s1">dim &lt;= arr.ndim </span><span class="s2">and </span><span class="s1">arr.shape[-dim] != </span><span class="s3">1</span><span class="s1">:</span>
+                <span class="s1">dim_lengths.add(arr.shape[-dim])</span>
+
+        <span class="s2">if </span><span class="s1">len(dim_lengths) &gt; </span><span class="s3">1</span><span class="s1">:</span>
+            <span class="s2">return False</span>
+    <span class="s2">return True</span>
+
+
+<span class="s1">@pytest.mark.slow</span>
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;hypotest&quot;</span><span class="s2">, </span><span class="s4">&quot;args&quot;</span><span class="s2">, </span><span class="s4">&quot;kwds&quot;</span><span class="s2">, </span><span class="s4">&quot;n_samples&quot;</span><span class="s2">, </span><span class="s4">&quot;n_outputs&quot;</span><span class="s2">,</span>
+                          <span class="s4">&quot;paired&quot;</span><span class="s2">, </span><span class="s4">&quot;unpacker&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">axis_nan_policy_cases)</span>
+<span class="s2">def </span><span class="s1">test_empty(hypotest</span><span class="s2">, </span><span class="s1">args</span><span class="s2">, </span><span class="s1">kwds</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_outputs</span><span class="s2">, </span><span class="s1">paired</span><span class="s2">, </span><span class="s1">unpacker):</span>
+    <span class="s0"># test for correct output shape when at least one input is empty</span>
+
+    <span class="s2">if </span><span class="s1">hypotest </span><span class="s2">in </span><span class="s1">override_propagate_funcs:</span>
+        <span class="s1">reason = </span><span class="s4">&quot;Doesn't follow the usual pattern. Tested separately.&quot;</span>
+        <span class="s1">pytest.skip(reason=reason)</span>
+
+    <span class="s2">if </span><span class="s1">unpacker </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">unpacker = </span><span class="s2">lambda </span><span class="s1">res: (res[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">res[</span><span class="s3">1</span><span class="s1">])  </span><span class="s0"># noqa: E731</span>
+
+    <span class="s2">def </span><span class="s1">small_data_generator(n_samples</span><span class="s2">, </span><span class="s1">n_dims):</span>
+
+        <span class="s2">def </span><span class="s1">small_sample_generator(n_dims):</span>
+            <span class="s0"># return all possible &quot;small&quot; arrays in up to n_dim dimensions</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">n_dims:</span>
+                <span class="s0"># &quot;small&quot; means with size along dimension either 0 or 1</span>
+                <span class="s2">for </span><span class="s1">combo </span><span class="s2">in </span><span class="s1">combinations_with_replacement([</span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">i):</span>
+                    <span class="s2">yield </span><span class="s1">np.zeros(combo)</span>
+
+        <span class="s0"># yield all possible combinations of small samples</span>
+        <span class="s1">gens = [small_sample_generator(n_dims) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(n_samples)]</span>
+        <span class="s2">yield from </span><span class="s1">product(*gens)</span>
+
+    <span class="s1">n_dims = [</span><span class="s3">2</span><span class="s2">, </span><span class="s3">3</span><span class="s1">]</span>
+    <span class="s2">for </span><span class="s1">samples </span><span class="s2">in </span><span class="s1">small_data_generator(n_samples</span><span class="s2">, </span><span class="s1">n_dims):</span>
+
+        <span class="s0"># this test is only for arrays of zero size</span>
+        <span class="s2">if not </span><span class="s1">any(sample.size == </span><span class="s3">0 </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples):</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">max_axis = max(sample.ndim </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples)</span>
+
+        <span class="s0"># need to test for all valid values of `axis` parameter, too</span>
+        <span class="s2">for </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">range(-max_axis</span><span class="s2">, </span><span class="s1">max_axis):</span>
+
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s0"># After broadcasting, all arrays are the same shape, so</span>
+                <span class="s0"># the shape of the output should be the same as a single-</span>
+                <span class="s0"># sample statistic. Use np.mean as a reference.</span>
+                <span class="s1">concat = stats._stats_py._broadcast_concatenate(samples</span><span class="s2">, </span><span class="s1">axis)</span>
+                <span class="s2">with </span><span class="s1">np.testing.suppress_warnings() </span><span class="s2">as </span><span class="s1">sup:</span>
+                    <span class="s1">sup.filter(RuntimeWarning</span><span class="s2">, </span><span class="s4">&quot;Mean of empty slice.&quot;</span><span class="s1">)</span>
+                    <span class="s1">sup.filter(RuntimeWarning</span><span class="s2">, </span><span class="s4">&quot;invalid value encountered&quot;</span><span class="s1">)</span>
+                    <span class="s1">expected = np.mean(concat</span><span class="s2">, </span><span class="s1">axis=axis) * np.nan</span>
+
+                <span class="s1">res = hypotest(*samples</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">axis=axis</span><span class="s2">, </span><span class="s1">**kwds)</span>
+                <span class="s1">res = unpacker(res)</span>
+
+                <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(n_outputs):</span>
+                    <span class="s1">assert_equal(res[i]</span><span class="s2">, </span><span class="s1">expected)</span>
+
+            <span class="s2">except </span><span class="s1">ValueError:</span>
+                <span class="s0"># confirm that the arrays truly are not broadcastable</span>
+                <span class="s2">assert not </span><span class="s1">_check_arrays_broadcastable(samples</span><span class="s2">, </span><span class="s1">axis)</span>
+
+                <span class="s0"># confirm that _both_ `_broadcast_concatenate` and `hypotest`</span>
+                <span class="s0"># produce this information.</span>
+                <span class="s1">message = </span><span class="s4">&quot;Array shapes are incompatible for broadcasting.&quot;</span>
+                <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=message):</span>
+                    <span class="s1">stats._stats_py._broadcast_concatenate(samples</span><span class="s2">, </span><span class="s1">axis)</span>
+                <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=message):</span>
+                    <span class="s1">hypotest(*samples</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">axis=axis</span><span class="s2">, </span><span class="s1">**kwds)</span>
+
+
+<span class="s2">def </span><span class="s1">test_masked_array_2_sentinel_array():</span>
+    <span class="s0"># prepare arrays</span>
+    <span class="s1">np.random.seed(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">A = np.random.rand(</span><span class="s3">10</span><span class="s2">, </span><span class="s3">11</span><span class="s2">, </span><span class="s3">12</span><span class="s1">)</span>
+    <span class="s1">B = np.random.rand(</span><span class="s3">12</span><span class="s1">)</span>
+    <span class="s1">mask = A &lt; </span><span class="s3">0.5</span>
+    <span class="s1">A = np.ma.masked_array(A</span><span class="s2">, </span><span class="s1">mask)</span>
+
+    <span class="s0"># set arbitrary elements to special values</span>
+    <span class="s0"># (these values might have been considered for use as sentinel values)</span>
+    <span class="s1">max_float = np.finfo(np.float64).max</span>
+    <span class="s1">max_float2 = np.nextafter(max_float</span><span class="s2">, </span><span class="s1">-np.inf)</span>
+    <span class="s1">max_float3 = np.nextafter(max_float2</span><span class="s2">, </span><span class="s1">-np.inf)</span>
+    <span class="s1">A[</span><span class="s3">3</span><span class="s2">, </span><span class="s3">4</span><span class="s2">, </span><span class="s3">1</span><span class="s1">] = np.nan</span>
+    <span class="s1">A[</span><span class="s3">4</span><span class="s2">, </span><span class="s3">5</span><span class="s2">, </span><span class="s3">2</span><span class="s1">] = np.inf</span>
+    <span class="s1">A[</span><span class="s3">5</span><span class="s2">, </span><span class="s3">6</span><span class="s2">, </span><span class="s3">3</span><span class="s1">] = max_float</span>
+    <span class="s1">B[</span><span class="s3">8</span><span class="s1">] = np.nan</span>
+    <span class="s1">B[</span><span class="s3">7</span><span class="s1">] = np.inf</span>
+    <span class="s1">B[</span><span class="s3">6</span><span class="s1">] = max_float2</span>
+
+    <span class="s0"># convert masked A to array with sentinel value, don't modify B</span>
+    <span class="s1">out_arrays</span><span class="s2">, </span><span class="s1">sentinel = _masked_arrays_2_sentinel_arrays([A</span><span class="s2">, </span><span class="s1">B])</span>
+    <span class="s1">A_out</span><span class="s2">, </span><span class="s1">B_out = out_arrays</span>
+
+    <span class="s0"># check that good sentinel value was chosen (according to intended logic)</span>
+    <span class="s2">assert </span><span class="s1">(sentinel != max_float) </span><span class="s2">and </span><span class="s1">(sentinel != max_float2)</span>
+    <span class="s2">assert </span><span class="s1">sentinel == max_float3</span>
+
+    <span class="s0"># check that output arrays are as intended</span>
+    <span class="s1">A_reference = A.data</span>
+    <span class="s1">A_reference[A.mask] = sentinel</span>
+    <span class="s1">np.testing.assert_array_equal(A_out</span><span class="s2">, </span><span class="s1">A_reference)</span>
+    <span class="s2">assert </span><span class="s1">B_out </span><span class="s2">is </span><span class="s1">B</span>
+
+
+<span class="s2">def </span><span class="s1">test_masked_dtype():</span>
+    <span class="s0"># When _masked_arrays_2_sentinel_arrays was first added, it always</span>
+    <span class="s0"># upcast the arrays to np.float64. After gh16662, check expected promotion</span>
+    <span class="s0"># and that the expected sentinel is found.</span>
+
+    <span class="s0"># these are important because the max of the promoted dtype is the first</span>
+    <span class="s0"># candidate to be the sentinel value</span>
+    <span class="s1">max16 = np.iinfo(np.int16).max</span>
+    <span class="s1">max128c = np.finfo(np.complex128).max</span>
+
+    <span class="s0"># a is a regular array, b has masked elements, and c has no masked elements</span>
+    <span class="s1">a = np.array([</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s1">max16]</span><span class="s2">, </span><span class="s1">dtype=np.int16)</span>
+    <span class="s1">b = np.ma.array([</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.int8</span><span class="s2">, </span><span class="s1">mask=[</span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">0</span><span class="s1">])</span>
+    <span class="s1">c = np.ma.array([</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.complex128</span><span class="s2">, </span><span class="s1">mask=[</span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">])</span>
+
+    <span class="s0"># check integer masked -&gt; sentinel conversion</span>
+    <span class="s1">out_arrays</span><span class="s2">, </span><span class="s1">sentinel = _masked_arrays_2_sentinel_arrays([a</span><span class="s2">, </span><span class="s1">b])</span>
+    <span class="s1">a_out</span><span class="s2">, </span><span class="s1">b_out = out_arrays</span>
+    <span class="s2">assert </span><span class="s1">sentinel == max16-</span><span class="s3">1  </span><span class="s0"># not max16 because max16 was in the data</span>
+    <span class="s2">assert </span><span class="s1">b_out.dtype == np.int16  </span><span class="s0"># check expected promotion</span>
+    <span class="s1">assert_allclose(b_out</span><span class="s2">, </span><span class="s1">[b[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">sentinel</span><span class="s2">, </span><span class="s1">b[-</span><span class="s3">1</span><span class="s1">]])  </span><span class="s0"># check sentinel placement</span>
+    <span class="s2">assert </span><span class="s1">a_out </span><span class="s2">is </span><span class="s1">a  </span><span class="s0"># not a masked array, so left untouched</span>
+    <span class="s2">assert not </span><span class="s1">isinstance(b_out</span><span class="s2">, </span><span class="s1">np.ma.MaskedArray)  </span><span class="s0"># b became regular array</span>
+
+    <span class="s0"># similarly with complex</span>
+    <span class="s1">out_arrays</span><span class="s2">, </span><span class="s1">sentinel = _masked_arrays_2_sentinel_arrays([b</span><span class="s2">, </span><span class="s1">c])</span>
+    <span class="s1">b_out</span><span class="s2">, </span><span class="s1">c_out = out_arrays</span>
+    <span class="s2">assert </span><span class="s1">sentinel == max128c  </span><span class="s0"># max128c was not in the data</span>
+    <span class="s2">assert </span><span class="s1">b_out.dtype == np.complex128  </span><span class="s0"># b got promoted</span>
+    <span class="s1">assert_allclose(b_out</span><span class="s2">, </span><span class="s1">[b[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">sentinel</span><span class="s2">, </span><span class="s1">b[-</span><span class="s3">1</span><span class="s1">]])  </span><span class="s0"># check sentinel placement</span>
+    <span class="s2">assert not </span><span class="s1">isinstance(b_out</span><span class="s2">, </span><span class="s1">np.ma.MaskedArray)  </span><span class="s0"># b became regular array</span>
+    <span class="s2">assert not </span><span class="s1">isinstance(c_out</span><span class="s2">, </span><span class="s1">np.ma.MaskedArray)  </span><span class="s0"># c became regular array</span>
+
+    <span class="s0"># Also, check edge case when a sentinel value cannot be found in the data</span>
+    <span class="s1">min8</span><span class="s2">, </span><span class="s1">max8 = np.iinfo(np.int8).min</span><span class="s2">, </span><span class="s1">np.iinfo(np.int8).max</span>
+    <span class="s1">a = np.arange(min8</span><span class="s2">, </span><span class="s1">max8+</span><span class="s3">1</span><span class="s2">, </span><span class="s1">dtype=np.int8)  </span><span class="s0"># use all possible values</span>
+    <span class="s1">mask1 = np.zeros_like(a</span><span class="s2">, </span><span class="s1">dtype=bool)</span>
+    <span class="s1">mask0 = np.zeros_like(a</span><span class="s2">, </span><span class="s1">dtype=bool)</span>
+
+    <span class="s0"># a masked value can be used as the sentinel</span>
+    <span class="s1">mask1[</span><span class="s3">1</span><span class="s1">] = </span><span class="s2">True</span>
+    <span class="s1">a1 = np.ma.array(a</span><span class="s2">, </span><span class="s1">mask=mask1)</span>
+    <span class="s1">out_arrays</span><span class="s2">, </span><span class="s1">sentinel = _masked_arrays_2_sentinel_arrays([a1])</span>
+    <span class="s2">assert </span><span class="s1">sentinel == min8+</span><span class="s3">1</span>
+
+    <span class="s0"># unless it's the smallest possible; skipped for simiplicity (see code)</span>
+    <span class="s1">mask0[</span><span class="s3">0</span><span class="s1">] = </span><span class="s2">True</span>
+    <span class="s1">a0 = np.ma.array(a</span><span class="s2">, </span><span class="s1">mask=mask0)</span>
+    <span class="s1">message = </span><span class="s4">&quot;This function replaces masked elements with sentinel...&quot;</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=message):</span>
+        <span class="s1">_masked_arrays_2_sentinel_arrays([a0])</span>
+
+    <span class="s0"># test that dtype is preserved in functions</span>
+    <span class="s1">a = np.ma.array([</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">mask=[</span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.float32)</span>
+    <span class="s2">assert </span><span class="s1">stats.gmean(a).dtype == np.float32</span>
+
+
+<span class="s2">def </span><span class="s1">test_masked_stat_1d():</span>
+    <span class="s0"># basic test of _axis_nan_policy_factory with 1D masked sample</span>
+    <span class="s1">males = [</span><span class="s3">19</span><span class="s2">, </span><span class="s3">22</span><span class="s2">, </span><span class="s3">16</span><span class="s2">, </span><span class="s3">29</span><span class="s2">, </span><span class="s3">24</span><span class="s1">]</span>
+    <span class="s1">females = [</span><span class="s3">20</span><span class="s2">, </span><span class="s3">11</span><span class="s2">, </span><span class="s3">17</span><span class="s2">, </span><span class="s3">12</span><span class="s1">]</span>
+    <span class="s1">res = stats.mannwhitneyu(males</span><span class="s2">, </span><span class="s1">females)</span>
+
+    <span class="s0"># same result when extra nan is omitted</span>
+    <span class="s1">females2 = [</span><span class="s3">20</span><span class="s2">, </span><span class="s3">11</span><span class="s2">, </span><span class="s3">17</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">, </span><span class="s3">12</span><span class="s1">]</span>
+    <span class="s1">res2 = stats.mannwhitneyu(males</span><span class="s2">, </span><span class="s1">females2</span><span class="s2">, </span><span class="s1">nan_policy=</span><span class="s4">'omit'</span><span class="s1">)</span>
+    <span class="s1">np.testing.assert_array_equal(res2</span><span class="s2">, </span><span class="s1">res)</span>
+
+    <span class="s0"># same result when extra element is masked</span>
+    <span class="s1">females3 = [</span><span class="s3">20</span><span class="s2">, </span><span class="s3">11</span><span class="s2">, </span><span class="s3">17</span><span class="s2">, </span><span class="s3">1000</span><span class="s2">, </span><span class="s3">12</span><span class="s1">]</span>
+    <span class="s1">mask3 = [</span><span class="s2">False, False, False, True, False</span><span class="s1">]</span>
+    <span class="s1">females3 = np.ma.masked_array(females3</span><span class="s2">, </span><span class="s1">mask=mask3)</span>
+    <span class="s1">res3 = stats.mannwhitneyu(males</span><span class="s2">, </span><span class="s1">females3)</span>
+    <span class="s1">np.testing.assert_array_equal(res3</span><span class="s2">, </span><span class="s1">res)</span>
+
+    <span class="s0"># same result when extra nan is omitted and additional element is masked</span>
+    <span class="s1">females4 = [</span><span class="s3">20</span><span class="s2">, </span><span class="s3">11</span><span class="s2">, </span><span class="s3">17</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">, </span><span class="s3">1000</span><span class="s2">, </span><span class="s3">12</span><span class="s1">]</span>
+    <span class="s1">mask4 = [</span><span class="s2">False, False, False, False, True, False</span><span class="s1">]</span>
+    <span class="s1">females4 = np.ma.masked_array(females4</span><span class="s2">, </span><span class="s1">mask=mask4)</span>
+    <span class="s1">res4 = stats.mannwhitneyu(males</span><span class="s2">, </span><span class="s1">females4</span><span class="s2">, </span><span class="s1">nan_policy=</span><span class="s4">'omit'</span><span class="s1">)</span>
+    <span class="s1">np.testing.assert_array_equal(res4</span><span class="s2">, </span><span class="s1">res)</span>
+
+    <span class="s0"># same result when extra elements, including nan, are masked</span>
+    <span class="s1">females5 = [</span><span class="s3">20</span><span class="s2">, </span><span class="s3">11</span><span class="s2">, </span><span class="s3">17</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">, </span><span class="s3">1000</span><span class="s2">, </span><span class="s3">12</span><span class="s1">]</span>
+    <span class="s1">mask5 = [</span><span class="s2">False, False, False, True, True, False</span><span class="s1">]</span>
+    <span class="s1">females5 = np.ma.masked_array(females5</span><span class="s2">, </span><span class="s1">mask=mask5)</span>
+    <span class="s1">res5 = stats.mannwhitneyu(males</span><span class="s2">, </span><span class="s1">females5</span><span class="s2">, </span><span class="s1">nan_policy=</span><span class="s4">'propagate'</span><span class="s1">)</span>
+    <span class="s1">res6 = stats.mannwhitneyu(males</span><span class="s2">, </span><span class="s1">females5</span><span class="s2">, </span><span class="s1">nan_policy=</span><span class="s4">'raise'</span><span class="s1">)</span>
+    <span class="s1">np.testing.assert_array_equal(res5</span><span class="s2">, </span><span class="s1">res)</span>
+    <span class="s1">np.testing.assert_array_equal(res6</span><span class="s2">, </span><span class="s1">res)</span>
+
+
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;axis&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">range(-</span><span class="s3">3</span><span class="s2">, </span><span class="s3">3</span><span class="s1">))</span>
+<span class="s2">def </span><span class="s1">test_masked_stat_3d(axis):</span>
+    <span class="s0"># basic test of _axis_nan_policy_factory with 3D masked sample</span>
+    <span class="s1">np.random.seed(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">a = np.random.rand(</span><span class="s3">3</span><span class="s2">, </span><span class="s3">4</span><span class="s2">, </span><span class="s3">5</span><span class="s1">)</span>
+    <span class="s1">b = np.random.rand(</span><span class="s3">4</span><span class="s2">, </span><span class="s3">5</span><span class="s1">)</span>
+    <span class="s1">c = np.random.rand(</span><span class="s3">4</span><span class="s2">, </span><span class="s3">1</span><span class="s1">)</span>
+
+    <span class="s1">mask_a = a &lt; </span><span class="s3">0.1</span>
+    <span class="s1">mask_c = [</span><span class="s2">False, False, False, True</span><span class="s1">]</span>
+    <span class="s1">a_masked = np.ma.masked_array(a</span><span class="s2">, </span><span class="s1">mask=mask_a)</span>
+    <span class="s1">c_masked = np.ma.masked_array(c</span><span class="s2">, </span><span class="s1">mask=mask_c)</span>
+
+    <span class="s1">a_nans = a.copy()</span>
+    <span class="s1">a_nans[mask_a] = np.nan</span>
+    <span class="s1">c_nans = c.copy()</span>
+    <span class="s1">c_nans[mask_c] = np.nan</span>
+
+    <span class="s1">res = stats.kruskal(a_nans</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">c_nans</span><span class="s2">, </span><span class="s1">nan_policy=</span><span class="s4">'omit'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+    <span class="s1">res2 = stats.kruskal(a_masked</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">c_masked</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+    <span class="s1">np.testing.assert_array_equal(res</span><span class="s2">, </span><span class="s1">res2)</span>
+
+
+<span class="s2">def </span><span class="s1">test_mixed_mask_nan_1():</span>
+    <span class="s0"># targeted test of _axis_nan_policy_factory with 2D masked sample:</span>
+    <span class="s0"># omitting samples with masks and nan_policy='omit' are equivalent</span>
+    <span class="s0"># also checks paired-sample sentinel value removal</span>
+    <span class="s1">m</span><span class="s2">, </span><span class="s1">n = </span><span class="s3">3</span><span class="s2">, </span><span class="s3">20</span>
+    <span class="s1">axis = -</span><span class="s3">1</span>
+
+    <span class="s1">np.random.seed(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">a = np.random.rand(m</span><span class="s2">, </span><span class="s1">n)</span>
+    <span class="s1">b = np.random.rand(m</span><span class="s2">, </span><span class="s1">n)</span>
+    <span class="s1">mask_a1 = np.random.rand(m</span><span class="s2">, </span><span class="s1">n) &lt; </span><span class="s3">0.2</span>
+    <span class="s1">mask_a2 = np.random.rand(m</span><span class="s2">, </span><span class="s1">n) &lt; </span><span class="s3">0.1</span>
+    <span class="s1">mask_b1 = np.random.rand(m</span><span class="s2">, </span><span class="s1">n) &lt; </span><span class="s3">0.15</span>
+    <span class="s1">mask_b2 = np.random.rand(m</span><span class="s2">, </span><span class="s1">n) &lt; </span><span class="s3">0.15</span>
+    <span class="s1">mask_a1[</span><span class="s3">2</span><span class="s2">, </span><span class="s1">:] = </span><span class="s2">True</span>
+
+    <span class="s1">a_nans = a.copy()</span>
+    <span class="s1">b_nans = b.copy()</span>
+    <span class="s1">a_nans[mask_a1 | mask_a2] = np.nan</span>
+    <span class="s1">b_nans[mask_b1 | mask_b2] = np.nan</span>
+
+    <span class="s1">a_masked1 = np.ma.masked_array(a</span><span class="s2">, </span><span class="s1">mask=mask_a1)</span>
+    <span class="s1">b_masked1 = np.ma.masked_array(b</span><span class="s2">, </span><span class="s1">mask=mask_b1)</span>
+    <span class="s1">a_masked1[mask_a2] = np.nan</span>
+    <span class="s1">b_masked1[mask_b2] = np.nan</span>
+
+    <span class="s1">a_masked2 = np.ma.masked_array(a</span><span class="s2">, </span><span class="s1">mask=mask_a2)</span>
+    <span class="s1">b_masked2 = np.ma.masked_array(b</span><span class="s2">, </span><span class="s1">mask=mask_b2)</span>
+    <span class="s1">a_masked2[mask_a1] = np.nan</span>
+    <span class="s1">b_masked2[mask_b1] = np.nan</span>
+
+    <span class="s1">a_masked3 = np.ma.masked_array(a</span><span class="s2">, </span><span class="s1">mask=(mask_a1 | mask_a2))</span>
+    <span class="s1">b_masked3 = np.ma.masked_array(b</span><span class="s2">, </span><span class="s1">mask=(mask_b1 | mask_b2))</span>
+
+    <span class="s1">res = stats.wilcoxon(a_nans</span><span class="s2">, </span><span class="s1">b_nans</span><span class="s2">, </span><span class="s1">nan_policy=</span><span class="s4">'omit'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+    <span class="s1">res1 = stats.wilcoxon(a_masked1</span><span class="s2">, </span><span class="s1">b_masked1</span><span class="s2">, </span><span class="s1">nan_policy=</span><span class="s4">'omit'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+    <span class="s1">res2 = stats.wilcoxon(a_masked2</span><span class="s2">, </span><span class="s1">b_masked2</span><span class="s2">, </span><span class="s1">nan_policy=</span><span class="s4">'omit'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+    <span class="s1">res3 = stats.wilcoxon(a_masked3</span><span class="s2">, </span><span class="s1">b_masked3</span><span class="s2">, </span><span class="s1">nan_policy=</span><span class="s4">'raise'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+    <span class="s1">res4 = stats.wilcoxon(a_masked3</span><span class="s2">, </span><span class="s1">b_masked3</span><span class="s2">,</span>
+                          <span class="s1">nan_policy=</span><span class="s4">'propagate'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+
+    <span class="s1">np.testing.assert_array_equal(res1</span><span class="s2">, </span><span class="s1">res)</span>
+    <span class="s1">np.testing.assert_array_equal(res2</span><span class="s2">, </span><span class="s1">res)</span>
+    <span class="s1">np.testing.assert_array_equal(res3</span><span class="s2">, </span><span class="s1">res)</span>
+    <span class="s1">np.testing.assert_array_equal(res4</span><span class="s2">, </span><span class="s1">res)</span>
+
+
+<span class="s2">def </span><span class="s1">test_mixed_mask_nan_2():</span>
+    <span class="s0"># targeted test of _axis_nan_policy_factory with 2D masked sample:</span>
+    <span class="s0"># check for expected interaction between masks and nans</span>
+
+    <span class="s0"># Cases here are</span>
+    <span class="s0"># [mixed nan/mask, all nans, all masked,</span>
+    <span class="s0"># unmasked nan, masked nan, unmasked non-nan]</span>
+    <span class="s1">a = [[</span><span class="s3">1</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">, </span><span class="s3">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[np.nan</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">, </span><span class="s1">np.nan]</span><span class="s2">, </span><span class="s1">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">3</span><span class="s1">]</span><span class="s2">,</span>
+         <span class="s1">[</span><span class="s3">1</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">, </span><span class="s3">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s3">1</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">, </span><span class="s3">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">3</span><span class="s1">]]</span>
+    <span class="s1">mask = [[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">]]</span>
+    <span class="s1">a_masked = np.ma.masked_array(a</span><span class="s2">, </span><span class="s1">mask=mask)</span>
+    <span class="s1">b = [[</span><span class="s3">4</span><span class="s2">, </span><span class="s3">5</span><span class="s2">, </span><span class="s3">6</span><span class="s1">]]</span>
+    <span class="s1">ref1 = stats.ranksums([</span><span class="s3">1</span><span class="s2">, </span><span class="s3">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s3">4</span><span class="s2">, </span><span class="s3">5</span><span class="s2">, </span><span class="s3">6</span><span class="s1">])</span>
+    <span class="s1">ref2 = stats.ranksums([</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s3">4</span><span class="s2">, </span><span class="s3">5</span><span class="s2">, </span><span class="s3">6</span><span class="s1">])</span>
+
+    <span class="s0"># nan_policy = 'omit'</span>
+    <span class="s0"># all elements are removed from first three rows</span>
+    <span class="s0"># middle element is removed from fourth and fifth rows</span>
+    <span class="s0"># no elements removed from last row</span>
+    <span class="s1">res = stats.ranksums(a_masked</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">nan_policy=</span><span class="s4">'omit'</span><span class="s2">, </span><span class="s1">axis=-</span><span class="s3">1</span><span class="s1">)</span>
+    <span class="s1">stat_ref = [np.nan</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">,</span>
+                <span class="s1">ref1.statistic</span><span class="s2">, </span><span class="s1">ref1.statistic</span><span class="s2">, </span><span class="s1">ref2.statistic]</span>
+    <span class="s1">p_ref = [np.nan</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">,</span>
+             <span class="s1">ref1.pvalue</span><span class="s2">, </span><span class="s1">ref1.pvalue</span><span class="s2">, </span><span class="s1">ref2.pvalue]</span>
+    <span class="s1">np.testing.assert_array_equal(res.statistic</span><span class="s2">, </span><span class="s1">stat_ref)</span>
+    <span class="s1">np.testing.assert_array_equal(res.pvalue</span><span class="s2">, </span><span class="s1">p_ref)</span>
+
+    <span class="s0"># nan_policy = 'propagate'</span>
+    <span class="s0"># nans propagate in first, second, and fourth row</span>
+    <span class="s0"># all elements are removed by mask from third row</span>
+    <span class="s0"># middle element is removed from fifth row</span>
+    <span class="s0"># no elements removed from last row</span>
+    <span class="s1">res = stats.ranksums(a_masked</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">nan_policy=</span><span class="s4">'propagate'</span><span class="s2">, </span><span class="s1">axis=-</span><span class="s3">1</span><span class="s1">)</span>
+    <span class="s1">stat_ref = [np.nan</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">,</span>
+                <span class="s1">np.nan</span><span class="s2">, </span><span class="s1">ref1.statistic</span><span class="s2">, </span><span class="s1">ref2.statistic]</span>
+    <span class="s1">p_ref = [np.nan</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">, </span><span class="s1">np.nan</span><span class="s2">,</span>
+             <span class="s1">np.nan</span><span class="s2">, </span><span class="s1">ref1.pvalue</span><span class="s2">, </span><span class="s1">ref2.pvalue]</span>
+    <span class="s1">np.testing.assert_array_equal(res.statistic</span><span class="s2">, </span><span class="s1">stat_ref)</span>
+    <span class="s1">np.testing.assert_array_equal(res.pvalue</span><span class="s2">, </span><span class="s1">p_ref)</span>
+
+
+<span class="s2">def </span><span class="s1">test_axis_None_vs_tuple():</span>
+    <span class="s0"># `axis` `None` should be equivalent to tuple with all axes</span>
+    <span class="s1">shape = (</span><span class="s3">3</span><span class="s2">, </span><span class="s3">8</span><span class="s2">, </span><span class="s3">9</span><span class="s2">, </span><span class="s3">10</span><span class="s1">)</span>
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">x = rng.random(shape)</span>
+    <span class="s1">res = stats.kruskal(*x</span><span class="s2">, </span><span class="s1">axis=</span><span class="s2">None</span><span class="s1">)</span>
+    <span class="s1">res2 = stats.kruskal(*x</span><span class="s2">, </span><span class="s1">axis=(</span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s1">))</span>
+    <span class="s1">np.testing.assert_array_equal(res</span><span class="s2">, </span><span class="s1">res2)</span>
+
+
+<span class="s2">def </span><span class="s1">test_axis_None_vs_tuple_with_broadcasting():</span>
+    <span class="s0"># `axis` `None` should be equivalent to tuple with all axes,</span>
+    <span class="s0"># which should be equivalent to raveling the arrays before passing them</span>
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">x = rng.random((</span><span class="s3">5</span><span class="s2">, </span><span class="s3">1</span><span class="s1">))</span>
+    <span class="s1">y = rng.random((</span><span class="s3">1</span><span class="s2">, </span><span class="s3">5</span><span class="s1">))</span>
+    <span class="s1">x2</span><span class="s2">, </span><span class="s1">y2 = np.broadcast_arrays(x</span><span class="s2">, </span><span class="s1">y)</span>
+
+    <span class="s1">res0 = stats.mannwhitneyu(x.ravel()</span><span class="s2">, </span><span class="s1">y.ravel())</span>
+    <span class="s1">res1 = stats.mannwhitneyu(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">axis=</span><span class="s2">None</span><span class="s1">)</span>
+    <span class="s1">res2 = stats.mannwhitneyu(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">axis=(</span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s1">))</span>
+    <span class="s1">res3 = stats.mannwhitneyu(x2.ravel()</span><span class="s2">, </span><span class="s1">y2.ravel())</span>
+
+    <span class="s2">assert </span><span class="s1">res1 == res0</span>
+    <span class="s2">assert </span><span class="s1">res2 == res0</span>
+    <span class="s2">assert </span><span class="s1">res3 != res0</span>
+
+
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;axis&quot;</span><span class="s1">)</span><span class="s2">,</span>
+                         <span class="s1">list(permutations(range(-</span><span class="s3">3</span><span class="s2">, </span><span class="s3">3</span><span class="s1">)</span><span class="s2">, </span><span class="s3">2</span><span class="s1">)) + [(-</span><span class="s3">4</span><span class="s2">, </span><span class="s3">1</span><span class="s1">)])</span>
+<span class="s2">def </span><span class="s1">test_other_axis_tuples(axis):</span>
+    <span class="s0"># Check that _axis_nan_policy_factory treates all `axis` tuples as expected</span>
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">0</span><span class="s1">)</span>
+    <span class="s1">shape_x = (</span><span class="s3">4</span><span class="s2">, </span><span class="s3">5</span><span class="s2">, </span><span class="s3">6</span><span class="s1">)</span>
+    <span class="s1">shape_y = (</span><span class="s3">1</span><span class="s2">, </span><span class="s3">6</span><span class="s1">)</span>
+    <span class="s1">x = rng.random(shape_x)</span>
+    <span class="s1">y = rng.random(shape_y)</span>
+    <span class="s1">axis_original = axis</span>
+
+    <span class="s0"># convert axis elements to positive</span>
+    <span class="s1">axis = tuple([(i </span><span class="s2">if </span><span class="s1">i &gt;= </span><span class="s3">0 </span><span class="s2">else </span><span class="s3">3 </span><span class="s1">+ i) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">axis])</span>
+    <span class="s1">axis = sorted(axis)</span>
+
+    <span class="s2">if </span><span class="s1">len(set(axis)) != len(axis):</span>
+        <span class="s1">message = </span><span class="s4">&quot;`axis` must contain only distinct elements&quot;</span>
+        <span class="s2">with </span><span class="s1">pytest.raises(np.AxisError</span><span class="s2">, </span><span class="s1">match=re.escape(message)):</span>
+            <span class="s1">stats.mannwhitneyu(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">axis=axis_original)</span>
+        <span class="s2">return</span>
+
+    <span class="s2">if </span><span class="s1">axis[</span><span class="s3">0</span><span class="s1">] &lt; </span><span class="s3">0 </span><span class="s2">or </span><span class="s1">axis[-</span><span class="s3">1</span><span class="s1">] &gt; </span><span class="s3">2</span><span class="s1">:</span>
+        <span class="s1">message = </span><span class="s4">&quot;`axis` is out of bounds for array of dimension 3&quot;</span>
+        <span class="s2">with </span><span class="s1">pytest.raises(np.AxisError</span><span class="s2">, </span><span class="s1">match=re.escape(message)):</span>
+            <span class="s1">stats.mannwhitneyu(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">axis=axis_original)</span>
+        <span class="s2">return</span>
+
+    <span class="s1">res = stats.mannwhitneyu(x</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">axis=axis_original)</span>
+
+    <span class="s0"># reference behavior</span>
+    <span class="s1">not_axis = {</span><span class="s3">0</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s1">} - set(axis)  </span><span class="s0"># which axis is not part of `axis`</span>
+    <span class="s1">not_axis = next(iter(not_axis))  </span><span class="s0"># take it out of the set</span>
+
+    <span class="s1">x2 = x</span>
+    <span class="s1">shape_y_broadcasted = [</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">6</span><span class="s1">]</span>
+    <span class="s1">shape_y_broadcasted[not_axis] = shape_x[not_axis]</span>
+    <span class="s1">y2 = np.broadcast_to(y</span><span class="s2">, </span><span class="s1">shape_y_broadcasted)</span>
+
+    <span class="s1">m = x2.shape[not_axis]</span>
+    <span class="s1">x2 = np.moveaxis(x2</span><span class="s2">, </span><span class="s1">axis</span><span class="s2">, </span><span class="s1">(</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s1">))</span>
+    <span class="s1">y2 = np.moveaxis(y2</span><span class="s2">, </span><span class="s1">axis</span><span class="s2">, </span><span class="s1">(</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s1">))</span>
+    <span class="s1">x2 = np.reshape(x2</span><span class="s2">, </span><span class="s1">(m</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s1">))</span>
+    <span class="s1">y2 = np.reshape(y2</span><span class="s2">, </span><span class="s1">(m</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s1">))</span>
+    <span class="s1">res2 = stats.mannwhitneyu(x2</span><span class="s2">, </span><span class="s1">y2</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">1</span><span class="s1">)</span>
+
+    <span class="s1">np.testing.assert_array_equal(res</span><span class="s2">, </span><span class="s1">res2)</span>
+
+
+<span class="s1">@pytest.mark.parametrize((</span><span class="s4">&quot;weighted_fun_name&quot;</span><span class="s1">)</span><span class="s2">, </span><span class="s1">[</span><span class="s4">&quot;gmean&quot;</span><span class="s2">, </span><span class="s4">&quot;hmean&quot;</span><span class="s2">, </span><span class="s4">&quot;pmean&quot;</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_mean_mixed_mask_nan_weights(weighted_fun_name):</span>
+    <span class="s0"># targeted test of _axis_nan_policy_factory with 2D masked sample:</span>
+    <span class="s0"># omitting samples with masks and nan_policy='omit' are equivalent</span>
+    <span class="s0"># also checks paired-sample sentinel value removal</span>
+
+    <span class="s2">if </span><span class="s1">weighted_fun_name == </span><span class="s4">'pmean'</span><span class="s1">:</span>
+        <span class="s2">def </span><span class="s1">weighted_fun(a</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+            <span class="s2">return </span><span class="s1">stats.pmean(a</span><span class="s2">, </span><span class="s1">p=</span><span class="s3">0.42</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">weighted_fun = getattr(stats</span><span class="s2">, </span><span class="s1">weighted_fun_name)</span>
+
+    <span class="s1">m</span><span class="s2">, </span><span class="s1">n = </span><span class="s3">3</span><span class="s2">, </span><span class="s3">20</span>
+    <span class="s1">axis = -</span><span class="s3">1</span>
+
+    <span class="s1">rng = np.random.default_rng(</span><span class="s3">6541968121</span><span class="s1">)</span>
+    <span class="s1">a = rng.uniform(size=(m</span><span class="s2">, </span><span class="s1">n))</span>
+    <span class="s1">b = rng.uniform(size=(m</span><span class="s2">, </span><span class="s1">n))</span>
+    <span class="s1">mask_a1 = rng.uniform(size=(m</span><span class="s2">, </span><span class="s1">n)) &lt; </span><span class="s3">0.2</span>
+    <span class="s1">mask_a2 = rng.uniform(size=(m</span><span class="s2">, </span><span class="s1">n)) &lt; </span><span class="s3">0.1</span>
+    <span class="s1">mask_b1 = rng.uniform(size=(m</span><span class="s2">, </span><span class="s1">n)) &lt; </span><span class="s3">0.15</span>
+    <span class="s1">mask_b2 = rng.uniform(size=(m</span><span class="s2">, </span><span class="s1">n)) &lt; </span><span class="s3">0.15</span>
+    <span class="s1">mask_a1[</span><span class="s3">2</span><span class="s2">, </span><span class="s1">:] = </span><span class="s2">True</span>
+
+    <span class="s1">a_nans = a.copy()</span>
+    <span class="s1">b_nans = b.copy()</span>
+    <span class="s1">a_nans[mask_a1 | mask_a2] = np.nan</span>
+    <span class="s1">b_nans[mask_b1 | mask_b2] = np.nan</span>
+
+    <span class="s1">a_masked1 = np.ma.masked_array(a</span><span class="s2">, </span><span class="s1">mask=mask_a1)</span>
+    <span class="s1">b_masked1 = np.ma.masked_array(b</span><span class="s2">, </span><span class="s1">mask=mask_b1)</span>
+    <span class="s1">a_masked1[mask_a2] = np.nan</span>
+    <span class="s1">b_masked1[mask_b2] = np.nan</span>
+
+    <span class="s1">a_masked2 = np.ma.masked_array(a</span><span class="s2">, </span><span class="s1">mask=mask_a2)</span>
+    <span class="s1">b_masked2 = np.ma.masked_array(b</span><span class="s2">, </span><span class="s1">mask=mask_b2)</span>
+    <span class="s1">a_masked2[mask_a1] = np.nan</span>
+    <span class="s1">b_masked2[mask_b1] = np.nan</span>
+
+    <span class="s1">a_masked3 = np.ma.masked_array(a</span><span class="s2">, </span><span class="s1">mask=(mask_a1 | mask_a2))</span>
+    <span class="s1">b_masked3 = np.ma.masked_array(b</span><span class="s2">, </span><span class="s1">mask=(mask_b1 | mask_b2))</span>
+
+    <span class="s1">mask_all = (mask_a1 | mask_a2 | mask_b1 | mask_b2)</span>
+    <span class="s1">a_masked4 = np.ma.masked_array(a</span><span class="s2">, </span><span class="s1">mask=mask_all)</span>
+    <span class="s1">b_masked4 = np.ma.masked_array(b</span><span class="s2">, </span><span class="s1">mask=mask_all)</span>
+
+    <span class="s2">with </span><span class="s1">np.testing.suppress_warnings() </span><span class="s2">as </span><span class="s1">sup:</span>
+        <span class="s1">message = </span><span class="s4">'invalid value encountered'</span>
+        <span class="s1">sup.filter(RuntimeWarning</span><span class="s2">, </span><span class="s1">message)</span>
+        <span class="s1">res = weighted_fun(a_nans</span><span class="s2">, </span><span class="s1">weights=b_nans</span><span class="s2">,</span>
+                           <span class="s1">nan_policy=</span><span class="s4">'omit'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+        <span class="s1">res1 = weighted_fun(a_masked1</span><span class="s2">, </span><span class="s1">weights=b_masked1</span><span class="s2">,</span>
+                            <span class="s1">nan_policy=</span><span class="s4">'omit'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+        <span class="s1">res2 = weighted_fun(a_masked2</span><span class="s2">, </span><span class="s1">weights=b_masked2</span><span class="s2">,</span>
+                            <span class="s1">nan_policy=</span><span class="s4">'omit'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+        <span class="s1">res3 = weighted_fun(a_masked3</span><span class="s2">, </span><span class="s1">weights=b_masked3</span><span class="s2">,</span>
+                            <span class="s1">nan_policy=</span><span class="s4">'raise'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+        <span class="s1">res4 = weighted_fun(a_masked3</span><span class="s2">, </span><span class="s1">weights=b_masked3</span><span class="s2">,</span>
+                            <span class="s1">nan_policy=</span><span class="s4">'propagate'</span><span class="s2">, </span><span class="s1">axis=axis)</span>
+        <span class="s0"># Would test with a_masked3/b_masked3, but there is a bug in np.average</span>
+        <span class="s0"># that causes a bug in _no_deco mean with masked weights. Would use</span>
+        <span class="s0"># np.ma.average, but that causes other problems. See numpy/numpy#7330.</span>
+        <span class="s2">if </span><span class="s1">weighted_fun_name </span><span class="s2">not in </span><span class="s1">{</span><span class="s4">'pmean'</span><span class="s2">, </span><span class="s4">'gmean'</span><span class="s1">}:</span>
+            <span class="s1">weighted_fun_ma = getattr(stats.mstats</span><span class="s2">, </span><span class="s1">weighted_fun_name)</span>
+            <span class="s1">res5 = weighted_fun_ma(a_masked4</span><span class="s2">, </span><span class="s1">weights=b_masked4</span><span class="s2">,</span>
+                                   <span class="s1">axis=axis</span><span class="s2">, </span><span class="s1">_no_deco=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s1">np.testing.assert_array_equal(res1</span><span class="s2">, </span><span class="s1">res)</span>
+    <span class="s1">np.testing.assert_array_equal(res2</span><span class="s2">, </span><span class="s1">res)</span>
+    <span class="s1">np.testing.assert_array_equal(res3</span><span class="s2">, </span><span class="s1">res)</span>
+    <span class="s1">np.testing.assert_array_equal(res4</span><span class="s2">, </span><span class="s1">res)</span>
+    <span class="s2">if </span><span class="s1">weighted_fun_name </span><span class="s2">not in </span><span class="s1">{</span><span class="s4">'pmean'</span><span class="s2">, </span><span class="s4">'gmean'</span><span class="s1">}:</span>
+        <span class="s0"># _no_deco mean returns masked array, last element was masked</span>
+        <span class="s1">np.testing.assert_allclose(res5.compressed()</span><span class="s2">, </span><span class="s1">res[~np.isnan(res)])</span>
+
+
+<span class="s2">def </span><span class="s1">test_raise_invalid_args_g17713():</span>
+    <span class="s0"># other cases are handled in:</span>
+    <span class="s0"># test_axis_nan_policy_decorated_positional_axis - multiple values for arg</span>
+    <span class="s0"># test_axis_nan_policy_decorated_positional_args - unexpected kwd arg</span>
+    <span class="s1">message = </span><span class="s4">&quot;got an unexpected keyword argument&quot;</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(TypeError</span><span class="s2">, </span><span class="s1">match=message):</span>
+        <span class="s1">stats.gmean([</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">invalid_arg=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s1">message = </span><span class="s4">&quot; got multiple values for argument&quot;</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(TypeError</span><span class="s2">, </span><span class="s1">match=message):</span>
+        <span class="s1">stats.gmean([</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">a=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s1">message = </span><span class="s4">&quot;missing 1 required positional argument&quot;</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(TypeError</span><span class="s2">, </span><span class="s1">match=message):</span>
+        <span class="s1">stats.gmean()</span>
+
+    <span class="s1">message = </span><span class="s4">&quot;takes from 1 to 4 positional arguments but 5 were given&quot;</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(TypeError</span><span class="s2">, </span><span class="s1">match=message):</span>
+        <span class="s1">stats.gmean([</span><span class="s3">1</span><span class="s2">, </span><span class="s3">2</span><span class="s2">, </span><span class="s3">3</span><span class="s1">]</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s1">float</span><span class="s2">, </span><span class="s1">[</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s3">10</span><span class="s1">)</span>
+
+<span class="s1">@pytest.mark.parametrize(</span>
+    <span class="s4">'dtype'</span><span class="s2">,</span>
+    <span class="s1">(list(np.typecodes[</span><span class="s4">'Float'</span><span class="s1">]</span>
+          <span class="s1">+ np.typecodes[</span><span class="s4">'Integer'</span><span class="s1">]</span>
+          <span class="s1">+ np.typecodes[</span><span class="s4">'Complex'</span><span class="s1">])))</span>
+<span class="s2">def </span><span class="s1">test_array_like_input(dtype):</span>
+    <span class="s0"># Check that `_axis_nan_policy`-decorated functions work with custom</span>
+    <span class="s0"># containers that are coercible to numeric arrays</span>
+
+    <span class="s2">class </span><span class="s1">ArrLike():</span>
+        <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">x):</span>
+            <span class="s1">self._x = x</span>
+
+        <span class="s2">def </span><span class="s1">__array__(self):</span>
+            <span class="s2">return </span><span class="s1">np.asarray(x</span><span class="s2">, </span><span class="s1">dtype=dtype)</span>
+
+    <span class="s1">x = [</span><span class="s3">1</span><span class="s1">]*</span><span class="s3">2 </span><span class="s1">+ [</span><span class="s3">3</span><span class="s2">, </span><span class="s3">4</span><span class="s2">, </span><span class="s3">5</span><span class="s1">]</span>
+    <span class="s1">res = stats.mode(ArrLike(x))</span>
+    <span class="s2">assert </span><span class="s1">res.mode == </span><span class="s3">1</span>
+    <span class="s2">assert </span><span class="s1">res.count == </span><span class="s3">2</span>
+</pre>
+</body>
+</html>

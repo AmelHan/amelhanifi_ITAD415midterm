@@ -1,0 +1,599 @@
+<html>
+<head>
+<title>hdf.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+hdf.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">uuid</span>
+<span class="s0">from </span><span class="s1">fnmatch </span><span class="s0">import </span><span class="s1">fnmatch</span>
+<span class="s0">from </span><span class="s1">glob </span><span class="s0">import </span><span class="s1">glob</span>
+<span class="s0">from </span><span class="s1">warnings </span><span class="s0">import </span><span class="s1">warn</span>
+
+<span class="s0">import </span><span class="s1">pandas </span><span class="s0">as </span><span class="s1">pd</span>
+<span class="s0">from </span><span class="s1">fsspec.utils </span><span class="s0">import </span><span class="s1">build_name_function</span><span class="s0">, </span><span class="s1">stringify_path</span>
+<span class="s0">from </span><span class="s1">tlz </span><span class="s0">import </span><span class="s1">merge</span>
+
+<span class="s0">from </span><span class="s1">dask </span><span class="s0">import </span><span class="s1">config</span>
+<span class="s0">from </span><span class="s1">dask.base </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">compute_as_if_collection</span><span class="s0">,</span>
+    <span class="s1">get_scheduler</span><span class="s0">,</span>
+    <span class="s1">named_schedulers</span><span class="s0">,</span>
+    <span class="s1">tokenize</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.backends </span><span class="s0">import </span><span class="s1">dataframe_creation_dispatch</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.core </span><span class="s0">import </span><span class="s1">DataFrame</span><span class="s0">, </span><span class="s1">Scalar</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.io.io </span><span class="s0">import </span><span class="s1">_link</span><span class="s0">, </span><span class="s1">from_map</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.io.utils </span><span class="s0">import </span><span class="s1">DataFrameIOFunction</span><span class="s0">, </span><span class="s1">SupportsLock</span>
+<span class="s0">from </span><span class="s1">dask.highlevelgraph </span><span class="s0">import </span><span class="s1">HighLevelGraph</span>
+<span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">get_scheduler_lock</span>
+
+<span class="s1">MP_GET = named_schedulers.get(</span><span class="s2">&quot;processes&quot;</span><span class="s0">, </span><span class="s1">object())</span>
+
+
+<span class="s0">def </span><span class="s1">_pd_to_hdf(pd_to_hdf</span><span class="s0">, </span><span class="s1">lock</span><span class="s0">, </span><span class="s1">args</span><span class="s0">, </span><span class="s1">kwargs=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;A wrapper function around pd_to_hdf that enables locking&quot;&quot;&quot;</span>
+
+    <span class="s0">if </span><span class="s1">lock:</span>
+        <span class="s1">lock.acquire()</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">pd_to_hdf(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s0">finally</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">lock:</span>
+            <span class="s1">lock.release()</span>
+
+    <span class="s0">return None</span>
+
+
+<span class="s0">def </span><span class="s1">to_hdf(</span>
+    <span class="s1">df</span><span class="s0">,</span>
+    <span class="s1">path</span><span class="s0">,</span>
+    <span class="s1">key</span><span class="s0">,</span>
+    <span class="s1">mode=</span><span class="s2">&quot;a&quot;</span><span class="s0">,</span>
+    <span class="s1">append=</span><span class="s0">False,</span>
+    <span class="s1">scheduler=</span><span class="s0">None,</span>
+    <span class="s1">name_function=</span><span class="s0">None,</span>
+    <span class="s1">compute=</span><span class="s0">True,</span>
+    <span class="s1">lock=</span><span class="s0">None,</span>
+    <span class="s1">dask_kwargs=</span><span class="s0">None,</span>
+    <span class="s1">**kwargs</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Store Dask Dataframe to Hierarchical Data Format (HDF) files 
+ 
+    This is a parallel version of the Pandas function of the same name.  Please 
+    see the Pandas docstring for more detailed information about shared keyword 
+    arguments. 
+ 
+    This function differs from the Pandas version by saving the many partitions 
+    of a Dask DataFrame in parallel, either to many files, or to many datasets 
+    within the same file.  You may specify this parallelism with an asterix 
+    ``*`` within the filename or datapath, and an optional ``name_function``. 
+    The asterix will be replaced with an increasing sequence of integers 
+    starting from ``0`` or with the result of calling ``name_function`` on each 
+    of those integers. 
+ 
+    This function only supports the Pandas ``'table'`` format, not the more 
+    specialized ``'fixed'`` format. 
+ 
+    Parameters 
+    ---------- 
+    path : string, pathlib.Path 
+        Path to a target filename. Supports strings, ``pathlib.Path``, or any 
+        object implementing the ``__fspath__`` protocol. May contain a ``*`` to 
+        denote many filenames. 
+    key : string 
+        Datapath within the files.  May contain a ``*`` to denote many locations 
+    name_function : function 
+        A function to convert the ``*`` in the above options to a string. 
+        Should take in a number from 0 to the number of partitions and return a 
+        string. (see examples below) 
+    compute : bool 
+        Whether or not to execute immediately.  If False then this returns a 
+        ``dask.Delayed`` value. 
+    lock : bool, Lock, optional 
+        Lock to use to prevent concurrency issues.  By default a 
+        ``threading.Lock``, ``multiprocessing.Lock`` or ``SerializableLock`` 
+        will be used depending on your scheduler if a lock is required. See 
+        dask.utils.get_scheduler_lock for more information about lock 
+        selection. 
+    scheduler : string 
+        The scheduler to use, like &quot;threads&quot; or &quot;processes&quot; 
+    **other: 
+        See pandas.to_hdf for more information 
+ 
+    Examples 
+    -------- 
+    Save Data to a single file 
+ 
+    &gt;&gt;&gt; df.to_hdf('output.hdf', '/data')            # doctest: +SKIP 
+ 
+    Save data to multiple datapaths within the same file: 
+ 
+    &gt;&gt;&gt; df.to_hdf('output.hdf', '/data-*')          # doctest: +SKIP 
+ 
+    Save data to multiple files: 
+ 
+    &gt;&gt;&gt; df.to_hdf('output-*.hdf', '/data')          # doctest: +SKIP 
+ 
+    Save data to multiple files, using the multiprocessing scheduler: 
+ 
+    &gt;&gt;&gt; df.to_hdf('output-*.hdf', '/data', scheduler='processes') # doctest: +SKIP 
+ 
+    Specify custom naming scheme.  This writes files as 
+    '2000-01-01.hdf', '2000-01-02.hdf', '2000-01-03.hdf', etc.. 
+ 
+    &gt;&gt;&gt; from datetime import date, timedelta 
+    &gt;&gt;&gt; base = date(year=2000, month=1, day=1) 
+    &gt;&gt;&gt; def name_function(i): 
+    ...     ''' Convert integer 0 to n to a string ''' 
+    ...     return base + timedelta(days=i) 
+ 
+    &gt;&gt;&gt; df.to_hdf('*.hdf', '/data', name_function=name_function) # doctest: +SKIP 
+ 
+    Returns 
+    ------- 
+    filenames : list 
+        Returned if ``compute`` is True. List of file names that each partition 
+        is saved to. 
+    delayed : dask.Delayed 
+        Returned if ``compute`` is False. Delayed object to execute ``to_hdf`` 
+        when computed. 
+ 
+    See Also 
+    -------- 
+    read_hdf: 
+    to_parquet: 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">dask_kwargs </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">dask_kwargs = {}</span>
+
+    <span class="s1">name = </span><span class="s2">&quot;to-hdf-&quot; </span><span class="s1">+ uuid.uuid1().hex</span>
+
+    <span class="s1">pd_to_hdf = df._partition_type.to_hdf</span>
+
+    <span class="s1">single_file = </span><span class="s0">True</span>
+    <span class="s1">single_node = </span><span class="s0">True</span>
+
+    <span class="s1">path = stringify_path(path)</span>
+
+    <span class="s4"># if path is string, format using i_name</span>
+    <span class="s0">if </span><span class="s1">isinstance(path</span><span class="s0">, </span><span class="s1">str):</span>
+        <span class="s0">if </span><span class="s1">path.count(</span><span class="s2">&quot;*&quot;</span><span class="s1">) + key.count(</span><span class="s2">&quot;*&quot;</span><span class="s1">) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s2">&quot;A maximum of one asterisk is accepted in file path and dataset key&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">fmt_obj = </span><span class="s0">lambda </span><span class="s1">path</span><span class="s0">, </span><span class="s1">i_name: path.replace(</span><span class="s2">&quot;*&quot;</span><span class="s0">, </span><span class="s1">i_name)</span>
+
+        <span class="s0">if </span><span class="s2">&quot;*&quot; </span><span class="s0">in </span><span class="s1">path:</span>
+            <span class="s1">single_file = </span><span class="s0">False</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">key.count(</span><span class="s2">&quot;*&quot;</span><span class="s1">) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;A maximum of one asterisk is accepted in dataset key&quot;</span><span class="s1">)</span>
+
+        <span class="s1">fmt_obj = </span><span class="s0">lambda </span><span class="s1">path</span><span class="s0">, </span><span class="s1">_: path</span>
+
+    <span class="s0">if </span><span class="s2">&quot;*&quot; </span><span class="s0">in </span><span class="s1">key:</span>
+        <span class="s1">single_node = </span><span class="s0">False</span>
+
+    <span class="s0">if </span><span class="s2">&quot;format&quot; </span><span class="s0">in </span><span class="s1">kwargs </span><span class="s0">and </span><span class="s1">kwargs[</span><span class="s2">&quot;format&quot;</span><span class="s1">] </span><span class="s0">not in </span><span class="s1">[</span><span class="s2">&quot;t&quot;</span><span class="s0">, </span><span class="s2">&quot;table&quot;</span><span class="s1">]:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Dask only support 'table' format in hdf files.&quot;</span><span class="s1">)</span>
+
+    <span class="s0">if </span><span class="s1">mode </span><span class="s0">not in </span><span class="s1">(</span><span class="s2">&quot;a&quot;</span><span class="s0">, </span><span class="s2">&quot;w&quot;</span><span class="s0">, </span><span class="s2">&quot;r+&quot;</span><span class="s1">):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Mode must be one of 'a', 'w' or 'r+'&quot;</span><span class="s1">)</span>
+
+    <span class="s0">if </span><span class="s1">name_function </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">name_function = build_name_function(df.npartitions - </span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s4"># we guarantee partition order is preserved when its saved and read</span>
+    <span class="s4"># so we enforce name_function to maintain the order of its input.</span>
+    <span class="s0">if not </span><span class="s1">(single_file </span><span class="s0">and </span><span class="s1">single_node):</span>
+        <span class="s1">formatted_names = [name_function(i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(df.npartitions)]</span>
+        <span class="s0">if </span><span class="s1">formatted_names != sorted(formatted_names):</span>
+            <span class="s1">warn(</span>
+                <span class="s2">&quot;To preserve order between partitions name_function &quot;</span>
+                <span class="s2">&quot;must preserve the order of its input&quot;</span>
+            <span class="s1">)</span>
+
+    <span class="s4"># If user did not specify scheduler and write is sequential default to the</span>
+    <span class="s4"># sequential scheduler. otherwise let the _get method choose the scheduler</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s0">from </span><span class="s1">distributed </span><span class="s0">import </span><span class="s1">default_client</span>
+
+        <span class="s1">default_client()</span>
+        <span class="s1">client_available = </span><span class="s0">True</span>
+    <span class="s0">except </span><span class="s1">(ImportError</span><span class="s0">, </span><span class="s1">ValueError):</span>
+        <span class="s1">client_available = </span><span class="s0">False</span>
+
+    <span class="s0">if </span><span class="s1">(</span>
+        <span class="s1">scheduler </span><span class="s0">is None</span>
+        <span class="s0">and not </span><span class="s1">config.get(</span><span class="s2">&quot;scheduler&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s0">and not </span><span class="s1">client_available</span>
+        <span class="s0">and </span><span class="s1">single_node</span>
+        <span class="s0">and </span><span class="s1">single_file</span>
+    <span class="s1">):</span>
+        <span class="s1">scheduler = </span><span class="s2">&quot;single-threaded&quot;</span>
+
+    <span class="s4"># handle lock default based on whether we're writing to a single entity</span>
+    <span class="s1">_actual_get = get_scheduler(collections=[df]</span><span class="s0">, </span><span class="s1">scheduler=scheduler)</span>
+    <span class="s0">if </span><span class="s1">lock </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">if not </span><span class="s1">single_node:</span>
+            <span class="s1">lock = </span><span class="s0">True</span>
+        <span class="s0">elif not </span><span class="s1">single_file </span><span class="s0">and </span><span class="s1">_actual_get </span><span class="s0">is not </span><span class="s1">MP_GET:</span>
+            <span class="s4"># if we're writing to multiple files with the multiprocessing</span>
+            <span class="s4"># scheduler we don't need to lock</span>
+            <span class="s1">lock = </span><span class="s0">True</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">lock = </span><span class="s0">False</span>
+
+    <span class="s4"># TODO: validation logic to ensure that provided locks are compatible with the scheduler</span>
+    <span class="s0">if </span><span class="s1">isinstance(lock</span><span class="s0">, </span><span class="s1">bool) </span><span class="s0">and </span><span class="s1">lock:</span>
+        <span class="s1">lock = get_scheduler_lock(df</span><span class="s0">, </span><span class="s1">scheduler=scheduler)</span>
+    <span class="s0">elif </span><span class="s1">lock:</span>
+        <span class="s0">assert </span><span class="s1">isinstance(lock</span><span class="s0">, </span><span class="s1">SupportsLock)</span>
+
+    <span class="s1">kwargs.update({</span><span class="s2">&quot;format&quot;</span><span class="s1">: </span><span class="s2">&quot;table&quot;</span><span class="s0">, </span><span class="s2">&quot;mode&quot;</span><span class="s1">: mode</span><span class="s0">, </span><span class="s2">&quot;append&quot;</span><span class="s1">: append})</span>
+
+    <span class="s1">dsk = dict()</span>
+
+    <span class="s1">i_name = name_function(</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">dsk[(name</span><span class="s0">, </span><span class="s5">0</span><span class="s1">)] = (</span>
+        <span class="s1">_pd_to_hdf</span><span class="s0">,</span>
+        <span class="s1">pd_to_hdf</span><span class="s0">,</span>
+        <span class="s1">lock</span><span class="s0">,</span>
+        <span class="s1">[(df._name</span><span class="s0">, </span><span class="s5">0</span><span class="s1">)</span><span class="s0">, </span><span class="s1">fmt_obj(path</span><span class="s0">, </span><span class="s1">i_name)</span><span class="s0">, </span><span class="s1">key.replace(</span><span class="s2">&quot;*&quot;</span><span class="s0">, </span><span class="s1">i_name)]</span><span class="s0">,</span>
+        <span class="s1">kwargs</span><span class="s0">,</span>
+    <span class="s1">)</span>
+
+    <span class="s1">kwargs2 = kwargs.copy()</span>
+    <span class="s0">if </span><span class="s1">single_file:</span>
+        <span class="s1">kwargs2[</span><span class="s2">&quot;mode&quot;</span><span class="s1">] = </span><span class="s2">&quot;a&quot;</span>
+    <span class="s0">if </span><span class="s1">single_node:</span>
+        <span class="s1">kwargs2[</span><span class="s2">&quot;append&quot;</span><span class="s1">] = </span><span class="s0">True</span>
+
+    <span class="s1">filenames = []</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s0">, </span><span class="s1">df.npartitions):</span>
+        <span class="s1">i_name = name_function(i)</span>
+        <span class="s1">filenames.append(fmt_obj(path</span><span class="s0">, </span><span class="s1">i_name))</span>
+
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(</span><span class="s5">1</span><span class="s0">, </span><span class="s1">df.npartitions):</span>
+        <span class="s1">i_name = name_function(i)</span>
+        <span class="s1">task = (</span>
+            <span class="s1">_pd_to_hdf</span><span class="s0">,</span>
+            <span class="s1">pd_to_hdf</span><span class="s0">,</span>
+            <span class="s1">lock</span><span class="s0">,</span>
+            <span class="s1">[(df._name</span><span class="s0">, </span><span class="s1">i)</span><span class="s0">, </span><span class="s1">fmt_obj(path</span><span class="s0">, </span><span class="s1">i_name)</span><span class="s0">, </span><span class="s1">key.replace(</span><span class="s2">&quot;*&quot;</span><span class="s0">, </span><span class="s1">i_name)]</span><span class="s0">,</span>
+            <span class="s1">kwargs2</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">single_file:</span>
+            <span class="s1">link_dep = i - </span><span class="s5">1 </span><span class="s0">if </span><span class="s1">single_node </span><span class="s0">else </span><span class="s5">0</span>
+            <span class="s1">task = (_link</span><span class="s0">, </span><span class="s1">(name</span><span class="s0">, </span><span class="s1">link_dep)</span><span class="s0">, </span><span class="s1">task)</span>
+        <span class="s1">dsk[(name</span><span class="s0">, </span><span class="s1">i)] = task</span>
+
+    <span class="s0">if </span><span class="s1">single_file </span><span class="s0">and </span><span class="s1">single_node:</span>
+        <span class="s1">keys = [(name</span><span class="s0">, </span><span class="s1">df.npartitions - </span><span class="s5">1</span><span class="s1">)]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">keys = [(name</span><span class="s0">, </span><span class="s1">i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(df.npartitions)]</span>
+
+    <span class="s1">final_name = name + </span><span class="s2">&quot;-final&quot;</span>
+    <span class="s1">dsk[(final_name</span><span class="s0">, </span><span class="s5">0</span><span class="s1">)] = (</span><span class="s0">lambda </span><span class="s1">x: </span><span class="s0">None, </span><span class="s1">keys)</span>
+    <span class="s1">graph = HighLevelGraph.from_collections((name</span><span class="s0">, </span><span class="s5">0</span><span class="s1">)</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">dependencies=[df])</span>
+
+    <span class="s0">if </span><span class="s1">compute:</span>
+        <span class="s1">compute_as_if_collection(</span>
+            <span class="s1">DataFrame</span><span class="s0">, </span><span class="s1">graph</span><span class="s0">, </span><span class="s1">keys</span><span class="s0">, </span><span class="s1">scheduler=scheduler</span><span class="s0">, </span><span class="s1">**dask_kwargs</span>
+        <span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">filenames</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">Scalar(graph</span><span class="s0">, </span><span class="s1">final_name</span><span class="s0">, </span><span class="s2">&quot;&quot;</span><span class="s1">)</span>
+
+
+<span class="s1">dont_use_fixed_error_message = </span><span class="s2">&quot;&quot;&quot; 
+This HDFStore is not partitionable and can only be use monolithically with 
+pandas.  In the future when creating HDFStores use the ``format='table'`` 
+option to ensure that your dataset can be parallelized&quot;&quot;&quot;</span>
+
+<span class="s1">read_hdf_error_msg = </span><span class="s2">&quot;&quot;&quot; 
+The start and stop keywords are not supported when reading from more than 
+one file/dataset. 
+ 
+The combination is ambiguous because it could be interpreted as the starting 
+and stopping index per file, or starting and stopping index of the global 
+dataset.&quot;&quot;&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">HDFFunctionWrapper(DataFrameIOFunction):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    HDF5 Function-Wrapper Class 
+ 
+    Reads HDF5 data from disk to produce a partition (given a key). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">columns</span><span class="s0">, </span><span class="s1">dim</span><span class="s0">, </span><span class="s1">lock</span><span class="s0">, </span><span class="s1">common_kwargs):</span>
+        <span class="s1">self._columns = columns</span>
+        <span class="s1">self.lock = lock</span>
+        <span class="s1">self.common_kwargs = common_kwargs</span>
+        <span class="s1">self.dim = dim</span>
+        <span class="s0">if </span><span class="s1">columns </span><span class="s0">and </span><span class="s1">dim &gt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">self.common_kwargs = merge(common_kwargs</span><span class="s0">, </span><span class="s1">{</span><span class="s2">&quot;columns&quot;</span><span class="s1">: columns})</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">columns(self):</span>
+        <span class="s0">return </span><span class="s1">self._columns</span>
+
+    <span class="s0">def </span><span class="s1">project_columns(self</span><span class="s0">, </span><span class="s1">columns):</span>
+        <span class="s3">&quot;&quot;&quot;Return a new HDFFunctionWrapper object with 
+        a sub-column projection. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">columns == self.columns:</span>
+            <span class="s0">return </span><span class="s1">self</span>
+        <span class="s0">return </span><span class="s1">HDFFunctionWrapper(columns</span><span class="s0">, </span><span class="s1">self.dim</span><span class="s0">, </span><span class="s1">self.lock</span><span class="s0">, </span><span class="s1">self.common_kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">part):</span>
+        <span class="s3">&quot;&quot;&quot;Read from hdf5 file with a lock&quot;&quot;&quot;</span>
+
+        <span class="s1">path</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">kwargs = part</span>
+        <span class="s0">if </span><span class="s1">self.lock:</span>
+            <span class="s1">self.lock.acquire()</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">result = pd.read_hdf(path</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">**merge(self.common_kwargs</span><span class="s0">, </span><span class="s1">kwargs))</span>
+        <span class="s0">finally</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">self.lock:</span>
+                <span class="s1">self.lock.release()</span>
+        <span class="s0">return </span><span class="s1">result</span>
+
+
+<span class="s1">@dataframe_creation_dispatch.register_inplace(</span><span class="s2">&quot;pandas&quot;</span><span class="s1">)</span>
+<span class="s0">def </span><span class="s1">read_hdf(</span>
+    <span class="s1">pattern</span><span class="s0">,</span>
+    <span class="s1">key</span><span class="s0">,</span>
+    <span class="s1">start=</span><span class="s5">0</span><span class="s0">,</span>
+    <span class="s1">stop=</span><span class="s0">None,</span>
+    <span class="s1">columns=</span><span class="s0">None,</span>
+    <span class="s1">chunksize=</span><span class="s5">1000000</span><span class="s0">,</span>
+    <span class="s1">sorted_index=</span><span class="s0">False,</span>
+    <span class="s1">lock=</span><span class="s0">True,</span>
+    <span class="s1">mode=</span><span class="s2">&quot;r&quot;</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Read HDF files into a Dask DataFrame 
+ 
+    Read hdf files into a dask dataframe. This function is like 
+    ``pandas.read_hdf``, except it can read from a single large file, or from 
+    multiple files, or from multiple keys from the same file. 
+ 
+    Parameters 
+    ---------- 
+    pattern : string, pathlib.Path, list 
+        File pattern (string), pathlib.Path, buffer to read from, or list of 
+        file paths. Can contain wildcards. 
+    key : group identifier in the store. Can contain wildcards 
+    start : optional, integer (defaults to 0), row number to start at 
+    stop : optional, integer (defaults to None, the last row), row number to 
+        stop at 
+    columns : list of columns, optional 
+        A list of columns that if not None, will limit the return 
+        columns (default is None) 
+    chunksize : positive integer, optional 
+        Maximal number of rows per partition (default is 1000000). 
+    sorted_index : boolean, optional 
+        Option to specify whether or not the input hdf files have a sorted 
+        index (default is False). 
+    lock : boolean, optional 
+        Option to use a lock to prevent concurrency issues (default is True). 
+    mode : {'a', 'r', 'r+'}, default 'r'. Mode to use when opening file(s). 
+        'r' 
+            Read-only; no data can be modified. 
+        'a' 
+            Append; an existing file is opened for reading and writing, 
+            and if the file does not exist it is created. 
+        'r+' 
+            It is similar to 'a', but the file must already exist. 
+ 
+    Returns 
+    ------- 
+    dask.DataFrame 
+ 
+    Examples 
+    -------- 
+    Load single file 
+ 
+    &gt;&gt;&gt; dd.read_hdf('myfile.1.hdf5', '/x')  # doctest: +SKIP 
+ 
+    Load multiple files 
+ 
+    &gt;&gt;&gt; dd.read_hdf('myfile.*.hdf5', '/x')  # doctest: +SKIP 
+ 
+    &gt;&gt;&gt; dd.read_hdf(['myfile.1.hdf5', 'myfile.2.hdf5'], '/x')  # doctest: +SKIP 
+ 
+    Load multiple datasets 
+ 
+    &gt;&gt;&gt; dd.read_hdf('myfile.1.hdf5', '/*')  # doctest: +SKIP 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">lock </span><span class="s0">is True</span><span class="s1">:</span>
+        <span class="s1">lock = get_scheduler_lock()</span>
+
+    <span class="s1">key = key </span><span class="s0">if </span><span class="s1">key.startswith(</span><span class="s2">&quot;/&quot;</span><span class="s1">) </span><span class="s0">else </span><span class="s2">&quot;/&quot; </span><span class="s1">+ key</span>
+    <span class="s4"># Convert path-like objects to a string</span>
+    <span class="s1">pattern = stringify_path(pattern)</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(pattern</span><span class="s0">, </span><span class="s1">str):</span>
+        <span class="s1">paths = sorted(glob(pattern))</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">paths = pattern</span>
+
+    <span class="s0">if not </span><span class="s1">isinstance(pattern</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">and </span><span class="s1">len(paths) == </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;No files provided&quot;</span><span class="s1">)</span>
+    <span class="s0">if not </span><span class="s1">paths </span><span class="s0">or </span><span class="s1">len(paths) == </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">OSError(</span><span class="s2">f&quot;File(s) not found: </span><span class="s0">{</span><span class="s1">pattern</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+    <span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">paths:</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">exists = os.path.exists(path)</span>
+        <span class="s0">except </span><span class="s1">(ValueError</span><span class="s0">, </span><span class="s1">TypeError):</span>
+            <span class="s1">exists = </span><span class="s0">False</span>
+        <span class="s0">if not </span><span class="s1">exists:</span>
+            <span class="s0">raise </span><span class="s1">OSError(</span><span class="s2">f&quot;File not found or insufficient permissions: </span><span class="s0">{</span><span class="s1">path</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">(start != </span><span class="s5">0 </span><span class="s0">or </span><span class="s1">stop </span><span class="s0">is not None</span><span class="s1">) </span><span class="s0">and </span><span class="s1">len(paths) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError(read_hdf_error_msg)</span>
+    <span class="s0">if </span><span class="s1">chunksize &lt;= </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Chunksize must be a positive integer&quot;</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">(start != </span><span class="s5">0 </span><span class="s0">or </span><span class="s1">stop </span><span class="s0">is not None</span><span class="s1">) </span><span class="s0">and </span><span class="s1">sorted_index:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s2">&quot;When assuming pre-partitioned data, data must be &quot;</span>
+            <span class="s2">&quot;read in its entirety using the same chunksizes&quot;</span>
+        <span class="s1">)</span>
+
+    <span class="s4"># Build metadata</span>
+    <span class="s0">with </span><span class="s1">pd.HDFStore(paths[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">mode=mode) </span><span class="s0">as </span><span class="s1">hdf:</span>
+        <span class="s1">meta_key = _expand_key(key</span><span class="s0">, </span><span class="s1">hdf)[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">meta = pd.read_hdf(hdf</span><span class="s0">, </span><span class="s1">meta_key</span><span class="s0">, </span><span class="s1">stop=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s0">except </span><span class="s1">IndexError:  </span><span class="s4"># if file is empty, don't set stop</span>
+            <span class="s1">meta = pd.read_hdf(hdf</span><span class="s0">, </span><span class="s1">meta_key)</span>
+    <span class="s0">if </span><span class="s1">columns </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s1">meta = meta[columns]</span>
+
+    <span class="s4"># Common kwargs</span>
+    <span class="s0">if </span><span class="s1">meta.ndim == </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s1">common_kwargs = {</span><span class="s2">&quot;name&quot;</span><span class="s1">: meta.name</span><span class="s0">, </span><span class="s2">&quot;mode&quot;</span><span class="s1">: mode}</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">common_kwargs = {</span><span class="s2">&quot;mode&quot;</span><span class="s1">: mode}</span>
+
+    <span class="s4"># Build parts</span>
+    <span class="s1">parts</span><span class="s0">, </span><span class="s1">divisions = _build_parts(</span>
+        <span class="s1">paths</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">chunksize</span><span class="s0">, </span><span class="s1">sorted_index</span><span class="s0">, </span><span class="s1">mode</span>
+    <span class="s1">)</span>
+
+    <span class="s4"># Construct the output collection with from_map</span>
+    <span class="s0">return </span><span class="s1">from_map(</span>
+        <span class="s1">HDFFunctionWrapper(columns</span><span class="s0">, </span><span class="s1">meta.ndim</span><span class="s0">, </span><span class="s1">lock</span><span class="s0">, </span><span class="s1">common_kwargs)</span><span class="s0">,</span>
+        <span class="s1">parts</span><span class="s0">,</span>
+        <span class="s1">meta=meta</span><span class="s0">,</span>
+        <span class="s1">divisions=divisions</span><span class="s0">,</span>
+        <span class="s1">label=</span><span class="s2">&quot;read-hdf&quot;</span><span class="s0">,</span>
+        <span class="s1">token=tokenize(paths</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">sorted_index</span><span class="s0">, </span><span class="s1">chunksize</span><span class="s0">, </span><span class="s1">mode)</span><span class="s0">,</span>
+        <span class="s1">enforce_metadata=</span><span class="s0">False,</span>
+    <span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">_build_parts(paths</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">chunksize</span><span class="s0">, </span><span class="s1">sorted_index</span><span class="s0">, </span><span class="s1">mode):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Build the list of partition inputs and divisions for read_hdf 
+    &quot;&quot;&quot;</span>
+    <span class="s1">parts = []</span>
+    <span class="s1">global_divisions = []</span>
+    <span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">paths:</span>
+        <span class="s1">keys</span><span class="s0">, </span><span class="s1">stops</span><span class="s0">, </span><span class="s1">divisions = _get_keys_stops_divisions(</span>
+            <span class="s1">path</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">sorted_index</span><span class="s0">, </span><span class="s1">chunksize</span><span class="s0">, </span><span class="s1">mode</span>
+        <span class="s1">)</span>
+
+        <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">d </span><span class="s0">in </span><span class="s1">zip(keys</span><span class="s0">, </span><span class="s1">stops</span><span class="s0">, </span><span class="s1">divisions):</span>
+            <span class="s0">if </span><span class="s1">d </span><span class="s0">and </span><span class="s1">global_divisions:</span>
+                <span class="s1">global_divisions = global_divisions[:-</span><span class="s5">1</span><span class="s1">] + d</span>
+            <span class="s0">elif </span><span class="s1">d:</span>
+                <span class="s1">global_divisions = d</span>
+
+            <span class="s1">parts.extend(_one_path_one_key(path</span><span class="s0">, </span><span class="s1">k</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">chunksize))</span>
+
+    <span class="s0">return </span><span class="s1">parts</span><span class="s0">, </span><span class="s1">global_divisions </span><span class="s0">or </span><span class="s1">[</span><span class="s0">None</span><span class="s1">] * (len(parts) + </span><span class="s5">1</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">_one_path_one_key(path</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">chunksize):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Get the DataFrame corresponding to one path and one key (which 
+    should not contain any wildcards). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">if </span><span class="s1">start &gt;= stop:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s2">&quot;Start row number ({}) is above or equal to stop &quot;</span>
+            <span class="s2">&quot;row number ({})&quot;</span><span class="s1">.format(start</span><span class="s0">, </span><span class="s1">stop)</span>
+        <span class="s1">)</span>
+
+    <span class="s0">return </span><span class="s1">[</span>
+        <span class="s1">(path</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">{</span><span class="s2">&quot;start&quot;</span><span class="s1">: s</span><span class="s0">, </span><span class="s2">&quot;stop&quot;</span><span class="s1">: s + chunksize})</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">s </span><span class="s0">in </span><span class="s1">enumerate(range(start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">chunksize))</span>
+    <span class="s1">]</span>
+
+
+<span class="s0">def </span><span class="s1">_expand_key(key</span><span class="s0">, </span><span class="s1">hdf):</span>
+    <span class="s0">import </span><span class="s1">glob</span>
+
+    <span class="s0">if not </span><span class="s1">glob.has_magic(key):</span>
+        <span class="s1">keys = [key]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">keys = [k </span><span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">hdf.keys() </span><span class="s0">if </span><span class="s1">fnmatch(k</span><span class="s0">, </span><span class="s1">key)]</span>
+        <span class="s4"># https://github.com/dask/dask/issues/5934</span>
+        <span class="s4"># TODO: remove this part if/when pandas copes with all keys</span>
+        <span class="s1">keys.extend(</span>
+            <span class="s1">n._v_pathname</span>
+            <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">hdf._handle.walk_nodes(</span><span class="s2">&quot;/&quot;</span><span class="s0">, </span><span class="s1">classname=</span><span class="s2">&quot;Table&quot;</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">fnmatch(n._v_pathname</span><span class="s0">, </span><span class="s1">key)</span>
+            <span class="s0">and </span><span class="s1">n._v_name != </span><span class="s2">&quot;table&quot;</span>
+            <span class="s0">and </span><span class="s1">n._v_pathname </span><span class="s0">not in </span><span class="s1">keys</span>
+        <span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">keys</span>
+
+
+<span class="s0">def </span><span class="s1">_get_keys_stops_divisions(path</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">sorted_index</span><span class="s0">, </span><span class="s1">chunksize</span><span class="s0">, </span><span class="s1">mode):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Get the &quot;keys&quot; or group identifiers which match the given key, which 
+    can contain wildcards (see _expand_path). This uses the hdf file 
+    identified by the given path. Also get the index of the last row of 
+    data for each matched key. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">with </span><span class="s1">pd.HDFStore(path</span><span class="s0">, </span><span class="s1">mode=mode) </span><span class="s0">as </span><span class="s1">hdf:</span>
+        <span class="s1">stops = []</span>
+        <span class="s1">divisions = []</span>
+        <span class="s1">keys = _expand_key(key</span><span class="s0">, </span><span class="s1">hdf)</span>
+        <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">keys:</span>
+            <span class="s1">storer = hdf.get_storer(k)</span>
+            <span class="s0">if </span><span class="s1">storer.format_type != </span><span class="s2">&quot;table&quot;</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">TypeError(dont_use_fixed_error_message)</span>
+            <span class="s0">if </span><span class="s1">stop </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s1">stops.append(storer.nrows)</span>
+            <span class="s0">elif </span><span class="s1">stop &gt; storer.nrows:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s2">&quot;Stop keyword exceeds dataset number &quot;</span>
+                    <span class="s2">&quot;of rows ({})&quot;</span><span class="s1">.format(storer.nrows)</span>
+                <span class="s1">)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">stops.append(stop)</span>
+            <span class="s0">if </span><span class="s1">sorted_index:</span>
+                <span class="s1">division = [</span>
+                    <span class="s1">storer.read_column(</span><span class="s2">&quot;index&quot;</span><span class="s0">, </span><span class="s1">start=start</span><span class="s0">, </span><span class="s1">stop=start + </span><span class="s5">1</span><span class="s1">)[</span><span class="s5">0</span><span class="s1">]</span>
+                    <span class="s0">for </span><span class="s1">start </span><span class="s0">in </span><span class="s1">range(</span><span class="s5">0</span><span class="s0">, </span><span class="s1">storer.nrows</span><span class="s0">, </span><span class="s1">chunksize)</span>
+                <span class="s1">]</span>
+                <span class="s1">division_end = storer.read_column(</span>
+                    <span class="s2">&quot;index&quot;</span><span class="s0">, </span><span class="s1">start=storer.nrows - </span><span class="s5">1</span><span class="s0">, </span><span class="s1">stop=storer.nrows</span>
+                <span class="s1">)[</span><span class="s5">0</span><span class="s1">]</span>
+
+                <span class="s1">division.append(division_end)</span>
+                <span class="s1">divisions.append(division)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">divisions.append(</span><span class="s0">None</span><span class="s1">)</span>
+
+    <span class="s0">return </span><span class="s1">keys</span><span class="s0">, </span><span class="s1">stops</span><span class="s0">, </span><span class="s1">divisions</span>
+
+
+<span class="s0">from </span><span class="s1">dask.dataframe.core </span><span class="s0">import </span><span class="s1">_Frame</span>
+
+<span class="s1">_Frame.to_hdf.__doc__ = to_hdf.__doc__</span>
+</pre>
+</body>
+</html>

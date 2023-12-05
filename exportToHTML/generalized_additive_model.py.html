@@ -1,0 +1,1037 @@
+<html>
+<head>
+<title>generalized_additive_model.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+generalized_additive_model.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+<span class="s2">&quot;&quot;&quot; 
+Generalized Additive Models 
+ 
+Author: Luca Puggini 
+Author: Josef Perktold 
+ 
+created on 08/07/2015 
+&quot;&quot;&quot;</span>
+
+<span class="s3">from </span><span class="s1">collections.abc </span><span class="s3">import </span><span class="s1">Iterable</span>
+<span class="s3">import </span><span class="s1">copy  </span><span class="s0"># check if needed when dropping python 2.7</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">optimize</span>
+<span class="s3">import </span><span class="s1">pandas </span><span class="s3">as </span><span class="s1">pd</span>
+
+<span class="s3">import </span><span class="s1">statsmodels.base.wrapper </span><span class="s3">as </span><span class="s1">wrap</span>
+
+<span class="s3">from </span><span class="s1">statsmodels.discrete.discrete_model </span><span class="s3">import </span><span class="s1">Logit</span>
+<span class="s3">from </span><span class="s1">statsmodels.genmod.generalized_linear_model </span><span class="s3">import </span><span class="s1">(</span>
+    <span class="s1">GLM</span><span class="s3">, </span><span class="s1">GLMResults</span><span class="s3">, </span><span class="s1">GLMResultsWrapper</span><span class="s3">, </span><span class="s1">_check_convergence)</span>
+<span class="s3">import </span><span class="s1">statsmodels.regression.linear_model </span><span class="s3">as </span><span class="s1">lm</span>
+<span class="s0"># import statsmodels.regression._tools as reg_tools  # TODO: use this for pirls</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.sm_exceptions </span><span class="s3">import </span><span class="s1">(PerfectSeparationError</span><span class="s3">,</span>
+                                             <span class="s1">ValueWarning)</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.decorators </span><span class="s3">import </span><span class="s1">cache_readonly</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.data </span><span class="s3">import </span><span class="s1">_is_using_pandas</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.linalg </span><span class="s3">import </span><span class="s1">matrix_sqrt</span>
+
+<span class="s3">from </span><span class="s1">statsmodels.base._penalized </span><span class="s3">import </span><span class="s1">PenalizedMixin</span>
+<span class="s3">from </span><span class="s1">statsmodels.gam.gam_penalties </span><span class="s3">import </span><span class="s1">MultivariateGamPenalty</span>
+<span class="s3">from </span><span class="s1">statsmodels.gam.gam_cross_validation.gam_cross_validation </span><span class="s3">import </span><span class="s1">(</span>
+    <span class="s1">MultivariateGAMCVPath)</span>
+<span class="s3">from </span><span class="s1">statsmodels.gam.gam_cross_validation.cross_validators </span><span class="s3">import </span><span class="s1">KFold</span>
+
+
+<span class="s3">def </span><span class="s1">_transform_predict_exog(model</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">design_info=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;transform exog for predict using design_info 
+ 
+    Note: this is copied from base.model.Results.predict and converted to 
+    standalone function with additional options. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">is_pandas = _is_using_pandas(exog</span><span class="s3">, None</span><span class="s1">)</span>
+
+    <span class="s1">exog_index = exog.index </span><span class="s3">if </span><span class="s1">is_pandas </span><span class="s3">else None</span>
+
+    <span class="s3">if </span><span class="s1">design_info </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">design_info = getattr(model.data</span><span class="s3">, </span><span class="s4">'design_info'</span><span class="s3">, None</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s1">design_info </span><span class="s3">is not None and </span><span class="s1">(exog </span><span class="s3">is not None</span><span class="s1">):</span>
+        <span class="s3">from </span><span class="s1">patsy </span><span class="s3">import </span><span class="s1">dmatrix</span>
+        <span class="s3">if </span><span class="s1">isinstance(exog</span><span class="s3">, </span><span class="s1">pd.Series):</span>
+            <span class="s0"># we are guessing whether it should be column or row</span>
+            <span class="s3">if </span><span class="s1">(hasattr(exog</span><span class="s3">, </span><span class="s4">'name'</span><span class="s1">) </span><span class="s3">and </span><span class="s1">isinstance(exog.name</span><span class="s3">, </span><span class="s1">str) </span><span class="s3">and</span>
+                    <span class="s1">exog.name </span><span class="s3">in </span><span class="s1">design_info.describe()):</span>
+                <span class="s0"># assume we need one column</span>
+                <span class="s1">exog = pd.DataFrame(exog)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s0"># assume we need a row</span>
+                <span class="s1">exog = pd.DataFrame(exog).T</span>
+        <span class="s1">orig_exog_len = len(exog)</span>
+        <span class="s1">is_dict = isinstance(exog</span><span class="s3">, </span><span class="s1">dict)</span>
+        <span class="s1">exog = dmatrix(design_info</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">return_type=</span><span class="s4">&quot;dataframe&quot;</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">orig_exog_len &gt; len(exog) </span><span class="s3">and not </span><span class="s1">is_dict:</span>
+            <span class="s3">import </span><span class="s1">warnings</span>
+            <span class="s3">if </span><span class="s1">exog_index </span><span class="s3">is None</span><span class="s1">:</span>
+                <span class="s1">warnings.warn(</span><span class="s4">'nan values have been dropped'</span><span class="s3">, </span><span class="s1">ValueWarning)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">exog = exog.reindex(exog_index)</span>
+        <span class="s1">exog_index = exog.index</span>
+
+    <span class="s3">if </span><span class="s1">exog </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s1">exog = np.asarray(exog)</span>
+        <span class="s3">if </span><span class="s1">exog.ndim == </span><span class="s5">1 </span><span class="s3">and </span><span class="s1">(model.exog.ndim == </span><span class="s5">1 </span><span class="s3">or</span>
+                               <span class="s1">model.exog.shape[</span><span class="s5">1</span><span class="s1">] == </span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">exog = exog[:</span><span class="s3">, None</span><span class="s1">]</span>
+        <span class="s1">exog = np.atleast_2d(exog)  </span><span class="s0"># needed in count model shape[1]</span>
+
+    <span class="s3">return </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">exog_index</span>
+
+
+<span class="s3">class </span><span class="s1">GLMGamResults(GLMResults):</span>
+    <span class="s2">&quot;&quot;&quot;Results class for generalized additive models, GAM. 
+ 
+    This inherits from GLMResults. 
+ 
+    Warning: some inherited methods might not correctly take account of the 
+    penalization 
+ 
+    GLMGamResults inherits from GLMResults 
+    All methods related to the loglikelihood function return the penalized 
+    values. 
+ 
+    Attributes 
+    ---------- 
+ 
+    edf 
+        list of effective degrees of freedom for each column of the design 
+        matrix. 
+    hat_matrix_diag 
+        diagonal of hat matrix 
+    gcv 
+        generalized cross-validation criterion computed as 
+        ``gcv = scale / (1. - hat_matrix_trace / self.nobs)**2`` 
+    cv 
+        cross-validation criterion computed as 
+        ``cv = ((resid_pearson / (1 - hat_matrix_diag))**2).sum() / nobs`` 
+ 
+    Notes 
+    ----- 
+    status: experimental 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">model</span><span class="s3">, </span><span class="s1">params</span><span class="s3">, </span><span class="s1">normalized_cov_params</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">, </span><span class="s1">**kwds):</span>
+
+        <span class="s0"># this is a messy way to compute edf and update scale</span>
+        <span class="s0"># need several attributes to compute edf</span>
+        <span class="s1">self.model = model</span>
+        <span class="s1">self.params = params</span>
+        <span class="s1">self.normalized_cov_params = normalized_cov_params</span>
+        <span class="s1">self.scale = scale</span>
+        <span class="s1">edf = self.edf.sum()</span>
+        <span class="s1">self.df_model = edf - </span><span class="s5">1  </span><span class="s0"># assume constant</span>
+        <span class="s0"># need to use nobs or wnobs attribute</span>
+        <span class="s1">self.df_resid = self.model.endog.shape[</span><span class="s5">0</span><span class="s1">] - edf</span>
+
+        <span class="s0"># we are setting the model df for the case when super is using it</span>
+        <span class="s0"># df in model will be incorrect state when alpha/pen_weight changes</span>
+        <span class="s1">self.model.df_model = self.df_model</span>
+        <span class="s1">self.model.df_resid = self.df_resid</span>
+        <span class="s1">mu = self.fittedvalues</span>
+        <span class="s1">self.scale = scale = self.model.estimate_scale(mu)</span>
+        <span class="s1">super(GLMGamResults</span><span class="s3">, </span><span class="s1">self).__init__(model</span><span class="s3">, </span><span class="s1">params</span><span class="s3">,</span>
+                                            <span class="s1">normalized_cov_params</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">,</span>
+                                            <span class="s1">**kwds)</span>
+
+    <span class="s3">def </span><span class="s1">_tranform_predict_exog(self</span><span class="s3">, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">exog_smooth=</span><span class="s3">None,</span>
+                               <span class="s1">transform=</span><span class="s3">True</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Transform original explanatory variables for prediction 
+ 
+        Parameters 
+        ---------- 
+        exog : array_like, optional 
+            The values for the linear explanatory variables. 
+        exog_smooth : array_like 
+            values for the variables in the smooth terms 
+        transform : bool, optional 
+            If transform is False, then ``exog`` is returned unchanged and 
+            ``x`` is ignored. It is assumed that exog contains the full 
+            design matrix for the predict observations. 
+            If transform is True, then the basis representation of the smooth 
+            term will be constructed from the provided ``x``. 
+ 
+        Returns 
+        ------- 
+        exog_transformed : ndarray 
+            design matrix for the prediction 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">exog_smooth </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">exog_smooth = np.asarray(exog_smooth)</span>
+        <span class="s1">exog_index = </span><span class="s3">None</span>
+        <span class="s3">if </span><span class="s1">transform </span><span class="s3">is False</span><span class="s1">:</span>
+            <span class="s0"># the following allows that either or both exog are not None</span>
+            <span class="s3">if </span><span class="s1">exog_smooth </span><span class="s3">is None</span><span class="s1">:</span>
+                <span class="s0"># exog could be None or array</span>
+                <span class="s1">ex = exog</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s3">if </span><span class="s1">exog </span><span class="s3">is None</span><span class="s1">:</span>
+                    <span class="s1">ex = exog_smooth</span>
+                <span class="s3">else</span><span class="s1">:</span>
+                    <span class="s1">ex = np.column_stack((exog</span><span class="s3">, </span><span class="s1">exog_smooth))</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s0"># transform exog_linear if needed</span>
+            <span class="s3">if </span><span class="s1">exog </span><span class="s3">is not None and </span><span class="s1">hasattr(self.model</span><span class="s3">, </span><span class="s4">'design_info_linear'</span><span class="s1">):</span>
+                <span class="s1">exog</span><span class="s3">, </span><span class="s1">exog_index = _transform_predict_exog(</span>
+                    <span class="s1">self.model</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">self.model.design_info_linear)</span>
+
+            <span class="s0"># create smooth basis</span>
+            <span class="s3">if </span><span class="s1">exog_smooth </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">ex_smooth = self.model.smoother.transform(exog_smooth)</span>
+                <span class="s3">if </span><span class="s1">exog </span><span class="s3">is None</span><span class="s1">:</span>
+                    <span class="s1">ex = ex_smooth</span>
+                <span class="s3">else</span><span class="s1">:</span>
+                    <span class="s0"># TODO: there might be problems is exog_smooth is 1-D</span>
+                    <span class="s1">ex = np.column_stack((exog</span><span class="s3">, </span><span class="s1">ex_smooth))</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">ex = exog</span>
+
+        <span class="s3">return </span><span class="s1">ex</span><span class="s3">, </span><span class="s1">exog_index</span>
+
+    <span class="s3">def </span><span class="s1">predict(self</span><span class="s3">, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">exog_smooth=</span><span class="s3">None, </span><span class="s1">transform=</span><span class="s3">True, </span><span class="s1">**kwargs):</span>
+        <span class="s2">&quot;&quot;&quot;&quot; 
+        compute prediction 
+ 
+        Parameters 
+        ---------- 
+        exog : array_like, optional 
+            The values for the linear explanatory variables 
+        exog_smooth : array_like 
+            values for the variables in the smooth terms 
+        transform : bool, optional 
+            If transform is True, then the basis representation of the smooth 
+            term will be constructed from the provided ``exog``. 
+        kwargs : 
+            Some models can take additional arguments or keywords, see the 
+            predict method of the model for the details. 
+ 
+        Returns 
+        ------- 
+        prediction : ndarray, pandas.Series or pandas.DataFrame 
+            predicted values 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ex</span><span class="s3">, </span><span class="s1">exog_index = self._tranform_predict_exog(exog=exog</span><span class="s3">,</span>
+                                                     <span class="s1">exog_smooth=exog_smooth</span><span class="s3">,</span>
+                                                     <span class="s1">transform=transform)</span>
+        <span class="s1">predict_results = super(GLMGamResults</span><span class="s3">, </span><span class="s1">self).predict(ex</span><span class="s3">,</span>
+                                                             <span class="s1">transform=</span><span class="s3">False,</span>
+                                                             <span class="s1">**kwargs)</span>
+        <span class="s3">if </span><span class="s1">exog_index </span><span class="s3">is not None and not </span><span class="s1">hasattr(</span>
+                <span class="s1">predict_results</span><span class="s3">, </span><span class="s4">'predicted_values'</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">predict_results.ndim == </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s3">return </span><span class="s1">pd.Series(predict_results</span><span class="s3">, </span><span class="s1">index=exog_index)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s3">return </span><span class="s1">pd.DataFrame(predict_results</span><span class="s3">, </span><span class="s1">index=exog_index)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">predict_results</span>
+
+    <span class="s3">def </span><span class="s1">get_prediction(self</span><span class="s3">, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">exog_smooth=</span><span class="s3">None, </span><span class="s1">transform=</span><span class="s3">True,</span>
+                       <span class="s1">**kwargs):</span>
+        <span class="s2">&quot;&quot;&quot;compute prediction results 
+ 
+        Parameters 
+        ---------- 
+        exog : array_like, optional 
+            The values for which you want to predict. 
+        exog_smooth : array_like 
+            values for the variables in the smooth terms 
+        transform : bool, optional 
+            If transform is True, then the basis representation of the smooth 
+            term will be constructed from the provided ``x``. 
+        kwargs : 
+            Some models can take additional arguments or keywords, see the 
+            predict method of the model for the details. 
+ 
+        Returns 
+        ------- 
+        prediction_results : generalized_linear_model.PredictionResults 
+            The prediction results instance contains prediction and prediction 
+            variance and can on demand calculate confidence intervals and 
+            summary tables for the prediction of the mean and of new 
+            observations. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ex</span><span class="s3">, </span><span class="s1">exog_index = self._tranform_predict_exog(exog=exog</span><span class="s3">,</span>
+                                                     <span class="s1">exog_smooth=exog_smooth</span><span class="s3">,</span>
+                                                     <span class="s1">transform=transform)</span>
+        <span class="s3">return </span><span class="s1">super(GLMGamResults</span><span class="s3">, </span><span class="s1">self).get_prediction(ex</span><span class="s3">, </span><span class="s1">transform=</span><span class="s3">False,</span>
+                                                         <span class="s1">**kwargs)</span>
+
+    <span class="s3">def </span><span class="s1">partial_values(self</span><span class="s3">, </span><span class="s1">smooth_index</span><span class="s3">, </span><span class="s1">include_constant=</span><span class="s3">True</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;contribution of a smooth term to the linear prediction 
+ 
+        Warning: This will be replaced by a predict method 
+ 
+        Parameters 
+        ---------- 
+        smooth_index : int 
+            index of the smooth term within list of smooth terms 
+        include_constant : bool 
+            If true, then the estimated intercept is added to the prediction 
+            and its standard errors. This avoids that the confidence interval 
+            has zero width at the imposed identification constraint, e.g. 
+            either at a reference point or at the mean. 
+ 
+        Returns 
+        ------- 
+        predicted : nd_array 
+            predicted value of linear term. 
+            This is not the expected response if the link function is not 
+            linear. 
+        se_pred : nd_array 
+            standard error of linear prediction 
+        &quot;&quot;&quot;</span>
+        <span class="s1">variable = smooth_index</span>
+        <span class="s1">smoother = self.model.smoother</span>
+        <span class="s1">mask = smoother.mask[variable]</span>
+
+        <span class="s1">start_idx = self.model.k_exog_linear</span>
+        <span class="s1">idx = start_idx + np.nonzero(mask)[</span><span class="s5">0</span><span class="s1">]</span>
+
+        <span class="s0"># smoother has only smooth parts, not exog_linear</span>
+        <span class="s1">exog_part = smoother.basis[:</span><span class="s3">, </span><span class="s1">mask]</span>
+
+        <span class="s1">const_idx = self.model.data.const_idx</span>
+        <span class="s3">if </span><span class="s1">include_constant </span><span class="s3">and </span><span class="s1">const_idx </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">idx = np.concatenate(([const_idx]</span><span class="s3">, </span><span class="s1">idx))</span>
+            <span class="s1">exog_part = self.model.exog[:</span><span class="s3">, </span><span class="s1">idx]</span>
+
+        <span class="s1">linpred = np.dot(exog_part</span><span class="s3">, </span><span class="s1">self.params[idx])</span>
+        <span class="s0"># select the submatrix corresponding to a single variable</span>
+        <span class="s1">partial_cov_params = self.cov_params(column=idx)</span>
+
+        <span class="s1">covb = partial_cov_params</span>
+        <span class="s1">var = (exog_part * np.dot(covb</span><span class="s3">, </span><span class="s1">exog_part.T).T).sum(</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">se = np.sqrt(var)</span>
+
+        <span class="s3">return </span><span class="s1">linpred</span><span class="s3">, </span><span class="s1">se</span>
+
+    <span class="s3">def </span><span class="s1">plot_partial(self</span><span class="s3">, </span><span class="s1">smooth_index</span><span class="s3">, </span><span class="s1">plot_se=</span><span class="s3">True, </span><span class="s1">cpr=</span><span class="s3">False,</span>
+                     <span class="s1">include_constant=</span><span class="s3">True, </span><span class="s1">ax=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;plot the contribution of a smooth term to the linear prediction 
+ 
+        Parameters 
+        ---------- 
+        smooth_index : int 
+            index of the smooth term within list of smooth terms 
+        plot_se : bool 
+            If plot_se is true, then the confidence interval for the linear 
+            prediction will be added to the plot. 
+        cpr : bool 
+            If cpr (component plus residual) is true, the a scatter plot of 
+            the partial working residuals will be added to the plot. 
+        include_constant : bool 
+            If true, then the estimated intercept is added to the prediction 
+            and its standard errors. This avoids that the confidence interval 
+            has zero width at the imposed identification constraint, e.g. 
+            either at a reference point or at the mean. 
+        ax : None or matplotlib axis instance 
+           If ax is not None, then the plot will be added to it. 
+ 
+        Returns 
+        ------- 
+        Figure 
+            If `ax` is None, the created figure. Otherwise the Figure to which 
+            `ax` is connected. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">from </span><span class="s1">statsmodels.graphics.utils </span><span class="s3">import </span><span class="s1">_import_mpl</span><span class="s3">, </span><span class="s1">create_mpl_ax</span>
+        <span class="s1">_import_mpl()</span>
+
+        <span class="s1">variable = smooth_index</span>
+        <span class="s1">y_est</span><span class="s3">, </span><span class="s1">se = self.partial_values(variable</span><span class="s3">,</span>
+                                        <span class="s1">include_constant=include_constant)</span>
+        <span class="s1">smoother = self.model.smoother</span>
+        <span class="s1">x = smoother.smoothers[variable].x</span>
+        <span class="s1">sort_index = np.argsort(x)</span>
+        <span class="s1">x = x[sort_index]</span>
+        <span class="s1">y_est = y_est[sort_index]</span>
+        <span class="s1">se = se[sort_index]</span>
+
+        <span class="s1">fig</span><span class="s3">, </span><span class="s1">ax = create_mpl_ax(ax)</span>
+        <span class="s1">ax.plot(x</span><span class="s3">, </span><span class="s1">y_est</span><span class="s3">, </span><span class="s1">c=</span><span class="s4">'blue'</span><span class="s3">, </span><span class="s1">lw=</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">plot_se:</span>
+            <span class="s1">ax.plot(x</span><span class="s3">, </span><span class="s1">y_est + </span><span class="s5">1.96 </span><span class="s1">* se</span><span class="s3">, </span><span class="s4">'-'</span><span class="s3">, </span><span class="s1">c=</span><span class="s4">'blue'</span><span class="s1">)</span>
+            <span class="s1">ax.plot(x</span><span class="s3">, </span><span class="s1">y_est - </span><span class="s5">1.96 </span><span class="s1">* se</span><span class="s3">, </span><span class="s4">'-'</span><span class="s3">, </span><span class="s1">c=</span><span class="s4">'blue'</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">cpr:</span>
+            <span class="s0"># TODO: resid_response does not make sense with nonlinear link</span>
+            <span class="s0"># use resid_working ?</span>
+            <span class="s1">residual = self.resid_working[sort_index]</span>
+            <span class="s1">cpr_ = y_est + residual</span>
+            <span class="s1">ax.plot(x</span><span class="s3">, </span><span class="s1">cpr_</span><span class="s3">, </span><span class="s4">'.'</span><span class="s3">, </span><span class="s1">lw=</span><span class="s5">2</span><span class="s1">)</span>
+
+        <span class="s1">ax.set_xlabel(smoother.smoothers[variable].variable_name)</span>
+
+        <span class="s3">return </span><span class="s1">fig</span>
+
+    <span class="s3">def </span><span class="s1">test_significance(self</span><span class="s3">, </span><span class="s1">smooth_index):</span>
+        <span class="s2">&quot;&quot;&quot;hypothesis test that a smooth component is zero. 
+ 
+        This calls `wald_test` to compute the hypothesis test, but uses 
+        effective degrees of freedom. 
+ 
+        Parameters 
+        ---------- 
+        smooth_index : int 
+            index of the smooth term within list of smooth terms 
+ 
+        Returns 
+        ------- 
+        wald_test : ContrastResults instance 
+            the results instance created by `wald_test` 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">variable = smooth_index</span>
+        <span class="s1">smoother = self.model.smoother</span>
+        <span class="s1">start_idx = self.model.k_exog_linear</span>
+
+        <span class="s1">k_params = len(self.params)</span>
+        <span class="s0"># a bit messy, we need first index plus length of smooth term</span>
+        <span class="s1">mask = smoother.mask[variable]</span>
+        <span class="s1">k_constraints = mask.sum()</span>
+        <span class="s1">idx = start_idx + np.nonzero(mask)[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">constraints = np.eye(k_constraints</span><span class="s3">, </span><span class="s1">k_params</span><span class="s3">, </span><span class="s1">idx)</span>
+        <span class="s1">df_constraints = self.edf[idx: idx + k_constraints].sum()</span>
+
+        <span class="s3">return </span><span class="s1">self.wald_test(constraints</span><span class="s3">, </span><span class="s1">df_constraints=df_constraints)</span>
+
+    <span class="s3">def </span><span class="s1">get_hat_matrix_diag(self</span><span class="s3">, </span><span class="s1">observed=</span><span class="s3">True, </span><span class="s1">_axis=</span><span class="s5">1</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Compute the diagonal of the hat matrix 
+ 
+        Parameters 
+        ---------- 
+        observed : bool 
+            If true, then observed hessian is used in the hat matrix 
+            computation. If false, then the expected hessian is used. 
+            In the case of a canonical link function both are the same. 
+            This is only relevant for models that implement both observed 
+            and expected Hessian, which is currently only GLM. Other 
+            models only use the observed Hessian. 
+        _axis : int 
+            This is mainly for internal use. By default it returns the usual 
+            diagonal of the hat matrix. If _axis is zero, then the result 
+            corresponds to the effective degrees of freedom, ``edf`` for each 
+            column of exog. 
+ 
+        Returns 
+        ------- 
+        hat_matrix_diag : ndarray 
+            The diagonal of the hat matrix computed from the observed 
+            or expected hessian. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">weights = self.model.hessian_factor(self.params</span><span class="s3">, </span><span class="s1">scale=self.scale</span><span class="s3">,</span>
+                                            <span class="s1">observed=observed)</span>
+        <span class="s1">wexog = np.sqrt(weights)[:</span><span class="s3">, None</span><span class="s1">] * self.model.exog</span>
+
+        <span class="s0"># we can use inverse hessian directly instead of computing it from</span>
+        <span class="s0"># WLS/IRLS as in GLM</span>
+
+        <span class="s0"># TODO: does `normalized_cov_params * scale` work in all cases?</span>
+        <span class="s0"># this avoids recomputing hessian, check when used for other models.</span>
+        <span class="s1">hess_inv = self.normalized_cov_params * self.scale</span>
+        <span class="s0"># this is in GLM equivalent to the more generic and direct</span>
+        <span class="s0"># hess_inv = np.linalg.inv(-self.model.hessian(self.params))</span>
+        <span class="s1">hd = (wexog * hess_inv.dot(wexog.T).T).sum(axis=_axis)</span>
+        <span class="s3">return </span><span class="s1">hd</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">edf(self):</span>
+        <span class="s3">return </span><span class="s1">self.get_hat_matrix_diag(_axis=</span><span class="s5">0</span><span class="s1">)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">hat_matrix_trace(self):</span>
+        <span class="s3">return </span><span class="s1">self.hat_matrix_diag.sum()</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">hat_matrix_diag(self):</span>
+        <span class="s3">return </span><span class="s1">self.get_hat_matrix_diag(observed=</span><span class="s3">True</span><span class="s1">)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">gcv(self):</span>
+        <span class="s3">return </span><span class="s1">self.scale / (</span><span class="s5">1. </span><span class="s1">- self.hat_matrix_trace / self.nobs)**</span><span class="s5">2</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">cv(self):</span>
+        <span class="s1">cv_ = ((self.resid_pearson / (</span><span class="s5">1. </span><span class="s1">- self.hat_matrix_diag))**</span><span class="s5">2</span><span class="s1">).sum()</span>
+        <span class="s1">cv_ /= self.nobs</span>
+        <span class="s3">return </span><span class="s1">cv_</span>
+
+
+<span class="s3">class </span><span class="s1">GLMGamResultsWrapper(GLMResultsWrapper):</span>
+    <span class="s3">pass</span>
+
+
+<span class="s1">wrap.populate_wrapper(GLMGamResultsWrapper</span><span class="s3">, </span><span class="s1">GLMGamResults)</span>
+
+
+<span class="s3">class </span><span class="s1">GLMGam(PenalizedMixin</span><span class="s3">, </span><span class="s1">GLM):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Generalized Additive Models (GAM) 
+ 
+    This inherits from `GLM`. 
+ 
+    Warning: Not all inherited methods might take correctly account of the 
+    penalization. Not all options including offset and exposure have been 
+    verified yet. 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        The response variable. 
+    exog : array_like or None 
+        This explanatory variables are treated as linear. The model in this 
+        case is a partial linear model. 
+    smoother : instance of additive smoother class 
+        Examples of smoother instances include Bsplines or CyclicCubicSplines. 
+    alpha : float or list of floats 
+        Penalization weights for smooth terms. The length of the list needs 
+        to be the same as the number of smooth terms in the ``smoother``. 
+    family : instance of GLM family 
+        See GLM. 
+    offset : None or array_like 
+        See GLM. 
+    exposure : None or array_like 
+        See GLM. 
+    missing : 'none' 
+        Missing value handling is not supported in this class. 
+    **kwargs 
+        Extra keywords are used in call to the super classes. 
+ 
+    Notes 
+    ----- 
+    Status: experimental. This has full unit test coverage for the core 
+    results with Gaussian and Poisson (without offset and exposure). Other 
+    options and additional results might not be correctly supported yet. 
+    (Binomial with counts, i.e. with n_trials, is most likely wrong in pirls. 
+    User specified var or freq weights are most likely also not correct for 
+    all results.) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_results_class = GLMGamResults</span>
+    <span class="s1">_results_class_wrapper = GLMGamResultsWrapper</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">smoother=</span><span class="s3">None, </span><span class="s1">alpha=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">family=</span><span class="s3">None,</span>
+                 <span class="s1">offset=</span><span class="s3">None, </span><span class="s1">exposure=</span><span class="s3">None, </span><span class="s1">missing=</span><span class="s4">'none'</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+
+        <span class="s0"># TODO: check usage of hasconst</span>
+        <span class="s1">hasconst = kwargs.get(</span><span class="s4">'hasconst'</span><span class="s3">, None</span><span class="s1">)</span>
+        <span class="s1">xnames_linear = </span><span class="s3">None</span>
+        <span class="s3">if </span><span class="s1">hasattr(exog</span><span class="s3">, </span><span class="s4">'design_info'</span><span class="s1">):</span>
+            <span class="s1">self.design_info_linear = exog.design_info</span>
+            <span class="s1">xnames_linear = self.design_info_linear.column_names</span>
+
+        <span class="s1">is_pandas = _is_using_pandas(exog</span><span class="s3">, None</span><span class="s1">)</span>
+
+        <span class="s0"># TODO: handle data is experimental, see #5469</span>
+        <span class="s0"># This is a bit wasteful because we need to `handle_data twice`</span>
+        <span class="s1">self.data_linear = self._handle_data(endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">missing</span><span class="s3">, </span><span class="s1">hasconst)</span>
+        <span class="s3">if </span><span class="s1">xnames_linear </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">xnames_linear = self.data_linear.xnames</span>
+        <span class="s3">if </span><span class="s1">exog </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">exog_linear = self.data_linear.exog</span>
+            <span class="s1">k_exog_linear = exog_linear.shape[</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">exog_linear = </span><span class="s3">None</span>
+            <span class="s1">k_exog_linear = </span><span class="s5">0</span>
+        <span class="s1">self.k_exog_linear = k_exog_linear</span>
+        <span class="s0"># We need exog_linear for k-fold cross validation</span>
+        <span class="s0"># TODO: alternative is to take columns from combined exog</span>
+        <span class="s1">self.exog_linear = exog_linear</span>
+
+        <span class="s1">self.smoother = smoother</span>
+        <span class="s1">self.k_smooths = smoother.k_variables</span>
+        <span class="s1">self.alpha = self._check_alpha(alpha)</span>
+        <span class="s1">penal = MultivariateGamPenalty(smoother</span><span class="s3">, </span><span class="s1">alpha=self.alpha</span><span class="s3">,</span>
+                                       <span class="s1">start_idx=k_exog_linear)</span>
+        <span class="s1">kwargs.pop(</span><span class="s4">'penal'</span><span class="s3">, None</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">exog_linear </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">exog = np.column_stack((exog_linear</span><span class="s3">, </span><span class="s1">smoother.basis))</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">exog = smoother.basis</span>
+
+        <span class="s0"># TODO: check: xnames_linear will be None instead of empty list</span>
+        <span class="s0">#       if no exog_linear</span>
+        <span class="s0"># can smoother be empty ? I guess not allowed.</span>
+        <span class="s3">if </span><span class="s1">xnames_linear </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">xnames_linear = []</span>
+        <span class="s1">xnames = xnames_linear + self.smoother.col_names</span>
+
+        <span class="s3">if </span><span class="s1">is_pandas </span><span class="s3">and </span><span class="s1">exog_linear </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s0"># we a dataframe so we can get a PandasData instance for wrapping</span>
+            <span class="s1">exog = pd.DataFrame(exog</span><span class="s3">, </span><span class="s1">index=self.data_linear.row_labels</span><span class="s3">,</span>
+                                <span class="s1">columns=xnames)</span>
+
+        <span class="s1">super(GLMGam</span><span class="s3">, </span><span class="s1">self).__init__(endog</span><span class="s3">, </span><span class="s1">exog=exog</span><span class="s3">, </span><span class="s1">family=family</span><span class="s3">,</span>
+                                     <span class="s1">offset=offset</span><span class="s3">, </span><span class="s1">exposure=exposure</span><span class="s3">,</span>
+                                     <span class="s1">penal=penal</span><span class="s3">, </span><span class="s1">missing=missing</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s3">if not </span><span class="s1">is_pandas:</span>
+            <span class="s0"># set exog nanmes if not given by pandas DataFrame</span>
+            <span class="s1">self.exog_names[:] = xnames</span>
+
+        <span class="s0"># TODO: the generic data handling might attach the design_info from the</span>
+        <span class="s0">#       linear part, but this is incorrect for the full model and</span>
+        <span class="s0">#       causes problems in wald_test_terms</span>
+
+        <span class="s3">if </span><span class="s1">hasattr(self.data</span><span class="s3">, </span><span class="s4">'design_info'</span><span class="s1">):</span>
+            <span class="s3">del </span><span class="s1">self.data.design_info</span>
+        <span class="s0"># formula also might be attached which causes problems in predict</span>
+        <span class="s3">if </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'formula'</span><span class="s1">):</span>
+            <span class="s1">self.formula_linear = self.formula</span>
+            <span class="s1">self.formula = </span><span class="s3">None</span>
+            <span class="s3">del </span><span class="s1">self.formula</span>
+
+    <span class="s3">def </span><span class="s1">_check_alpha(self</span><span class="s3">, </span><span class="s1">alpha):</span>
+        <span class="s2">&quot;&quot;&quot;check and convert alpha to required list format 
+ 
+        Parameters 
+        ---------- 
+        alpha : scalar, list or array_like 
+            penalization weight 
+ 
+        Returns 
+        ------- 
+        alpha : list 
+            penalization weight, list with length equal to the number of 
+            smooth terms 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if not </span><span class="s1">isinstance(alpha</span><span class="s3">, </span><span class="s1">Iterable):</span>
+            <span class="s1">alpha = [alpha] * len(self.smoother.smoothers)</span>
+        <span class="s3">elif not </span><span class="s1">isinstance(alpha</span><span class="s3">, </span><span class="s1">list):</span>
+            <span class="s0"># we want alpha to be a list</span>
+            <span class="s1">alpha = list(alpha)</span>
+        <span class="s3">return </span><span class="s1">alpha</span>
+
+    <span class="s3">def </span><span class="s1">fit(self</span><span class="s3">, </span><span class="s1">start_params=</span><span class="s3">None, </span><span class="s1">maxiter=</span><span class="s5">1000</span><span class="s3">, </span><span class="s1">method=</span><span class="s4">'pirls'</span><span class="s3">, </span><span class="s1">tol=</span><span class="s5">1e-8</span><span class="s3">,</span>
+            <span class="s1">scale=</span><span class="s3">None, </span><span class="s1">cov_type=</span><span class="s4">'nonrobust'</span><span class="s3">, </span><span class="s1">cov_kwds=</span><span class="s3">None, </span><span class="s1">use_t=</span><span class="s3">None,</span>
+            <span class="s1">full_output=</span><span class="s3">True, </span><span class="s1">disp=</span><span class="s3">False, </span><span class="s1">max_start_irls=</span><span class="s5">3</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">&quot;&quot;&quot;estimate parameters and create instance of GLMGamResults class 
+ 
+        Parameters 
+        ---------- 
+        most parameters are the same as for GLM 
+        method : optimization method 
+            The special optimization method is &quot;pirls&quot; which uses a penalized 
+            version of IRLS. Other methods are gradient optimizers as used in 
+            base.model.LikelihoodModel. 
+ 
+        Returns 
+        ------- 
+        res : instance of wrapped GLMGamResults 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># TODO: temporary hack to remove attribute</span>
+        <span class="s0"># formula also might be attached which in inherited from_formula</span>
+        <span class="s0"># causes problems in predict</span>
+        <span class="s3">if </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'formula'</span><span class="s1">):</span>
+            <span class="s1">self.formula_linear = self.formula</span>
+            <span class="s3">del </span><span class="s1">self.formula</span>
+
+        <span class="s0"># TODO: alpha not allowed yet, but is in `_fit_pirls`</span>
+        <span class="s0"># alpha = self._check_alpha()</span>
+
+        <span class="s3">if </span><span class="s1">method.lower() </span><span class="s3">in </span><span class="s1">[</span><span class="s4">'pirls'</span><span class="s3">, </span><span class="s4">'irls'</span><span class="s1">]:</span>
+            <span class="s1">res = self._fit_pirls(self.alpha</span><span class="s3">, </span><span class="s1">start_params=start_params</span><span class="s3">,</span>
+                                  <span class="s1">maxiter=maxiter</span><span class="s3">, </span><span class="s1">tol=tol</span><span class="s3">, </span><span class="s1">scale=scale</span><span class="s3">,</span>
+                                  <span class="s1">cov_type=cov_type</span><span class="s3">, </span><span class="s1">cov_kwds=cov_kwds</span><span class="s3">,</span>
+                                  <span class="s1">use_t=use_t</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">max_start_irls &gt; </span><span class="s5">0 </span><span class="s3">and </span><span class="s1">(start_params </span><span class="s3">is None</span><span class="s1">):</span>
+                <span class="s1">res = self._fit_pirls(self.alpha</span><span class="s3">, </span><span class="s1">start_params=start_params</span><span class="s3">,</span>
+                                      <span class="s1">maxiter=max_start_irls</span><span class="s3">, </span><span class="s1">tol=tol</span><span class="s3">,</span>
+                                      <span class="s1">scale=scale</span><span class="s3">,</span>
+                                      <span class="s1">cov_type=cov_type</span><span class="s3">, </span><span class="s1">cov_kwds=cov_kwds</span><span class="s3">,</span>
+                                      <span class="s1">use_t=use_t</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+                <span class="s1">start_params = res.params</span>
+                <span class="s3">del </span><span class="s1">res</span>
+            <span class="s1">res = super(GLMGam</span><span class="s3">, </span><span class="s1">self).fit(start_params=start_params</span><span class="s3">,</span>
+                                          <span class="s1">maxiter=maxiter</span><span class="s3">, </span><span class="s1">method=method</span><span class="s3">,</span>
+                                          <span class="s1">tol=tol</span><span class="s3">, </span><span class="s1">scale=scale</span><span class="s3">,</span>
+                                          <span class="s1">cov_type=cov_type</span><span class="s3">, </span><span class="s1">cov_kwds=cov_kwds</span><span class="s3">,</span>
+                                          <span class="s1">use_t=use_t</span><span class="s3">,</span>
+                                          <span class="s1">full_output=full_output</span><span class="s3">, </span><span class="s1">disp=disp</span><span class="s3">,</span>
+                                          <span class="s1">max_start_irls=</span><span class="s5">0</span><span class="s3">,</span>
+                                          <span class="s1">**kwargs)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s0"># pag 165 4.3 # pag 136 PIRLS</span>
+    <span class="s3">def </span><span class="s1">_fit_pirls(self</span><span class="s3">, </span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">start_params=</span><span class="s3">None, </span><span class="s1">maxiter=</span><span class="s5">100</span><span class="s3">, </span><span class="s1">tol=</span><span class="s5">1e-8</span><span class="s3">,</span>
+                   <span class="s1">scale=</span><span class="s3">None, </span><span class="s1">cov_type=</span><span class="s4">'nonrobust'</span><span class="s3">, </span><span class="s1">cov_kwds=</span><span class="s3">None, </span><span class="s1">use_t=</span><span class="s3">None,</span>
+                   <span class="s1">weights=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;fit model with penalized reweighted least squares 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># TODO: this currently modifies several attributes</span>
+        <span class="s0"># self.scale, self.scaletype, self.mu, self.weights</span>
+        <span class="s0"># self.data_weights,</span>
+        <span class="s0"># and possibly self._offset_exposure</span>
+        <span class="s0"># several of those might not be necessary, e.g. mu and weights</span>
+
+        <span class="s0"># alpha = alpha * len(y) * self.scale / 100</span>
+        <span class="s0"># TODO: we need to rescale alpha</span>
+        <span class="s1">endog = self.endog</span>
+        <span class="s1">wlsexog = self.exog  </span><span class="s0"># smoother.basis</span>
+        <span class="s1">spl_s = self.penal.penalty_matrix(alpha=alpha)</span>
+
+        <span class="s1">nobs</span><span class="s3">, </span><span class="s1">n_columns = wlsexog.shape</span>
+
+        <span class="s0"># TODO what are these values?</span>
+        <span class="s3">if </span><span class="s1">weights </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">self.data_weights = np.array([</span><span class="s5">1.</span><span class="s1">] * nobs)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.data_weights = weights</span>
+
+        <span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'_offset_exposure'</span><span class="s1">):</span>
+            <span class="s1">self._offset_exposure = </span><span class="s5">0</span>
+
+        <span class="s1">self.scaletype = scale</span>
+        <span class="s0"># TODO: check default scale types</span>
+        <span class="s0"># self.scaletype = 'dev'</span>
+        <span class="s0"># during iteration</span>
+        <span class="s1">self.scale = </span><span class="s5">1</span>
+
+        <span class="s3">if </span><span class="s1">start_params </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">mu = self.family.starting_mu(endog)</span>
+            <span class="s1">lin_pred = self.family.predict(mu)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">lin_pred = np.dot(wlsexog</span><span class="s3">, </span><span class="s1">start_params) + self._offset_exposure</span>
+            <span class="s1">mu = self.family.fitted(lin_pred)</span>
+        <span class="s1">dev = self.family.deviance(endog</span><span class="s3">, </span><span class="s1">mu)</span>
+
+        <span class="s1">history = dict(params=[</span><span class="s3">None, </span><span class="s1">start_params]</span><span class="s3">, </span><span class="s1">deviance=[np.inf</span><span class="s3">, </span><span class="s1">dev])</span>
+        <span class="s1">converged = </span><span class="s3">False</span>
+        <span class="s1">criterion = history[</span><span class="s4">'deviance'</span><span class="s1">]</span>
+        <span class="s0"># This special case is used to get the likelihood for a specific</span>
+        <span class="s0"># params vector.</span>
+        <span class="s3">if </span><span class="s1">maxiter == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">mu = self.family.fitted(lin_pred)</span>
+            <span class="s1">self.scale = self.estimate_scale(mu)</span>
+            <span class="s1">wls_results = lm.RegressionResults(self</span><span class="s3">, </span><span class="s1">start_params</span><span class="s3">, None</span><span class="s1">)</span>
+            <span class="s1">iteration = </span><span class="s5">0</span>
+
+        <span class="s3">for </span><span class="s1">iteration </span><span class="s3">in </span><span class="s1">range(maxiter):</span>
+
+            <span class="s0"># TODO: is this equivalent to point 1 of page 136:</span>
+            <span class="s0"># w = 1 / (V(mu) * g'(mu))  ?</span>
+            <span class="s1">self.weights = self.data_weights * self.family.weights(mu)</span>
+
+            <span class="s0"># TODO: is this equivalent to point 1 of page 136:</span>
+            <span class="s0"># z = g(mu)(y - mu) + X beta  ?</span>
+            <span class="s1">wlsendog = (lin_pred + self.family.link.deriv(mu) * (endog - mu)</span>
+                        <span class="s1">- self._offset_exposure)</span>
+
+            <span class="s0"># this defines the augmented matrix point 2a on page 136</span>
+            <span class="s1">wls_results = penalized_wls(wlsendog</span><span class="s3">, </span><span class="s1">wlsexog</span><span class="s3">, </span><span class="s1">spl_s</span><span class="s3">, </span><span class="s1">self.weights)</span>
+            <span class="s1">lin_pred = np.dot(wlsexog</span><span class="s3">, </span><span class="s1">wls_results.params).ravel()</span>
+            <span class="s1">lin_pred += self._offset_exposure</span>
+            <span class="s1">mu = self.family.fitted(lin_pred)</span>
+
+            <span class="s0"># We do not need to update scale in GLM/LEF models</span>
+            <span class="s0"># We might need it in dispersion models.</span>
+            <span class="s0"># self.scale = self.estimate_scale(mu)</span>
+            <span class="s1">history = self._update_history(wls_results</span><span class="s3">, </span><span class="s1">mu</span><span class="s3">, </span><span class="s1">history)</span>
+
+            <span class="s3">if </span><span class="s1">endog.squeeze().ndim == </span><span class="s5">1 </span><span class="s3">and </span><span class="s1">np.allclose(mu - endog</span><span class="s3">, </span><span class="s5">0</span><span class="s1">):</span>
+                <span class="s1">msg = </span><span class="s4">&quot;Perfect separation detected, results not available&quot;</span>
+                <span class="s3">raise </span><span class="s1">PerfectSeparationError(msg)</span>
+
+            <span class="s0"># TODO need atol, rtol</span>
+            <span class="s0"># args of _check_convergence: (criterion, iteration, atol, rtol)</span>
+            <span class="s1">converged = _check_convergence(criterion</span><span class="s3">, </span><span class="s1">iteration</span><span class="s3">, </span><span class="s1">tol</span><span class="s3">, </span><span class="s5">0</span><span class="s1">)</span>
+            <span class="s3">if </span><span class="s1">converged:</span>
+                <span class="s3">break</span>
+        <span class="s1">self.mu = mu</span>
+        <span class="s1">self.scale = self.estimate_scale(mu)</span>
+        <span class="s1">glm_results = GLMGamResults(self</span><span class="s3">, </span><span class="s1">wls_results.params</span><span class="s3">,</span>
+                                    <span class="s1">wls_results.normalized_cov_params</span><span class="s3">,</span>
+                                    <span class="s1">self.scale</span><span class="s3">,</span>
+                                    <span class="s1">cov_type=cov_type</span><span class="s3">, </span><span class="s1">cov_kwds=cov_kwds</span><span class="s3">,</span>
+                                    <span class="s1">use_t=use_t)</span>
+
+        <span class="s1">glm_results.method = </span><span class="s4">&quot;PIRLS&quot;</span>
+        <span class="s1">history[</span><span class="s4">'iteration'</span><span class="s1">] = iteration + </span><span class="s5">1</span>
+        <span class="s1">glm_results.fit_history = history</span>
+        <span class="s1">glm_results.converged = converged</span>
+
+        <span class="s3">return </span><span class="s1">GLMGamResultsWrapper(glm_results)</span>
+
+    <span class="s3">def </span><span class="s1">select_penweight(self</span><span class="s3">, </span><span class="s1">criterion=</span><span class="s4">'aic'</span><span class="s3">, </span><span class="s1">start_params=</span><span class="s3">None,</span>
+                         <span class="s1">start_model_params=</span><span class="s3">None,</span>
+                         <span class="s1">method=</span><span class="s4">'basinhopping'</span><span class="s3">, </span><span class="s1">**fit_kwds):</span>
+        <span class="s2">&quot;&quot;&quot;find alpha by minimizing results criterion 
+ 
+        The objective for the minimization can be results attributes like 
+        ``gcv``, ``aic`` or ``bic`` where the latter are based on effective 
+        degrees of freedom. 
+ 
+        Warning: In many case the optimization might converge to a local 
+        optimum or near optimum. Different start_params or using a global 
+        optimizer is recommended, default is basinhopping. 
+ 
+        Parameters 
+        ---------- 
+        criterion='aic' 
+            name of results attribute to be minimized. 
+            Default is 'aic', other options are 'gcv', 'cv' or 'bic'. 
+        start_params : None or array 
+            starting parameters for alpha in the penalization weight 
+            minimization. The parameters are internally exponentiated and 
+            the minimization is with respect to ``exp(alpha)`` 
+        start_model_params : None or array 
+            starting parameter for the ``model._fit_pirls``. 
+        method : 'basinhopping', 'nm' or 'minimize' 
+            'basinhopping' and 'nm' directly use the underlying scipy.optimize 
+            functions `basinhopping` and `fmin`. 'minimize' provides access 
+            to the high level interface, `scipy.optimize.minimize`. 
+        fit_kwds : keyword arguments 
+            additional keyword arguments will be used in the call to the 
+            scipy optimizer. Which keywords are supported depends on the 
+            scipy optimization function. 
+ 
+        Returns 
+        ------- 
+        alpha : ndarray 
+            penalization parameter found by minimizing the criterion. 
+            Note that this can be only a local (near) optimum. 
+        fit_res : tuple 
+            results returned by the scipy optimization routine. The 
+            parameters in the optimization problem are `log(alpha)` 
+        history : dict 
+            history of calls to pirls and contains alpha, the fit 
+            criterion and the parameters to which pirls converged to for the 
+            given alpha. 
+ 
+        Notes 
+        ----- 
+        In the test cases Nelder-Mead and bfgs often converge to local optima, 
+        see also https://github.com/statsmodels/statsmodels/issues/5381. 
+ 
+        This does not use any analytical derivatives for the criterion 
+        minimization. 
+ 
+        Status: experimental, It is possible that defaults change if there 
+        is a better way to find a global optimum. API (e.g. type of return) 
+        might also change. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># copy attributes that are changed, so we can reset them</span>
+        <span class="s1">scale_keep = self.scale</span>
+        <span class="s1">scaletype_keep = self.scaletype</span>
+        <span class="s0"># TODO: use .copy() method when available for all types</span>
+        <span class="s1">alpha_keep = copy.copy(self.alpha)</span>
+
+        <span class="s3">if </span><span class="s1">start_params </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">start_params = np.zeros(self.k_smooths)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">start_params = np.log(</span><span class="s5">1e-20 </span><span class="s1">+ start_params)</span>
+
+        <span class="s1">history = {}</span>
+        <span class="s1">history[</span><span class="s4">'alpha'</span><span class="s1">] = []</span>
+        <span class="s1">history[</span><span class="s4">'params'</span><span class="s1">] = [start_model_params]</span>
+        <span class="s1">history[</span><span class="s4">'criterion'</span><span class="s1">] = []</span>
+
+        <span class="s3">def </span><span class="s1">fun(p):</span>
+            <span class="s1">a = np.exp(p)</span>
+            <span class="s1">res_ = self._fit_pirls(start_params=history[</span><span class="s4">'params'</span><span class="s1">][-</span><span class="s5">1</span><span class="s1">]</span><span class="s3">,</span>
+                                   <span class="s1">alpha=a)</span>
+            <span class="s1">history[</span><span class="s4">'alpha'</span><span class="s1">].append(a)</span>
+            <span class="s1">history[</span><span class="s4">'params'</span><span class="s1">].append(np.asarray(res_.params))</span>
+            <span class="s3">return </span><span class="s1">getattr(res_</span><span class="s3">, </span><span class="s1">criterion)</span>
+
+        <span class="s3">if </span><span class="s1">method == </span><span class="s4">'nm'</span><span class="s1">:</span>
+            <span class="s1">kwds = dict(full_output=</span><span class="s3">True, </span><span class="s1">maxiter=</span><span class="s5">1000</span><span class="s3">, </span><span class="s1">maxfun=</span><span class="s5">2000</span><span class="s1">)</span>
+            <span class="s1">kwds.update(fit_kwds)</span>
+            <span class="s1">fit_res = optimize.fmin(fun</span><span class="s3">, </span><span class="s1">start_params</span><span class="s3">, </span><span class="s1">**kwds)</span>
+            <span class="s1">opt = fit_res[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s3">elif </span><span class="s1">method == </span><span class="s4">'basinhopping'</span><span class="s1">:</span>
+            <span class="s1">kwds = dict(minimizer_kwargs={</span><span class="s4">'method'</span><span class="s1">: </span><span class="s4">'Nelder-Mead'</span><span class="s3">,</span>
+                        <span class="s4">'options'</span><span class="s1">: {</span><span class="s4">'maxiter'</span><span class="s1">: </span><span class="s5">100</span><span class="s3">, </span><span class="s4">'maxfev'</span><span class="s1">: </span><span class="s5">500</span><span class="s1">}}</span><span class="s3">,</span>
+                        <span class="s1">niter=</span><span class="s5">10</span><span class="s1">)</span>
+            <span class="s1">kwds.update(fit_kwds)</span>
+            <span class="s1">fit_res = optimize.basinhopping(fun</span><span class="s3">, </span><span class="s1">start_params</span><span class="s3">, </span><span class="s1">**kwds)</span>
+            <span class="s1">opt = fit_res.x</span>
+        <span class="s3">elif </span><span class="s1">method == </span><span class="s4">'minimize'</span><span class="s1">:</span>
+            <span class="s1">fit_res = optimize.minimize(fun</span><span class="s3">, </span><span class="s1">start_params</span><span class="s3">, </span><span class="s1">**fit_kwds)</span>
+            <span class="s1">opt = fit_res.x</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">'method not recognized'</span><span class="s1">)</span>
+
+        <span class="s3">del </span><span class="s1">history[</span><span class="s4">'params'</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]  </span><span class="s0"># remove the model start_params</span>
+
+        <span class="s1">alpha = np.exp(opt)</span>
+
+        <span class="s0"># reset attributes that have or might have changed</span>
+        <span class="s1">self.scale = scale_keep</span>
+        <span class="s1">self.scaletype = scaletype_keep</span>
+        <span class="s1">self.alpha = alpha_keep</span>
+
+        <span class="s3">return </span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">fit_res</span><span class="s3">, </span><span class="s1">history</span>
+
+    <span class="s3">def </span><span class="s1">select_penweight_kfold(self</span><span class="s3">, </span><span class="s1">alphas=</span><span class="s3">None, </span><span class="s1">cv_iterator=</span><span class="s3">None, </span><span class="s1">cost=</span><span class="s3">None,</span>
+                               <span class="s1">k_folds=</span><span class="s5">5</span><span class="s3">, </span><span class="s1">k_grid=</span><span class="s5">11</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;find alphas by k-fold cross-validation 
+ 
+        Warning: This estimates ``k_folds`` models for each point in the 
+            grid of alphas. 
+ 
+        Parameters 
+        ---------- 
+        alphas : None or list of arrays 
+        cv_iterator : instance 
+            instance of a cross-validation iterator, by default this is a 
+            KFold instance 
+        cost : function 
+            default is mean squared error. The cost function to evaluate the 
+            prediction error for the left out sample. This should take two 
+            arrays as argument and return one float. 
+        k_folds : int 
+            number of folds if default Kfold iterator is used. 
+            This is ignored if ``cv_iterator`` is not None. 
+ 
+        Returns 
+        ------- 
+        alpha_cv : list of float 
+            Best alpha in grid according to cross-validation 
+        res_cv : instance of MultivariateGAMCVPath 
+            The instance was used for cross-validation and holds the results 
+ 
+        Notes 
+        ----- 
+        The default alphas are defined as 
+        ``alphas = [np.logspace(0, 7, k_grid) for _ in range(k_smooths)]`` 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">if </span><span class="s1">cost </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s3">def </span><span class="s1">cost(x1</span><span class="s3">, </span><span class="s1">x2):</span>
+                <span class="s3">return </span><span class="s1">np.linalg.norm(x1 - x2) / len(x1)</span>
+
+        <span class="s3">if </span><span class="s1">alphas </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">alphas = [np.logspace(</span><span class="s5">0</span><span class="s3">, </span><span class="s5">7</span><span class="s3">, </span><span class="s1">k_grid) </span><span class="s3">for </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">range(self.k_smooths)]</span>
+
+        <span class="s3">if </span><span class="s1">cv_iterator </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">cv_iterator = KFold(k_folds=k_folds</span><span class="s3">, </span><span class="s1">shuffle=</span><span class="s3">True</span><span class="s1">)</span>
+
+        <span class="s1">gam_cv = MultivariateGAMCVPath(smoother=self.smoother</span><span class="s3">, </span><span class="s1">alphas=alphas</span><span class="s3">,</span>
+                                       <span class="s1">gam=GLMGam</span><span class="s3">, </span><span class="s1">cost=cost</span><span class="s3">, </span><span class="s1">endog=self.endog</span><span class="s3">,</span>
+                                       <span class="s1">exog=self.exog_linear</span><span class="s3">,</span>
+                                       <span class="s1">cv_iterator=cv_iterator)</span>
+        <span class="s1">gam_cv_res = gam_cv.fit()</span>
+
+        <span class="s3">return </span><span class="s1">gam_cv_res.alpha_cv</span><span class="s3">, </span><span class="s1">gam_cv_res</span>
+
+
+<span class="s3">class </span><span class="s1">LogitGam(PenalizedMixin</span><span class="s3">, </span><span class="s1">Logit):</span>
+    <span class="s2">&quot;&quot;&quot;Generalized Additive model for discrete Logit 
+ 
+    This subclasses discrete_model Logit. 
+ 
+    Warning: not all inherited methods might take correctly account of the 
+    penalization 
+ 
+    not verified yet. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">smoother</span><span class="s3">, </span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">if not </span><span class="s1">isinstance(alpha</span><span class="s3">, </span><span class="s1">Iterable):</span>
+            <span class="s1">alpha = np.array([alpha] * len(smoother.smoothers))</span>
+
+        <span class="s1">self.smoother = smoother</span>
+        <span class="s1">self.alpha = alpha</span>
+        <span class="s1">self.pen_weight = </span><span class="s5">1  </span><span class="s0"># TODO: pen weight should not be defined here!!</span>
+        <span class="s1">penal = MultivariateGamPenalty(smoother</span><span class="s3">, </span><span class="s1">alpha=alpha)</span>
+
+        <span class="s1">super(LogitGam</span><span class="s3">, </span><span class="s1">self).__init__(endog</span><span class="s3">, </span><span class="s1">smoother.basis</span><span class="s3">, </span><span class="s1">penal=penal</span><span class="s3">,</span>
+                                       <span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s3">def </span><span class="s1">penalized_wls(endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">penalty_matrix</span><span class="s3">, </span><span class="s1">weights):</span>
+    <span class="s2">&quot;&quot;&quot;weighted least squares with quadratic penalty 
+ 
+    Parameters 
+    ---------- 
+    endog : ndarray 
+        response or endogenous variable 
+    exog : ndarray 
+        design matrix, matrix of exogenous or explanatory variables 
+    penalty_matrix : ndarray, 2-Dim square 
+        penality matrix for quadratic penalization. Note, the penalty_matrix 
+        is multiplied by two to match non-pirls fitting methods. 
+    weights : ndarray 
+        weights for WLS 
+ 
+    Returns 
+    ------- 
+    results : Results instance of WLS 
+    &quot;&quot;&quot;</span>
+    <span class="s1">y</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">s = endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">penalty_matrix</span>
+    <span class="s0"># TODO: I do not understand why I need 2 * s</span>
+    <span class="s1">aug_y</span><span class="s3">, </span><span class="s1">aug_x</span><span class="s3">, </span><span class="s1">aug_weights = make_augmented_matrix(y</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s5">2 </span><span class="s1">* s</span><span class="s3">, </span><span class="s1">weights)</span>
+    <span class="s1">wls_results = lm.WLS(aug_y</span><span class="s3">, </span><span class="s1">aug_x</span><span class="s3">, </span><span class="s1">aug_weights).fit()</span>
+    <span class="s0"># TODO: use MinimalWLS during iterations, less overhead</span>
+    <span class="s0"># However, MinimalWLS does not return normalized_cov_params</span>
+    <span class="s0">#   which we need at the end of the iterations</span>
+    <span class="s0"># call would be</span>
+    <span class="s0"># wls_results = reg_tools._MinimalWLS(aug_y, aug_x, aug_weights).fit()</span>
+    <span class="s1">wls_results.params = wls_results.params.ravel()</span>
+
+    <span class="s3">return </span><span class="s1">wls_results</span>
+
+
+<span class="s3">def </span><span class="s1">make_augmented_matrix(endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">penalty_matrix</span><span class="s3">, </span><span class="s1">weights):</span>
+    <span class="s2">&quot;&quot;&quot;augment endog, exog and weights with stochastic restriction matrix 
+ 
+    Parameters 
+    ---------- 
+    endog : ndarray 
+        response or endogenous variable 
+    exog : ndarray 
+        design matrix, matrix of exogenous or explanatory variables 
+    penalty_matrix : ndarray, 2-Dim square 
+        penality matrix for quadratic penalization 
+    weights : ndarray 
+        weights for WLS 
+ 
+    Returns 
+    ------- 
+    endog_aug : ndarray 
+        augmented response variable 
+    exog_aug : ndarray 
+        augmented design matrix 
+    weights_aug : ndarray 
+        augmented weights for WLS 
+    &quot;&quot;&quot;</span>
+    <span class="s1">y</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">= endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">penalty_matrix</span>
+    <span class="s1">nobs = x.shape[</span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s0"># TODO: needs full because of broadcasting with weights</span>
+    <span class="s0"># check what weights should be doing</span>
+    <span class="s1">rs = matrix_sqrt(s)</span>
+    <span class="s1">x1 = np.vstack([x</span><span class="s3">, </span><span class="s1">rs])  </span><span class="s0"># augmented x</span>
+    <span class="s1">n_samp1es_x1 = x1.shape[</span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s1">y1 = np.array([</span><span class="s5">0.</span><span class="s1">] * n_samp1es_x1)  </span><span class="s0"># augmented y</span>
+    <span class="s1">y1[:nobs] = y</span>
+
+    <span class="s1">id1 = np.array([</span><span class="s5">1.</span><span class="s1">] * rs.shape[</span><span class="s5">0</span><span class="s1">])</span>
+    <span class="s1">w1 = np.concatenate([weights</span><span class="s3">, </span><span class="s1">id1])</span>
+
+    <span class="s3">return </span><span class="s1">y1</span><span class="s3">, </span><span class="s1">x1</span><span class="s3">, </span><span class="s1">w1</span>
+</pre>
+</body>
+</html>

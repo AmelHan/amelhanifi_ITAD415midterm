@@ -1,0 +1,1998 @@
+<html>
+<head>
+<title>spec.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+spec.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">io</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">threading</span>
+<span class="s0">import </span><span class="s1">warnings</span>
+<span class="s0">import </span><span class="s1">weakref</span>
+<span class="s0">from </span><span class="s1">errno </span><span class="s0">import </span><span class="s1">ESPIPE</span>
+<span class="s0">from </span><span class="s1">glob </span><span class="s0">import </span><span class="s1">has_magic</span>
+<span class="s0">from </span><span class="s1">hashlib </span><span class="s0">import </span><span class="s1">sha256</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">ClassVar</span>
+
+<span class="s0">from </span><span class="s1">.callbacks </span><span class="s0">import </span><span class="s1">_DEFAULT_CALLBACK</span>
+<span class="s0">from </span><span class="s1">.config </span><span class="s0">import </span><span class="s1">apply_config</span><span class="s0">, </span><span class="s1">conf</span>
+<span class="s0">from </span><span class="s1">.dircache </span><span class="s0">import </span><span class="s1">DirCache</span>
+<span class="s0">from </span><span class="s1">.transaction </span><span class="s0">import </span><span class="s1">Transaction</span>
+<span class="s0">from </span><span class="s1">.utils </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">_unstrip_protocol</span><span class="s0">,</span>
+    <span class="s1">isfilelike</span><span class="s0">,</span>
+    <span class="s1">other_paths</span><span class="s0">,</span>
+    <span class="s1">read_block</span><span class="s0">,</span>
+    <span class="s1">stringify_path</span><span class="s0">,</span>
+    <span class="s1">tokenize</span><span class="s0">,</span>
+<span class="s1">)</span>
+
+<span class="s1">logger = logging.getLogger(</span><span class="s2">&quot;fsspec&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">make_instance(cls</span><span class="s0">, </span><span class="s1">args</span><span class="s0">, </span><span class="s1">kwargs):</span>
+    <span class="s0">return </span><span class="s1">cls(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s0">class </span><span class="s1">_Cached(type):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Metaclass for caching file system instances. 
+ 
+    Notes 
+    ----- 
+    Instances are cached according to 
+ 
+    * The values of the class attributes listed in `_extra_tokenize_attributes` 
+    * The arguments passed to ``__init__``. 
+ 
+    This creates an additional reference to the filesystem, which prevents the 
+    filesystem from being garbage collected when all *user* references go away. 
+    A call to the :meth:`AbstractFileSystem.clear_instance_cache` must *also* 
+    be made for a filesystem instance to be garbage collected. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(cls</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super().__init__(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s4"># Note: we intentionally create a reference here, to avoid garbage</span>
+        <span class="s4"># collecting instances when all other references are gone. To really</span>
+        <span class="s4"># delete a FileSystem, the cache must be cleared.</span>
+        <span class="s0">if </span><span class="s1">conf.get(</span><span class="s2">&quot;weakref_instance_cache&quot;</span><span class="s1">):  </span><span class="s4"># pragma: no cover</span>
+            <span class="s4"># debug option for analysing fork/spawn conditions</span>
+            <span class="s1">cls._cache = weakref.WeakValueDictionary()</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">cls._cache = {}</span>
+        <span class="s1">cls._pid = os.getpid()</span>
+
+    <span class="s0">def </span><span class="s1">__call__(cls</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">kwargs = apply_config(cls</span><span class="s0">, </span><span class="s1">kwargs)</span>
+        <span class="s1">extra_tokens = tuple(</span>
+            <span class="s1">getattr(cls</span><span class="s0">, </span><span class="s1">attr</span><span class="s0">, None</span><span class="s1">) </span><span class="s0">for </span><span class="s1">attr </span><span class="s0">in </span><span class="s1">cls._extra_tokenize_attributes</span>
+        <span class="s1">)</span>
+        <span class="s1">token = tokenize(</span>
+            <span class="s1">cls</span><span class="s0">, </span><span class="s1">cls._pid</span><span class="s0">, </span><span class="s1">threading.get_ident()</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">*extra_tokens</span><span class="s0">, </span><span class="s1">**kwargs</span>
+        <span class="s1">)</span>
+        <span class="s1">skip = kwargs.pop(</span><span class="s2">&quot;skip_instance_cache&quot;</span><span class="s0">, False</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">os.getpid() != cls._pid:</span>
+            <span class="s1">cls._cache.clear()</span>
+            <span class="s1">cls._pid = os.getpid()</span>
+        <span class="s0">if not </span><span class="s1">skip </span><span class="s0">and </span><span class="s1">cls.cachable </span><span class="s0">and </span><span class="s1">token </span><span class="s0">in </span><span class="s1">cls._cache:</span>
+            <span class="s1">cls._latest = token</span>
+            <span class="s0">return </span><span class="s1">cls._cache[token]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">obj = super().__call__(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+            <span class="s4"># Setting _fs_token here causes some static linters to complain.</span>
+            <span class="s1">obj._fs_token_ = token</span>
+            <span class="s1">obj.storage_args = args</span>
+            <span class="s1">obj.storage_options = kwargs</span>
+            <span class="s0">if </span><span class="s1">obj.async_impl </span><span class="s0">and </span><span class="s1">obj.mirror_sync_methods:</span>
+                <span class="s0">from </span><span class="s1">.asyn </span><span class="s0">import </span><span class="s1">mirror_sync_methods</span>
+
+                <span class="s1">mirror_sync_methods(obj)</span>
+
+            <span class="s0">if </span><span class="s1">cls.cachable </span><span class="s0">and not </span><span class="s1">skip:</span>
+                <span class="s1">cls._latest = token</span>
+                <span class="s1">cls._cache[token] = obj</span>
+            <span class="s0">return </span><span class="s1">obj</span>
+
+
+<span class="s0">class </span><span class="s1">AbstractFileSystem(metaclass=_Cached):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    An abstract super-class for pythonic file-systems 
+ 
+    Implementations are expected to be compatible with or, better, subclass 
+    from here. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">cachable = </span><span class="s0">True  </span><span class="s4"># this class can be cached, instances reused</span>
+    <span class="s1">_cached = </span><span class="s0">False</span>
+    <span class="s1">blocksize = </span><span class="s5">2</span><span class="s1">**</span><span class="s5">22</span>
+    <span class="s1">sep = </span><span class="s2">&quot;/&quot;</span>
+    <span class="s1">protocol: ClassVar[str | tuple[str</span><span class="s0">, </span><span class="s1">...]] = </span><span class="s2">&quot;abstract&quot;</span>
+    <span class="s1">_latest = </span><span class="s0">None</span>
+    <span class="s1">async_impl = </span><span class="s0">False</span>
+    <span class="s1">mirror_sync_methods = </span><span class="s0">False</span>
+    <span class="s1">root_marker = </span><span class="s2">&quot;&quot;  </span><span class="s4"># For some FSs, may require leading '/' or other character</span>
+
+    <span class="s4">#: Extra *class attributes* that should be considered when hashing.</span>
+    <span class="s1">_extra_tokenize_attributes = ()</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**storage_options):</span>
+        <span class="s3">&quot;&quot;&quot;Create and configure file-system instance 
+ 
+        Instances may be cachable, so if similar enough arguments are seen 
+        a new instance is not required. The token attribute exists to allow 
+        implementations to cache instances if they wish. 
+ 
+        A reasonable default should be provided if there are no arguments. 
+ 
+        Subclasses should call this method. 
+ 
+        Parameters 
+        ---------- 
+        use_listings_cache, listings_expiry_time, max_paths: 
+            passed to ``DirCache``, if the implementation supports 
+            directory listing caching. Pass use_listings_cache=False 
+            to disable such caching. 
+        skip_instance_cache: bool 
+            If this is a cachable implementation, pass True here to force 
+            creating a new instance even if a matching instance exists, and prevent 
+            storing this instance. 
+        asynchronous: bool 
+        loop: asyncio-compatible IOLoop or None 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self._cached:</span>
+            <span class="s4"># reusing instance, don't change</span>
+            <span class="s0">return</span>
+        <span class="s1">self._cached = </span><span class="s0">True</span>
+        <span class="s1">self._intrans = </span><span class="s0">False</span>
+        <span class="s1">self._transaction = </span><span class="s0">None</span>
+        <span class="s1">self._invalidated_caches_in_transaction = []</span>
+        <span class="s1">self.dircache = DirCache(**storage_options)</span>
+
+        <span class="s0">if </span><span class="s1">storage_options.pop(</span><span class="s2">&quot;add_docs&quot;</span><span class="s0">, None</span><span class="s1">):</span>
+            <span class="s1">warnings.warn(</span><span class="s2">&quot;add_docs is no longer supported.&quot;</span><span class="s0">, </span><span class="s1">FutureWarning)</span>
+
+        <span class="s0">if </span><span class="s1">storage_options.pop(</span><span class="s2">&quot;add_aliases&quot;</span><span class="s0">, None</span><span class="s1">):</span>
+            <span class="s1">warnings.warn(</span><span class="s2">&quot;add_aliases has been removed.&quot;</span><span class="s0">, </span><span class="s1">FutureWarning)</span>
+        <span class="s4"># This is set in _Cached</span>
+        <span class="s1">self._fs_token_ = </span><span class="s0">None</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">fsid(self):</span>
+        <span class="s3">&quot;&quot;&quot;Persistent filesystem id that can be used to compare filesystems 
+        across sessions. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">_fs_token(self):</span>
+        <span class="s0">return </span><span class="s1">self._fs_token_</span>
+
+    <span class="s0">def </span><span class="s1">__dask_tokenize__(self):</span>
+        <span class="s0">return </span><span class="s1">self._fs_token</span>
+
+    <span class="s0">def </span><span class="s1">__hash__(self):</span>
+        <span class="s0">return </span><span class="s1">int(self._fs_token</span><span class="s0">, </span><span class="s5">16</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__eq__(self</span><span class="s0">, </span><span class="s1">other):</span>
+        <span class="s0">return </span><span class="s1">isinstance(other</span><span class="s0">, </span><span class="s1">type(self)) </span><span class="s0">and </span><span class="s1">self._fs_token == other._fs_token</span>
+
+    <span class="s0">def </span><span class="s1">__reduce__(self):</span>
+        <span class="s0">return </span><span class="s1">make_instance</span><span class="s0">, </span><span class="s1">(type(self)</span><span class="s0">, </span><span class="s1">self.storage_args</span><span class="s0">, </span><span class="s1">self.storage_options)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_strip_protocol(cls</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Turn path from fully-qualified to file-system-specific 
+ 
+        May require FS-specific handling, e.g., for relative paths or links. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">isinstance(path</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s0">return </span><span class="s1">[cls._strip_protocol(p) </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">path]</span>
+        <span class="s1">path = stringify_path(path)</span>
+        <span class="s1">protos = (cls.protocol</span><span class="s0">,</span><span class="s1">) </span><span class="s0">if </span><span class="s1">isinstance(cls.protocol</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">else </span><span class="s1">cls.protocol</span>
+        <span class="s0">for </span><span class="s1">protocol </span><span class="s0">in </span><span class="s1">protos:</span>
+            <span class="s0">if </span><span class="s1">path.startswith(protocol + </span><span class="s2">&quot;://&quot;</span><span class="s1">):</span>
+                <span class="s1">path = path[len(protocol) + </span><span class="s5">3 </span><span class="s1">:]</span>
+            <span class="s0">elif </span><span class="s1">path.startswith(protocol + </span><span class="s2">&quot;::&quot;</span><span class="s1">):</span>
+                <span class="s1">path = path[len(protocol) + </span><span class="s5">2 </span><span class="s1">:]</span>
+        <span class="s1">path = path.rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+        <span class="s4"># use of root_marker to make minimum required path, e.g., &quot;/&quot;</span>
+        <span class="s0">return </span><span class="s1">path </span><span class="s0">or </span><span class="s1">cls.root_marker</span>
+
+    <span class="s0">def </span><span class="s1">unstrip_protocol(self</span><span class="s0">, </span><span class="s1">name: str) -&gt; str:</span>
+        <span class="s3">&quot;&quot;&quot;Format FS-specific path to generic, including protocol&quot;&quot;&quot;</span>
+        <span class="s1">protos = (self.protocol</span><span class="s0">,</span><span class="s1">) </span><span class="s0">if </span><span class="s1">isinstance(self.protocol</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">else </span><span class="s1">self.protocol</span>
+        <span class="s0">for </span><span class="s1">protocol </span><span class="s0">in </span><span class="s1">protos:</span>
+            <span class="s0">if </span><span class="s1">name.startswith(</span><span class="s2">f&quot;</span><span class="s0">{</span><span class="s1">protocol</span><span class="s0">}</span><span class="s2">://&quot;</span><span class="s1">):</span>
+                <span class="s0">return </span><span class="s1">name</span>
+        <span class="s0">return </span><span class="s2">f&quot;</span><span class="s0">{</span><span class="s1">protos[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">}</span><span class="s2">://</span><span class="s0">{</span><span class="s1">name</span><span class="s0">}</span><span class="s2">&quot;</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s0">def </span><span class="s1">_get_kwargs_from_urls(path):</span>
+        <span class="s3">&quot;&quot;&quot;If kwargs can be encoded in the paths, extract them here 
+ 
+        This should happen before instantiation of the class; incoming paths 
+        then should be amended to strip the options in methods. 
+ 
+        Examples may look like an sftp path &quot;sftp://user@host:/my/path&quot;, where 
+        the user and host should become kwargs and later get stripped. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># by default, nothing happens</span>
+        <span class="s0">return </span><span class="s1">{}</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">current(cls):</span>
+        <span class="s3">&quot;&quot;&quot;Return the most recently instantiated FileSystem 
+ 
+        If no instance has been created, then create one with defaults 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">cls._latest </span><span class="s0">in </span><span class="s1">cls._cache:</span>
+            <span class="s0">return </span><span class="s1">cls._cache[cls._latest]</span>
+        <span class="s0">return </span><span class="s1">cls()</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">transaction(self):</span>
+        <span class="s3">&quot;&quot;&quot;A context within which files are committed together upon exit 
+ 
+        Requires the file class to implement `.commit()` and `.discard()` 
+        for the normal and exception cases. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self._transaction </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self._transaction = Transaction(self)</span>
+        <span class="s0">return </span><span class="s1">self._transaction</span>
+
+    <span class="s0">def </span><span class="s1">start_transaction(self):</span>
+        <span class="s3">&quot;&quot;&quot;Begin write transaction for deferring files, non-context version&quot;&quot;&quot;</span>
+        <span class="s1">self._intrans = </span><span class="s0">True</span>
+        <span class="s1">self._transaction = Transaction(self)</span>
+        <span class="s0">return </span><span class="s1">self.transaction</span>
+
+    <span class="s0">def </span><span class="s1">end_transaction(self):</span>
+        <span class="s3">&quot;&quot;&quot;Finish write transaction, non-context version&quot;&quot;&quot;</span>
+        <span class="s1">self.transaction.complete()</span>
+        <span class="s1">self._transaction = </span><span class="s0">None</span>
+        <span class="s4"># The invalid cache must be cleared after the transcation is completed.</span>
+        <span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">self._invalidated_caches_in_transaction:</span>
+            <span class="s1">self.invalidate_cache(path)</span>
+        <span class="s1">self._invalidated_caches_in_transaction.clear()</span>
+
+    <span class="s0">def </span><span class="s1">invalidate_cache(self</span><span class="s0">, </span><span class="s1">path=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Discard any cached directory information 
+ 
+        Parameters 
+        ---------- 
+        path: string or None 
+            If None, clear all listings cached else listings at or under given 
+            path. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># Not necessary to implement invalidation mechanism, may have no cache.</span>
+        <span class="s4"># But if have, you should call this method of parent class from your</span>
+        <span class="s4"># subclass to ensure expiring caches after transacations correctly.</span>
+        <span class="s4"># See the implementation of FTPFileSystem in ftp.py</span>
+        <span class="s0">if </span><span class="s1">self._intrans:</span>
+            <span class="s1">self._invalidated_caches_in_transaction.append(path)</span>
+
+    <span class="s0">def </span><span class="s1">mkdir(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">create_parents=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Create directory entry at path 
+ 
+        For systems that don't have true directories, may create an for 
+        this instance only and not touch the real filesystem 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+            location 
+        create_parents: bool 
+            if True, this is equivalent to ``makedirs`` 
+        kwargs: 
+            may be permissions, etc. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">pass  </span><span class="s4"># not necessary to implement, may not have directories</span>
+
+    <span class="s0">def </span><span class="s1">makedirs(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Recursively make directories 
+ 
+        Creates directory at path and any intervening required directories. 
+        Raises exception if, for instance, the path already exists but is a 
+        file. 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+            leaf directory name 
+        exist_ok: bool (False) 
+            If False, will error if the target already exists 
+        &quot;&quot;&quot;</span>
+        <span class="s0">pass  </span><span class="s4"># not necessary to implement, may not have directories</span>
+
+    <span class="s0">def </span><span class="s1">rmdir(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Remove a directory, if empty&quot;&quot;&quot;</span>
+        <span class="s0">pass  </span><span class="s4"># not necessary to implement, may not have directories</span>
+
+    <span class="s0">def </span><span class="s1">ls(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;List objects at path. 
+ 
+        This should include subdirectories and files at that location. The 
+        difference between a file and a directory must be clear when details 
+        are requested. 
+ 
+        The specific keys, or perhaps a FileInfo class, or similar, is TBD, 
+        but must be consistent across implementations. 
+        Must include: 
+ 
+        - full path to the entry (without protocol) 
+        - size of the entry, in bytes. If the value cannot be determined, will 
+          be ``None``. 
+        - type of entry, &quot;file&quot;, &quot;directory&quot; or other 
+ 
+        Additional information 
+        may be present, appropriate to the file-system, e.g., generation, 
+        checksum, etc. 
+ 
+        May use refresh=True|False to allow use of self._ls_from_cache to 
+        check for a saved listing and avoid calling the backend. This would be 
+        common where listing may be expensive. 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+        detail: bool 
+            if True, gives a list of dictionaries, where each is the same as 
+            the result of ``info(path)``. If False, gives a list of paths 
+            (str). 
+        kwargs: may have additional backend-specific options, such as version 
+            information 
+ 
+        Returns 
+        ------- 
+        List of strings if detail is False, or list of directory information 
+        dicts if detail is True. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">def </span><span class="s1">_ls_from_cache(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Check cache for listing 
+ 
+        Returns listing, if found (may be empty list for a directly that exists 
+        but contains nothing), None if not in cache. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">parent = self._parent(path)</span>
+        <span class="s0">if </span><span class="s1">path.rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">) </span><span class="s0">in </span><span class="s1">self.dircache:</span>
+            <span class="s0">return </span><span class="s1">self.dircache[path.rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)]</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">files = [</span>
+                <span class="s1">f</span>
+                <span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">self.dircache[parent]</span>
+                <span class="s0">if </span><span class="s1">f[</span><span class="s2">&quot;name&quot;</span><span class="s1">] == path</span>
+                <span class="s0">or </span><span class="s1">(f[</span><span class="s2">&quot;name&quot;</span><span class="s1">] == path.rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">) </span><span class="s0">and </span><span class="s1">f[</span><span class="s2">&quot;type&quot;</span><span class="s1">] == </span><span class="s2">&quot;directory&quot;</span><span class="s1">)</span>
+            <span class="s1">]</span>
+            <span class="s0">if </span><span class="s1">len(files) == </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s4"># parent dir was listed but did not contain this file</span>
+                <span class="s0">raise </span><span class="s1">FileNotFoundError(path)</span>
+            <span class="s0">return </span><span class="s1">files</span>
+        <span class="s0">except </span><span class="s1">KeyError:</span>
+            <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">walk(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">topdown=</span><span class="s0">True, </span><span class="s1">on_error=</span><span class="s2">&quot;omit&quot;</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Return all files belows path 
+ 
+        List all files, recursing into subdirectories; output is iterator-style, 
+        like ``os.walk()``. For a simple list of files, ``find()`` is available. 
+ 
+        When topdown is True, the caller can modify the dirnames list in-place (perhaps 
+        using del or slice assignment), and walk() will 
+        only recurse into the subdirectories whose names remain in dirnames; 
+        this can be used to prune the search, impose a specific order of visiting, 
+        or even to inform walk() about directories the caller creates or renames before 
+        it resumes walk() again. 
+        Modifying dirnames when topdown is False has no effect. (see os.walk) 
+ 
+        Note that the &quot;files&quot; outputted will include anything that is not 
+        a directory, such as links. 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+            Root to recurse into 
+        maxdepth: int 
+            Maximum recursion depth. None means limitless, but not recommended 
+            on link-based file-systems. 
+        topdown: bool (True) 
+            Whether to walk the directory tree from the top downwards or from 
+            the bottom upwards. 
+        on_error: &quot;omit&quot;, &quot;raise&quot;, a collable 
+            if omit (default), path with exception will simply be empty; 
+            If raise, an underlying exception will be raised; 
+            if callable, it will be called with a single OSError instance as argument 
+        kwargs: passed to ``ls`` 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None and </span><span class="s1">maxdepth &lt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;maxdepth must be at least 1&quot;</span><span class="s1">)</span>
+
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">full_dirs = {}</span>
+        <span class="s1">dirs = {}</span>
+        <span class="s1">files = {}</span>
+
+        <span class="s1">detail = kwargs.pop(</span><span class="s2">&quot;detail&quot;</span><span class="s0">, False</span><span class="s1">)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">listing = self.ls(path</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs)</span>
+        <span class="s0">except </span><span class="s1">(FileNotFoundError</span><span class="s0">, </span><span class="s1">OSError) </span><span class="s0">as </span><span class="s1">e:</span>
+            <span class="s0">if </span><span class="s1">on_error == </span><span class="s2">&quot;raise&quot;</span><span class="s1">:</span>
+                <span class="s0">raise</span>
+            <span class="s0">elif </span><span class="s1">callable(on_error):</span>
+                <span class="s1">on_error(e)</span>
+            <span class="s0">if </span><span class="s1">detail:</span>
+                <span class="s0">return </span><span class="s1">path</span><span class="s0">, </span><span class="s1">{}</span><span class="s0">, </span><span class="s1">{}</span>
+            <span class="s0">return </span><span class="s1">path</span><span class="s0">, </span><span class="s1">[]</span><span class="s0">, </span><span class="s1">[]</span>
+
+        <span class="s0">for </span><span class="s1">info </span><span class="s0">in </span><span class="s1">listing:</span>
+            <span class="s4"># each info name must be at least [path]/part , but here</span>
+            <span class="s4"># we check also for names like [path]/part/</span>
+            <span class="s1">pathname = info[</span><span class="s2">&quot;name&quot;</span><span class="s1">].rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+            <span class="s1">name = pathname.rsplit(</span><span class="s2">&quot;/&quot;</span><span class="s0">, </span><span class="s5">1</span><span class="s1">)[-</span><span class="s5">1</span><span class="s1">]</span>
+            <span class="s0">if </span><span class="s1">info[</span><span class="s2">&quot;type&quot;</span><span class="s1">] == </span><span class="s2">&quot;directory&quot; </span><span class="s0">and </span><span class="s1">pathname != path:</span>
+                <span class="s4"># do not include &quot;self&quot; path</span>
+                <span class="s1">full_dirs[name] = pathname</span>
+                <span class="s1">dirs[name] = info</span>
+            <span class="s0">elif </span><span class="s1">pathname == path:</span>
+                <span class="s4"># file-like with same name as give path</span>
+                <span class="s1">files[</span><span class="s2">&quot;&quot;</span><span class="s1">] = info</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">files[name] = info</span>
+
+        <span class="s0">if not </span><span class="s1">detail:</span>
+            <span class="s1">dirs = list(dirs)</span>
+            <span class="s1">files = list(files)</span>
+
+        <span class="s0">if </span><span class="s1">topdown:</span>
+            <span class="s4"># Yield before recursion if walking top down</span>
+            <span class="s0">yield </span><span class="s1">path</span><span class="s0">, </span><span class="s1">dirs</span><span class="s0">, </span><span class="s1">files</span>
+
+        <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">maxdepth -= </span><span class="s5">1</span>
+            <span class="s0">if </span><span class="s1">maxdepth &lt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s0">if not </span><span class="s1">topdown:</span>
+                    <span class="s0">yield </span><span class="s1">path</span><span class="s0">, </span><span class="s1">dirs</span><span class="s0">, </span><span class="s1">files</span>
+                <span class="s0">return</span>
+
+        <span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">dirs:</span>
+            <span class="s0">yield from </span><span class="s1">self.walk(</span>
+                <span class="s1">full_dirs[d]</span><span class="s0">,</span>
+                <span class="s1">maxdepth=maxdepth</span><span class="s0">,</span>
+                <span class="s1">detail=detail</span><span class="s0">,</span>
+                <span class="s1">topdown=topdown</span><span class="s0">,</span>
+                <span class="s1">**kwargs</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s0">if not </span><span class="s1">topdown:</span>
+            <span class="s4"># Yield after recursion if walking bottom up</span>
+            <span class="s0">yield </span><span class="s1">path</span><span class="s0">, </span><span class="s1">dirs</span><span class="s0">, </span><span class="s1">files</span>
+
+    <span class="s0">def </span><span class="s1">find(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">withdirs=</span><span class="s0">False, </span><span class="s1">detail=</span><span class="s0">False, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;List all files below path. 
+ 
+        Like posix ``find`` command without conditions 
+ 
+        Parameters 
+        ---------- 
+        path : str 
+        maxdepth: int or None 
+            If not None, the maximum number of levels to descend 
+        withdirs: bool 
+            Whether to include directory paths in the output. This is True 
+            when used by glob, but users usually only want files. 
+        kwargs are passed to ``ls``. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># TODO: allow equivalent of -name parameter</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">out = {}</span>
+
+        <span class="s4"># Add the root directory if withdirs is requested</span>
+        <span class="s4"># This is needed for posix glob compliance</span>
+        <span class="s0">if </span><span class="s1">withdirs </span><span class="s0">and </span><span class="s1">path != </span><span class="s2">&quot;&quot; </span><span class="s0">and </span><span class="s1">self.isdir(path):</span>
+            <span class="s1">out[path] = self.info(path)</span>
+
+        <span class="s0">for </span><span class="s1">_</span><span class="s0">, </span><span class="s1">dirs</span><span class="s0">, </span><span class="s1">files </span><span class="s0">in </span><span class="s1">self.walk(path</span><span class="s0">, </span><span class="s1">maxdepth</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+            <span class="s0">if </span><span class="s1">withdirs:</span>
+                <span class="s1">files.update(dirs)</span>
+            <span class="s1">out.update({info[</span><span class="s2">&quot;name&quot;</span><span class="s1">]: info </span><span class="s0">for </span><span class="s1">name</span><span class="s0">, </span><span class="s1">info </span><span class="s0">in </span><span class="s1">files.items()})</span>
+        <span class="s0">if not </span><span class="s1">out </span><span class="s0">and </span><span class="s1">self.isfile(path):</span>
+            <span class="s4"># walk works on directories, but find should also return [path]</span>
+            <span class="s4"># when path happens to be a file</span>
+            <span class="s1">out[path] = {}</span>
+        <span class="s1">names = sorted(out)</span>
+        <span class="s0">if not </span><span class="s1">detail:</span>
+            <span class="s0">return </span><span class="s1">names</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">{name: out[name] </span><span class="s0">for </span><span class="s1">name </span><span class="s0">in </span><span class="s1">names}</span>
+
+    <span class="s0">def </span><span class="s1">du(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">total=</span><span class="s0">True, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">withdirs=</span><span class="s0">False, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Space used by files and optionally directories within a path 
+ 
+        Directory size does not include the size of its contents. 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+        total: bool 
+            Whether to sum all the file sizes 
+        maxdepth: int or None 
+            Maximum number of directory levels to descend, None for unlimited. 
+        withdirs: bool 
+            Whether to include directory paths in the output. 
+        kwargs: passed to ``find`` 
+ 
+        Returns 
+        ------- 
+        Dict of {path: size} if total=False, or int otherwise, where numbers 
+        refer to bytes used. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">sizes = {}</span>
+        <span class="s0">if </span><span class="s1">withdirs </span><span class="s0">and </span><span class="s1">self.isdir(path):</span>
+            <span class="s4"># Include top-level directory in output</span>
+            <span class="s1">info = self.info(path)</span>
+            <span class="s1">sizes[info[</span><span class="s2">&quot;name&quot;</span><span class="s1">]] = info[</span><span class="s2">&quot;size&quot;</span><span class="s1">]</span>
+        <span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">self.find(path</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth</span><span class="s0">, </span><span class="s1">withdirs=withdirs</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+            <span class="s1">info = self.info(f)</span>
+            <span class="s1">sizes[info[</span><span class="s2">&quot;name&quot;</span><span class="s1">]] = info[</span><span class="s2">&quot;size&quot;</span><span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">total:</span>
+            <span class="s0">return </span><span class="s1">sum(sizes.values())</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">sizes</span>
+
+    <span class="s0">def </span><span class="s1">glob(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Find files by glob-matching. 
+ 
+        If the path ends with '/', only folders are returned. 
+ 
+        We support ``&quot;**&quot;``, 
+        ``&quot;?&quot;`` and ``&quot;[..]&quot;``. We do not support ^ for pattern negation. 
+ 
+        The `maxdepth` option is applied on the first `**` found in the path. 
+ 
+        Search path names that contain embedded characters special to this 
+        implementation of glob may not produce expected results; 
+        e.g., ``foo/bar/*starredfilename*``. 
+ 
+        kwargs are passed to ``ls``. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None and </span><span class="s1">maxdepth &lt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;maxdepth must be at least 1&quot;</span><span class="s1">)</span>
+
+        <span class="s0">import </span><span class="s1">re</span>
+
+        <span class="s1">ends = path.endswith(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">idx_star = path.find(</span><span class="s2">&quot;*&quot;</span><span class="s1">) </span><span class="s0">if </span><span class="s1">path.find(</span><span class="s2">&quot;*&quot;</span><span class="s1">) &gt;= </span><span class="s5">0 </span><span class="s0">else </span><span class="s1">len(path)</span>
+        <span class="s1">idx_qmark = path.find(</span><span class="s2">&quot;?&quot;</span><span class="s1">) </span><span class="s0">if </span><span class="s1">path.find(</span><span class="s2">&quot;?&quot;</span><span class="s1">) &gt;= </span><span class="s5">0 </span><span class="s0">else </span><span class="s1">len(path)</span>
+        <span class="s1">idx_brace = path.find(</span><span class="s2">&quot;[&quot;</span><span class="s1">) </span><span class="s0">if </span><span class="s1">path.find(</span><span class="s2">&quot;[&quot;</span><span class="s1">) &gt;= </span><span class="s5">0 </span><span class="s0">else </span><span class="s1">len(path)</span>
+
+        <span class="s1">min_idx = min(idx_star</span><span class="s0">, </span><span class="s1">idx_qmark</span><span class="s0">, </span><span class="s1">idx_brace)</span>
+
+        <span class="s1">detail = kwargs.pop(</span><span class="s2">&quot;detail&quot;</span><span class="s0">, False</span><span class="s1">)</span>
+
+        <span class="s0">if not </span><span class="s1">has_magic(path):</span>
+            <span class="s0">if </span><span class="s1">self.exists(path):</span>
+                <span class="s0">if not </span><span class="s1">detail:</span>
+                    <span class="s0">return </span><span class="s1">[path]</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s0">return </span><span class="s1">{path: self.info(path)}</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">if not </span><span class="s1">detail:</span>
+                    <span class="s0">return </span><span class="s1">[]  </span><span class="s4"># glob of non-existent returns empty</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s0">return </span><span class="s1">{}</span>
+        <span class="s0">elif </span><span class="s2">&quot;/&quot; </span><span class="s0">in </span><span class="s1">path[:min_idx]:</span>
+            <span class="s1">min_idx = path[:min_idx].rindex(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+            <span class="s1">root = path[: min_idx + </span><span class="s5">1</span><span class="s1">]</span>
+            <span class="s1">depth = path[min_idx + </span><span class="s5">1 </span><span class="s1">:].count(</span><span class="s2">&quot;/&quot;</span><span class="s1">) + </span><span class="s5">1</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">root = </span><span class="s2">&quot;&quot;</span>
+            <span class="s1">depth = path[min_idx + </span><span class="s5">1 </span><span class="s1">:].count(</span><span class="s2">&quot;/&quot;</span><span class="s1">) + </span><span class="s5">1</span>
+
+        <span class="s0">if </span><span class="s2">&quot;**&quot; </span><span class="s0">in </span><span class="s1">path:</span>
+            <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">idx_double_stars = path.find(</span><span class="s2">&quot;**&quot;</span><span class="s1">)</span>
+                <span class="s1">depth_double_stars = path[idx_double_stars:].count(</span><span class="s2">&quot;/&quot;</span><span class="s1">) + </span><span class="s5">1</span>
+                <span class="s1">depth = depth - depth_double_stars + maxdepth</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">depth = </span><span class="s0">None</span>
+
+        <span class="s1">allpaths = self.find(root</span><span class="s0">, </span><span class="s1">maxdepth=depth</span><span class="s0">, </span><span class="s1">withdirs=</span><span class="s0">True, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs)</span>
+        <span class="s4"># Escape characters special to python regex, leaving our supported</span>
+        <span class="s4"># special characters in place.</span>
+        <span class="s4"># See https://www.gnu.org/software/bash/manual/html_node/Pattern-Matching.html</span>
+        <span class="s4"># for shell globbing details.</span>
+        <span class="s1">pattern = (</span>
+            <span class="s2">&quot;^&quot;</span>
+            <span class="s1">+ (</span>
+                <span class="s1">path.replace(</span><span class="s2">&quot;</span><span class="s0">\\</span><span class="s2">&quot;</span><span class="s0">, </span><span class="s2">r&quot;\\&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;.&quot;</span><span class="s0">, </span><span class="s2">r&quot;\.&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;+&quot;</span><span class="s0">, </span><span class="s2">r&quot;\+&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;//&quot;</span><span class="s0">, </span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;(&quot;</span><span class="s0">, </span><span class="s2">r&quot;\(&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;)&quot;</span><span class="s0">, </span><span class="s2">r&quot;\)&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;|&quot;</span><span class="s0">, </span><span class="s2">r&quot;\|&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;^&quot;</span><span class="s0">, </span><span class="s2">r&quot;\^&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;$&quot;</span><span class="s0">, </span><span class="s2">r&quot;\$&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;{&quot;</span><span class="s0">, </span><span class="s2">r&quot;\{&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;}&quot;</span><span class="s0">, </span><span class="s2">r&quot;\}&quot;</span><span class="s1">)</span>
+                <span class="s1">.rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+                <span class="s1">.replace(</span><span class="s2">&quot;?&quot;</span><span class="s0">, </span><span class="s2">&quot;.&quot;</span><span class="s1">)</span>
+            <span class="s1">)</span>
+            <span class="s1">+ </span><span class="s2">&quot;$&quot;</span>
+        <span class="s1">)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s2">&quot;/[*]{2}&quot;</span><span class="s0">, </span><span class="s2">&quot;=SLASH_DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s2">&quot;[*]{2}/?&quot;</span><span class="s0">, </span><span class="s2">&quot;=DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s2">&quot;[*]&quot;</span><span class="s0">, </span><span class="s2">&quot;[^/]*&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s2">&quot;=SLASH_DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s2">&quot;(|/.*)&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.sub(</span><span class="s2">&quot;=DOUBLE_STARS=&quot;</span><span class="s0">, </span><span class="s2">&quot;.*&quot;</span><span class="s0">, </span><span class="s1">pattern)</span>
+        <span class="s1">pattern = re.compile(pattern)</span>
+
+        <span class="s1">out = {</span>
+            <span class="s1">p: allpaths[p]</span>
+            <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">sorted(allpaths)</span>
+            <span class="s0">if </span><span class="s1">pattern.match(p.replace(</span><span class="s2">&quot;//&quot;</span><span class="s0">, </span><span class="s2">&quot;/&quot;</span><span class="s1">).rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">))</span>
+        <span class="s1">}</span>
+
+        <span class="s4"># Return directories only when the glob end by a slash</span>
+        <span class="s4"># This is needed for posix glob compliance</span>
+        <span class="s0">if </span><span class="s1">ends:</span>
+            <span class="s1">out = {k: v </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">out.items() </span><span class="s0">if </span><span class="s1">v[</span><span class="s2">&quot;type&quot;</span><span class="s1">] == </span><span class="s2">&quot;directory&quot;</span><span class="s1">}</span>
+
+        <span class="s0">if </span><span class="s1">detail:</span>
+            <span class="s0">return </span><span class="s1">out</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">list(out)</span>
+
+    <span class="s0">def </span><span class="s1">exists(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Is there a file at the given path&quot;&quot;&quot;</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">self.info(path</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+            <span class="s0">return True</span>
+        <span class="s0">except</span><span class="s1">:  </span><span class="s4"># noqa: E722</span>
+            <span class="s4"># any exception allowed bar FileNotFoundError?</span>
+            <span class="s0">return False</span>
+
+    <span class="s0">def </span><span class="s1">lexists(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;If there is a file at the given path (including 
+        broken links)&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.exists(path)</span>
+
+    <span class="s0">def </span><span class="s1">info(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Give details of entry at path 
+ 
+        Returns a single dictionary, with exactly the same information as ``ls`` 
+        would with ``detail=True``. 
+ 
+        The default implementation should calls ls and could be overridden by a 
+        shortcut. kwargs are passed on to ```ls()``. 
+ 
+        Some file systems might not be able to measure the file's size, in 
+        which case, the returned dict will include ``'size': None``. 
+ 
+        Returns 
+        ------- 
+        dict with keys: name (full path in the FS), size (in bytes), type (file, 
+        directory, or something else) and other FS-specific keys. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">out = self.ls(self._parent(path)</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs)</span>
+        <span class="s1">out = [o </span><span class="s0">for </span><span class="s1">o </span><span class="s0">in </span><span class="s1">out </span><span class="s0">if </span><span class="s1">o[</span><span class="s2">&quot;name&quot;</span><span class="s1">].rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">) == path]</span>
+        <span class="s0">if </span><span class="s1">out:</span>
+            <span class="s0">return </span><span class="s1">out[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">out = self.ls(path</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs)</span>
+        <span class="s1">path = path.rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+        <span class="s1">out1 = [o </span><span class="s0">for </span><span class="s1">o </span><span class="s0">in </span><span class="s1">out </span><span class="s0">if </span><span class="s1">o[</span><span class="s2">&quot;name&quot;</span><span class="s1">].rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">) == path]</span>
+        <span class="s0">if </span><span class="s1">len(out1) == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s2">&quot;size&quot; </span><span class="s0">not in </span><span class="s1">out1[</span><span class="s5">0</span><span class="s1">]:</span>
+                <span class="s1">out1[</span><span class="s5">0</span><span class="s1">][</span><span class="s2">&quot;size&quot;</span><span class="s1">] = </span><span class="s0">None</span>
+            <span class="s0">return </span><span class="s1">out1[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s0">elif </span><span class="s1">len(out1) &gt; </span><span class="s5">1 </span><span class="s0">or </span><span class="s1">out:</span>
+            <span class="s0">return </span><span class="s1">{</span><span class="s2">&quot;name&quot;</span><span class="s1">: path</span><span class="s0">, </span><span class="s2">&quot;size&quot;</span><span class="s1">: </span><span class="s5">0</span><span class="s0">, </span><span class="s2">&quot;type&quot;</span><span class="s1">: </span><span class="s2">&quot;directory&quot;</span><span class="s1">}</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">FileNotFoundError(path)</span>
+
+    <span class="s0">def </span><span class="s1">checksum(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Unique value for current version of file 
+ 
+        If the checksum is the same from one moment to another, the contents 
+        are guaranteed to be the same. If the checksum changes, the contents 
+        *might* have changed. 
+ 
+        This should normally be overridden; default will probably capture 
+        creation/modification timestamp (which would be good) or maybe 
+        access timestamp (which would be bad) 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">int(tokenize(self.info(path))</span><span class="s0">, </span><span class="s5">16</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">size(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Size in bytes of file&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.info(path).get(</span><span class="s2">&quot;size&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">sizes(self</span><span class="s0">, </span><span class="s1">paths):</span>
+        <span class="s3">&quot;&quot;&quot;Size in bytes of each file in a list of paths&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">[self.size(p) </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">paths]</span>
+
+    <span class="s0">def </span><span class="s1">isdir(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Is this entry directory-like?&quot;&quot;&quot;</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self.info(path)[</span><span class="s2">&quot;type&quot;</span><span class="s1">] == </span><span class="s2">&quot;directory&quot;</span>
+        <span class="s0">except </span><span class="s1">OSError:</span>
+            <span class="s0">return False</span>
+
+    <span class="s0">def </span><span class="s1">isfile(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Is this entry file-like?&quot;&quot;&quot;</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self.info(path)[</span><span class="s2">&quot;type&quot;</span><span class="s1">] == </span><span class="s2">&quot;file&quot;</span>
+        <span class="s0">except</span><span class="s1">:  </span><span class="s4"># noqa: E722</span>
+            <span class="s0">return False</span>
+
+    <span class="s0">def </span><span class="s1">read_text(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s0">None, </span><span class="s1">errors=</span><span class="s0">None, </span><span class="s1">newline=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Get the contents of the file as a string. 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+            URL of file on this filesystems 
+        encoding, errors, newline: same as `open`. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">with </span><span class="s1">self.open(</span>
+            <span class="s1">path</span><span class="s0">,</span>
+            <span class="s1">mode=</span><span class="s2">&quot;r&quot;</span><span class="s0">,</span>
+            <span class="s1">encoding=encoding</span><span class="s0">,</span>
+            <span class="s1">errors=errors</span><span class="s0">,</span>
+            <span class="s1">newline=newline</span><span class="s0">,</span>
+            <span class="s1">**kwargs</span><span class="s0">,</span>
+        <span class="s1">) </span><span class="s0">as </span><span class="s1">f:</span>
+            <span class="s0">return </span><span class="s1">f.read()</span>
+
+    <span class="s0">def </span><span class="s1">write_text(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">encoding=</span><span class="s0">None, </span><span class="s1">errors=</span><span class="s0">None, </span><span class="s1">newline=</span><span class="s0">None, </span><span class="s1">**kwargs</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Write the text to the given file. 
+ 
+        An existing file will be overwritten. 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+            URL of file on this filesystems 
+        value: str 
+            Text to write. 
+        encoding, errors, newline: same as `open`. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">with </span><span class="s1">self.open(</span>
+            <span class="s1">path</span><span class="s0">,</span>
+            <span class="s1">mode=</span><span class="s2">&quot;w&quot;</span><span class="s0">,</span>
+            <span class="s1">encoding=encoding</span><span class="s0">,</span>
+            <span class="s1">errors=errors</span><span class="s0">,</span>
+            <span class="s1">newline=newline</span><span class="s0">,</span>
+            <span class="s1">**kwargs</span><span class="s0">,</span>
+        <span class="s1">) </span><span class="s0">as </span><span class="s1">f:</span>
+            <span class="s0">return </span><span class="s1">f.write(value)</span>
+
+    <span class="s0">def </span><span class="s1">cat_file(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">start=</span><span class="s0">None, </span><span class="s1">end=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Get the content of a file 
+ 
+        Parameters 
+        ---------- 
+        path: URL of file on this filesystems 
+        start, end: int 
+            Bytes limits of the read. If negative, backwards from end, 
+            like usual python slices. Either can be None for start or 
+            end of file, respectively 
+        kwargs: passed to ``open()``. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># explicitly set buffering off?</span>
+        <span class="s0">with </span><span class="s1">self.open(path</span><span class="s0">, </span><span class="s2">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">**kwargs) </span><span class="s0">as </span><span class="s1">f:</span>
+            <span class="s0">if </span><span class="s1">start </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s0">if </span><span class="s1">start &gt;= </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">f.seek(start)</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">f.seek(max(</span><span class="s5">0</span><span class="s0">, </span><span class="s1">f.size + start))</span>
+            <span class="s0">if </span><span class="s1">end </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s0">if </span><span class="s1">end &lt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">end = f.size + end</span>
+                <span class="s0">return </span><span class="s1">f.read(end - f.tell())</span>
+            <span class="s0">return </span><span class="s1">f.read()</span>
+
+    <span class="s0">def </span><span class="s1">pipe_file(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Set the bytes of given file&quot;&quot;&quot;</span>
+        <span class="s0">with </span><span class="s1">self.open(path</span><span class="s0">, </span><span class="s2">&quot;wb&quot;</span><span class="s0">, </span><span class="s1">**kwargs) </span><span class="s0">as </span><span class="s1">f:</span>
+            <span class="s1">f.write(value)</span>
+
+    <span class="s0">def </span><span class="s1">pipe(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">value=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Put value into path 
+ 
+        (counterpart to ``cat``) 
+ 
+        Parameters 
+        ---------- 
+        path: string or dict(str, bytes) 
+            If a string, a single remote location to put ``value`` bytes; if a dict, 
+            a mapping of {path: bytesvalue}. 
+        value: bytes, optional 
+            If using a single path, these are the bytes to put there. Ignored if 
+            ``path`` is a dict 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">isinstance(path</span><span class="s0">, </span><span class="s1">str):</span>
+            <span class="s1">self.pipe_file(self._strip_protocol(path)</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s0">elif </span><span class="s1">isinstance(path</span><span class="s0">, </span><span class="s1">dict):</span>
+            <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">path.items():</span>
+                <span class="s1">self.pipe_file(self._strip_protocol(k)</span><span class="s0">, </span><span class="s1">v</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;path must be str or dict&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">cat_ranges(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">paths</span><span class="s0">, </span><span class="s1">starts</span><span class="s0">, </span><span class="s1">ends</span><span class="s0">, </span><span class="s1">max_gap=</span><span class="s0">None, </span><span class="s1">on_error=</span><span class="s2">&quot;return&quot;</span><span class="s0">, </span><span class="s1">**kwargs</span>
+    <span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">max_gap </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+        <span class="s0">if not </span><span class="s1">isinstance(paths</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s0">raise </span><span class="s1">TypeError</span>
+        <span class="s0">if not </span><span class="s1">isinstance(starts</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s1">starts = [starts] * len(paths)</span>
+        <span class="s0">if not </span><span class="s1">isinstance(ends</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s1">ends = [starts] * len(paths)</span>
+        <span class="s0">if </span><span class="s1">len(starts) != len(paths) </span><span class="s0">or </span><span class="s1">len(ends) != len(paths):</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span>
+        <span class="s1">out = []</span>
+        <span class="s0">for </span><span class="s1">p</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">e </span><span class="s0">in </span><span class="s1">zip(paths</span><span class="s0">, </span><span class="s1">starts</span><span class="s0">, </span><span class="s1">ends):</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">out.append(self.cat_file(p</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">e))</span>
+            <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e:</span>
+                <span class="s0">if </span><span class="s1">on_error == </span><span class="s2">&quot;return&quot;</span><span class="s1">:</span>
+                    <span class="s1">out.append(e)</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s0">raise</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">cat(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">on_error=</span><span class="s2">&quot;raise&quot;</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Fetch (potentially multiple) paths' contents 
+ 
+        Parameters 
+        ---------- 
+        recursive: bool 
+            If True, assume the path(s) are directories, and get all the 
+            contained files 
+        on_error : &quot;raise&quot;, &quot;omit&quot;, &quot;return&quot; 
+            If raise, an underlying exception will be raised (converted to KeyError 
+            if the type is in self.missing_exceptions); if omit, keys with exception 
+            will simply not be included in the output; if &quot;return&quot;, all keys are 
+            included in the output, but the value will be bytes or an exception 
+            instance. 
+        kwargs: passed to cat_file 
+ 
+        Returns 
+        ------- 
+        dict of {path: contents} if there are multiple paths 
+        or the path has been otherwise expanded 
+        &quot;&quot;&quot;</span>
+        <span class="s1">paths = self.expand_path(path</span><span class="s0">, </span><span class="s1">recursive=recursive)</span>
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">len(paths) &gt; </span><span class="s5">1</span>
+            <span class="s0">or </span><span class="s1">isinstance(path</span><span class="s0">, </span><span class="s1">list)</span>
+            <span class="s0">or </span><span class="s1">paths[</span><span class="s5">0</span><span class="s1">] != self._strip_protocol(path)</span>
+        <span class="s1">):</span>
+            <span class="s1">out = {}</span>
+            <span class="s0">for </span><span class="s1">path </span><span class="s0">in </span><span class="s1">paths:</span>
+                <span class="s0">try</span><span class="s1">:</span>
+                    <span class="s1">out[path] = self.cat_file(path</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+                <span class="s0">except </span><span class="s1">Exception </span><span class="s0">as </span><span class="s1">e:</span>
+                    <span class="s0">if </span><span class="s1">on_error == </span><span class="s2">&quot;raise&quot;</span><span class="s1">:</span>
+                        <span class="s0">raise</span>
+                    <span class="s0">if </span><span class="s1">on_error == </span><span class="s2">&quot;return&quot;</span><span class="s1">:</span>
+                        <span class="s1">out[path] = e</span>
+            <span class="s0">return </span><span class="s1">out</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self.cat_file(paths[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">get_file(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">callback=_DEFAULT_CALLBACK</span><span class="s0">, </span><span class="s1">outfile=</span><span class="s0">None, </span><span class="s1">**kwargs</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Copy single remote file to local&quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">.implementations.local </span><span class="s0">import </span><span class="s1">LocalFileSystem</span>
+
+        <span class="s0">if </span><span class="s1">isfilelike(lpath):</span>
+            <span class="s1">outfile = lpath</span>
+        <span class="s0">elif </span><span class="s1">self.isdir(rpath):</span>
+            <span class="s1">os.makedirs(lpath</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+            <span class="s0">return None</span>
+
+        <span class="s1">LocalFileSystem(auto_mkdir=</span><span class="s0">True</span><span class="s1">).makedirs(self._parent(lpath)</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+
+        <span class="s0">with </span><span class="s1">self.open(rpath</span><span class="s0">, </span><span class="s2">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">**kwargs) </span><span class="s0">as </span><span class="s1">f1:</span>
+            <span class="s0">if </span><span class="s1">outfile </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s1">outfile = open(lpath</span><span class="s0">, </span><span class="s2">&quot;wb&quot;</span><span class="s1">)</span>
+
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">callback.set_size(getattr(f1</span><span class="s0">, </span><span class="s2">&quot;size&quot;</span><span class="s0">, None</span><span class="s1">))</span>
+                <span class="s1">data = </span><span class="s0">True</span>
+                <span class="s0">while </span><span class="s1">data:</span>
+                    <span class="s1">data = f1.read(self.blocksize)</span>
+                    <span class="s1">segment_len = outfile.write(data)</span>
+                    <span class="s0">if </span><span class="s1">segment_len </span><span class="s0">is None</span><span class="s1">:</span>
+                        <span class="s1">segment_len = len(data)</span>
+                    <span class="s1">callback.relative_update(segment_len)</span>
+            <span class="s0">finally</span><span class="s1">:</span>
+                <span class="s0">if not </span><span class="s1">isfilelike(lpath):</span>
+                    <span class="s1">outfile.close()</span>
+
+    <span class="s0">def </span><span class="s1">get(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">rpath</span><span class="s0">,</span>
+        <span class="s1">lpath</span><span class="s0">,</span>
+        <span class="s1">recursive=</span><span class="s0">False,</span>
+        <span class="s1">callback=_DEFAULT_CALLBACK</span><span class="s0">,</span>
+        <span class="s1">maxdepth=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Copy file(s) to local. 
+ 
+        Copies a specific file or tree of files (if recursive=True). If lpath 
+        ends with a &quot;/&quot;, it will be assumed to be a directory, and target files 
+        will go within. Can submit a list of paths, which may be glob-patterns 
+        and will be expanded. 
+ 
+        Calls get_file for each source. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">isinstance(lpath</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">and </span><span class="s1">isinstance(rpath</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s4"># No need to expand paths when both source and destination</span>
+            <span class="s4"># are provided as lists</span>
+            <span class="s1">rpaths = rpath</span>
+            <span class="s1">lpaths = lpath</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">from </span><span class="s1">.implementations.local </span><span class="s0">import </span><span class="s1">(</span>
+                <span class="s1">LocalFileSystem</span><span class="s0">,</span>
+                <span class="s1">make_path_posix</span><span class="s0">,</span>
+                <span class="s1">trailing_sep</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+            <span class="s1">source_is_str = isinstance(rpath</span><span class="s0">, </span><span class="s1">str)</span>
+            <span class="s1">rpaths = self.expand_path(rpath</span><span class="s0">, </span><span class="s1">recursive=recursive</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth)</span>
+            <span class="s0">if </span><span class="s1">source_is_str </span><span class="s0">and </span><span class="s1">(</span><span class="s0">not </span><span class="s1">recursive </span><span class="s0">or </span><span class="s1">maxdepth </span><span class="s0">is not None</span><span class="s1">):</span>
+                <span class="s4"># Non-recursive glob does not copy directories</span>
+                <span class="s1">rpaths = [p </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">rpaths </span><span class="s0">if not </span><span class="s1">(trailing_sep(p) </span><span class="s0">or </span><span class="s1">self.isdir(p))]</span>
+                <span class="s0">if not </span><span class="s1">rpaths:</span>
+                    <span class="s0">return</span>
+
+            <span class="s0">if </span><span class="s1">isinstance(lpath</span><span class="s0">, </span><span class="s1">str):</span>
+                <span class="s1">lpath = make_path_posix(lpath)</span>
+
+            <span class="s1">source_is_file = len(rpaths) == </span><span class="s5">1</span>
+            <span class="s1">dest_is_dir = isinstance(lpath</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">trailing_sep(lpath) </span><span class="s0">or </span><span class="s1">LocalFileSystem().isdir(lpath)</span>
+            <span class="s1">)</span>
+
+            <span class="s1">exists = source_is_str </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">(has_magic(rpath) </span><span class="s0">and </span><span class="s1">source_is_file)</span>
+                <span class="s0">or </span><span class="s1">(</span><span class="s0">not </span><span class="s1">has_magic(rpath) </span><span class="s0">and </span><span class="s1">dest_is_dir </span><span class="s0">and not </span><span class="s1">trailing_sep(rpath))</span>
+            <span class="s1">)</span>
+            <span class="s1">lpaths = other_paths(</span>
+                <span class="s1">rpaths</span><span class="s0">,</span>
+                <span class="s1">lpath</span><span class="s0">,</span>
+                <span class="s1">exists=exists</span><span class="s0">,</span>
+                <span class="s1">flatten=</span><span class="s0">not </span><span class="s1">source_is_str</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s1">callback.set_size(len(lpaths))</span>
+        <span class="s0">for </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">rpath </span><span class="s0">in </span><span class="s1">callback.wrap(zip(lpaths</span><span class="s0">, </span><span class="s1">rpaths)):</span>
+            <span class="s1">callback.branch(rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">kwargs)</span>
+            <span class="s1">self.get_file(rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">put_file(self</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">callback=_DEFAULT_CALLBACK</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Copy single file to remote&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">os.path.isdir(lpath):</span>
+            <span class="s1">self.makedirs(rpath</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+            <span class="s0">return None</span>
+
+        <span class="s0">with </span><span class="s1">open(lpath</span><span class="s0">, </span><span class="s2">&quot;rb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">f1:</span>
+            <span class="s1">size = f1.seek(</span><span class="s5">0</span><span class="s0">, </span><span class="s5">2</span><span class="s1">)</span>
+            <span class="s1">callback.set_size(size)</span>
+            <span class="s1">f1.seek(</span><span class="s5">0</span><span class="s1">)</span>
+
+            <span class="s1">self.mkdirs(self._parent(os.fspath(rpath))</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+            <span class="s0">with </span><span class="s1">self.open(rpath</span><span class="s0">, </span><span class="s2">&quot;wb&quot;</span><span class="s0">, </span><span class="s1">**kwargs) </span><span class="s0">as </span><span class="s1">f2:</span>
+                <span class="s0">while </span><span class="s1">f1.tell() &lt; size:</span>
+                    <span class="s1">data = f1.read(self.blocksize)</span>
+                    <span class="s1">segment_len = f2.write(data)</span>
+                    <span class="s0">if </span><span class="s1">segment_len </span><span class="s0">is None</span><span class="s1">:</span>
+                        <span class="s1">segment_len = len(data)</span>
+                    <span class="s1">callback.relative_update(segment_len)</span>
+
+    <span class="s0">def </span><span class="s1">put(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">lpath</span><span class="s0">,</span>
+        <span class="s1">rpath</span><span class="s0">,</span>
+        <span class="s1">recursive=</span><span class="s0">False,</span>
+        <span class="s1">callback=_DEFAULT_CALLBACK</span><span class="s0">,</span>
+        <span class="s1">maxdepth=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Copy file(s) from local. 
+ 
+        Copies a specific file or tree of files (if recursive=True). If rpath 
+        ends with a &quot;/&quot;, it will be assumed to be a directory, and target files 
+        will go within. 
+ 
+        Calls put_file for each source. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">isinstance(lpath</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">and </span><span class="s1">isinstance(rpath</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s4"># No need to expand paths when both source and destination</span>
+            <span class="s4"># are provided as lists</span>
+            <span class="s1">rpaths = rpath</span>
+            <span class="s1">lpaths = lpath</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">from </span><span class="s1">.implementations.local </span><span class="s0">import </span><span class="s1">(</span>
+                <span class="s1">LocalFileSystem</span><span class="s0">,</span>
+                <span class="s1">make_path_posix</span><span class="s0">,</span>
+                <span class="s1">trailing_sep</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+            <span class="s1">source_is_str = isinstance(lpath</span><span class="s0">, </span><span class="s1">str)</span>
+            <span class="s0">if </span><span class="s1">source_is_str:</span>
+                <span class="s1">lpath = make_path_posix(lpath)</span>
+            <span class="s1">fs = LocalFileSystem()</span>
+            <span class="s1">lpaths = fs.expand_path(lpath</span><span class="s0">, </span><span class="s1">recursive=recursive</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth)</span>
+            <span class="s0">if </span><span class="s1">source_is_str </span><span class="s0">and </span><span class="s1">(</span><span class="s0">not </span><span class="s1">recursive </span><span class="s0">or </span><span class="s1">maxdepth </span><span class="s0">is not None</span><span class="s1">):</span>
+                <span class="s4"># Non-recursive glob does not copy directories</span>
+                <span class="s1">lpaths = [p </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">lpaths </span><span class="s0">if not </span><span class="s1">(trailing_sep(p) </span><span class="s0">or </span><span class="s1">fs.isdir(p))]</span>
+                <span class="s0">if not </span><span class="s1">lpaths:</span>
+                    <span class="s0">return</span>
+
+            <span class="s1">source_is_file = len(lpaths) == </span><span class="s5">1</span>
+            <span class="s1">dest_is_dir = isinstance(rpath</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">trailing_sep(rpath) </span><span class="s0">or </span><span class="s1">self.isdir(rpath)</span>
+            <span class="s1">)</span>
+
+            <span class="s1">rpath = (</span>
+                <span class="s1">self._strip_protocol(rpath)</span>
+                <span class="s0">if </span><span class="s1">isinstance(rpath</span><span class="s0">, </span><span class="s1">str)</span>
+                <span class="s0">else </span><span class="s1">[self._strip_protocol(p) </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">rpath]</span>
+            <span class="s1">)</span>
+            <span class="s1">exists = source_is_str </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">(has_magic(lpath) </span><span class="s0">and </span><span class="s1">source_is_file)</span>
+                <span class="s0">or </span><span class="s1">(</span><span class="s0">not </span><span class="s1">has_magic(lpath) </span><span class="s0">and </span><span class="s1">dest_is_dir </span><span class="s0">and not </span><span class="s1">trailing_sep(lpath))</span>
+            <span class="s1">)</span>
+            <span class="s1">rpaths = other_paths(</span>
+                <span class="s1">lpaths</span><span class="s0">,</span>
+                <span class="s1">rpath</span><span class="s0">,</span>
+                <span class="s1">exists=exists</span><span class="s0">,</span>
+                <span class="s1">flatten=</span><span class="s0">not </span><span class="s1">source_is_str</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s1">callback.set_size(len(rpaths))</span>
+        <span class="s0">for </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">rpath </span><span class="s0">in </span><span class="s1">callback.wrap(zip(lpaths</span><span class="s0">, </span><span class="s1">rpaths)):</span>
+            <span class="s1">callback.branch(lpath</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">kwargs)</span>
+            <span class="s1">self.put_file(lpath</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">head(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">size=</span><span class="s5">1024</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Get the first ``size`` bytes from file&quot;&quot;&quot;</span>
+        <span class="s0">with </span><span class="s1">self.open(path</span><span class="s0">, </span><span class="s2">&quot;rb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">f:</span>
+            <span class="s0">return </span><span class="s1">f.read(size)</span>
+
+    <span class="s0">def </span><span class="s1">tail(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">size=</span><span class="s5">1024</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Get the last ``size`` bytes from file&quot;&quot;&quot;</span>
+        <span class="s0">with </span><span class="s1">self.open(path</span><span class="s0">, </span><span class="s2">&quot;rb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">f:</span>
+            <span class="s1">f.seek(max(-size</span><span class="s0">, </span><span class="s1">-f.size)</span><span class="s0">, </span><span class="s5">2</span><span class="s1">)</span>
+            <span class="s0">return </span><span class="s1">f.read()</span>
+
+    <span class="s0">def </span><span class="s1">cp_file(self</span><span class="s0">, </span><span class="s1">path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">def </span><span class="s1">copy(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">on_error=</span><span class="s0">None, </span><span class="s1">**kwargs</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Copy within two locations in the filesystem 
+ 
+        on_error : &quot;raise&quot;, &quot;ignore&quot; 
+            If raise, any not-found exceptions will be raised; if ignore any 
+            not-found exceptions will cause the path to be skipped; defaults to 
+            raise unless recursive is true, where the default is ignore 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">on_error </span><span class="s0">is None and </span><span class="s1">recursive:</span>
+            <span class="s1">on_error = </span><span class="s2">&quot;ignore&quot;</span>
+        <span class="s0">elif </span><span class="s1">on_error </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">on_error = </span><span class="s2">&quot;raise&quot;</span>
+
+        <span class="s0">if </span><span class="s1">isinstance(path1</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">and </span><span class="s1">isinstance(path2</span><span class="s0">, </span><span class="s1">list):</span>
+            <span class="s4"># No need to expand paths when both source and destination</span>
+            <span class="s4"># are provided as lists</span>
+            <span class="s1">paths1 = path1</span>
+            <span class="s1">paths2 = path2</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">from </span><span class="s1">.implementations.local </span><span class="s0">import </span><span class="s1">trailing_sep</span>
+
+            <span class="s1">source_is_str = isinstance(path1</span><span class="s0">, </span><span class="s1">str)</span>
+            <span class="s1">paths1 = self.expand_path(path1</span><span class="s0">, </span><span class="s1">recursive=recursive</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth)</span>
+            <span class="s0">if </span><span class="s1">source_is_str </span><span class="s0">and </span><span class="s1">(</span><span class="s0">not </span><span class="s1">recursive </span><span class="s0">or </span><span class="s1">maxdepth </span><span class="s0">is not None</span><span class="s1">):</span>
+                <span class="s4"># Non-recursive glob does not copy directories</span>
+                <span class="s1">paths1 = [p </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">paths1 </span><span class="s0">if not </span><span class="s1">(trailing_sep(p) </span><span class="s0">or </span><span class="s1">self.isdir(p))]</span>
+                <span class="s0">if not </span><span class="s1">paths1:</span>
+                    <span class="s0">return</span>
+
+            <span class="s1">source_is_file = len(paths1) == </span><span class="s5">1</span>
+            <span class="s1">dest_is_dir = isinstance(path2</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">trailing_sep(path2) </span><span class="s0">or </span><span class="s1">self.isdir(path2)</span>
+            <span class="s1">)</span>
+
+            <span class="s1">exists = source_is_str </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">(has_magic(path1) </span><span class="s0">and </span><span class="s1">source_is_file)</span>
+                <span class="s0">or </span><span class="s1">(</span><span class="s0">not </span><span class="s1">has_magic(path1) </span><span class="s0">and </span><span class="s1">dest_is_dir </span><span class="s0">and not </span><span class="s1">trailing_sep(path1))</span>
+            <span class="s1">)</span>
+            <span class="s1">paths2 = other_paths(</span>
+                <span class="s1">paths1</span><span class="s0">,</span>
+                <span class="s1">path2</span><span class="s0">,</span>
+                <span class="s1">exists=exists</span><span class="s0">,</span>
+                <span class="s1">flatten=</span><span class="s0">not </span><span class="s1">source_is_str</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s0">for </span><span class="s1">p1</span><span class="s0">, </span><span class="s1">p2 </span><span class="s0">in </span><span class="s1">zip(paths1</span><span class="s0">, </span><span class="s1">paths2):</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">self.cp_file(p1</span><span class="s0">, </span><span class="s1">p2</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+            <span class="s0">except </span><span class="s1">FileNotFoundError:</span>
+                <span class="s0">if </span><span class="s1">on_error == </span><span class="s2">&quot;raise&quot;</span><span class="s1">:</span>
+                    <span class="s0">raise</span>
+
+    <span class="s0">def </span><span class="s1">expand_path(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Turn one or more globs or directories into a list of all matching paths 
+        to files or directories. 
+ 
+        kwargs are passed to ``glob`` or ``find``, which may in turn call ``ls`` 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None and </span><span class="s1">maxdepth &lt; </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;maxdepth must be at least 1&quot;</span><span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">isinstance(path</span><span class="s0">, </span><span class="s1">str):</span>
+            <span class="s1">out = self.expand_path([path]</span><span class="s0">, </span><span class="s1">recursive</span><span class="s0">, </span><span class="s1">maxdepth)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">out = set()</span>
+            <span class="s1">path = [self._strip_protocol(p) </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">path]</span>
+            <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">path:</span>
+                <span class="s0">if </span><span class="s1">has_magic(p):</span>
+                    <span class="s1">bit = set(self.glob(p</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth</span><span class="s0">, </span><span class="s1">**kwargs))</span>
+                    <span class="s1">out |= bit</span>
+                    <span class="s0">if </span><span class="s1">recursive:</span>
+                        <span class="s4"># glob call above expanded one depth so if maxdepth is defined</span>
+                        <span class="s4"># then decrement it in expand_path call below. If it is zero</span>
+                        <span class="s4"># after decrementing then avoid expand_path call.</span>
+                        <span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None and </span><span class="s1">maxdepth &lt;= </span><span class="s5">1</span><span class="s1">:</span>
+                            <span class="s0">continue</span>
+                        <span class="s1">out |= set(</span>
+                            <span class="s1">self.expand_path(</span>
+                                <span class="s1">list(bit)</span><span class="s0">,</span>
+                                <span class="s1">recursive=recursive</span><span class="s0">,</span>
+                                <span class="s1">maxdepth=maxdepth - </span><span class="s5">1 </span><span class="s0">if </span><span class="s1">maxdepth </span><span class="s0">is not None else None,</span>
+                                <span class="s1">**kwargs</span><span class="s0">,</span>
+                            <span class="s1">)</span>
+                        <span class="s1">)</span>
+                    <span class="s0">continue</span>
+                <span class="s0">elif </span><span class="s1">recursive:</span>
+                    <span class="s1">rec = set(</span>
+                        <span class="s1">self.find(</span>
+                            <span class="s1">p</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth</span><span class="s0">, </span><span class="s1">withdirs=</span><span class="s0">True, </span><span class="s1">detail=</span><span class="s0">False, </span><span class="s1">**kwargs</span>
+                        <span class="s1">)</span>
+                    <span class="s1">)</span>
+                    <span class="s1">out |= rec</span>
+                <span class="s0">if </span><span class="s1">p </span><span class="s0">not in </span><span class="s1">out </span><span class="s0">and </span><span class="s1">(recursive </span><span class="s0">is False or </span><span class="s1">self.exists(p)):</span>
+                    <span class="s4"># should only check once, for the root</span>
+                    <span class="s1">out.add(p)</span>
+        <span class="s0">if not </span><span class="s1">out:</span>
+            <span class="s0">raise </span><span class="s1">FileNotFoundError(path)</span>
+        <span class="s0">return </span><span class="s1">sorted(out)</span>
+
+    <span class="s0">def </span><span class="s1">mv(self</span><span class="s0">, </span><span class="s1">path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Move file(s) from one location to another&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">path1 == path2:</span>
+            <span class="s1">logger.debug(</span><span class="s2">&quot;%s mv: The paths are the same, so no files were moved.&quot;</span><span class="s0">, </span><span class="s1">self)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.copy(path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">recursive=recursive</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth)</span>
+            <span class="s1">self.rm(path1</span><span class="s0">, </span><span class="s1">recursive=recursive)</span>
+
+    <span class="s0">def </span><span class="s1">rm_file(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Delete a file&quot;&quot;&quot;</span>
+        <span class="s1">self._rm(path)</span>
+
+    <span class="s0">def </span><span class="s1">_rm(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Delete one file&quot;&quot;&quot;</span>
+        <span class="s4"># this is the old name for the method, prefer rm_file</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">def </span><span class="s1">rm(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">maxdepth=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Delete files. 
+ 
+        Parameters 
+        ---------- 
+        path: str or list of str 
+            File(s) to delete. 
+        recursive: bool 
+            If file(s) are directories, recursively delete contents and then 
+            also remove the directory 
+        maxdepth: int or None 
+            Depth to pass to walk for finding files to delete, if recursive. 
+            If None, there will be no limit and infinite recursion may be 
+            possible. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">path = self.expand_path(path</span><span class="s0">, </span><span class="s1">recursive=recursive</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth)</span>
+        <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">reversed(path):</span>
+            <span class="s1">self.rm_file(p)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_parent(cls</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">path = cls._strip_protocol(path)</span>
+        <span class="s0">if </span><span class="s2">&quot;/&quot; </span><span class="s0">in </span><span class="s1">path:</span>
+            <span class="s1">parent = path.rsplit(</span><span class="s2">&quot;/&quot;</span><span class="s0">, </span><span class="s5">1</span><span class="s1">)[</span><span class="s5">0</span><span class="s1">].lstrip(cls.root_marker)</span>
+            <span class="s0">return </span><span class="s1">cls.root_marker + parent</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">cls.root_marker</span>
+
+    <span class="s0">def </span><span class="s1">_open(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">path</span><span class="s0">,</span>
+        <span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s0">,</span>
+        <span class="s1">block_size=</span><span class="s0">None,</span>
+        <span class="s1">autocommit=</span><span class="s0">True,</span>
+        <span class="s1">cache_options=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Return raw bytes-mode file-like from the file-system&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">AbstractBufferedFile(</span>
+            <span class="s1">self</span><span class="s0">,</span>
+            <span class="s1">path</span><span class="s0">,</span>
+            <span class="s1">mode</span><span class="s0">,</span>
+            <span class="s1">block_size</span><span class="s0">,</span>
+            <span class="s1">autocommit</span><span class="s0">,</span>
+            <span class="s1">cache_options=cache_options</span><span class="s0">,</span>
+            <span class="s1">**kwargs</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">open(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">path</span><span class="s0">,</span>
+        <span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s0">,</span>
+        <span class="s1">block_size=</span><span class="s0">None,</span>
+        <span class="s1">cache_options=</span><span class="s0">None,</span>
+        <span class="s1">compression=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Return a file-like object from the filesystem 
+ 
+        The resultant instance must function correctly in a context ``with`` 
+        block. 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+            Target file 
+        mode: str like 'rb', 'w' 
+            See builtin ``open()`` 
+        block_size: int 
+            Some indication of buffering - this is a value in bytes 
+        cache_options : dict, optional 
+            Extra arguments to pass through to the cache. 
+        compression: string or None 
+            If given, open file using compression codec. Can either be a compression 
+            name (a key in ``fsspec.compression.compr``) or &quot;infer&quot; to guess the 
+            compression from the filename suffix. 
+        encoding, errors, newline: passed on to TextIOWrapper for text mode 
+        &quot;&quot;&quot;</span>
+        <span class="s0">import </span><span class="s1">io</span>
+
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s0">if </span><span class="s2">&quot;b&quot; </span><span class="s0">not in </span><span class="s1">mode:</span>
+            <span class="s1">mode = mode.replace(</span><span class="s2">&quot;t&quot;</span><span class="s0">, </span><span class="s2">&quot;&quot;</span><span class="s1">) + </span><span class="s2">&quot;b&quot;</span>
+
+            <span class="s1">text_kwargs = {</span>
+                <span class="s1">k: kwargs.pop(k)</span>
+                <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">[</span><span class="s2">&quot;encoding&quot;</span><span class="s0">, </span><span class="s2">&quot;errors&quot;</span><span class="s0">, </span><span class="s2">&quot;newline&quot;</span><span class="s1">]</span>
+                <span class="s0">if </span><span class="s1">k </span><span class="s0">in </span><span class="s1">kwargs</span>
+            <span class="s1">}</span>
+            <span class="s0">return </span><span class="s1">io.TextIOWrapper(</span>
+                <span class="s1">self.open(</span>
+                    <span class="s1">path</span><span class="s0">,</span>
+                    <span class="s1">mode</span><span class="s0">,</span>
+                    <span class="s1">block_size=block_size</span><span class="s0">,</span>
+                    <span class="s1">cache_options=cache_options</span><span class="s0">,</span>
+                    <span class="s1">compression=compression</span><span class="s0">,</span>
+                    <span class="s1">**kwargs</span><span class="s0">,</span>
+                <span class="s1">)</span><span class="s0">,</span>
+                <span class="s1">**text_kwargs</span><span class="s0">,</span>
+            <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">ac = kwargs.pop(</span><span class="s2">&quot;autocommit&quot;</span><span class="s0">, not </span><span class="s1">self._intrans)</span>
+            <span class="s1">f = self._open(</span>
+                <span class="s1">path</span><span class="s0">,</span>
+                <span class="s1">mode=mode</span><span class="s0">,</span>
+                <span class="s1">block_size=block_size</span><span class="s0">,</span>
+                <span class="s1">autocommit=ac</span><span class="s0">,</span>
+                <span class="s1">cache_options=cache_options</span><span class="s0">,</span>
+                <span class="s1">**kwargs</span><span class="s0">,</span>
+            <span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">compression </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s0">from </span><span class="s1">fsspec.compression </span><span class="s0">import </span><span class="s1">compr</span>
+                <span class="s0">from </span><span class="s1">fsspec.core </span><span class="s0">import </span><span class="s1">get_compression</span>
+
+                <span class="s1">compression = get_compression(path</span><span class="s0">, </span><span class="s1">compression)</span>
+                <span class="s1">compress = compr[compression]</span>
+                <span class="s1">f = compress(f</span><span class="s0">, </span><span class="s1">mode=mode[</span><span class="s5">0</span><span class="s1">])</span>
+
+            <span class="s0">if not </span><span class="s1">ac </span><span class="s0">and </span><span class="s2">&quot;r&quot; </span><span class="s0">not in </span><span class="s1">mode:</span>
+                <span class="s1">self.transaction.files.append(f)</span>
+            <span class="s0">return </span><span class="s1">f</span>
+
+    <span class="s0">def </span><span class="s1">touch(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">truncate=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Create empty file, or update timestamp 
+ 
+        Parameters 
+        ---------- 
+        path: str 
+            file location 
+        truncate: bool 
+            If True, always set file size to 0; if False, update timestamp and 
+            leave file unchanged, if backend allows this 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">truncate </span><span class="s0">or not </span><span class="s1">self.exists(path):</span>
+            <span class="s0">with </span><span class="s1">self.open(path</span><span class="s0">, </span><span class="s2">&quot;wb&quot;</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+                <span class="s0">pass</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError  </span><span class="s4"># update timestamp, if possible</span>
+
+    <span class="s0">def </span><span class="s1">ukey(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Hash of file properties, to tell if it has changed&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">sha256(str(self.info(path)).encode()).hexdigest()</span>
+
+    <span class="s0">def </span><span class="s1">read_block(self</span><span class="s0">, </span><span class="s1">fn</span><span class="s0">, </span><span class="s1">offset</span><span class="s0">, </span><span class="s1">length</span><span class="s0">, </span><span class="s1">delimiter=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Read a block of bytes from 
+ 
+        Starting at ``offset`` of the file, read ``length`` bytes.  If 
+        ``delimiter`` is set then we ensure that the read starts and stops at 
+        delimiter boundaries that follow the locations ``offset`` and ``offset 
+        + length``.  If ``offset`` is zero then we start at zero.  The 
+        bytestring returned WILL include the end delimiter string. 
+ 
+        If offset+length is beyond the eof, reads to eof. 
+ 
+        Parameters 
+        ---------- 
+        fn: string 
+            Path to filename 
+        offset: int 
+            Byte offset to start read 
+        length: int 
+            Number of bytes to read. If None, read to end. 
+        delimiter: bytes (optional) 
+            Ensure reading starts and stops at delimiter bytestring 
+ 
+        Examples 
+        -------- 
+        &gt;&gt;&gt; fs.read_block('data/file.csv', 0, 13)  # doctest: +SKIP 
+        b'Alice, 100\\nBo' 
+        &gt;&gt;&gt; fs.read_block('data/file.csv', 0, 13, delimiter=b'\\n')  # doctest: +SKIP 
+        b'Alice, 100\\nBob, 200\\n' 
+ 
+        Use ``length=None`` to read to the end of the file. 
+        &gt;&gt;&gt; fs.read_block('data/file.csv', 0, None, delimiter=b'\\n')  # doctest: +SKIP 
+        b'Alice, 100\\nBob, 200\\nCharlie, 300' 
+ 
+        See Also 
+        -------- 
+        :func:`fsspec.utils.read_block` 
+        &quot;&quot;&quot;</span>
+        <span class="s0">with </span><span class="s1">self.open(fn</span><span class="s0">, </span><span class="s2">&quot;rb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">f:</span>
+            <span class="s1">size = f.size</span>
+            <span class="s0">if </span><span class="s1">length </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s1">length = size</span>
+            <span class="s0">if </span><span class="s1">size </span><span class="s0">is not None and </span><span class="s1">offset + length &gt; size:</span>
+                <span class="s1">length = size - offset</span>
+            <span class="s0">return </span><span class="s1">read_block(f</span><span class="s0">, </span><span class="s1">offset</span><span class="s0">, </span><span class="s1">length</span><span class="s0">, </span><span class="s1">delimiter)</span>
+
+    <span class="s0">def </span><span class="s1">to_json(self):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        JSON representation of this filesystem instance 
+ 
+        Returns 
+        ------- 
+        str: JSON structure with keys cls (the python location of this class), 
+            protocol (text name of this class's protocol, first one in case of 
+            multiple), args (positional args, usually empty), and all other 
+            kwargs as their own keys. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">import </span><span class="s1">json</span>
+
+        <span class="s1">cls = type(self)</span>
+        <span class="s1">cls = </span><span class="s2">&quot;.&quot;</span><span class="s1">.join((cls.__module__</span><span class="s0">, </span><span class="s1">cls.__name__))</span>
+        <span class="s1">proto = (</span>
+            <span class="s1">self.protocol[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s0">if </span><span class="s1">isinstance(self.protocol</span><span class="s0">, </span><span class="s1">(tuple</span><span class="s0">, </span><span class="s1">list))</span>
+            <span class="s0">else </span><span class="s1">self.protocol</span>
+        <span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">json.dumps(</span>
+            <span class="s1">dict(</span>
+                <span class="s1">**{</span><span class="s2">&quot;cls&quot;</span><span class="s1">: cls</span><span class="s0">, </span><span class="s2">&quot;protocol&quot;</span><span class="s1">: proto</span><span class="s0">, </span><span class="s2">&quot;args&quot;</span><span class="s1">: self.storage_args}</span><span class="s0">,</span>
+                <span class="s1">**self.storage_options</span><span class="s0">,</span>
+            <span class="s1">)</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s0">def </span><span class="s1">from_json(blob):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Recreate a filesystem instance from JSON representation 
+ 
+        See ``.to_json()`` for the expected structure of the input 
+ 
+        Parameters 
+        ---------- 
+        blob: str 
+ 
+        Returns 
+        ------- 
+        file system instance, not necessarily of this particular class. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">import </span><span class="s1">json</span>
+
+        <span class="s0">from </span><span class="s1">.registry </span><span class="s0">import </span><span class="s1">_import_class</span><span class="s0">, </span><span class="s1">get_filesystem_class</span>
+
+        <span class="s1">dic = json.loads(blob)</span>
+        <span class="s1">protocol = dic.pop(</span><span class="s2">&quot;protocol&quot;</span><span class="s1">)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">cls = _import_class(dic.pop(</span><span class="s2">&quot;cls&quot;</span><span class="s1">))</span>
+        <span class="s0">except </span><span class="s1">(ImportError</span><span class="s0">, </span><span class="s1">ValueError</span><span class="s0">, </span><span class="s1">RuntimeError</span><span class="s0">, </span><span class="s1">KeyError):</span>
+            <span class="s1">cls = get_filesystem_class(protocol)</span>
+        <span class="s0">return </span><span class="s1">cls(*dic.pop(</span><span class="s2">&quot;args&quot;</span><span class="s0">, </span><span class="s1">())</span><span class="s0">, </span><span class="s1">**dic)</span>
+
+    <span class="s0">def </span><span class="s1">_get_pyarrow_filesystem(self):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Make a version of the FS instance which will be acceptable to pyarrow 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># all instances already also derive from pyarrow</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">get_mapper(self</span><span class="s0">, </span><span class="s1">root=</span><span class="s2">&quot;&quot;</span><span class="s0">, </span><span class="s1">check=</span><span class="s0">False, </span><span class="s1">create=</span><span class="s0">False, </span><span class="s1">missing_exceptions=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Create key/value store based on this file-system 
+ 
+        Makes a MutableMapping interface to the FS at the given root path. 
+        See ``fsspec.mapping.FSMap`` for further details. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">.mapping </span><span class="s0">import </span><span class="s1">FSMap</span>
+
+        <span class="s0">return </span><span class="s1">FSMap(</span>
+            <span class="s1">root</span><span class="s0">,</span>
+            <span class="s1">self</span><span class="s0">,</span>
+            <span class="s1">check=check</span><span class="s0">,</span>
+            <span class="s1">create=create</span><span class="s0">,</span>
+            <span class="s1">missing_exceptions=missing_exceptions</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">clear_instance_cache(cls):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Clear the cache of filesystem instances. 
+ 
+        Notes 
+        ----- 
+        Unless overridden by setting the ``cachable`` class attribute to False, 
+        the filesystem class stores a reference to newly created instances. This 
+        prevents Python's normal rules around garbage collection from working, 
+        since the instances refcount will not drop to zero until 
+        ``clear_instance_cache`` is called. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">cls._cache.clear()</span>
+
+    <span class="s0">def </span><span class="s1">created(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Return the created timestamp of a file as a datetime.datetime&quot;&quot;&quot;</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">def </span><span class="s1">modified(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s3">&quot;&quot;&quot;Return the modified timestamp of a file as a datetime.datetime&quot;&quot;&quot;</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s4"># ------------------------------------------------------------------------</span>
+    <span class="s4"># Aliases</span>
+
+    <span class="s0">def </span><span class="s1">read_bytes(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">start=</span><span class="s0">None, </span><span class="s1">end=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.cat_file`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.cat_file(path</span><span class="s0">, </span><span class="s1">start=start</span><span class="s0">, </span><span class="s1">end=end</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">write_bytes(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.pipe_file`.&quot;&quot;&quot;</span>
+        <span class="s1">self.pipe_file(path</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">makedir(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">create_parents=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.mkdir`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.mkdir(path</span><span class="s0">, </span><span class="s1">create_parents=create_parents</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">mkdirs(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.makedirs`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.makedirs(path</span><span class="s0">, </span><span class="s1">exist_ok=exist_ok)</span>
+
+    <span class="s0">def </span><span class="s1">listdir(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.ls`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.ls(path</span><span class="s0">, </span><span class="s1">detail=detail</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">cp(self</span><span class="s0">, </span><span class="s1">path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.copy`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.copy(path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">move(self</span><span class="s0">, </span><span class="s1">path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.mv`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.mv(path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">stat(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.info`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.info(path</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">disk_usage(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">total=</span><span class="s0">True, </span><span class="s1">maxdepth=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.du`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.du(path</span><span class="s0">, </span><span class="s1">total=total</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">rename(self</span><span class="s0">, </span><span class="s1">path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.mv`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.mv(path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">delete(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">maxdepth=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.rm`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.rm(path</span><span class="s0">, </span><span class="s1">recursive=recursive</span><span class="s0">, </span><span class="s1">maxdepth=maxdepth)</span>
+
+    <span class="s0">def </span><span class="s1">upload(self</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.put`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.put(lpath</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">recursive=recursive</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">download(self</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Alias of `AbstractFileSystem.get`.&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.get(rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">recursive=recursive</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">sign(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">expiration=</span><span class="s5">100</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Create a signed URL representing the given path 
+ 
+        Some implementations allow temporary URLs to be generated, as a 
+        way of delegating credentials. 
+ 
+        Parameters 
+        ---------- 
+        path : str 
+             The path on the filesystem 
+        expiration : int 
+            Number of seconds to enable the URL for (if supported) 
+ 
+        Returns 
+        ------- 
+        URL : str 
+            The signed URL 
+ 
+        Raises 
+        ------ 
+        NotImplementedError : if method is not implemented for a filesystem 
+        &quot;&quot;&quot;</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError(</span><span class="s2">&quot;Sign is not implemented for this filesystem&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_isfilestore(self):</span>
+        <span class="s4"># Originally inherited from pyarrow DaskFileSystem. Keeping this</span>
+        <span class="s4"># here for backwards compatibility as long as pyarrow uses its</span>
+        <span class="s4"># legacy fsspec-compatible filesystems and thus accepts fsspec</span>
+        <span class="s4"># filesystems as well</span>
+        <span class="s0">return False</span>
+
+
+<span class="s0">class </span><span class="s1">AbstractBufferedFile(io.IOBase):</span>
+    <span class="s3">&quot;&quot;&quot;Convenient class to derive from to provide buffering 
+ 
+    In the case that the backend does not provide a pythonic file-like object 
+    already, this class contains much of the logic to build one. The only 
+    methods that need to be overridden are ``_upload_chunk``, 
+    ``_initiate_upload`` and ``_fetch_range``. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">DEFAULT_BLOCK_SIZE = </span><span class="s5">5 </span><span class="s1">* </span><span class="s5">2</span><span class="s1">**</span><span class="s5">20</span>
+    <span class="s1">_details = </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">fs</span><span class="s0">,</span>
+        <span class="s1">path</span><span class="s0">,</span>
+        <span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s0">,</span>
+        <span class="s1">block_size=</span><span class="s2">&quot;default&quot;</span><span class="s0">,</span>
+        <span class="s1">autocommit=</span><span class="s0">True,</span>
+        <span class="s1">cache_type=</span><span class="s2">&quot;readahead&quot;</span><span class="s0">,</span>
+        <span class="s1">cache_options=</span><span class="s0">None,</span>
+        <span class="s1">size=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Template for files with buffered reading and writing 
+ 
+        Parameters 
+        ---------- 
+        fs: instance of FileSystem 
+        path: str 
+            location in file-system 
+        mode: str 
+            Normal file modes. Currently only 'wb', 'ab' or 'rb'. Some file 
+            systems may be read-only, and some may not support append. 
+        block_size: int 
+            Buffer size for reading or writing, 'default' for class default 
+        autocommit: bool 
+            Whether to write to final destination; may only impact what 
+            happens when file is being closed. 
+        cache_type: {&quot;readahead&quot;, &quot;none&quot;, &quot;mmap&quot;, &quot;bytes&quot;}, default &quot;readahead&quot; 
+            Caching policy in read mode. See the definitions in ``core``. 
+        cache_options : dict 
+            Additional options passed to the constructor for the cache specified 
+            by `cache_type`. 
+        size: int 
+            If given and in read mode, suppressed having to look up the file size 
+        kwargs: 
+            Gets stored as self.kwargs 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">.core </span><span class="s0">import </span><span class="s1">caches</span>
+
+        <span class="s1">self.path = path</span>
+        <span class="s1">self.fs = fs</span>
+        <span class="s1">self.mode = mode</span>
+        <span class="s1">self.blocksize = (</span>
+            <span class="s1">self.DEFAULT_BLOCK_SIZE </span><span class="s0">if </span><span class="s1">block_size </span><span class="s0">in </span><span class="s1">[</span><span class="s2">&quot;default&quot;</span><span class="s0">, None</span><span class="s1">] </span><span class="s0">else </span><span class="s1">block_size</span>
+        <span class="s1">)</span>
+        <span class="s1">self.loc = </span><span class="s5">0</span>
+        <span class="s1">self.autocommit = autocommit</span>
+        <span class="s1">self.end = </span><span class="s0">None</span>
+        <span class="s1">self.start = </span><span class="s0">None</span>
+        <span class="s1">self.closed = </span><span class="s0">False</span>
+
+        <span class="s0">if </span><span class="s1">cache_options </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">cache_options = {}</span>
+
+        <span class="s0">if </span><span class="s2">&quot;trim&quot; </span><span class="s0">in </span><span class="s1">kwargs:</span>
+            <span class="s1">warnings.warn(</span>
+                <span class="s2">&quot;Passing 'trim' to control the cache behavior has been deprecated. &quot;</span>
+                <span class="s2">&quot;Specify it within the 'cache_options' argument instead.&quot;</span><span class="s0">,</span>
+                <span class="s1">FutureWarning</span><span class="s0">,</span>
+            <span class="s1">)</span>
+            <span class="s1">cache_options[</span><span class="s2">&quot;trim&quot;</span><span class="s1">] = kwargs.pop(</span><span class="s2">&quot;trim&quot;</span><span class="s1">)</span>
+
+        <span class="s1">self.kwargs = kwargs</span>
+
+        <span class="s0">if </span><span class="s1">mode </span><span class="s0">not in </span><span class="s1">{</span><span class="s2">&quot;ab&quot;</span><span class="s0">, </span><span class="s2">&quot;rb&quot;</span><span class="s0">, </span><span class="s2">&quot;wb&quot;</span><span class="s1">}:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError(</span><span class="s2">&quot;File mode not supported&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">mode == </span><span class="s2">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">size </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">self.size = size</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">self.size = self.details[</span><span class="s2">&quot;size&quot;</span><span class="s1">]</span>
+            <span class="s1">self.cache = caches[cache_type](</span>
+                <span class="s1">self.blocksize</span><span class="s0">, </span><span class="s1">self._fetch_range</span><span class="s0">, </span><span class="s1">self.size</span><span class="s0">, </span><span class="s1">**cache_options</span>
+            <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.buffer = io.BytesIO()</span>
+            <span class="s1">self.offset = </span><span class="s0">None</span>
+            <span class="s1">self.forced = </span><span class="s0">False</span>
+            <span class="s1">self.location = </span><span class="s0">None</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">details(self):</span>
+        <span class="s0">if </span><span class="s1">self._details </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self._details = self.fs.info(self.path)</span>
+        <span class="s0">return </span><span class="s1">self._details</span>
+
+    <span class="s1">@details.setter</span>
+    <span class="s0">def </span><span class="s1">details(self</span><span class="s0">, </span><span class="s1">value):</span>
+        <span class="s1">self._details = value</span>
+        <span class="s1">self.size = value[</span><span class="s2">&quot;size&quot;</span><span class="s1">]</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">full_name(self):</span>
+        <span class="s0">return </span><span class="s1">_unstrip_protocol(self.path</span><span class="s0">, </span><span class="s1">self.fs)</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">closed(self):</span>
+        <span class="s4"># get around this attr being read-only in IOBase</span>
+        <span class="s4"># use getattr here, since this can be called during del</span>
+        <span class="s0">return </span><span class="s1">getattr(self</span><span class="s0">, </span><span class="s2">&quot;_closed&quot;</span><span class="s0">, True</span><span class="s1">)</span>
+
+    <span class="s1">@closed.setter</span>
+    <span class="s0">def </span><span class="s1">closed(self</span><span class="s0">, </span><span class="s1">c):</span>
+        <span class="s1">self._closed = c</span>
+
+    <span class="s0">def </span><span class="s1">__hash__(self):</span>
+        <span class="s0">if </span><span class="s2">&quot;w&quot; </span><span class="s0">in </span><span class="s1">self.mode:</span>
+            <span class="s0">return </span><span class="s1">id(self)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">int(tokenize(self.details)</span><span class="s0">, </span><span class="s5">16</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__eq__(self</span><span class="s0">, </span><span class="s1">other):</span>
+        <span class="s3">&quot;&quot;&quot;Files are equal if they have the same checksum, only in read mode&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.mode == </span><span class="s2">&quot;rb&quot; </span><span class="s0">and </span><span class="s1">other.mode == </span><span class="s2">&quot;rb&quot; </span><span class="s0">and </span><span class="s1">hash(self) == hash(other)</span>
+
+    <span class="s0">def </span><span class="s1">commit(self):</span>
+        <span class="s3">&quot;&quot;&quot;Move from temp to final destination&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">discard(self):</span>
+        <span class="s3">&quot;&quot;&quot;Throw away temporary file&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">info(self):</span>
+        <span class="s3">&quot;&quot;&quot;File information about this path&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s2">&quot;r&quot; </span><span class="s0">in </span><span class="s1">self.mode:</span>
+            <span class="s0">return </span><span class="s1">self.details</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Info not available while writing&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">tell(self):</span>
+        <span class="s3">&quot;&quot;&quot;Current file location&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.loc</span>
+
+    <span class="s0">def </span><span class="s1">seek(self</span><span class="s0">, </span><span class="s1">loc</span><span class="s0">, </span><span class="s1">whence=</span><span class="s5">0</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Set current file location 
+ 
+        Parameters 
+        ---------- 
+        loc: int 
+            byte location 
+        whence: {0, 1, 2} 
+            from start of file, current location or end of file, resp. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">loc = int(loc)</span>
+        <span class="s0">if not </span><span class="s1">self.mode == </span><span class="s2">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">OSError(ESPIPE</span><span class="s0">, </span><span class="s2">&quot;Seek only available in read mode&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">whence == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">nloc = loc</span>
+        <span class="s0">elif </span><span class="s1">whence == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">nloc = self.loc + loc</span>
+        <span class="s0">elif </span><span class="s1">whence == </span><span class="s5">2</span><span class="s1">:</span>
+            <span class="s1">nloc = self.size + loc</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">f&quot;invalid whence (</span><span class="s0">{</span><span class="s1">whence</span><span class="s0">}</span><span class="s2">, should be 0, 1 or 2)&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">nloc &lt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Seek before start of file&quot;</span><span class="s1">)</span>
+        <span class="s1">self.loc = nloc</span>
+        <span class="s0">return </span><span class="s1">self.loc</span>
+
+    <span class="s0">def </span><span class="s1">write(self</span><span class="s0">, </span><span class="s1">data):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Write data to buffer. 
+ 
+        Buffer only sent on flush() or if buffer is greater than 
+        or equal to blocksize. 
+ 
+        Parameters 
+        ---------- 
+        data: bytes 
+            Set of bytes to be written. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self.mode </span><span class="s0">not in </span><span class="s1">{</span><span class="s2">&quot;wb&quot;</span><span class="s0">, </span><span class="s2">&quot;ab&quot;</span><span class="s1">}:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;File not in write mode&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.closed:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;I/O operation on closed file.&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.forced:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;This file has been force-flushed, can only close&quot;</span><span class="s1">)</span>
+        <span class="s1">out = self.buffer.write(data)</span>
+        <span class="s1">self.loc += out</span>
+        <span class="s0">if </span><span class="s1">self.buffer.tell() &gt;= self.blocksize:</span>
+            <span class="s1">self.flush()</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">flush(self</span><span class="s0">, </span><span class="s1">force=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Write buffered data to backend store. 
+ 
+        Writes the current buffer, if it is larger than the block-size, or if 
+        the file is being closed. 
+ 
+        Parameters 
+        ---------- 
+        force: bool 
+            When closing, write the last block even if it is smaller than 
+            blocks are allowed to be. Disallows further writing to this file. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">if </span><span class="s1">self.closed:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Flush on closed file&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">force </span><span class="s0">and </span><span class="s1">self.forced:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Force flush cannot be called more than once&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">force:</span>
+            <span class="s1">self.forced = </span><span class="s0">True</span>
+
+        <span class="s0">if </span><span class="s1">self.mode </span><span class="s0">not in </span><span class="s1">{</span><span class="s2">&quot;wb&quot;</span><span class="s0">, </span><span class="s2">&quot;ab&quot;</span><span class="s1">}:</span>
+            <span class="s4"># no-op to flush on read-mode</span>
+            <span class="s0">return</span>
+
+        <span class="s0">if not </span><span class="s1">force </span><span class="s0">and </span><span class="s1">self.buffer.tell() &lt; self.blocksize:</span>
+            <span class="s4"># Defer write on small block</span>
+            <span class="s0">return</span>
+
+        <span class="s0">if </span><span class="s1">self.offset </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s4"># Initialize a multipart upload</span>
+            <span class="s1">self.offset = </span><span class="s5">0</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">self._initiate_upload()</span>
+            <span class="s0">except</span><span class="s1">:  </span><span class="s4"># noqa: E722</span>
+                <span class="s1">self.closed = </span><span class="s0">True</span>
+                <span class="s0">raise</span>
+
+        <span class="s0">if </span><span class="s1">self._upload_chunk(final=force) </span><span class="s0">is not False</span><span class="s1">:</span>
+            <span class="s1">self.offset += self.buffer.seek(</span><span class="s5">0</span><span class="s0">, </span><span class="s5">2</span><span class="s1">)</span>
+            <span class="s1">self.buffer = io.BytesIO()</span>
+
+    <span class="s0">def </span><span class="s1">_upload_chunk(self</span><span class="s0">, </span><span class="s1">final=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Write one part of a multi-block file upload 
+ 
+        Parameters 
+        ========== 
+        final: bool 
+            This is the last block, so should complete file, if 
+            self.autocommit is True. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># may not yet have been initialized, may need to call _initialize_upload</span>
+
+    <span class="s0">def </span><span class="s1">_initiate_upload(self):</span>
+        <span class="s3">&quot;&quot;&quot;Create remote file/upload&quot;&quot;&quot;</span>
+        <span class="s0">pass</span>
+
+    <span class="s0">def </span><span class="s1">_fetch_range(self</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">end):</span>
+        <span class="s3">&quot;&quot;&quot;Get the specified set of bytes from remote&quot;&quot;&quot;</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">def </span><span class="s1">read(self</span><span class="s0">, </span><span class="s1">length=-</span><span class="s5">1</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        Return data from cache, or fetch pieces as necessary 
+ 
+        Parameters 
+        ---------- 
+        length: int (-1) 
+            Number of bytes to read; if &lt;0, all remaining bytes. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">length = -</span><span class="s5">1 </span><span class="s0">if </span><span class="s1">length </span><span class="s0">is None else </span><span class="s1">int(length)</span>
+        <span class="s0">if </span><span class="s1">self.mode != </span><span class="s2">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;File not in read mode&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">length &lt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">length = self.size - self.loc</span>
+        <span class="s0">if </span><span class="s1">self.closed:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;I/O operation on closed file.&quot;</span><span class="s1">)</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;%s read: %i - %i&quot;</span><span class="s0">, </span><span class="s1">self</span><span class="s0">, </span><span class="s1">self.loc</span><span class="s0">, </span><span class="s1">self.loc + length)</span>
+        <span class="s0">if </span><span class="s1">length == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s4"># don't even bother calling fetch</span>
+            <span class="s0">return </span><span class="s6">b&quot;&quot;</span>
+        <span class="s1">out = self.cache._fetch(self.loc</span><span class="s0">, </span><span class="s1">self.loc + length)</span>
+        <span class="s1">self.loc += len(out)</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">readinto(self</span><span class="s0">, </span><span class="s1">b):</span>
+        <span class="s3">&quot;&quot;&quot;mirrors builtin file's readinto method 
+ 
+        https://docs.python.org/3/library/io.html#io.RawIOBase.readinto 
+        &quot;&quot;&quot;</span>
+        <span class="s1">out = memoryview(b).cast(</span><span class="s2">&quot;B&quot;</span><span class="s1">)</span>
+        <span class="s1">data = self.read(out.nbytes)</span>
+        <span class="s1">out[: len(data)] = data</span>
+        <span class="s0">return </span><span class="s1">len(data)</span>
+
+    <span class="s0">def </span><span class="s1">readuntil(self</span><span class="s0">, </span><span class="s1">char=</span><span class="s6">b&quot;</span><span class="s0">\n</span><span class="s6">&quot;</span><span class="s0">, </span><span class="s1">blocks=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Return data between current position and first occurrence of char 
+ 
+        char is included in the output, except if the end of the tile is 
+        encountered first. 
+ 
+        Parameters 
+        ---------- 
+        char: bytes 
+            Thing to find 
+        blocks: None or int 
+            How much to read in each go. Defaults to file blocksize - which may 
+            mean a new read on every call. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">out = []</span>
+        <span class="s0">while True</span><span class="s1">:</span>
+            <span class="s1">start = self.tell()</span>
+            <span class="s1">part = self.read(blocks </span><span class="s0">or </span><span class="s1">self.blocksize)</span>
+            <span class="s0">if </span><span class="s1">len(part) == </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s0">break</span>
+            <span class="s1">found = part.find(char)</span>
+            <span class="s0">if </span><span class="s1">found &gt; -</span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">out.append(part[: found + len(char)])</span>
+                <span class="s1">self.seek(start + found + len(char))</span>
+                <span class="s0">break</span>
+            <span class="s1">out.append(part)</span>
+        <span class="s0">return </span><span class="s6">b&quot;&quot;</span><span class="s1">.join(out)</span>
+
+    <span class="s0">def </span><span class="s1">readline(self):</span>
+        <span class="s3">&quot;&quot;&quot;Read until first occurrence of newline character 
+ 
+        Note that, because of character encoding, this is not necessarily a 
+        true line ending. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.readuntil(</span><span class="s6">b&quot;</span><span class="s0">\n</span><span class="s6">&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__next__(self):</span>
+        <span class="s1">out = self.readline()</span>
+        <span class="s0">if </span><span class="s1">out:</span>
+            <span class="s0">return </span><span class="s1">out</span>
+        <span class="s0">raise </span><span class="s1">StopIteration</span>
+
+    <span class="s0">def </span><span class="s1">__iter__(self):</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">readlines(self):</span>
+        <span class="s3">&quot;&quot;&quot;Return all data, split by the newline character&quot;&quot;&quot;</span>
+        <span class="s1">data = self.read()</span>
+        <span class="s1">lines = data.split(</span><span class="s6">b&quot;</span><span class="s0">\n</span><span class="s6">&quot;</span><span class="s1">)</span>
+        <span class="s1">out = [l + </span><span class="s6">b&quot;</span><span class="s0">\n</span><span class="s6">&quot; </span><span class="s0">for </span><span class="s1">l </span><span class="s0">in </span><span class="s1">lines[:-</span><span class="s5">1</span><span class="s1">]]</span>
+        <span class="s0">if </span><span class="s1">data.endswith(</span><span class="s6">b&quot;</span><span class="s0">\n</span><span class="s6">&quot;</span><span class="s1">):</span>
+            <span class="s0">return </span><span class="s1">out</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">out + [lines[-</span><span class="s5">1</span><span class="s1">]]</span>
+        <span class="s4"># return list(self)  ???</span>
+
+    <span class="s0">def </span><span class="s1">readinto1(self</span><span class="s0">, </span><span class="s1">b):</span>
+        <span class="s0">return </span><span class="s1">self.readinto(b)</span>
+
+    <span class="s0">def </span><span class="s1">close(self):</span>
+        <span class="s3">&quot;&quot;&quot;Close file 
+ 
+        Finalizes writes, discards cache 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">getattr(self</span><span class="s0">, </span><span class="s2">&quot;_unclosable&quot;</span><span class="s0">, False</span><span class="s1">):</span>
+            <span class="s0">return</span>
+        <span class="s0">if </span><span class="s1">self.closed:</span>
+            <span class="s0">return</span>
+        <span class="s0">if </span><span class="s1">self.mode == </span><span class="s2">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s1">self.cache = </span><span class="s0">None</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">if not </span><span class="s1">self.forced:</span>
+                <span class="s1">self.flush(force=</span><span class="s0">True</span><span class="s1">)</span>
+
+            <span class="s0">if </span><span class="s1">self.fs </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">self.fs.invalidate_cache(self.path)</span>
+                <span class="s1">self.fs.invalidate_cache(self.fs._parent(self.path))</span>
+
+        <span class="s1">self.closed = </span><span class="s0">True</span>
+
+    <span class="s0">def </span><span class="s1">readable(self):</span>
+        <span class="s3">&quot;&quot;&quot;Whether opened for reading&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.mode == </span><span class="s2">&quot;rb&quot; </span><span class="s0">and not </span><span class="s1">self.closed</span>
+
+    <span class="s0">def </span><span class="s1">seekable(self):</span>
+        <span class="s3">&quot;&quot;&quot;Whether is seekable (only in read mode)&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.readable()</span>
+
+    <span class="s0">def </span><span class="s1">writable(self):</span>
+        <span class="s3">&quot;&quot;&quot;Whether opened for writing&quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.mode </span><span class="s0">in </span><span class="s1">{</span><span class="s2">&quot;wb&quot;</span><span class="s0">, </span><span class="s2">&quot;ab&quot;</span><span class="s1">} </span><span class="s0">and not </span><span class="s1">self.closed</span>
+
+    <span class="s0">def </span><span class="s1">__del__(self):</span>
+        <span class="s0">if not </span><span class="s1">self.closed:</span>
+            <span class="s1">self.close()</span>
+
+    <span class="s0">def </span><span class="s1">__str__(self):</span>
+        <span class="s0">return </span><span class="s2">f&quot;&lt;File-like object </span><span class="s0">{</span><span class="s1">type(self.fs).__name__</span><span class="s0">}</span><span class="s2">, </span><span class="s0">{</span><span class="s1">self.path</span><span class="s0">}</span><span class="s2">&gt;&quot;</span>
+
+    <span class="s1">__repr__ = __str__</span>
+
+    <span class="s0">def </span><span class="s1">__enter__(self):</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">__exit__(self</span><span class="s0">, </span><span class="s1">*args):</span>
+        <span class="s1">self.close()</span>
+</pre>
+</body>
+</html>

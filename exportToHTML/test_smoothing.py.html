@@ -1,0 +1,1561 @@
+<html>
+<head>
+<title>test_smoothing.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_smoothing.py</font>
+</center></td></tr></table>
+<pre><span class="s0">r&quot;&quot;&quot; 
+Tests for smoothing and estimation of unobserved states and disturbances 
+ 
+- Predicted states: :math:`E(\alpha_t | Y_{t-1})` 
+- Filtered states: :math:`E(\alpha_t | Y_t)` 
+- Smoothed states: :math:`E(\alpha_t | Y_n)` 
+- Smoothed disturbances :math:`E(\varepsilon_t | Y_n), E(\eta_t | Y_n)` 
+ 
+Tested against R (FKF, KalmanRun / KalmanSmooth), Stata (sspace), and 
+MATLAB (ssm toolbox) 
+ 
+Author: Chad Fulton 
+License: Simplified-BSD 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">os</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numpy.testing </span><span class="s2">import </span><span class="s1">assert_allclose</span><span class="s2">, </span><span class="s1">assert_almost_equal</span><span class="s2">, </span><span class="s1">assert_equal</span>
+<span class="s2">import </span><span class="s1">pandas </span><span class="s2">as </span><span class="s1">pd</span>
+
+<span class="s2">import </span><span class="s1">pytest</span>
+
+<span class="s2">from </span><span class="s1">statsmodels </span><span class="s2">import </span><span class="s1">datasets</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace </span><span class="s2">import </span><span class="s1">mlemodel</span><span class="s2">, </span><span class="s1">sarimax</span><span class="s2">, </span><span class="s1">varmax</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.tests.test_impulse_responses </span><span class="s2">import </span><span class="s1">TVSS</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.kalman_filter </span><span class="s2">import </span><span class="s1">FILTER_UNIVARIATE</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.kalman_smoother </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">SMOOTH_CLASSICAL</span><span class="s2">, </span><span class="s1">SMOOTH_ALTERNATIVE</span><span class="s2">,</span>
+    <span class="s1">SMOOTH_UNIVARIATE)</span>
+
+<span class="s1">current_path = os.path.dirname(os.path.abspath(__file__))</span>
+
+
+<span class="s2">class </span><span class="s1">TestStatesAR3:</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">alternate_timing=</span><span class="s2">False, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># Dataset / Stata comparison</span>
+        <span class="s1">path = os.path.join(current_path</span><span class="s2">, </span><span class="s4">'results'</span><span class="s2">,</span>
+                            <span class="s4">'results_wpi1_ar3_stata.csv'</span><span class="s1">)</span>
+        <span class="s1">cls.stata = pd.read_csv(path)</span>
+        <span class="s1">cls.stata.index = pd.date_range(start=</span><span class="s4">'1960-01-01'</span><span class="s2">, </span><span class="s1">periods=</span><span class="s5">124</span><span class="s2">,</span>
+                                        <span class="s1">freq=</span><span class="s4">'QS'</span><span class="s1">)</span>
+        <span class="s3"># Matlab comparison</span>
+        <span class="s1">path = os.path.join(current_path</span><span class="s2">, </span><span class="s4">'results'</span><span class="s2">,</span>
+                            <span class="s4">'results_wpi1_ar3_matlab_ssm.csv'</span><span class="s1">)</span>
+        <span class="s1">matlab_names = [</span>
+            <span class="s4">'a1'</span><span class="s2">, </span><span class="s4">'a2'</span><span class="s2">, </span><span class="s4">'a3'</span><span class="s2">, </span><span class="s4">'detP'</span><span class="s2">, </span><span class="s4">'alphahat1'</span><span class="s2">, </span><span class="s4">'alphahat2'</span><span class="s2">, </span><span class="s4">'alphahat3'</span><span class="s2">,</span>
+            <span class="s4">'detV'</span><span class="s2">, </span><span class="s4">'eps'</span><span class="s2">, </span><span class="s4">'epsvar'</span><span class="s2">, </span><span class="s4">'eta'</span><span class="s2">, </span><span class="s4">'etavar'</span>
+        <span class="s1">]</span>
+        <span class="s1">cls.matlab_ssm = pd.read_csv(path</span><span class="s2">, </span><span class="s1">header=</span><span class="s2">None, </span><span class="s1">names=matlab_names)</span>
+
+        <span class="s1">cls.model = sarimax.SARIMAX(</span>
+            <span class="s1">cls.stata[</span><span class="s4">'wpi'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">order=(</span><span class="s5">3</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">, </span><span class="s1">simple_differencing=</span><span class="s2">True,</span>
+            <span class="s1">hamilton_representation=</span><span class="s2">True, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs</span>
+        <span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">alternate_timing:</span>
+            <span class="s1">cls.model.ssm.timing_init_filtered = </span><span class="s2">True</span>
+
+        <span class="s3"># Parameters from from Stata's sspace MLE estimation</span>
+        <span class="s1">params = np.r_[</span><span class="s5">.5270715</span><span class="s2">, </span><span class="s5">.0952613</span><span class="s2">, </span><span class="s5">.2580355</span><span class="s2">, </span><span class="s5">.5307459</span><span class="s1">]</span>
+        <span class="s1">cls.results = cls.model.smooth(params</span><span class="s2">, </span><span class="s1">cov_type=</span><span class="s4">'none'</span><span class="s1">)</span>
+
+        <span class="s3"># Calculate the determinant of the covariance matrices (for easy</span>
+        <span class="s3"># comparison to other languages without having to store 2-dim arrays)</span>
+        <span class="s1">cls.results.det_predicted_state_cov = np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs))</span>
+        <span class="s1">cls.results.det_smoothed_state_cov = np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs))</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(cls.model.nobs):</span>
+            <span class="s1">cls.results.det_predicted_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = np.linalg.det(</span>
+                <span class="s1">cls.results.filter_results.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i])</span>
+            <span class="s1">cls.results.det_smoothed_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = np.linalg.det(</span>
+                <span class="s1">cls.results.smoother_results.smoothed_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i])</span>
+
+        <span class="s3"># Perform simulation smoothing</span>
+        <span class="s1">nobs = cls.model.nobs</span>
+        <span class="s1">k_endog = cls.model.k_endog</span>
+        <span class="s1">k_posdef = cls.model.ssm.k_posdef</span>
+        <span class="s1">cls.sim = cls.model.simulation_smoother(filter_timing=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">cls.sim.simulate(</span>
+            <span class="s1">measurement_disturbance_variates=np.zeros(nobs * k_endog)</span><span class="s2">,</span>
+            <span class="s1">state_disturbance_variates=np.zeros(nobs * k_posdef)</span><span class="s2">,</span>
+            <span class="s1">initial_state_variates=np.zeros(cls.model.k_states)</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_predict_obs(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.filter_results.predict().forecasts[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">self.stata.iloc[</span><span class="s5">1</span><span class="s1">:][</span><span class="s4">'dep1'</span><span class="s1">]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_standardized_residuals(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.filter_results.standardized_forecasts_error[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">self.stata.iloc[</span><span class="s5">1</span><span class="s1">:][</span><span class="s4">'sr1'</span><span class="s1">]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_states(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.filter_results.predicted_state[:</span><span class="s2">, </span><span class="s1">:-</span><span class="s5">1</span><span class="s1">].T</span><span class="s2">,</span>
+            <span class="s1">self.stata.iloc[</span><span class="s5">1</span><span class="s1">:][[</span><span class="s4">'sp1'</span><span class="s2">, </span><span class="s4">'sp2'</span><span class="s2">, </span><span class="s4">'sp3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.filter_results.predicted_state[:</span><span class="s2">, </span><span class="s1">:-</span><span class="s5">1</span><span class="s1">].T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'a1'</span><span class="s2">, </span><span class="s4">'a2'</span><span class="s2">, </span><span class="s4">'a3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_states_cov(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.det_predicted_state_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'detP'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_filtered_states(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.filter_results.filtered_state.T</span><span class="s2">,</span>
+            <span class="s1">self.stata.iloc[</span><span class="s5">1</span><span class="s1">:][[</span><span class="s4">'sf1'</span><span class="s2">, </span><span class="s4">'sf2'</span><span class="s2">, </span><span class="s4">'sf3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoother_results.smoothed_state.T</span><span class="s2">,</span>
+            <span class="s1">self.stata.iloc[</span><span class="s5">1</span><span class="s1">:][[</span><span class="s4">'sm1'</span><span class="s2">, </span><span class="s4">'sm2'</span><span class="s2">, </span><span class="s4">'sm3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoother_results.smoothed_state.T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'alphahat1'</span><span class="s2">, </span><span class="s4">'alphahat2'</span><span class="s2">, </span><span class="s4">'alphahat3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states_cov(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.det_smoothed_state_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'detV'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoother_results.smoothed_measurement_disturbance.T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'eps'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance_cov(self):</span>
+        <span class="s1">res = self.results.smoother_results</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">res.smoothed_measurement_disturbance_cov[</span><span class="s5">0</span><span class="s1">].T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'epsvar'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoother_results.smoothed_state_disturbance.T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'eta'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance_cov(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoother_results.smoothed_state_disturbance_cov[</span><span class="s5">0</span><span class="s1">].T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'etavar'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestStatesAR3AlternateTiming(TestStatesAR3):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestStatesAR3AlternateTiming</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">alternate_timing=</span><span class="s2">True, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s2">class </span><span class="s1">TestStatesAR3AlternativeSmoothing(TestStatesAR3):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestStatesAR3AlternativeSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">smooth_method=SMOOTH_ALTERNATIVE</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states(self):</span>
+        <span class="s3"># Initialization issues can change the first few smoothed states</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoother_results.smoothed_state.T[</span><span class="s5">2</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s1">self.stata.iloc[</span><span class="s5">3</span><span class="s1">:][[</span><span class="s4">'sm1'</span><span class="s2">, </span><span class="s4">'sm2'</span><span class="s2">, </span><span class="s4">'sm3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoother_results.smoothed_state.T[</span><span class="s5">2</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm.iloc[</span><span class="s5">2</span><span class="s1">:][[</span><span class="s4">'alphahat1'</span><span class="s2">, </span><span class="s4">'alphahat2'</span><span class="s2">, </span><span class="s4">'alphahat3'</span><span class="s1">]]</span><span class="s2">,</span>
+            <span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states_cov(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.det_smoothed_state_cov.T[</span><span class="s5">1</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm.iloc[</span><span class="s5">1</span><span class="s1">:][[</span><span class="s4">'detV'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s1">SMOOTH_ALTERNATIVE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_ALTERNATIVE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_ALTERNATIVE)</span>
+
+
+<span class="s2">class </span><span class="s1">TestStatesAR3UnivariateSmoothing(TestStatesAR3):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestStatesAR3UnivariateSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">filter_method=FILTER_UNIVARIATE</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_UNIVARIATE)</span>
+
+
+<span class="s2">class </span><span class="s1">TestStatesMissingAR3:</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">alternate_timing=</span><span class="s2">False, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># Dataset</span>
+        <span class="s1">path = os.path.join(current_path</span><span class="s2">, </span><span class="s4">'results'</span><span class="s2">,</span>
+                            <span class="s4">'results_wpi1_ar3_stata.csv'</span><span class="s1">)</span>
+        <span class="s1">cls.stata = pd.read_csv(path)</span>
+        <span class="s1">cls.stata.index = pd.date_range(start=</span><span class="s4">'1960-01-01'</span><span class="s2">, </span><span class="s1">periods=</span><span class="s5">124</span><span class="s2">,</span>
+                                        <span class="s1">freq=</span><span class="s4">'QS'</span><span class="s1">)</span>
+        <span class="s3"># Matlab comparison</span>
+        <span class="s1">path = os.path.join(current_path</span><span class="s2">, </span><span class="s4">'results'</span><span class="s2">,</span>
+                            <span class="s4">'results_wpi1_missing_ar3_matlab_ssm.csv'</span><span class="s1">)</span>
+        <span class="s1">matlab_names = [</span>
+            <span class="s4">'a1'</span><span class="s2">, </span><span class="s4">'a2'</span><span class="s2">, </span><span class="s4">'a3'</span><span class="s2">, </span><span class="s4">'detP'</span><span class="s2">, </span><span class="s4">'alphahat1'</span><span class="s2">, </span><span class="s4">'alphahat2'</span><span class="s2">, </span><span class="s4">'alphahat3'</span><span class="s2">,</span>
+            <span class="s4">'detV'</span><span class="s2">, </span><span class="s4">'eps'</span><span class="s2">, </span><span class="s4">'epsvar'</span><span class="s2">, </span><span class="s4">'eta'</span><span class="s2">, </span><span class="s4">'etavar'</span>
+        <span class="s1">]</span>
+        <span class="s1">cls.matlab_ssm = pd.read_csv(path</span><span class="s2">, </span><span class="s1">header=</span><span class="s2">None, </span><span class="s1">names=matlab_names)</span>
+        <span class="s3"># KFAS comparison</span>
+        <span class="s1">path = os.path.join(current_path</span><span class="s2">, </span><span class="s4">'results'</span><span class="s2">,</span>
+                            <span class="s4">'results_smoothing3_R.csv'</span><span class="s1">)</span>
+        <span class="s1">cls.R_ssm = pd.read_csv(path)</span>
+
+        <span class="s3"># Create missing observations</span>
+        <span class="s1">cls.stata[</span><span class="s4">'dwpi'</span><span class="s1">] = cls.stata[</span><span class="s4">'wpi'</span><span class="s1">].diff()</span>
+        <span class="s1">cls.stata.loc[cls.stata.index[</span><span class="s5">10</span><span class="s1">:</span><span class="s5">21</span><span class="s1">]</span><span class="s2">, </span><span class="s4">'dwpi'</span><span class="s1">] = np.nan</span>
+
+        <span class="s1">cls.model = sarimax.SARIMAX(</span>
+            <span class="s1">cls.stata.loc[cls.stata.index[</span><span class="s5">1</span><span class="s1">:]</span><span class="s2">, </span><span class="s4">'dwpi'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">order=(</span><span class="s5">3</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s1">hamilton_representation=</span><span class="s2">True, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs</span>
+        <span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">alternate_timing:</span>
+            <span class="s1">cls.model.ssm.timing_init_filtered = </span><span class="s2">True</span>
+
+        <span class="s3"># Parameters from from Stata's sspace MLE estimation</span>
+        <span class="s1">params = np.r_[</span><span class="s5">.5270715</span><span class="s2">, </span><span class="s5">.0952613</span><span class="s2">, </span><span class="s5">.2580355</span><span class="s2">, </span><span class="s5">.5307459</span><span class="s1">]</span>
+        <span class="s1">cls.results = cls.model.smooth(params</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s3"># Calculate the determinant of the covariance matrices (for easy</span>
+        <span class="s3"># comparison to other languages without having to store 2-dim arrays)</span>
+        <span class="s1">cls.results.det_predicted_state_cov = np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs))</span>
+        <span class="s1">cls.results.det_smoothed_state_cov = np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs))</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(cls.model.nobs):</span>
+            <span class="s1">cls.results.det_predicted_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = np.linalg.det(</span>
+                <span class="s1">cls.results.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i])</span>
+            <span class="s1">cls.results.det_smoothed_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = np.linalg.det(</span>
+                <span class="s1">cls.results.smoothed_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i])</span>
+
+        <span class="s3"># Perform simulation smoothing</span>
+        <span class="s1">nobs = cls.model.nobs</span>
+        <span class="s1">k_endog = cls.model.k_endog</span>
+        <span class="s1">k_posdef = cls.model.ssm.k_posdef</span>
+        <span class="s1">cls.sim = cls.model.simulation_smoother()</span>
+        <span class="s1">cls.sim.simulate(</span>
+            <span class="s1">measurement_disturbance_variates=np.zeros(nobs * k_endog)</span><span class="s2">,</span>
+            <span class="s1">state_disturbance_variates=np.zeros(nobs * k_posdef)</span><span class="s2">,</span>
+            <span class="s1">initial_state_variates=np.zeros(cls.model.k_states)</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_states(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.predicted_state[:</span><span class="s2">, </span><span class="s1">:-</span><span class="s5">1</span><span class="s1">].T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'a1'</span><span class="s2">, </span><span class="s4">'a2'</span><span class="s2">, </span><span class="s4">'a3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_states_cov(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.det_predicted_state_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'detP'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoothed_state.T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'alphahat1'</span><span class="s2">, </span><span class="s4">'alphahat2'</span><span class="s2">, </span><span class="s4">'alphahat3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states_cov(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.det_smoothed_state_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'detV'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoothed_measurement_disturbance.T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'eps'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance_cov(self):</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoothed_measurement_disturbance_cov[</span><span class="s5">0</span><span class="s1">].T</span><span class="s2">,</span>
+            <span class="s1">self.matlab_ssm[[</span><span class="s4">'epsvar'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">4</span>
+        <span class="s1">)</span>
+
+    <span class="s3"># There is a discrepancy between MATLAB ssm toolbox and</span>
+    <span class="s3"># statsmodels.tsa.statespace on the following variables in the case of</span>
+    <span class="s3"># missing data. Tests against the R package KFAS confirm our results</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance(self):</span>
+        <span class="s3"># See note above about why this assertion is invalid</span>
+        <span class="s3"># assert_almost_equal(</span>
+        <span class="s3">#     self.results.smoothed_state_disturbance.T,</span>
+        <span class="s3">#     self.matlab_ssm[['eta']], 4</span>
+        <span class="s3"># )</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoothed_state_disturbance.T</span><span class="s2">,</span>
+            <span class="s1">self.R_ssm[[</span><span class="s4">'etahat'</span><span class="s1">]]</span><span class="s2">, </span><span class="s5">9</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance_cov(self):</span>
+        <span class="s3"># See note above about why this assertion is invalid</span>
+        <span class="s3"># assert_almost_equal(</span>
+        <span class="s3">#     self.results.smoothed_state_disturbance_cov[0].T,</span>
+        <span class="s3">#     self.matlab_ssm[['etavar']], 4</span>
+        <span class="s3"># )</span>
+        <span class="s1">assert_almost_equal(</span>
+            <span class="s1">self.results.smoothed_state_disturbance_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s1">self.R_ssm[</span><span class="s4">'detVeta'</span><span class="s1">]</span><span class="s2">, </span><span class="s5">9</span>
+        <span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestStatesMissingAR3AlternateTiming(TestStatesMissingAR3):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestStatesMissingAR3AlternateTiming</span><span class="s2">,</span>
+              <span class="s1">cls).setup_class(alternate_timing=</span><span class="s2">True, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s2">class </span><span class="s1">TestStatesMissingAR3AlternativeSmoothing(TestStatesMissingAR3):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestStatesMissingAR3AlternativeSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">smooth_method=SMOOTH_ALTERNATIVE</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s1">SMOOTH_ALTERNATIVE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_ALTERNATIVE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_ALTERNATIVE)</span>
+
+
+<span class="s2">class </span><span class="s1">TestStatesMissingAR3UnivariateSmoothing(TestStatesMissingAR3):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestStatesMissingAR3UnivariateSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">filter_method=FILTER_UNIVARIATE</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_UNIVARIATE)</span>
+
+
+<span class="s2">class </span><span class="s1">TestMultivariateMissing:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Tests for most filtering and smoothing variables against output from the 
+    R library KFAS. 
+ 
+    Note that KFAS uses the univariate approach which generally will result in 
+    different predicted values and covariance matrices associated with the 
+    measurement equation (e.g. forecasts, etc.). In this case, although the 
+    model is multivariate, each of the series is truly independent so the 
+    values will be the same regardless of whether the univariate approach 
+    is used or not. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># Results</span>
+        <span class="s1">path = os.path.join(current_path</span><span class="s2">, </span><span class="s4">'results'</span><span class="s2">, </span><span class="s4">'results_smoothing_R.csv'</span><span class="s1">)</span>
+        <span class="s1">cls.desired = pd.read_csv(path)</span>
+
+        <span class="s3"># Data</span>
+        <span class="s1">dta = datasets.macrodata.load_pandas().data</span>
+        <span class="s1">dta.index = pd.date_range(start=</span><span class="s4">'1959-01-01'</span><span class="s2">, </span><span class="s1">end=</span><span class="s4">'2009-7-01'</span><span class="s2">,</span>
+                                  <span class="s1">freq=</span><span class="s4">'QS'</span><span class="s1">)</span>
+        <span class="s1">obs = dta[[</span><span class="s4">'realgdp'</span><span class="s2">, </span><span class="s4">'realcons'</span><span class="s2">, </span><span class="s4">'realinv'</span><span class="s1">]].diff().iloc[</span><span class="s5">1</span><span class="s1">:]</span>
+        <span class="s1">obs.iloc[</span><span class="s5">0</span><span class="s1">:</span><span class="s5">50</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = np.nan</span>
+        <span class="s1">obs.iloc[</span><span class="s5">19</span><span class="s1">:</span><span class="s5">70</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = np.nan</span>
+        <span class="s1">obs.iloc[</span><span class="s5">39</span><span class="s1">:</span><span class="s5">90</span><span class="s2">, </span><span class="s5">2</span><span class="s1">] = np.nan</span>
+        <span class="s1">obs.iloc[</span><span class="s5">119</span><span class="s1">:</span><span class="s5">130</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = np.nan</span>
+        <span class="s1">obs.iloc[</span><span class="s5">119</span><span class="s1">:</span><span class="s5">130</span><span class="s2">, </span><span class="s5">2</span><span class="s1">] = np.nan</span>
+
+        <span class="s3"># Create the model</span>
+        <span class="s1">mod = mlemodel.MLEModel(obs</span><span class="s2">, </span><span class="s1">k_states=</span><span class="s5">3</span><span class="s2">, </span><span class="s1">k_posdef=</span><span class="s5">3</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">mod[</span><span class="s4">'design'</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'obs_cov'</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'transition'</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'selection'</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'state_cov'</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod.initialize_approximate_diffuse(</span><span class="s5">1e6</span><span class="s1">)</span>
+        <span class="s1">cls.model = mod</span>
+        <span class="s1">cls.results = mod.smooth([]</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s3"># Calculate the determinant of the covariance matrices (for easy</span>
+        <span class="s3"># comparison to other languages without having to store 2-dim arrays)</span>
+        <span class="s1">cls.results.det_scaled_smoothed_estimator_cov = (</span>
+            <span class="s1">np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs)))</span>
+        <span class="s1">cls.results.det_predicted_state_cov = np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs))</span>
+        <span class="s1">cls.results.det_smoothed_state_cov = np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs))</span>
+        <span class="s1">cls.results.det_smoothed_state_disturbance_cov = (</span>
+            <span class="s1">np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs)))</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(cls.model.nobs):</span>
+            <span class="s1">cls.results.det_scaled_smoothed_estimator_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = (</span>
+                <span class="s1">np.linalg.det(</span>
+                    <span class="s1">cls.results.scaled_smoothed_estimator_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i]))</span>
+            <span class="s1">cls.results.det_predicted_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = np.linalg.det(</span>
+                <span class="s1">cls.results.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i+</span><span class="s5">1</span><span class="s1">])</span>
+            <span class="s1">cls.results.det_smoothed_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = np.linalg.det(</span>
+                <span class="s1">cls.results.smoothed_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i])</span>
+            <span class="s1">cls.results.det_smoothed_state_disturbance_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = (</span>
+                <span class="s1">np.linalg.det(</span>
+                    <span class="s1">cls.results.smoothed_state_disturbance_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i]))</span>
+
+    <span class="s2">def </span><span class="s1">test_loglike(self):</span>
+        <span class="s1">assert_allclose(np.sum(self.results.llf_obs)</span><span class="s2">, </span><span class="s1">-</span><span class="s5">205310.9767</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_scaled_smoothed_estimator(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.scaled_smoothed_estimator.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'r1'</span><span class="s2">, </span><span class="s4">'r2'</span><span class="s2">, </span><span class="s4">'r3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_scaled_smoothed_estimator_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.det_scaled_smoothed_estimator_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'detN'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.forecasts.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'m1'</span><span class="s2">, </span><span class="s4">'m2'</span><span class="s2">, </span><span class="s4">'m3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts_error(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.forecasts_error.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'v1'</span><span class="s2">, </span><span class="s4">'v2'</span><span class="s2">, </span><span class="s4">'v3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts_error_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.forecasts_error_cov.diagonal()</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'F1'</span><span class="s2">, </span><span class="s4">'F2'</span><span class="s2">, </span><span class="s4">'F3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_states(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.predicted_state[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:].T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'a1'</span><span class="s2">, </span><span class="s4">'a2'</span><span class="s2">, </span><span class="s4">'a3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_states_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.det_predicted_state_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'detP'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_state.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'alphahat1'</span><span class="s2">, </span><span class="s4">'alphahat2'</span><span class="s2">, </span><span class="s4">'alphahat3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.det_smoothed_state_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'detV'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_forecasts(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_forecasts.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'muhat1'</span><span class="s2">, </span><span class="s4">'muhat2'</span><span class="s2">, </span><span class="s4">'muhat3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_state_disturbance.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'etahat1'</span><span class="s2">, </span><span class="s4">'etahat2'</span><span class="s2">, </span><span class="s4">'etahat3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.det_smoothed_state_disturbance_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'detVeta'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_measurement_disturbance.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'epshat1'</span><span class="s2">, </span><span class="s4">'epshat2'</span><span class="s2">, </span><span class="s4">'epshat3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_measurement_disturbance_cov.diagonal()</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'Veps1'</span><span class="s2">, </span><span class="s4">'Veps2'</span><span class="s2">, </span><span class="s4">'Veps3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestMultivariateMissingClassicalSmoothing(TestMultivariateMissing):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestMultivariateMissingClassicalSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">smooth_method=SMOOTH_CLASSICAL</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s1">SMOOTH_CLASSICAL)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_CLASSICAL)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_CLASSICAL)</span>
+
+
+<span class="s2">class </span><span class="s1">TestMultivariateMissingAlternativeSmoothing(TestMultivariateMissing):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestMultivariateMissingAlternativeSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">smooth_method=SMOOTH_ALTERNATIVE</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s1">SMOOTH_ALTERNATIVE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_ALTERNATIVE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_ALTERNATIVE)</span>
+
+
+<span class="s2">class </span><span class="s1">TestMultivariateMissingUnivariateSmoothing(TestMultivariateMissing):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestMultivariateMissingUnivariateSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">filter_method=FILTER_UNIVARIATE</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_UNIVARIATE)</span>
+
+
+<span class="s2">class </span><span class="s1">TestMultivariateVAR:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Tests for most filtering and smoothing variables against output from the 
+    R library KFAS. 
+ 
+    Note that KFAS uses the univariate approach which generally will result in 
+    different predicted values and covariance matrices associated with the 
+    measurement equation (e.g. forecasts, etc.). In this case, although the 
+    model is multivariate, each of the series is truly independent so the 
+    values will be the same regardless of whether the univariate approach is 
+    used or not. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># Results</span>
+        <span class="s1">path = os.path.join(current_path</span><span class="s2">, </span><span class="s4">'results'</span><span class="s2">,</span>
+                            <span class="s4">'results_smoothing2_R.csv'</span><span class="s1">)</span>
+        <span class="s1">cls.desired = pd.read_csv(path)</span>
+
+        <span class="s3"># Data</span>
+        <span class="s1">dta = datasets.macrodata.load_pandas().data</span>
+        <span class="s1">dta.index = pd.date_range(start=</span><span class="s4">'1959-01-01'</span><span class="s2">, </span><span class="s1">end=</span><span class="s4">'2009-7-01'</span><span class="s2">,</span>
+                                  <span class="s1">freq=</span><span class="s4">'QS'</span><span class="s1">)</span>
+        <span class="s1">obs = np.log(dta[[</span><span class="s4">'realgdp'</span><span class="s2">, </span><span class="s4">'realcons'</span><span class="s2">, </span><span class="s4">'realinv'</span><span class="s1">]]).diff().iloc[</span><span class="s5">1</span><span class="s1">:]</span>
+
+        <span class="s3"># Create the model</span>
+        <span class="s1">mod = mlemodel.MLEModel(obs</span><span class="s2">, </span><span class="s1">k_states=</span><span class="s5">3</span><span class="s2">, </span><span class="s1">k_posdef=</span><span class="s5">3</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">mod[</span><span class="s4">'design'</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'obs_cov'</span><span class="s1">] = np.array([</span>
+            <span class="s1">[</span><span class="s5">0.0000640649</span><span class="s2">,  </span><span class="s5">0.</span><span class="s2">,            </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.</span><span class="s2">,            </span><span class="s5">0.0000572802</span><span class="s2">,  </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.</span><span class="s2">,            </span><span class="s5">0.</span><span class="s2">,            </span><span class="s5">0.0017088585</span><span class="s1">]])</span>
+        <span class="s1">mod[</span><span class="s4">'transition'</span><span class="s1">] = np.array([</span>
+            <span class="s1">[-</span><span class="s5">0.1119908792</span><span class="s2">,  </span><span class="s5">0.8441841604</span><span class="s2">,  </span><span class="s5">0.0238725303</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.2629347724</span><span class="s2">,   </span><span class="s5">0.4996718412</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.0173023305</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[-</span><span class="s5">3.2192369082</span><span class="s2">,  </span><span class="s5">4.1536028244</span><span class="s2">,  </span><span class="s5">0.4514379215</span><span class="s1">]])</span>
+        <span class="s1">mod[</span><span class="s4">'selection'</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'state_cov'</span><span class="s1">] = np.array([</span>
+            <span class="s1">[</span><span class="s5">0.0000640649</span><span class="s2">,  </span><span class="s5">0.0000388496</span><span class="s2">,  </span><span class="s5">0.0002148769</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.0000388496</span><span class="s2">,  </span><span class="s5">0.0000572802</span><span class="s2">,  </span><span class="s5">0.000001555</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.0002148769</span><span class="s2">,  </span><span class="s5">0.000001555</span><span class="s2">,   </span><span class="s5">0.0017088585</span><span class="s1">]])</span>
+        <span class="s1">mod.initialize_approximate_diffuse(</span><span class="s5">1e6</span><span class="s1">)</span>
+        <span class="s1">cls.model = mod</span>
+        <span class="s1">cls.results = mod.smooth([]</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s3"># Calculate the determinant of the covariance matrices (for easy</span>
+        <span class="s3"># comparison to other languages without having to store 2-dim arrays)</span>
+        <span class="s1">cls.results.det_scaled_smoothed_estimator_cov = (</span>
+            <span class="s1">np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs)))</span>
+        <span class="s1">cls.results.det_predicted_state_cov = np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs))</span>
+        <span class="s1">cls.results.det_smoothed_state_cov = np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs))</span>
+        <span class="s1">cls.results.det_smoothed_state_disturbance_cov = (</span>
+            <span class="s1">np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs)))</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(cls.model.nobs):</span>
+            <span class="s1">cls.results.det_scaled_smoothed_estimator_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = (</span>
+                <span class="s1">np.linalg.det(</span>
+                    <span class="s1">cls.results.scaled_smoothed_estimator_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i]))</span>
+            <span class="s1">cls.results.det_predicted_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = np.linalg.det(</span>
+                <span class="s1">cls.results.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i+</span><span class="s5">1</span><span class="s1">])</span>
+            <span class="s1">cls.results.det_smoothed_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = np.linalg.det(</span>
+                <span class="s1">cls.results.smoothed_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i])</span>
+            <span class="s1">cls.results.det_smoothed_state_disturbance_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = (</span>
+                <span class="s1">np.linalg.det(</span>
+                    <span class="s1">cls.results.smoothed_state_disturbance_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i]))</span>
+
+    <span class="s2">def </span><span class="s1">test_loglike(self):</span>
+        <span class="s1">assert_allclose(np.sum(self.results.llf_obs)</span><span class="s2">, </span><span class="s5">1695.34872</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_scaled_smoothed_estimator(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.scaled_smoothed_estimator.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'r1'</span><span class="s2">, </span><span class="s4">'r2'</span><span class="s2">, </span><span class="s4">'r3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_scaled_smoothed_estimator_cov(self):</span>
+        <span class="s3"># Last obs is zero, so exclude it</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">np.log(self.results.det_scaled_smoothed_estimator_cov.T[:-</span><span class="s5">1</span><span class="s1">])</span><span class="s2">,</span>
+            <span class="s1">np.log(self.desired[[</span><span class="s4">'detN'</span><span class="s1">]][:-</span><span class="s5">1</span><span class="s1">])</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.forecasts.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'m1'</span><span class="s2">, </span><span class="s4">'m2'</span><span class="s2">, </span><span class="s4">'m3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts_error(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.forecasts_error.T[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">self.desired[</span><span class="s4">'v1'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts_error_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.forecasts_error_cov.diagonal()[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">self.desired[</span><span class="s4">'F1'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_states(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.predicted_state[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:].T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'a1'</span><span class="s2">, </span><span class="s4">'a2'</span><span class="s2">, </span><span class="s4">'a3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_states_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.det_predicted_state_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'detP'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-16</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_state.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'alphahat1'</span><span class="s2">, </span><span class="s4">'alphahat2'</span><span class="s2">, </span><span class="s4">'alphahat3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.det_smoothed_state_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'detV'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-16</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_forecasts(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_forecasts.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'muhat1'</span><span class="s2">, </span><span class="s4">'muhat2'</span><span class="s2">, </span><span class="s4">'muhat3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_state_disturbance.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'etahat1'</span><span class="s2">, </span><span class="s4">'etahat2'</span><span class="s2">, </span><span class="s4">'etahat3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.det_smoothed_state_disturbance_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'detVeta'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-18</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_measurement_disturbance.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'epshat1'</span><span class="s2">, </span><span class="s4">'epshat2'</span><span class="s2">, </span><span class="s4">'epshat3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_measurement_disturbance_cov.diagonal()</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'Veps1'</span><span class="s2">, </span><span class="s4">'Veps2'</span><span class="s2">, </span><span class="s4">'Veps3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestMultivariateVARAlternativeSmoothing(TestMultivariateVAR):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestMultivariateVARAlternativeSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">smooth_method=SMOOTH_ALTERNATIVE</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s1">SMOOTH_ALTERNATIVE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_ALTERNATIVE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_ALTERNATIVE)</span>
+
+
+<span class="s2">class </span><span class="s1">TestMultivariateVARClassicalSmoothing(TestMultivariateVAR):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestMultivariateVARClassicalSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">smooth_method=SMOOTH_CLASSICAL</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s1">SMOOTH_CLASSICAL)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_CLASSICAL)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_CLASSICAL)</span>
+
+
+<span class="s2">class </span><span class="s1">TestMultivariateVARUnivariate:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Tests for most filtering and smoothing variables against output from the 
+    R library KFAS. 
+ 
+    Note that KFAS uses the univariate approach which generally will result in 
+    different predicted values and covariance matrices associated with the 
+    measurement equation (e.g. forecasts, etc.). In this case, although the 
+    model is multivariate, each of the series is truly independent so the 
+    values will be the same regardless of whether the univariate approach is 
+    used or not. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># Results</span>
+        <span class="s1">path = os.path.join(current_path</span><span class="s2">, </span><span class="s4">'results'</span><span class="s2">,</span>
+                            <span class="s4">'results_smoothing2_R.csv'</span><span class="s1">)</span>
+        <span class="s1">cls.desired = pd.read_csv(path)</span>
+
+        <span class="s3"># Data</span>
+        <span class="s1">dta = datasets.macrodata.load_pandas().data</span>
+        <span class="s1">dta.index = pd.date_range(start=</span><span class="s4">'1959-01-01'</span><span class="s2">, </span><span class="s1">end=</span><span class="s4">'2009-7-01'</span><span class="s2">,</span>
+                                  <span class="s1">freq=</span><span class="s4">'QS'</span><span class="s1">)</span>
+        <span class="s1">obs = np.log(dta[[</span><span class="s4">'realgdp'</span><span class="s2">, </span><span class="s4">'realcons'</span><span class="s2">, </span><span class="s4">'realinv'</span><span class="s1">]]).diff().iloc[</span><span class="s5">1</span><span class="s1">:]</span>
+
+        <span class="s3"># Create the model</span>
+        <span class="s1">mod = mlemodel.MLEModel(obs</span><span class="s2">, </span><span class="s1">k_states=</span><span class="s5">3</span><span class="s2">, </span><span class="s1">k_posdef=</span><span class="s5">3</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">mod.ssm.filter_univariate = </span><span class="s2">True</span>
+        <span class="s1">mod[</span><span class="s4">'design'</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'obs_cov'</span><span class="s1">] = np.array([</span>
+            <span class="s1">[</span><span class="s5">0.0000640649</span><span class="s2">,  </span><span class="s5">0.</span><span class="s2">,            </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.</span><span class="s2">,            </span><span class="s5">0.0000572802</span><span class="s2">,  </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.</span><span class="s2">,            </span><span class="s5">0.</span><span class="s2">,            </span><span class="s5">0.0017088585</span><span class="s1">]])</span>
+        <span class="s1">mod[</span><span class="s4">'transition'</span><span class="s1">] = np.array([</span>
+            <span class="s1">[-</span><span class="s5">0.1119908792</span><span class="s2">,  </span><span class="s5">0.8441841604</span><span class="s2">,  </span><span class="s5">0.0238725303</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.2629347724</span><span class="s2">,   </span><span class="s5">0.4996718412</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.0173023305</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[-</span><span class="s5">3.2192369082</span><span class="s2">,  </span><span class="s5">4.1536028244</span><span class="s2">,  </span><span class="s5">0.4514379215</span><span class="s1">]])</span>
+        <span class="s1">mod[</span><span class="s4">'selection'</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'state_cov'</span><span class="s1">] = np.array([</span>
+            <span class="s1">[</span><span class="s5">0.0000640649</span><span class="s2">,  </span><span class="s5">0.0000388496</span><span class="s2">,  </span><span class="s5">0.0002148769</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.0000388496</span><span class="s2">,  </span><span class="s5">0.0000572802</span><span class="s2">,  </span><span class="s5">0.000001555</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.0002148769</span><span class="s2">,  </span><span class="s5">0.000001555</span><span class="s2">,   </span><span class="s5">0.0017088585</span><span class="s1">]])</span>
+        <span class="s1">mod.initialize_approximate_diffuse(</span><span class="s5">1e6</span><span class="s1">)</span>
+        <span class="s1">cls.model = mod</span>
+        <span class="s1">cls.results = mod.smooth([]</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s3"># Calculate the determinant of the covariance matrices (for easy</span>
+        <span class="s3"># comparison to other languages without having to store 2-dim arrays)</span>
+        <span class="s1">cls.results.det_scaled_smoothed_estimator_cov = (</span>
+            <span class="s1">np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs)))</span>
+        <span class="s1">cls.results.det_predicted_state_cov = np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs))</span>
+        <span class="s1">cls.results.det_smoothed_state_cov = np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs))</span>
+        <span class="s1">cls.results.det_smoothed_state_disturbance_cov = (</span>
+            <span class="s1">np.zeros((</span><span class="s5">1</span><span class="s2">, </span><span class="s1">cls.model.nobs)))</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(cls.model.nobs):</span>
+            <span class="s1">cls.results.det_scaled_smoothed_estimator_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = (</span>
+                <span class="s1">np.linalg.det(</span>
+                    <span class="s1">cls.results.scaled_smoothed_estimator_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i]))</span>
+            <span class="s1">cls.results.det_predicted_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = np.linalg.det(</span>
+                <span class="s1">cls.results.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i+</span><span class="s5">1</span><span class="s1">])</span>
+            <span class="s1">cls.results.det_smoothed_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = np.linalg.det(</span>
+                <span class="s1">cls.results.smoothed_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i])</span>
+            <span class="s1">cls.results.det_smoothed_state_disturbance_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">i] = (</span>
+                <span class="s1">np.linalg.det(</span>
+                    <span class="s1">cls.results.smoothed_state_disturbance_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i]))</span>
+
+    <span class="s2">def </span><span class="s1">test_loglike(self):</span>
+        <span class="s1">assert_allclose(np.sum(self.results.llf_obs)</span><span class="s2">, </span><span class="s5">1695.34872</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_scaled_smoothed_estimator(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.scaled_smoothed_estimator.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'r1'</span><span class="s2">, </span><span class="s4">'r2'</span><span class="s2">, </span><span class="s4">'r3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-4</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_scaled_smoothed_estimator_cov(self):</span>
+        <span class="s3"># Last obs is zero, so exclude it</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">np.log(self.results.det_scaled_smoothed_estimator_cov.T[:-</span><span class="s5">1</span><span class="s1">])</span><span class="s2">,</span>
+            <span class="s1">np.log(self.desired[[</span><span class="s4">'detN'</span><span class="s1">]][:-</span><span class="s5">1</span><span class="s1">])</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.forecasts.T[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">self.desired[</span><span class="s4">'m1'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts_error(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.forecasts_error.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'v1'</span><span class="s2">, </span><span class="s4">'v2'</span><span class="s2">, </span><span class="s4">'v3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts_error_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.forecasts_error_cov.diagonal()</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'F1'</span><span class="s2">, </span><span class="s4">'F2'</span><span class="s2">, </span><span class="s4">'F3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_states(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.predicted_state[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:].T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'a1'</span><span class="s2">, </span><span class="s4">'a2'</span><span class="s2">, </span><span class="s4">'a3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-8</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_states_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.det_predicted_state_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'detP'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-18</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_state.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'alphahat1'</span><span class="s2">, </span><span class="s4">'alphahat2'</span><span class="s2">, </span><span class="s4">'alphahat3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_states_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.det_smoothed_state_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'detV'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-18</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_forecasts(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_forecasts.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'muhat1'</span><span class="s2">, </span><span class="s4">'muhat2'</span><span class="s2">, </span><span class="s4">'muhat3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_state_disturbance.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'etahat1'</span><span class="s2">, </span><span class="s4">'etahat2'</span><span class="s2">, </span><span class="s4">'etahat3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.det_smoothed_state_disturbance_cov.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'detVeta'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-18</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_measurement_disturbance.T</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'epshat1'</span><span class="s2">, </span><span class="s4">'epshat2'</span><span class="s2">, </span><span class="s4">'epshat3'</span><span class="s1">]]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance_cov(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.results.smoothed_measurement_disturbance_cov.diagonal()</span><span class="s2">,</span>
+            <span class="s1">self.desired[[</span><span class="s4">'Veps1'</span><span class="s2">, </span><span class="s4">'Veps2'</span><span class="s2">, </span><span class="s4">'Veps3'</span><span class="s1">]]</span>
+        <span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestMultivariateVARUnivariateSmoothing(TestMultivariateVARUnivariate):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestMultivariateVARUnivariateSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">filter_method=FILTER_UNIVARIATE</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_filter_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.filter_method</span><span class="s2">, </span><span class="s1">FILTER_UNIVARIATE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.filter_method</span><span class="s2">,</span>
+                     <span class="s1">FILTER_UNIVARIATE)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_UNIVARIATE)</span>
+
+
+<span class="s2">class </span><span class="s1">TestVARAutocovariances:</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">which=</span><span class="s4">'mixed'</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># Data</span>
+        <span class="s1">dta = datasets.macrodata.load_pandas().data</span>
+        <span class="s1">dta.index = pd.date_range(start=</span><span class="s4">'1959-01-01'</span><span class="s2">, </span><span class="s1">end=</span><span class="s4">'2009-7-01'</span><span class="s2">,</span>
+                                  <span class="s1">freq=</span><span class="s4">'QS'</span><span class="s1">)</span>
+        <span class="s1">obs = np.log(dta[[</span><span class="s4">'realgdp'</span><span class="s2">, </span><span class="s4">'realcons'</span><span class="s2">, </span><span class="s4">'realinv'</span><span class="s1">]]).diff().iloc[</span><span class="s5">1</span><span class="s1">:]</span>
+
+        <span class="s2">if </span><span class="s1">which == </span><span class="s4">'all'</span><span class="s1">:</span>
+            <span class="s1">obs.iloc[:</span><span class="s5">50</span><span class="s2">, </span><span class="s1">:] = np.nan</span>
+            <span class="s1">obs.iloc[</span><span class="s5">119</span><span class="s1">:</span><span class="s5">130</span><span class="s2">, </span><span class="s1">:] = np.nan</span>
+        <span class="s2">elif </span><span class="s1">which == </span><span class="s4">'partial'</span><span class="s1">:</span>
+            <span class="s1">obs.iloc[</span><span class="s5">0</span><span class="s1">:</span><span class="s5">50</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = np.nan</span>
+            <span class="s1">obs.iloc[</span><span class="s5">119</span><span class="s1">:</span><span class="s5">130</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = np.nan</span>
+        <span class="s2">elif </span><span class="s1">which == </span><span class="s4">'mixed'</span><span class="s1">:</span>
+            <span class="s1">obs.iloc[</span><span class="s5">0</span><span class="s1">:</span><span class="s5">50</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = np.nan</span>
+            <span class="s1">obs.iloc[</span><span class="s5">19</span><span class="s1">:</span><span class="s5">70</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = np.nan</span>
+            <span class="s1">obs.iloc[</span><span class="s5">39</span><span class="s1">:</span><span class="s5">90</span><span class="s2">, </span><span class="s5">2</span><span class="s1">] = np.nan</span>
+            <span class="s1">obs.iloc[</span><span class="s5">119</span><span class="s1">:</span><span class="s5">130</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = np.nan</span>
+            <span class="s1">obs.iloc[</span><span class="s5">119</span><span class="s1">:</span><span class="s5">130</span><span class="s2">, </span><span class="s5">2</span><span class="s1">] = np.nan</span>
+
+        <span class="s3"># Create the model with typical state space</span>
+        <span class="s1">mod = mlemodel.MLEModel(obs</span><span class="s2">, </span><span class="s1">k_states=</span><span class="s5">3</span><span class="s2">, </span><span class="s1">k_posdef=</span><span class="s5">3</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">mod[</span><span class="s4">'design'</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'obs_cov'</span><span class="s1">] = np.array([</span>
+            <span class="s1">[</span><span class="s5">609.0746647855</span><span class="s2">,  </span><span class="s5">0.</span><span class="s2">,              </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.</span><span class="s2">,              </span><span class="s5">1.8774916622</span><span class="s2">,    </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.</span><span class="s2">,              </span><span class="s5">0.</span><span class="s2">,            </span><span class="s5">124.6768281675</span><span class="s1">]])</span>
+        <span class="s1">mod[</span><span class="s4">'transition'</span><span class="s1">] = np.array([</span>
+            <span class="s1">[-</span><span class="s5">0.8110473405</span><span class="s2">,  </span><span class="s5">1.8005304445</span><span class="s2">,  </span><span class="s5">1.0215975772</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[-</span><span class="s5">1.9846632699</span><span class="s2">,  </span><span class="s5">2.4091302213</span><span class="s2">,  </span><span class="s5">1.9264449765</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.9181658823</span><span class="s2">,  </span><span class="s1">-</span><span class="s5">0.2442384581</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.6393462272</span><span class="s1">]])</span>
+        <span class="s1">mod[</span><span class="s4">'selection'</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'state_cov'</span><span class="s1">] = np.array([</span>
+            <span class="s1">[</span><span class="s5">1552.9758843938</span><span class="s2">,   </span><span class="s5">612.7185121905</span><span class="s2">,   </span><span class="s5">877.6157204992</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">612.7185121905</span><span class="s2">,    </span><span class="s5">467.8739411204</span><span class="s2">,    </span><span class="s5">70.608037339</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">877.6157204992</span><span class="s2">,     </span><span class="s5">70.608037339</span><span class="s2">,    </span><span class="s5">900.5440385836</span><span class="s1">]])</span>
+        <span class="s1">mod.initialize_approximate_diffuse(</span><span class="s5">1e6</span><span class="s1">)</span>
+        <span class="s1">cls.model = mod</span>
+        <span class="s1">cls.results = mod.smooth([]</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s3"># Create the model with augmented state space</span>
+        <span class="s1">kwargs.pop(</span><span class="s4">'filter_collapsed'</span><span class="s2">, None</span><span class="s1">)</span>
+        <span class="s1">mod = mlemodel.MLEModel(obs</span><span class="s2">, </span><span class="s1">k_states=</span><span class="s5">6</span><span class="s2">, </span><span class="s1">k_posdef=</span><span class="s5">3</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">mod[</span><span class="s4">'design'</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'obs_cov'</span><span class="s1">] = np.array([</span>
+            <span class="s1">[</span><span class="s5">609.0746647855</span><span class="s2">,    </span><span class="s5">0.</span><span class="s2">,              </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.</span><span class="s2">,                </span><span class="s5">1.8774916622</span><span class="s2">,    </span><span class="s5">0.</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.</span><span class="s2">,                </span><span class="s5">0.</span><span class="s2">,            </span><span class="s5">124.6768281675</span><span class="s1">]])</span>
+        <span class="s1">mod[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s1">] = np.array([</span>
+            <span class="s1">[-</span><span class="s5">0.8110473405</span><span class="s2">,  </span><span class="s5">1.8005304445</span><span class="s2">,  </span><span class="s5">1.0215975772</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[-</span><span class="s5">1.9846632699</span><span class="s2">,  </span><span class="s5">2.4091302213</span><span class="s2">,  </span><span class="s5">1.9264449765</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">0.9181658823</span><span class="s2">,  </span><span class="s1">-</span><span class="s5">0.2442384581</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.6393462272</span><span class="s1">]])</span>
+        <span class="s1">mod[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s5">3</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'selection'</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s1">] = np.eye(</span><span class="s5">3</span><span class="s1">)</span>
+        <span class="s1">mod[</span><span class="s4">'state_cov'</span><span class="s1">] = np.array([</span>
+            <span class="s1">[</span><span class="s5">1552.9758843938</span><span class="s2">,  </span><span class="s5">612.7185121905</span><span class="s2">,   </span><span class="s5">877.6157204992</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">612.7185121905</span><span class="s2">,   </span><span class="s5">467.8739411204</span><span class="s2">,    </span><span class="s5">70.608037339</span><span class="s1">]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">877.6157204992</span><span class="s2">,    </span><span class="s5">70.608037339</span><span class="s2">,    </span><span class="s5">900.5440385836</span><span class="s1">]])</span>
+
+        <span class="s1">mod.initialize_approximate_diffuse(</span><span class="s5">1e6</span><span class="s1">)</span>
+        <span class="s1">cls.augmented_model = mod</span>
+        <span class="s1">cls.augmented_results = mod.smooth([]</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_autocov(self):</span>
+        <span class="s3"># Cov(\alpha_{t+1}, \alpha_t)</span>
+        <span class="s3"># Initialization makes these two methods slightly different for the</span>
+        <span class="s3"># first few observations</span>
+        <span class="s1">assert_allclose(self.results.smoothed_state_autocov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">:</span><span class="s5">5</span><span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">self.augmented_results.smoothed_state_cov[:</span><span class="s5">3</span><span class="s2">, </span><span class="s5">3</span><span class="s1">:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">:</span><span class="s5">6</span><span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">atol=</span><span class="s5">1e-4</span><span class="s1">)</span>
+        <span class="s1">assert_allclose(self.results.smoothed_state_autocov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s5">5</span><span class="s1">:-</span><span class="s5">1</span><span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">self.augmented_results.smoothed_state_cov[:</span><span class="s5">3</span><span class="s2">, </span><span class="s5">3</span><span class="s1">:</span><span class="s2">, </span><span class="s5">6</span><span class="s1">:]</span><span class="s2">,</span>
+                        <span class="s1">atol=</span><span class="s5">1e-7</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestVARAutocovariancesAlternativeSmoothing(TestVARAutocovariances):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestVARAutocovariancesAlternativeSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">smooth_method=SMOOTH_ALTERNATIVE</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s1">SMOOTH_ALTERNATIVE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_ALTERNATIVE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_ALTERNATIVE)</span>
+
+
+<span class="s2">class </span><span class="s1">TestVARAutocovariancesClassicalSmoothing(TestVARAutocovariances):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestVARAutocovariancesClassicalSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">smooth_method=SMOOTH_CLASSICAL</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s1">SMOOTH_CLASSICAL)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_CLASSICAL)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_CLASSICAL)</span>
+
+
+<span class="s2">class </span><span class="s1">TestVARAutocovariancesUnivariateSmoothing(TestVARAutocovariances):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(TestVARAutocovariancesUnivariateSmoothing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">filter_method=FILTER_UNIVARIATE</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_filter_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.filter_method</span><span class="s2">, </span><span class="s1">FILTER_UNIVARIATE)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.filter_method</span><span class="s2">,</span>
+                     <span class="s1">FILTER_UNIVARIATE)</span>
+
+    <span class="s2">def </span><span class="s1">test_smooth_method(self):</span>
+        <span class="s1">assert_equal(self.model.ssm.smooth_method</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother.smooth_method</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_equal(self.model.ssm._kalman_smoother._smooth_method</span><span class="s2">,</span>
+                     <span class="s1">SMOOTH_UNIVARIATE)</span>
+
+
+<span class="s2">class </span><span class="s1">TVSSWithLags(TVSS):</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog):</span>
+        <span class="s3"># TVSS has 2 states, here we will add in 3 lags of those</span>
+        <span class="s1">super().__init__(endog</span><span class="s2">, </span><span class="s1">_k_states=</span><span class="s5">8</span><span class="s1">)</span>
+        <span class="s1">self[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s5">2</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">6</span><span class="s1">] = np.eye(</span><span class="s5">6</span><span class="s1">)[...</span><span class="s2">, None</span><span class="s1">]</span>
+        <span class="s3"># Can't use exact diffuse filtering</span>
+        <span class="s1">self.ssm.initialize_approximate_diffuse(</span><span class="s5">1e-4</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp</span><span class="s2">, </span><span class="s1">oos=</span><span class="s2">None, </span><span class="s1">params=</span><span class="s2">None,</span>
+                   <span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">):</span>
+    <span class="s1">dta = datasets.macrodata.load_pandas().data</span>
+    <span class="s1">dta.index = pd.date_range(start=</span><span class="s4">'1959-01-01'</span><span class="s2">, </span><span class="s1">end=</span><span class="s4">'2009-7-01'</span><span class="s2">,</span>
+                              <span class="s1">freq=</span><span class="s4">'QS'</span><span class="s1">)</span>
+    <span class="s1">endog = np.log(dta[[</span><span class="s4">'realgdp'</span><span class="s2">, </span><span class="s4">'realcons'</span><span class="s1">]]).diff().iloc[</span><span class="s5">1</span><span class="s1">:]</span>
+
+    <span class="s2">if </span><span class="s1">missing == </span><span class="s4">'all'</span><span class="s1">:</span>
+        <span class="s1">endog.iloc[:</span><span class="s5">5</span><span class="s2">, </span><span class="s1">:] = np.nan</span>
+        <span class="s1">endog.iloc[</span><span class="s5">11</span><span class="s1">:</span><span class="s5">13</span><span class="s2">, </span><span class="s1">:] = np.nan</span>
+    <span class="s2">elif </span><span class="s1">missing == </span><span class="s4">'partial'</span><span class="s1">:</span>
+        <span class="s1">endog.iloc[</span><span class="s5">0</span><span class="s1">:</span><span class="s5">5</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = np.nan</span>
+        <span class="s1">endog.iloc[</span><span class="s5">11</span><span class="s1">:</span><span class="s5">13</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = np.nan</span>
+    <span class="s2">elif </span><span class="s1">missing == </span><span class="s4">'mixed'</span><span class="s1">:</span>
+        <span class="s1">endog.iloc[</span><span class="s5">0</span><span class="s1">:</span><span class="s5">5</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = np.nan</span>
+        <span class="s1">endog.iloc[</span><span class="s5">1</span><span class="s1">:</span><span class="s5">7</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = np.nan</span>
+        <span class="s1">endog.iloc[</span><span class="s5">11</span><span class="s1">:</span><span class="s5">13</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = np.nan</span>
+
+    <span class="s2">if </span><span class="s1">oos </span><span class="s2">is not None</span><span class="s1">:</span>
+        <span class="s1">new_ix = pd.date_range(start=endog.index[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+                               <span class="s1">periods=len(endog) + oos</span><span class="s2">, </span><span class="s1">freq=</span><span class="s4">'QS'</span><span class="s1">)</span>
+        <span class="s1">endog = endog.reindex(new_ix)</span>
+
+    <span class="s2">if not </span><span class="s1">tvp:</span>
+        <span class="s1">mod = varmax.VARMAX(endog</span><span class="s2">, </span><span class="s1">order=(</span><span class="s5">4</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">, </span><span class="s1">measurement_error=</span><span class="s2">True,</span>
+                            <span class="s1">tolerance=</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">mod.ssm.filter_univariate = filter_univariate</span>
+        <span class="s2">if </span><span class="s1">params </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">params = mod.start_params</span>
+        <span class="s1">res = mod.smooth(params</span><span class="s2">, </span><span class="s1">return_ssm=return_ssm)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">mod = TVSSWithLags(endog)</span>
+        <span class="s1">mod.ssm.filter_univariate = filter_univariate</span>
+        <span class="s1">res = mod.smooth([]</span><span class="s2">, </span><span class="s1">return_ssm=return_ssm)</span>
+
+    <span class="s2">return </span><span class="s1">mod</span><span class="s2">, </span><span class="s1">res</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'missing'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'all'</span><span class="s2">, </span><span class="s4">'partial'</span><span class="s2">, </span><span class="s4">'mixed'</span><span class="s2">, None</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'filter_univariate'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'tvp'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_smoothed_state_autocovariances_backwards(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">,</span>
+                                                  <span class="s1">tvp):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Test for Cov(t, t - lag) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_</span><span class="s2">, </span><span class="s1">res = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp)</span>
+
+    <span class="s1">cov = res.smoothed_state_cov.transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">desired_acov1 = cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s5">2</span><span class="s1">:</span><span class="s5">4</span><span class="s1">]</span>
+    <span class="s1">desired_acov2 = cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s5">4</span><span class="s1">:</span><span class="s5">6</span><span class="s1">]</span>
+    <span class="s1">desired_acov3 = cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s5">6</span><span class="s1">:</span><span class="s5">8</span><span class="s1">]</span>
+
+    <span class="s3"># Test all &quot;backward&quot; autocovariances: Cov(t, t-lag)</span>
+    <span class="s1">acov1 = res.smoothed_state_autocovariance(</span><span class="s5">1</span><span class="s1">).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov1[</span><span class="s5">1</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov1[</span><span class="s5">1</span><span class="s1">:]</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s5">1e-6</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span><span class="s1">)</span>
+    <span class="s1">assert_equal(acov1[:</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.nan)</span>
+
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(</span><span class="s5">2</span><span class="s1">).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov2[</span><span class="s5">2</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov2[</span><span class="s5">2</span><span class="s1">:]</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s5">1e-6</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span><span class="s1">)</span>
+    <span class="s1">assert_equal(acov2[:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.nan)</span>
+
+    <span class="s1">acov3 = res.smoothed_state_autocovariance(</span><span class="s5">3</span><span class="s1">).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov3[</span><span class="s5">3</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov3[</span><span class="s5">3</span><span class="s1">:]</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s5">1e-6</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span><span class="s1">)</span>
+    <span class="s1">assert_equal(acov3[:</span><span class="s5">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.nan)</span>
+
+    <span class="s3"># Test for specific autocovariances</span>
+    <span class="s1">acov1 = res.smoothed_state_autocovariance(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">t=</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov1</span><span class="s2">, </span><span class="s1">np.nan)</span>
+    <span class="s1">acov1 = res.smoothed_state_autocovariance(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">t=</span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov1[:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov1[</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s5">1e-6</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span><span class="s1">)</span>
+    <span class="s1">acov1 = res.smoothed_state_autocovariance(</span>
+        <span class="s5">1</span><span class="s2">, </span><span class="s1">start=</span><span class="s5">8</span><span class="s2">, </span><span class="s1">end=</span><span class="s5">9</span><span class="s1">).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov1[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov1[</span><span class="s5">8</span><span class="s1">:</span><span class="s5">9</span><span class="s1">]</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s5">1e-6</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span><span class="s1">)</span>
+
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(</span><span class="s5">2</span><span class="s2">, </span><span class="s1">t=</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov2</span><span class="s2">, </span><span class="s1">np.nan)</span>
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(</span><span class="s5">2</span><span class="s2">, </span><span class="s1">t=</span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov2</span><span class="s2">, </span><span class="s1">np.nan)</span>
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(</span><span class="s5">2</span><span class="s2">, </span><span class="s1">t=</span><span class="s5">2</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov2[:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov2[</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s5">1e-6</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span><span class="s1">)</span>
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(</span>
+        <span class="s5">2</span><span class="s2">, </span><span class="s1">start=</span><span class="s5">8</span><span class="s2">, </span><span class="s1">end=</span><span class="s5">9</span><span class="s1">).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov2[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov2[</span><span class="s5">8</span><span class="s1">:</span><span class="s5">9</span><span class="s1">]</span><span class="s2">, </span><span class="s1">rtol=</span><span class="s5">1e-6</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-6</span><span class="s1">)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'missing'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'all'</span><span class="s2">, </span><span class="s4">'partial'</span><span class="s2">, </span><span class="s4">'mixed'</span><span class="s2">, None</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'filter_univariate'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'tvp'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_smoothed_state_autocovariances_forwards(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">,</span>
+                                                 <span class="s1">tvp):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Test for Cov(t, t + lag) 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># Out-of-sample model</span>
+    <span class="s3"># Note: in TVP case, we need to first generate the larger model, and then</span>
+    <span class="s3"># create the smaller model with the system matrices from the larger model</span>
+    <span class="s3"># (otherwise they will be different, since the matrices are randomly</span>
+    <span class="s3"># generated)</span>
+    <span class="s1">mod_oos</span><span class="s2">, </span><span class="s1">res_oos = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp</span><span class="s2">, </span><span class="s1">oos=</span><span class="s5">3</span><span class="s1">)</span>
+
+    <span class="s3"># Basic model</span>
+    <span class="s1">names = [</span><span class="s4">'obs_intercept'</span><span class="s2">, </span><span class="s4">'design'</span><span class="s2">, </span><span class="s4">'obs_cov'</span><span class="s2">, </span><span class="s4">'transition'</span><span class="s2">, </span><span class="s4">'selection'</span><span class="s2">,</span>
+             <span class="s4">'state_cov'</span><span class="s1">]</span>
+    <span class="s2">if not </span><span class="s1">tvp:</span>
+        <span class="s1">mod</span><span class="s2">, </span><span class="s1">res = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp</span><span class="s2">,</span>
+                                  <span class="s1">params=mod_oos.start_params)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">mod</span><span class="s2">, </span><span class="s1">_ = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp)</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">names:</span>
+            <span class="s1">mod[name] = mod_oos[name</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">:-</span><span class="s5">3</span><span class="s1">]</span>
+        <span class="s1">res = mod.ssm.smooth()</span>
+
+    <span class="s1">extend_kwargs1 = {}</span>
+    <span class="s1">extend_kwargs2 = {}</span>
+    <span class="s2">if </span><span class="s1">tvp:</span>
+        <span class="s1">keys = [</span><span class="s4">'obs_intercept'</span><span class="s2">, </span><span class="s4">'design'</span><span class="s2">, </span><span class="s4">'obs_cov'</span><span class="s2">, </span><span class="s4">'transition'</span><span class="s2">,</span>
+                <span class="s4">'selection'</span><span class="s2">, </span><span class="s4">'state_cov'</span><span class="s1">]</span>
+        <span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">keys:</span>
+            <span class="s1">extend_kwargs1[key] = mod_oos[key</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">3</span><span class="s1">:-</span><span class="s5">2</span><span class="s1">]</span>
+            <span class="s1">extend_kwargs2[key] = mod_oos[key</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">3</span><span class="s1">:-</span><span class="s5">1</span><span class="s1">]</span>
+
+    <span class="s1">assert_allclose(res_oos.llf</span><span class="s2">, </span><span class="s1">res.llf)</span>
+
+    <span class="s1">cov = res.smoothed_state_cov.transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">desired_acov1 = cov[:</span><span class="s2">, </span><span class="s5">2</span><span class="s1">:</span><span class="s5">4</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span>
+    <span class="s1">desired_acov2 = cov[:</span><span class="s2">, </span><span class="s5">4</span><span class="s1">:</span><span class="s5">6</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span>
+    <span class="s1">desired_acov3 = cov[:</span><span class="s2">, </span><span class="s5">6</span><span class="s1">:</span><span class="s5">8</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span>
+
+    <span class="s1">oos_cov = np.concatenate(</span>
+        <span class="s1">(res_oos.smoothed_state_cov</span><span class="s2">, </span><span class="s1">res_oos.predicted_state_cov[...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">:])</span><span class="s2">,</span>
+        <span class="s1">axis=</span><span class="s5">2</span><span class="s1">).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s3"># Test all &quot;forwards&quot; autocovariances: Cov(t, t+lag)</span>
+    <span class="s3"># For Cov(t, t+lag), the first out-of-sample forward covariance,</span>
+    <span class="s3"># Cov(T, T+1), is already available, so we dno't need extend kwaargs</span>
+    <span class="s1">acov1 = res.smoothed_state_autocovariance(-</span><span class="s5">1</span><span class="s1">).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov1[:-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov1[</span><span class="s5">1</span><span class="s1">:])</span>
+    <span class="s1">assert_allclose(acov1[-</span><span class="s5">2</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">oos_cov[-</span><span class="s5">5</span><span class="s1">:-</span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s1">:</span><span class="s5">4</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">])</span>
+
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(</span>
+        <span class="s1">-</span><span class="s5">2</span><span class="s2">, </span><span class="s1">extend_kwargs=extend_kwargs1).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov2[:-</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov2[</span><span class="s5">2</span><span class="s1">:])</span>
+    <span class="s1">assert_allclose(acov2[-</span><span class="s5">2</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">oos_cov[-</span><span class="s5">4</span><span class="s1">:-</span><span class="s5">2</span><span class="s2">, </span><span class="s5">4</span><span class="s1">:</span><span class="s5">6</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">])</span>
+
+    <span class="s1">acov3 = res.smoothed_state_autocovariance(</span>
+        <span class="s1">-</span><span class="s5">3</span><span class="s2">, </span><span class="s1">extend_kwargs=extend_kwargs2).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov3[:-</span><span class="s5">3</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov3[</span><span class="s5">3</span><span class="s1">:])</span>
+    <span class="s1">assert_allclose(acov3[-</span><span class="s5">3</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">oos_cov[-</span><span class="s5">4</span><span class="s1">:-</span><span class="s5">1</span><span class="s2">, </span><span class="s5">6</span><span class="s1">:</span><span class="s5">8</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">])</span>
+
+    <span class="s3"># Test for specific autocovariances</span>
+    <span class="s1">acov1 = res.smoothed_state_autocovariance(</span>
+        <span class="s1">-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">t=mod.nobs</span><span class="s2">, </span><span class="s1">extend_kwargs=extend_kwargs1)</span>
+    <span class="s1">assert_allclose(acov1[:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">oos_cov[-</span><span class="s5">3</span><span class="s2">, </span><span class="s5">2</span><span class="s1">:</span><span class="s5">4</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">])</span>
+    <span class="s1">acov1 = res.smoothed_state_autocovariance(-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">t=</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov1[:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov1[</span><span class="s5">0 </span><span class="s1">+ </span><span class="s5">1</span><span class="s1">])</span>
+    <span class="s1">acov1 = res.smoothed_state_autocovariance(</span>
+        <span class="s1">-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">start=</span><span class="s5">8</span><span class="s2">, </span><span class="s1">end=</span><span class="s5">9</span><span class="s1">).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov1[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov1[</span><span class="s5">8 </span><span class="s1">+ </span><span class="s5">1</span><span class="s1">:</span><span class="s5">9 </span><span class="s1">+ </span><span class="s5">1</span><span class="s1">])</span>
+
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(</span>
+        <span class="s1">-</span><span class="s5">2</span><span class="s2">, </span><span class="s1">t=mod.nobs</span><span class="s2">, </span><span class="s1">extend_kwargs=extend_kwargs2)</span>
+    <span class="s1">assert_allclose(acov2[:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">oos_cov[-</span><span class="s5">2</span><span class="s2">, </span><span class="s5">4</span><span class="s1">:</span><span class="s5">6</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">])</span>
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(</span>
+        <span class="s1">-</span><span class="s5">2</span><span class="s2">, </span><span class="s1">t=mod.nobs - </span><span class="s5">1</span><span class="s2">, </span><span class="s1">extend_kwargs=extend_kwargs1)</span>
+    <span class="s1">assert_allclose(acov2[:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">oos_cov[-</span><span class="s5">3</span><span class="s2">, </span><span class="s5">4</span><span class="s1">:</span><span class="s5">6</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">])</span>
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(-</span><span class="s5">2</span><span class="s2">, </span><span class="s1">t=</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov2[:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov2[</span><span class="s5">0 </span><span class="s1">+ </span><span class="s5">2</span><span class="s1">])</span>
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(</span>
+        <span class="s1">-</span><span class="s5">2</span><span class="s2">, </span><span class="s1">start=</span><span class="s5">8</span><span class="s2">, </span><span class="s1">end=</span><span class="s5">9</span><span class="s1">).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov2[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov2[</span><span class="s5">8 </span><span class="s1">+ </span><span class="s5">2</span><span class="s1">:</span><span class="s5">9 </span><span class="s1">+ </span><span class="s5">2</span><span class="s1">])</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'missing'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'all'</span><span class="s2">, </span><span class="s4">'partial'</span><span class="s2">, </span><span class="s4">'mixed'</span><span class="s2">, None</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'filter_univariate'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'tvp'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_smoothed_state_autocovariances_forwards_oos(missing</span><span class="s2">,</span>
+                                                     <span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp):</span>
+    <span class="s3"># Out-of-sample model</span>
+    <span class="s3"># Note: in TVP case, we need to first generate the larger model, and then</span>
+    <span class="s3"># create the smaller model with the system matrices from the larger model</span>
+    <span class="s3"># (otherwise they will be different, since the matrices are randomly</span>
+    <span class="s3"># generated)</span>
+    <span class="s1">mod_oos</span><span class="s2">, </span><span class="s1">res_oos = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp</span><span class="s2">, </span><span class="s1">oos=</span><span class="s5">5</span><span class="s1">)</span>
+
+    <span class="s3"># Basic model</span>
+    <span class="s1">names = [</span><span class="s4">'obs_intercept'</span><span class="s2">, </span><span class="s4">'design'</span><span class="s2">, </span><span class="s4">'obs_cov'</span><span class="s2">, </span><span class="s4">'transition'</span><span class="s2">, </span><span class="s4">'selection'</span><span class="s2">,</span>
+             <span class="s4">'state_cov'</span><span class="s1">]</span>
+    <span class="s2">if not </span><span class="s1">tvp:</span>
+        <span class="s1">mod</span><span class="s2">, </span><span class="s1">res = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp</span><span class="s2">,</span>
+                                  <span class="s1">params=mod_oos.start_params)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">mod</span><span class="s2">, </span><span class="s1">_ = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp)</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">names:</span>
+            <span class="s1">mod[name] = mod_oos[name</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">:-</span><span class="s5">5</span><span class="s1">]</span>
+        <span class="s1">res = mod.ssm.smooth()</span>
+
+    <span class="s1">assert_allclose(res_oos.llf</span><span class="s2">, </span><span class="s1">res.llf)</span>
+
+    <span class="s1">cov = np.concatenate(</span>
+        <span class="s1">(res_oos.smoothed_state_cov</span><span class="s2">, </span><span class="s1">res_oos.predicted_state_cov[...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">:])</span><span class="s2">,</span>
+        <span class="s1">axis=</span><span class="s5">2</span><span class="s1">).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">desired_acov1 = cov[:</span><span class="s2">, </span><span class="s5">2</span><span class="s1">:</span><span class="s5">4</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span>
+    <span class="s1">desired_acov2 = cov[:</span><span class="s2">, </span><span class="s5">4</span><span class="s1">:</span><span class="s5">6</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span>
+    <span class="s1">desired_acov3 = cov[:</span><span class="s2">, </span><span class="s5">6</span><span class="s1">:</span><span class="s5">8</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span>
+
+    <span class="s3"># Test all &quot;forwards&quot; autocovariances: Cov(t, t+lag)</span>
+    <span class="s1">extend_kwargs = {}</span>
+    <span class="s2">if </span><span class="s1">tvp:</span>
+        <span class="s1">extend_kwargs = {</span>
+            <span class="s4">'obs_intercept'</span><span class="s1">: mod_oos[</span><span class="s4">'obs_intercept'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s4">'design'</span><span class="s1">: mod_oos[</span><span class="s4">'design'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s4">'obs_cov'</span><span class="s1">: mod_oos[</span><span class="s4">'obs_cov'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s4">'transition'</span><span class="s1">: mod_oos[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s4">'selection'</span><span class="s1">: mod_oos[</span><span class="s4">'selection'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s4">'state_cov'</span><span class="s1">: mod_oos[</span><span class="s4">'state_cov'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]}</span>
+
+    <span class="s3"># Note: we can compute up to Cov(mod_oos.nobs, mod_oos.nobs + 1) using</span>
+    <span class="s3"># a model that has state space matrices defined up to mod_oos.nobs. Since</span>
+    <span class="s3"># mod_oos.nobs = mod.nobs + 5, we need to pass in 5 additional time points,</span>
+    <span class="s3"># and that is what extend_kwargs, above, does.</span>
+    <span class="s1">acov1 = res.smoothed_state_autocovariance(</span>
+        <span class="s1">-</span><span class="s5">1</span><span class="s2">, </span><span class="s1">end=mod_oos.nobs</span><span class="s2">, </span><span class="s1">extend_kwargs=extend_kwargs).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_equal(acov1.shape</span><span class="s2">, </span><span class="s1">(mod_oos.nobs</span><span class="s2">, </span><span class="s1">mod.k_states</span><span class="s2">, </span><span class="s1">mod.k_states))</span>
+    <span class="s1">assert_allclose(acov1[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov1[</span><span class="s5">1</span><span class="s1">:])</span>
+
+    <span class="s3"># Note: now we can compute up to Cov(mod_oos.nobs - 1, mod_oos.nobs + 1)</span>
+    <span class="s3"># using a model that has state space matrices defined up to mod_oos.nobs.</span>
+    <span class="s3"># We still need to pass in 5 additional time points for the extend kwargs.</span>
+    <span class="s3"># This is why we have end = mod_oos.nobs - 1, because this function returns</span>
+    <span class="s3"># values through Cov(end, end + 2). Because start=0 (the default), we</span>
+    <span class="s3"># will have values for Cov(0, 2), Cov(1, 3), ...,</span>
+    <span class="s3"># Cov(mod_oos.nobs - 1, mod_oos.nobs + 1), and that is a set of</span>
+    <span class="s3"># mod_oos.nobs - 1 matrices.</span>
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(</span>
+        <span class="s1">-</span><span class="s5">2</span><span class="s2">, </span><span class="s1">end=mod_oos.nobs - </span><span class="s5">1</span><span class="s2">,</span>
+        <span class="s1">extend_kwargs=extend_kwargs).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_equal(acov2.shape</span><span class="s2">, </span><span class="s1">(mod_oos.nobs - </span><span class="s5">1</span><span class="s2">, </span><span class="s1">mod.k_states</span><span class="s2">, </span><span class="s1">mod.k_states))</span>
+    <span class="s1">assert_allclose(acov2[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov2[</span><span class="s5">2</span><span class="s1">:])</span>
+
+    <span class="s3"># Note: now we can compute up to Cov(mod_oos.nobs - 2, mod_oos.nobs + 1)</span>
+    <span class="s3"># using a model that has state space matrices defined up to mod_oos.nobs.</span>
+    <span class="s3"># We still need to pass in 5 additional time points for the extend kwargs.</span>
+    <span class="s1">acov3 = res.smoothed_state_autocovariance(</span>
+        <span class="s1">-</span><span class="s5">3</span><span class="s2">, </span><span class="s1">end=mod_oos.nobs - </span><span class="s5">2</span><span class="s2">,</span>
+        <span class="s1">extend_kwargs=extend_kwargs).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_equal(acov3.shape</span><span class="s2">, </span><span class="s1">(mod_oos.nobs - </span><span class="s5">2</span><span class="s2">, </span><span class="s1">mod.k_states</span><span class="s2">, </span><span class="s1">mod.k_states))</span>
+    <span class="s1">assert_allclose(acov3[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov3[</span><span class="s5">3</span><span class="s1">:])</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'missing'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'all'</span><span class="s2">, </span><span class="s4">'partial'</span><span class="s2">, </span><span class="s4">'mixed'</span><span class="s2">, None</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'filter_univariate'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'tvp'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_smoothed_state_autocovariances_backwards_oos(missing</span><span class="s2">,</span>
+                                                      <span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp):</span>
+    <span class="s3"># Out-of-sample model</span>
+    <span class="s3"># Note: in TVP case, we need to first generate the larger model, and then</span>
+    <span class="s3"># create the smaller model with the system matrices from the larger model</span>
+    <span class="s3"># (otherwise they will be different, since the matrices are randomly</span>
+    <span class="s3"># generated)</span>
+    <span class="s1">mod_oos</span><span class="s2">, </span><span class="s1">res_oos = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp</span><span class="s2">, </span><span class="s1">oos=</span><span class="s5">5</span><span class="s1">)</span>
+
+    <span class="s3"># Basic model</span>
+    <span class="s1">names = [</span><span class="s4">'obs_intercept'</span><span class="s2">, </span><span class="s4">'design'</span><span class="s2">, </span><span class="s4">'obs_cov'</span><span class="s2">, </span><span class="s4">'transition'</span><span class="s2">, </span><span class="s4">'selection'</span><span class="s2">,</span>
+             <span class="s4">'state_cov'</span><span class="s1">]</span>
+    <span class="s2">if not </span><span class="s1">tvp:</span>
+        <span class="s1">mod</span><span class="s2">, </span><span class="s1">res = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp</span><span class="s2">,</span>
+                                  <span class="s1">params=mod_oos.start_params)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">mod</span><span class="s2">, </span><span class="s1">_ = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp)</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">names:</span>
+            <span class="s1">mod[name] = mod_oos[name</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">:-</span><span class="s5">5</span><span class="s1">]</span>
+        <span class="s1">res = mod.ssm.smooth()</span>
+
+    <span class="s1">assert_allclose(res_oos.llf</span><span class="s2">, </span><span class="s1">res.llf)</span>
+
+    <span class="s1">cov = np.concatenate(</span>
+        <span class="s1">(res_oos.smoothed_state_cov</span><span class="s2">, </span><span class="s1">res_oos.predicted_state_cov[...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">:])</span><span class="s2">,</span>
+        <span class="s1">axis=</span><span class="s5">2</span><span class="s1">).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">desired_acov1 = cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s5">2</span><span class="s1">:</span><span class="s5">4</span><span class="s1">]</span>
+    <span class="s1">desired_acov2 = cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s5">4</span><span class="s1">:</span><span class="s5">6</span><span class="s1">]</span>
+    <span class="s1">desired_acov3 = cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s5">6</span><span class="s1">:</span><span class="s5">8</span><span class="s1">]</span>
+
+    <span class="s3"># Test all &quot;backwards&quot; autocovariances: Cov(t, t - lag)</span>
+    <span class="s1">end = mod_oos.nobs + </span><span class="s5">1</span>
+    <span class="s1">extend_kwargs = {}</span>
+    <span class="s2">if </span><span class="s1">tvp:</span>
+        <span class="s1">extend_kwargs = {</span>
+            <span class="s4">'obs_intercept'</span><span class="s1">: mod_oos[</span><span class="s4">'obs_intercept'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s4">'design'</span><span class="s1">: mod_oos[</span><span class="s4">'design'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s4">'obs_cov'</span><span class="s1">: mod_oos[</span><span class="s4">'obs_cov'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s4">'transition'</span><span class="s1">: mod_oos[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s4">'selection'</span><span class="s1">: mod_oos[</span><span class="s4">'selection'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]</span><span class="s2">,</span>
+            <span class="s4">'state_cov'</span><span class="s1">: mod_oos[</span><span class="s4">'state_cov'</span><span class="s2">, </span><span class="s1">...</span><span class="s2">, </span><span class="s1">-</span><span class="s5">5</span><span class="s1">:]}</span>
+
+    <span class="s3"># Note: we can compute up to Cov(mod_oos.nobs + 1, mod_oos.nobs) using</span>
+    <span class="s3"># a model that has state space matrices defined up to mod_oos.nobs. Since</span>
+    <span class="s3"># mod_oos.nobs = mod.nobs + 5, we need to pass in 5 additional time points,</span>
+    <span class="s3"># and that is what extend_kwargs, above, does.</span>
+    <span class="s1">acov1 = res.smoothed_state_autocovariance(</span>
+        <span class="s5">1</span><span class="s2">, </span><span class="s1">end=end</span><span class="s2">, </span><span class="s1">extend_kwargs=extend_kwargs).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_equal(acov1.shape</span><span class="s2">, </span><span class="s1">(mod_oos.nobs + </span><span class="s5">1</span><span class="s2">, </span><span class="s1">mod.k_states</span><span class="s2">, </span><span class="s1">mod.k_states))</span>
+    <span class="s1">assert_allclose(acov1[</span><span class="s5">1</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov1[</span><span class="s5">1</span><span class="s1">:])</span>
+    <span class="s3"># We cannot compute Cov(1, 0), so this is always NaNs</span>
+    <span class="s1">assert_equal(acov1[:</span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.nan)</span>
+
+    <span class="s3"># Note: we can compute up to Cov(mod_oos.nobs + 1, mod_oos.nobs - 1) using</span>
+    <span class="s3"># a model that has state space matrices defined up to mod_oos.nobs, which</span>
+    <span class="s3"># is why we don't need to change `end` here relative to the lag=1 case</span>
+    <span class="s1">acov2 = res.smoothed_state_autocovariance(</span>
+        <span class="s5">2</span><span class="s2">, </span><span class="s1">end=end</span><span class="s2">, </span><span class="s1">extend_kwargs=extend_kwargs).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov2[</span><span class="s5">2</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov2[</span><span class="s5">2</span><span class="s1">:])</span>
+    <span class="s3"># We cannot compute Cov(1, -1) or Cov(2, 0), so this is always NaNs</span>
+    <span class="s1">assert_equal(acov2[:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.nan)</span>
+
+    <span class="s3"># Note: we can compute up to Cov(mod_oos.nobs + 1, mod_oos.nobs - 2) using</span>
+    <span class="s3"># a model that has state space matrices defined up to mod_oos.nobs, which</span>
+    <span class="s3"># is why we don't need to change `end` here relative to the lag=1 or lag=2</span>
+    <span class="s3"># cases</span>
+    <span class="s1">acov3 = res.smoothed_state_autocovariance(</span>
+        <span class="s5">3</span><span class="s2">, </span><span class="s1">end=end</span><span class="s2">, </span><span class="s1">extend_kwargs=extend_kwargs).transpose(</span><span class="s5">2</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(acov3[</span><span class="s5">3</span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s2">, </span><span class="s1">:</span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">desired_acov3[</span><span class="s5">3</span><span class="s1">:])</span>
+    <span class="s3"># We cannot compute Cov(1, -2), Cov(2, -1), or Cov(3, 0), so this is always</span>
+    <span class="s3"># NaNs</span>
+    <span class="s1">assert_equal(acov3[:</span><span class="s5">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.nan)</span>
+
+
+<span class="s2">def </span><span class="s1">test_smoothed_state_autocovariances_invalid():</span>
+    <span class="s3"># Tests for invalid calls of `smoothed_state_autocovariance`</span>
+    <span class="s1">_</span><span class="s2">, </span><span class="s1">res = get_acov_model(missing=</span><span class="s2">False, </span><span class="s1">filter_univariate=</span><span class="s2">False, </span><span class="s1">tvp=</span><span class="s2">False</span><span class="s1">)</span>
+
+    <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=</span><span class="s4">'Cannot specify both `t`'</span><span class="s1">):</span>
+        <span class="s1">res.smoothed_state_autocovariance(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">t=</span><span class="s5">1</span><span class="s2">, </span><span class="s1">start=</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=</span><span class="s4">'Negative `t`'</span><span class="s1">):</span>
+        <span class="s1">res.smoothed_state_autocovariance(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">t=-</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=</span><span class="s4">'Negative `t`'</span><span class="s1">):</span>
+        <span class="s1">res.smoothed_state_autocovariance(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">start=-</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=</span><span class="s4">'Negative `t`'</span><span class="s1">):</span>
+        <span class="s1">res.smoothed_state_autocovariance(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">end=-</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=</span><span class="s4">'`end` must be after `start`'</span><span class="s1">):</span>
+        <span class="s1">res.smoothed_state_autocovariance(</span><span class="s5">1</span><span class="s2">, </span><span class="s1">start=</span><span class="s5">5</span><span class="s2">, </span><span class="s1">end=</span><span class="s5">4</span><span class="s1">)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'missing'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'all'</span><span class="s2">, </span><span class="s4">'partial'</span><span class="s2">, </span><span class="s4">'mixed'</span><span class="s2">, None</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'filter_univariate'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'tvp'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_news_basic(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp):</span>
+    <span class="s3"># Basic tests for news</span>
+
+    <span class="s3"># Get the basic model</span>
+    <span class="s1">mod</span><span class="s2">, </span><span class="s1">res = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp)</span>
+    <span class="s1">params = [] </span><span class="s2">if </span><span class="s1">tvp </span><span class="s2">else </span><span class="s1">mod.start_params</span>
+
+    <span class="s3"># Get an expanded model with one new observation and 9 additional NaN</span>
+    <span class="s3"># datapoints (so that we can compute the desired value using the</span>
+    <span class="s3"># `smoothed_forecasts` attribute).</span>
+    <span class="s1">append = np.zeros((</span><span class="s5">10</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)) * np.nan</span>
+    <span class="s1">append[</span><span class="s5">0</span><span class="s1">] = [</span><span class="s5">0.1</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.2</span><span class="s1">]</span>
+    <span class="s1">endog2 = np.concatenate((mod.endog</span><span class="s2">, </span><span class="s1">append)</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">mod2 = mod.clone(endog2)</span>
+    <span class="s1">res2 = mod2.smooth(params</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s3"># Get an expanded model with only 10 additional NaN datapoints, to compute</span>
+    <span class="s3"># the baseline `smoothed_forecasts`.</span>
+    <span class="s1">endog3 = endog2.copy()</span>
+    <span class="s1">endog3[-</span><span class="s5">10</span><span class="s1">:] = np.nan</span>
+    <span class="s1">mod3 = mod2.clone(endog3)</span>
+    <span class="s1">res3 = mod3.smooth(params</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s3"># Test the news computation at the start, middle, and end of the sample, as</span>
+    <span class="s3"># well as out-of-sample.</span>
+    <span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">150</span><span class="s2">, </span><span class="s1">mod.nobs - </span><span class="s5">1</span><span class="s2">, </span><span class="s1">mod.nobs</span><span class="s2">, </span><span class="s1">mod.nobs + </span><span class="s5">1</span><span class="s2">, </span><span class="s1">mod.nobs + </span><span class="s5">9</span><span class="s1">]:</span>
+        <span class="s3"># Test with a time argument</span>
+        <span class="s1">out = res2.news(res</span><span class="s2">, </span><span class="s1">t=t)</span>
+        <span class="s1">desired = (res2.smoothed_forecasts[...</span><span class="s2">, </span><span class="s1">t] -</span>
+                   <span class="s1">res3.smoothed_forecasts[...</span><span class="s2">, </span><span class="s1">t])</span>
+        <span class="s3"># The &quot;news&quot; about the t=0 smoothed forecast from new data at</span>
+        <span class="s3"># observation t=202 is almost identically zero, so we need to set an</span>
+        <span class="s3"># &quot;atol&quot; to avoid problems with comparing floating point versions of</span>
+        <span class="s3"># zero.</span>
+        <span class="s1">assert_allclose(out.update_impacts</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-14</span><span class="s1">)</span>
+        <span class="s1">assert_equal(out.revision_impacts</span><span class="s2">, None</span><span class="s1">)</span>
+
+        <span class="s3"># Test with start/end arguments</span>
+        <span class="s1">out = res2.news(res</span><span class="s2">, </span><span class="s1">start=t</span><span class="s2">, </span><span class="s1">end=t + </span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">assert_allclose(out.update_impacts</span><span class="s2">, </span><span class="s1">desired[</span><span class="s2">None, </span><span class="s1">...]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-14</span><span class="s1">)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'missing'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'all'</span><span class="s2">, </span><span class="s4">'partial'</span><span class="s2">, </span><span class="s4">'mixed'</span><span class="s2">, None</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'filter_univariate'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'tvp'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_news_revisions(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp):</span>
+    <span class="s3"># Tests for news when there are revisions in the model</span>
+
+    <span class="s3"># Get the basic model</span>
+    <span class="s1">mod</span><span class="s2">, </span><span class="s1">res = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp</span><span class="s2">, </span><span class="s1">oos=</span><span class="s5">10</span><span class="s1">)</span>
+    <span class="s1">params = [] </span><span class="s2">if </span><span class="s1">tvp </span><span class="s2">else </span><span class="s1">mod.start_params</span>
+
+    <span class="s1">endog2 = mod.endog.copy()</span>
+    <span class="s3"># Revise the last datapoint</span>
+    <span class="s1">endog2[-</span><span class="s5">11</span><span class="s1">] = [</span><span class="s5">0.0</span><span class="s2">, </span><span class="s5">0.0</span><span class="s1">]</span>
+    <span class="s3"># Add a new datapoint</span>
+    <span class="s1">endog2[-</span><span class="s5">10</span><span class="s1">] = [-</span><span class="s5">0.3</span><span class="s2">, </span><span class="s1">-</span><span class="s5">0.4</span><span class="s1">]</span>
+    <span class="s1">mod2 = mod.clone(endog2)</span>
+    <span class="s1">res2 = mod2.smooth(params</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s3"># Test the news computation at the start, middle, and end of the sample, as</span>
+    <span class="s3"># well as out-of-sample.</span>
+    <span class="s1">nobs = mod.nobs - </span><span class="s5">10</span>
+    <span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">150</span><span class="s2">, </span><span class="s1">nobs - </span><span class="s5">1</span><span class="s2">, </span><span class="s1">nobs</span><span class="s2">, </span><span class="s1">nobs + </span><span class="s5">1</span><span class="s2">, </span><span class="s1">nobs + </span><span class="s5">9</span><span class="s1">]:</span>
+        <span class="s1">out = res2.news(res</span><span class="s2">, </span><span class="s1">t=t)</span>
+
+        <span class="s3"># Test for the news</span>
+        <span class="s1">desired = (res2.smoothed_forecasts[...</span><span class="s2">, </span><span class="s1">t] -</span>
+                   <span class="s1">out.revision_results.smoothed_forecasts[...</span><span class="s2">, </span><span class="s1">t])</span>
+        <span class="s3"># Relaxed tolerance to 1e-10 after random failures</span>
+        <span class="s1">assert_allclose(out.update_impacts</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-10</span><span class="s1">)</span>
+
+        <span class="s3"># Test for the revisions</span>
+        <span class="s1">desired = (out.revision_results.smoothed_forecasts[...</span><span class="s2">, </span><span class="s1">t] -</span>
+                   <span class="s1">res.smoothed_forecasts[...</span><span class="s2">, </span><span class="s1">t])</span>
+        <span class="s3"># Relaxed tolerance to 1e-10 after random failures</span>
+        <span class="s1">assert_allclose(out.revision_impacts</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-10</span><span class="s1">)</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'missing'</span><span class="s2">, </span><span class="s1">[</span><span class="s4">'all'</span><span class="s2">, </span><span class="s4">'partial'</span><span class="s2">, </span><span class="s4">'mixed'</span><span class="s2">, None</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'filter_univariate'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s1">@pytest.mark.parametrize(</span><span class="s4">'tvp'</span><span class="s2">, </span><span class="s1">[</span><span class="s2">True, False</span><span class="s1">])</span>
+<span class="s2">def </span><span class="s1">test_news_invalid(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp):</span>
+    <span class="s3"># Tests for invalid calls to news</span>
+
+    <span class="s3"># (generic error message used below)</span>
+    <span class="s1">error_ss = (</span><span class="s4">'This results object has %s and so it does not appear to'</span>
+                <span class="s4">' by an extension of `previous`. Can only compute the'</span>
+                <span class="s4">' news by comparing this results set to previous results'</span>
+                <span class="s4">' objects.'</span><span class="s1">)</span>
+
+    <span class="s3"># Basic model / results setup</span>
+    <span class="s1">mod</span><span class="s2">, </span><span class="s1">res = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp</span><span class="s2">, </span><span class="s1">oos=</span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">params = [] </span><span class="s2">if </span><span class="s1">tvp </span><span class="s2">else </span><span class="s1">mod.start_params</span>
+
+    <span class="s1">endog2 = mod.endog.copy()</span>
+    <span class="s1">endog2[-</span><span class="s5">1</span><span class="s1">] = [</span><span class="s5">0.2</span><span class="s2">, </span><span class="s5">0.5</span><span class="s1">]</span>
+    <span class="s1">mod2 = mod.clone(endog2)</span>
+    <span class="s1">res2_filtered = mod2.filter(params</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s1">res2_smoothed = mod2.smooth(params</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s3"># Test that news works with smoothing, but not with only filtering</span>
+    <span class="s1">res2_smoothed.news(res</span><span class="s2">, </span><span class="s1">t=mod.nobs - </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">msg = (</span><span class="s4">'Cannot compute news without having'</span>
+           <span class="s4">' applied the Kalman smoother first.'</span><span class="s1">)</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=msg):</span>
+        <span class="s1">res2_filtered.news(res</span><span class="s2">, </span><span class="s1">t=mod.nobs - </span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s3"># Test that if we want to request news for an out-of-sample period in a</span>
+    <span class="s3"># time-varying model, then we need to provide a new design matrix</span>
+    <span class="s2">if </span><span class="s1">tvp:</span>
+        <span class="s1">msg = (</span><span class="s4">'Cannot compute the impacts of news on periods outside of the'</span>
+               <span class="s4">' sample in time-varying models.'</span><span class="s1">)</span>
+        <span class="s2">with </span><span class="s1">pytest.raises(RuntimeError</span><span class="s2">, </span><span class="s1">match=msg):</span>
+            <span class="s1">res2_smoothed.news(res</span><span class="s2">, </span><span class="s1">t=mod.nobs + </span><span class="s5">2</span><span class="s1">)</span>
+
+    <span class="s3"># Test that news won't work when the calling model is is smaller</span>
+    <span class="s1">mod</span><span class="s2">, </span><span class="s1">res = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, </span><span class="s1">tvp)</span>
+    <span class="s1">params = [] </span><span class="s2">if </span><span class="s1">tvp </span><span class="s2">else </span><span class="s1">mod.start_params</span>
+
+    <span class="s1">endog2 = mod.endog.copy()[:mod.nobs - </span><span class="s5">1</span><span class="s1">]</span>
+    <span class="s1">mod2 = mod.clone(endog2)</span>
+    <span class="s1">res2 = mod2.smooth(params</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s1">msg = error_ss % </span><span class="s4">'fewer observations than `previous`'</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=msg):</span>
+        <span class="s1">res2.news(res</span><span class="s2">, </span><span class="s1">t=mod.nobs - </span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s3"># Test that news won't work when the state dimensions are different</span>
+    <span class="s1">mod2 = sarimax.SARIMAX(np.zeros(mod.nobs))</span>
+    <span class="s1">res2 = mod2.smooth([</span><span class="s5">0.5</span><span class="s2">, </span><span class="s5">1.</span><span class="s1">]</span><span class="s2">, </span><span class="s1">return_ssm=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s1">msg = error_ss % </span><span class="s4">'different state space dimensions than `previous`'</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=msg):</span>
+        <span class="s1">res2.news(res</span><span class="s2">, </span><span class="s1">t=mod.nobs - </span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s3"># Test that news won't work when one of the models is time-varying and one</span>
+    <span class="s3"># is time-invariant</span>
+    <span class="s1">mod2</span><span class="s2">, </span><span class="s1">res2 = get_acov_model(missing</span><span class="s2">, </span><span class="s1">filter_univariate</span><span class="s2">, not </span><span class="s1">tvp</span><span class="s2">, </span><span class="s1">oos=</span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s2">if </span><span class="s1">tvp:</span>
+        <span class="s1">msg = </span><span class="s4">'time-invariant design while `previous` does not'</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">msg = </span><span class="s4">'time-varying design while `previous` does not'</span>
+    <span class="s2">with </span><span class="s1">pytest.raises(ValueError</span><span class="s2">, </span><span class="s1">match=msg):</span>
+        <span class="s1">res2.news(res</span><span class="s2">, </span><span class="s1">t=mod.nobs - </span><span class="s5">1</span><span class="s1">)</span>
+</pre>
+</body>
+</html>

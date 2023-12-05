@@ -1,0 +1,1017 @@
+<html>
+<head>
+<title>highlevelgraph.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+highlevelgraph.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">abc</span>
+<span class="s0">import </span><span class="s1">copy</span>
+<span class="s0">import </span><span class="s1">html</span>
+<span class="s0">from </span><span class="s1">collections.abc </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">Collection</span><span class="s0">,</span>
+    <span class="s1">Hashable</span><span class="s0">,</span>
+    <span class="s1">ItemsView</span><span class="s0">,</span>
+    <span class="s1">Iterable</span><span class="s0">,</span>
+    <span class="s1">Iterator</span><span class="s0">,</span>
+    <span class="s1">KeysView</span><span class="s0">,</span>
+    <span class="s1">Mapping</span><span class="s0">,</span>
+    <span class="s1">Sequence</span><span class="s0">,</span>
+    <span class="s1">Set</span><span class="s0">,</span>
+    <span class="s1">ValuesView</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">Any</span>
+
+<span class="s0">import </span><span class="s1">tlz </span><span class="s0">as </span><span class="s1">toolz</span>
+
+<span class="s0">import </span><span class="s1">dask</span>
+<span class="s0">from </span><span class="s1">dask </span><span class="s0">import </span><span class="s1">config</span>
+<span class="s0">from </span><span class="s1">dask.base </span><span class="s0">import </span><span class="s1">clone_key</span><span class="s0">, </span><span class="s1">flatten</span><span class="s0">, </span><span class="s1">is_dask_collection</span>
+<span class="s0">from </span><span class="s1">dask.core </span><span class="s0">import </span><span class="s1">keys_in_tasks</span><span class="s0">, </span><span class="s1">reverse_dict</span>
+<span class="s0">from </span><span class="s1">dask.typing </span><span class="s0">import </span><span class="s1">DaskCollection</span><span class="s0">, </span><span class="s1">Graph</span><span class="s0">, </span><span class="s1">Key</span>
+<span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">ensure_dict</span><span class="s0">, </span><span class="s1">import_required</span><span class="s0">, </span><span class="s1">key_split</span>
+<span class="s0">from </span><span class="s1">dask.widgets </span><span class="s0">import </span><span class="s1">get_template</span>
+
+
+<span class="s0">def </span><span class="s1">compute_layer_dependencies(layers):</span>
+    <span class="s2">&quot;&quot;&quot;Returns the dependencies between layers&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">_find_layer_containing_key(key):</span>
+        <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">layers.items():</span>
+            <span class="s0">if </span><span class="s1">key </span><span class="s0">in </span><span class="s1">v:</span>
+                <span class="s0">return </span><span class="s1">k</span>
+        <span class="s0">raise </span><span class="s1">RuntimeError(</span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">repr(key)</span><span class="s0">} </span><span class="s3">not found&quot;</span><span class="s1">)</span>
+
+    <span class="s1">all_keys = {key </span><span class="s0">for </span><span class="s1">layer </span><span class="s0">in </span><span class="s1">layers.values() </span><span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">layer}</span>
+    <span class="s1">ret = {k: set() </span><span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">layers}</span>
+    <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">layers.items():</span>
+        <span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">keys_in_tasks(all_keys - v.keys()</span><span class="s0">, </span><span class="s1">v.values()):</span>
+            <span class="s1">ret[k].add(_find_layer_containing_key(key))</span>
+    <span class="s0">return </span><span class="s1">ret</span>
+
+
+<span class="s0">class </span><span class="s1">Layer(Graph):</span>
+    <span class="s2">&quot;&quot;&quot;High level graph layer 
+ 
+    This abstract class establish a protocol for high level graph layers. 
+ 
+    The main motivation of a layer is to represent a collection of tasks 
+    symbolically in order to speedup a series of operations significantly. 
+    Ideally, a layer should stay in this symbolic state until execution 
+    but in practice some operations will force the layer to generate all 
+    its internal tasks. We say that the layer has been materialized. 
+ 
+    Most of the default implementations in this class will materialize the 
+    layer. It is up to derived classes to implement non-materializing 
+    implementations. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">annotations: Mapping[str</span><span class="s0">, </span><span class="s1">Any] | </span><span class="s0">None</span>
+    <span class="s1">collection_annotations: Mapping[str</span><span class="s0">, </span><span class="s1">Any] | </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">annotations: Mapping[str</span><span class="s0">, </span><span class="s1">Any] | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+        <span class="s1">collection_annotations: Mapping[str</span><span class="s0">, </span><span class="s1">Any] | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Initialize Layer object. 
+ 
+        Parameters 
+        ---------- 
+        annotations : Mapping[str, Any], optional 
+            By default, None. 
+            Annotations are metadata or soft constraints associated with tasks 
+            that dask schedulers may choose to respect: 
+            They signal intent without enforcing hard constraints. 
+            As such, they are primarily designed for use with the distributed 
+            scheduler. See the dask.annotate function for more information. 
+        collection_annotations : Mapping[str, Any], optional. By default, None. 
+            Experimental, intended to assist with visualizing the performance 
+            characteristics of Dask computations. 
+            These annotations are *not* passed to the distributed scheduler. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.annotations = annotations </span><span class="s0">or </span><span class="s1">dask.get_annotations().copy() </span><span class="s0">or None</span>
+        <span class="s1">self.collection_annotations = collection_annotations </span><span class="s0">or </span><span class="s1">copy.copy(</span>
+            <span class="s1">config.get(</span><span class="s3">&quot;collection_annotations&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@abc.abstractmethod</span>
+    <span class="s0">def </span><span class="s1">is_materialized(self) -&gt; bool:</span>
+        <span class="s2">&quot;&quot;&quot;Return whether the layer is materialized or not&quot;&quot;&quot;</span>
+        <span class="s0">return True</span>
+
+    <span class="s1">@abc.abstractmethod</span>
+    <span class="s0">def </span><span class="s1">get_output_keys(self) -&gt; Set[Key]:</span>
+        <span class="s2">&quot;&quot;&quot;Return a set of all output keys 
+ 
+        Output keys are all keys in the layer that might be referenced by 
+        other layers. 
+ 
+        Classes overriding this implementation should not cause the layer 
+        to be materialized. 
+ 
+        Returns 
+        ------- 
+        keys: Set 
+            All output keys 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.keys()  </span><span class="s4"># this implementation will materialize the graph</span>
+
+    <span class="s0">def </span><span class="s1">cull(</span>
+        <span class="s1">self</span><span class="s0">, </span><span class="s1">keys: set[Key]</span><span class="s0">, </span><span class="s1">all_hlg_keys: Collection[Key]</span>
+    <span class="s1">) -&gt; tuple[Layer</span><span class="s0">, </span><span class="s1">Mapping[Key</span><span class="s0">, </span><span class="s1">set[Key]]]:</span>
+        <span class="s2">&quot;&quot;&quot;Remove unnecessary tasks from the layer 
+ 
+        In other words, return a new Layer with only the tasks required to 
+        calculate `keys` and a map of external key dependencies. 
+ 
+        Examples 
+        -------- 
+        &gt;&gt;&gt; inc = lambda x: x + 1 
+        &gt;&gt;&gt; add = lambda x, y: x + y 
+        &gt;&gt;&gt; d = MaterializedLayer({'x': 1, 'y': (inc, 'x'), 'out': (add, 'x', 10)}) 
+        &gt;&gt;&gt; _, deps = d.cull({'out'}, d.keys()) 
+        &gt;&gt;&gt; deps 
+        {'out': {'x'}, 'x': set()} 
+ 
+        Returns 
+        ------- 
+        layer: Layer 
+            Culled layer 
+        deps: Map 
+            Map of external key dependencies 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">if </span><span class="s1">len(keys) == len(self):</span>
+            <span class="s4"># Nothing to cull if preserving all existing keys</span>
+            <span class="s0">return </span><span class="s1">(</span>
+                <span class="s1">self</span><span class="s0">,</span>
+                <span class="s1">{k: self.get_dependencies(k</span><span class="s0">, </span><span class="s1">all_hlg_keys) </span><span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">self.keys()}</span><span class="s0">,</span>
+            <span class="s1">)</span>
+
+        <span class="s1">ret_deps = {}</span>
+        <span class="s1">seen = set()</span>
+        <span class="s1">out = {}</span>
+        <span class="s1">work = keys.copy()</span>
+        <span class="s0">while </span><span class="s1">work:</span>
+            <span class="s1">k = work.pop()</span>
+            <span class="s1">out[k] = self[k]</span>
+            <span class="s1">ret_deps[k] = self.get_dependencies(k</span><span class="s0">, </span><span class="s1">all_hlg_keys)</span>
+            <span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">ret_deps[k]:</span>
+                <span class="s0">if </span><span class="s1">d </span><span class="s0">not in </span><span class="s1">seen:</span>
+                    <span class="s0">if </span><span class="s1">d </span><span class="s0">in </span><span class="s1">self:</span>
+                        <span class="s1">seen.add(d)</span>
+                        <span class="s1">work.add(d)</span>
+
+        <span class="s0">return </span><span class="s1">MaterializedLayer(out</span><span class="s0">, </span><span class="s1">annotations=self.annotations)</span><span class="s0">, </span><span class="s1">ret_deps</span>
+
+    <span class="s0">def </span><span class="s1">get_dependencies(self</span><span class="s0">, </span><span class="s1">key: Key</span><span class="s0">, </span><span class="s1">all_hlg_keys: Collection[Key]) -&gt; set:</span>
+        <span class="s2">&quot;&quot;&quot;Get dependencies of `key` in the layer 
+ 
+        Parameters 
+        ---------- 
+        key: 
+            The key to find dependencies of 
+        all_hlg_keys: 
+            All keys in the high level graph. 
+ 
+        Returns 
+        ------- 
+        deps: set 
+            A set of dependencies 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">keys_in_tasks(all_hlg_keys</span><span class="s0">, </span><span class="s1">[self[key]])</span>
+
+    <span class="s0">def </span><span class="s1">clone(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">keys: set</span><span class="s0">,</span>
+        <span class="s1">seed: Hashable</span><span class="s0">,</span>
+        <span class="s1">bind_to: Key | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">) -&gt; tuple[Layer</span><span class="s0">, </span><span class="s1">bool]:</span>
+        <span class="s2">&quot;&quot;&quot;Clone selected keys in the layer, as well as references to keys in other 
+        layers 
+ 
+        Parameters 
+        ---------- 
+        keys 
+            Keys to be replaced. This never includes keys not listed by 
+            :meth:`get_output_keys`. It must also include any keys that are outside 
+            of this layer that may be referenced by it. 
+        seed 
+            Common hashable used to alter the keys; see :func:`dask.base.clone_key` 
+        bind_to 
+            Optional key to bind the leaf nodes to. A leaf node here is one that does 
+            not reference any replaced keys; in other words it's a node where the 
+            replacement graph traversal stops; it may still have dependencies on 
+            non-replaced nodes. 
+            A bound node will not be computed until after ``bind_to`` has been computed. 
+ 
+        Returns 
+        ------- 
+        - New layer 
+        - True if the ``bind_to`` key was injected anywhere; False otherwise 
+ 
+        Notes 
+        ----- 
+        This method should be overridden by subclasses to avoid materializing the layer. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">dask.graph_manipulation </span><span class="s0">import </span><span class="s1">chunks</span>
+
+        <span class="s1">is_leaf: bool</span>
+
+        <span class="s0">def </span><span class="s1">clone_value(o):</span>
+            <span class="s2">&quot;&quot;&quot;Variant of distributed.utils_comm.subs_multiple, which allows injecting 
+            bind_to 
+            &quot;&quot;&quot;</span>
+            <span class="s0">nonlocal </span><span class="s1">is_leaf</span>
+
+            <span class="s1">typ = type(o)</span>
+            <span class="s0">if </span><span class="s1">typ </span><span class="s0">is </span><span class="s1">tuple </span><span class="s0">and </span><span class="s1">o </span><span class="s0">and </span><span class="s1">callable(o[</span><span class="s5">0</span><span class="s1">]):</span>
+                <span class="s0">return </span><span class="s1">(o[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">,</span><span class="s1">) + tuple(clone_value(i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">o[</span><span class="s5">1</span><span class="s1">:])</span>
+            <span class="s0">elif </span><span class="s1">typ </span><span class="s0">is </span><span class="s1">list:</span>
+                <span class="s0">return </span><span class="s1">[clone_value(i) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">o]</span>
+            <span class="s0">elif </span><span class="s1">typ </span><span class="s0">is </span><span class="s1">dict:</span>
+                <span class="s0">return </span><span class="s1">{k: clone_value(v) </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">o.items()}</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">try</span><span class="s1">:</span>
+                    <span class="s0">if </span><span class="s1">o </span><span class="s0">not in </span><span class="s1">keys:</span>
+                        <span class="s0">return </span><span class="s1">o</span>
+                <span class="s0">except </span><span class="s1">TypeError:</span>
+                    <span class="s0">return </span><span class="s1">o</span>
+                <span class="s1">is_leaf = </span><span class="s0">False</span>
+                <span class="s0">return </span><span class="s1">clone_key(o</span><span class="s0">, </span><span class="s1">seed)</span>
+
+        <span class="s1">dsk_new = {}</span>
+        <span class="s1">bound = </span><span class="s0">False</span>
+
+        <span class="s0">for </span><span class="s1">key</span><span class="s0">, </span><span class="s1">value </span><span class="s0">in </span><span class="s1">self.items():</span>
+            <span class="s0">if </span><span class="s1">key </span><span class="s0">in </span><span class="s1">keys:</span>
+                <span class="s1">key = clone_key(key</span><span class="s0">, </span><span class="s1">seed)</span>
+                <span class="s1">is_leaf = </span><span class="s0">True</span>
+                <span class="s1">value = clone_value(value)</span>
+                <span class="s0">if </span><span class="s1">bind_to </span><span class="s0">is not None and </span><span class="s1">is_leaf:</span>
+                    <span class="s1">value = (chunks.bind</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">bind_to)</span>
+                    <span class="s1">bound = </span><span class="s0">True</span>
+
+            <span class="s1">dsk_new[key] = value</span>
+
+        <span class="s0">return </span><span class="s1">MaterializedLayer(dsk_new)</span><span class="s0">, </span><span class="s1">bound</span>
+
+    <span class="s0">def </span><span class="s1">__copy__(self):</span>
+        <span class="s2">&quot;&quot;&quot;Default shallow copy implementation&quot;&quot;&quot;</span>
+        <span class="s1">obj = type(self).__new__(self.__class__)</span>
+        <span class="s1">obj.__dict__.update(self.__dict__)</span>
+        <span class="s0">return </span><span class="s1">obj</span>
+
+    <span class="s0">def </span><span class="s1">_repr_html_(self</span><span class="s0">, </span><span class="s1">layer_index=</span><span class="s3">&quot;&quot;</span><span class="s0">, </span><span class="s1">highlevelgraph_key=</span><span class="s3">&quot;&quot;</span><span class="s0">, </span><span class="s1">dependencies=()):</span>
+        <span class="s0">if </span><span class="s1">highlevelgraph_key != </span><span class="s3">&quot;&quot;</span><span class="s1">:</span>
+            <span class="s1">shortname = key_split(highlevelgraph_key)</span>
+        <span class="s0">elif </span><span class="s1">hasattr(self</span><span class="s0">, </span><span class="s3">&quot;name&quot;</span><span class="s1">):</span>
+            <span class="s1">shortname = key_split(self.name)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">shortname = self.__class__.__name__</span>
+
+        <span class="s1">svg_repr = </span><span class="s3">&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">self.collection_annotations</span>
+            <span class="s0">and </span><span class="s1">self.collection_annotations.get(</span><span class="s3">&quot;type&quot;</span><span class="s1">) == </span><span class="s3">&quot;dask.array.core.Array&quot;</span>
+        <span class="s1">):</span>
+            <span class="s1">chunks = self.collection_annotations.get(</span><span class="s3">&quot;chunks&quot;</span><span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">chunks:</span>
+                <span class="s0">from </span><span class="s1">dask.array.svg </span><span class="s0">import </span><span class="s1">svg</span>
+
+                <span class="s1">svg_repr = svg(chunks)</span>
+
+        <span class="s0">return </span><span class="s1">get_template(</span><span class="s3">&quot;highlevelgraph_layer.html.j2&quot;</span><span class="s1">).render(</span>
+            <span class="s1">materialized=self.is_materialized()</span><span class="s0">,</span>
+            <span class="s1">shortname=shortname</span><span class="s0">,</span>
+            <span class="s1">layer_index=layer_index</span><span class="s0">,</span>
+            <span class="s1">highlevelgraph_key=highlevelgraph_key</span><span class="s0">,</span>
+            <span class="s1">info=self.layer_info_dict()</span><span class="s0">,</span>
+            <span class="s1">dependencies=dependencies</span><span class="s0">,</span>
+            <span class="s1">svg_repr=svg_repr</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">layer_info_dict(self):</span>
+        <span class="s1">info = {</span>
+            <span class="s3">&quot;layer_type&quot;</span><span class="s1">: type(self).__name__</span><span class="s0">,</span>
+            <span class="s3">&quot;is_materialized&quot;</span><span class="s1">: self.is_materialized()</span><span class="s0">,</span>
+            <span class="s3">&quot;number of outputs&quot;</span><span class="s1">: </span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">len(self.get_output_keys())</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s0">,</span>
+        <span class="s1">}</span>
+        <span class="s0">if </span><span class="s1">self.annotations </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">for </span><span class="s1">key</span><span class="s0">, </span><span class="s1">val </span><span class="s0">in </span><span class="s1">self.annotations.items():</span>
+                <span class="s1">info[key] = html.escape(str(val))</span>
+        <span class="s0">if </span><span class="s1">self.collection_annotations </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">for </span><span class="s1">key</span><span class="s0">, </span><span class="s1">val </span><span class="s0">in </span><span class="s1">self.collection_annotations.items():</span>
+                <span class="s4"># Hide verbose chunk details from the HTML table</span>
+                <span class="s0">if </span><span class="s1">key != </span><span class="s3">&quot;chunks&quot;</span><span class="s1">:</span>
+                    <span class="s1">info[key] = html.escape(str(val))</span>
+        <span class="s0">return </span><span class="s1">info</span>
+
+
+<span class="s0">class </span><span class="s1">MaterializedLayer(Layer):</span>
+    <span class="s2">&quot;&quot;&quot;Fully materialized layer of `Layer` 
+ 
+    Parameters 
+    ---------- 
+    mapping: Mapping 
+        The mapping between keys and tasks, typically a dask graph. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">mapping: Mapping</span><span class="s0">, </span><span class="s1">annotations=</span><span class="s0">None, </span><span class="s1">collection_annotations=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">super().__init__(</span>
+            <span class="s1">annotations=annotations</span><span class="s0">, </span><span class="s1">collection_annotations=collection_annotations</span>
+        <span class="s1">)</span>
+        <span class="s1">self.mapping = mapping</span>
+
+    <span class="s0">def </span><span class="s1">__contains__(self</span><span class="s0">, </span><span class="s1">k):</span>
+        <span class="s0">return </span><span class="s1">k </span><span class="s0">in </span><span class="s1">self.mapping</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">k):</span>
+        <span class="s0">return </span><span class="s1">self.mapping[k]</span>
+
+    <span class="s0">def </span><span class="s1">__iter__(self):</span>
+        <span class="s0">return </span><span class="s1">iter(self.mapping)</span>
+
+    <span class="s0">def </span><span class="s1">__len__(self):</span>
+        <span class="s0">return </span><span class="s1">len(self.mapping)</span>
+
+    <span class="s0">def </span><span class="s1">is_materialized(self):</span>
+        <span class="s0">return True</span>
+
+    <span class="s0">def </span><span class="s1">get_output_keys(self):</span>
+        <span class="s0">return </span><span class="s1">self.keys()</span>
+
+
+<span class="s0">class </span><span class="s1">HighLevelGraph(Graph):</span>
+    <span class="s2">&quot;&quot;&quot;Task graph composed of layers of dependent subgraphs 
+ 
+    This object encodes a Dask task graph that is composed of layers of 
+    dependent subgraphs, such as commonly occurs when building task graphs 
+    using high level collections like Dask array, bag, or dataframe. 
+ 
+    Typically each high level array, bag, or dataframe operation takes the task 
+    graphs of the input collections, merges them, and then adds one or more new 
+    layers of tasks for the new operation.  These layers typically have at 
+    least as many tasks as there are partitions or chunks in the collection. 
+    The HighLevelGraph object stores the subgraphs for each operation 
+    separately in sub-graphs, and also stores the dependency structure between 
+    them. 
+ 
+    Parameters 
+    ---------- 
+    layers : Mapping[str, Mapping] 
+        The subgraph layers, keyed by a unique name 
+    dependencies : Mapping[str, set[str]] 
+        The set of layers on which each layer depends 
+    key_dependencies : dict[Key, set], optional 
+        Mapping (some) keys in the high level graph to their dependencies. If 
+        a key is missing, its dependencies will be calculated on-the-fly. 
+ 
+    Examples 
+    -------- 
+    Here is an idealized example that shows the internal state of a 
+    HighLevelGraph 
+ 
+    &gt;&gt;&gt; import dask.dataframe as dd 
+ 
+    &gt;&gt;&gt; df = dd.read_csv('myfile.*.csv')  # doctest: +SKIP 
+    &gt;&gt;&gt; df = df + 100  # doctest: +SKIP 
+    &gt;&gt;&gt; df = df[df.name == 'Alice']  # doctest: +SKIP 
+ 
+    &gt;&gt;&gt; graph = df.__dask_graph__()  # doctest: +SKIP 
+    &gt;&gt;&gt; graph.layers  # doctest: +SKIP 
+    { 
+     'read-csv': {('read-csv', 0): (pandas.read_csv, 'myfile.0.csv'), 
+                  ('read-csv', 1): (pandas.read_csv, 'myfile.1.csv'), 
+                  ('read-csv', 2): (pandas.read_csv, 'myfile.2.csv'), 
+                  ('read-csv', 3): (pandas.read_csv, 'myfile.3.csv')}, 
+     'add': {('add', 0): (operator.add, ('read-csv', 0), 100), 
+             ('add', 1): (operator.add, ('read-csv', 1), 100), 
+             ('add', 2): (operator.add, ('read-csv', 2), 100), 
+             ('add', 3): (operator.add, ('read-csv', 3), 100)} 
+     'filter': {('filter', 0): (lambda part: part[part.name == 'Alice'], ('add', 0)), 
+                ('filter', 1): (lambda part: part[part.name == 'Alice'], ('add', 1)), 
+                ('filter', 2): (lambda part: part[part.name == 'Alice'], ('add', 2)), 
+                ('filter', 3): (lambda part: part[part.name == 'Alice'], ('add', 3))} 
+    } 
+ 
+    &gt;&gt;&gt; graph.dependencies  # doctest: +SKIP 
+    { 
+     'read-csv': set(), 
+     'add': {'read-csv'}, 
+     'filter': {'add'} 
+    } 
+ 
+    See Also 
+    -------- 
+    HighLevelGraph.from_collections : 
+        typically used by developers to make new HighLevelGraphs 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">layers: Mapping[str</span><span class="s0">, </span><span class="s1">Layer]</span>
+    <span class="s1">dependencies: Mapping[str</span><span class="s0">, </span><span class="s1">set[str]]</span>
+    <span class="s1">key_dependencies: dict[Key</span><span class="s0">, </span><span class="s1">set[Key]]</span>
+    <span class="s1">_to_dict: dict</span>
+    <span class="s1">_all_external_keys: set</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">layers: Mapping[str</span><span class="s0">, </span><span class="s1">Graph]</span><span class="s0">,</span>
+        <span class="s1">dependencies: Mapping[str</span><span class="s0">, </span><span class="s1">set[str]]</span><span class="s0">,</span>
+        <span class="s1">key_dependencies: dict[Key</span><span class="s0">, </span><span class="s1">set[Key]] | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None,</span>
+    <span class="s1">):</span>
+        <span class="s1">self.dependencies = dependencies</span>
+        <span class="s1">self.key_dependencies = key_dependencies </span><span class="s0">or </span><span class="s1">{}</span>
+        <span class="s4"># Makes sure that all layers are `Layer`</span>
+        <span class="s1">self.layers = {</span>
+            <span class="s1">k: v </span><span class="s0">if </span><span class="s1">isinstance(v</span><span class="s0">, </span><span class="s1">Layer) </span><span class="s0">else </span><span class="s1">MaterializedLayer(v)</span>
+            <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">layers.items()</span>
+        <span class="s1">}</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_from_collection(cls</span><span class="s0">, </span><span class="s1">name</span><span class="s0">, </span><span class="s1">layer</span><span class="s0">, </span><span class="s1">collection):</span>
+        <span class="s2">&quot;&quot;&quot;`from_collections` optimized for a single collection&quot;&quot;&quot;</span>
+        <span class="s0">if not </span><span class="s1">is_dask_collection(collection):</span>
+            <span class="s0">raise </span><span class="s1">TypeError(type(collection))</span>
+
+        <span class="s1">graph = collection.__dask_graph__()</span>
+        <span class="s0">if </span><span class="s1">isinstance(graph</span><span class="s0">, </span><span class="s1">HighLevelGraph):</span>
+            <span class="s1">layers = ensure_dict(graph.layers</span><span class="s0">, </span><span class="s1">copy=</span><span class="s0">True</span><span class="s1">)</span>
+            <span class="s1">layers[name] = layer</span>
+            <span class="s1">deps = ensure_dict(graph.dependencies</span><span class="s0">, </span><span class="s1">copy=</span><span class="s0">True</span><span class="s1">)</span>
+            <span class="s1">deps[name] = set(collection.__dask_layers__())</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">key = _get_some_layer_name(collection)</span>
+            <span class="s1">layers = {name: layer</span><span class="s0">, </span><span class="s1">key: graph}</span>
+            <span class="s1">deps = {name: {key}</span><span class="s0">, </span><span class="s1">key: set()}</span>
+
+        <span class="s0">return </span><span class="s1">cls(layers</span><span class="s0">, </span><span class="s1">deps)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">from_collections(</span>
+        <span class="s1">cls</span><span class="s0">,</span>
+        <span class="s1">name: str</span><span class="s0">,</span>
+        <span class="s1">layer: Graph</span><span class="s0">,</span>
+        <span class="s1">dependencies: Sequence[DaskCollection] = ()</span><span class="s0">,</span>
+    <span class="s1">) -&gt; HighLevelGraph:</span>
+        <span class="s2">&quot;&quot;&quot;Construct a HighLevelGraph from a new layer and a set of collections 
+ 
+        This constructs a HighLevelGraph in the common case where we have a single 
+        new layer and a set of old collections on which we want to depend. 
+ 
+        This pulls out the ``__dask_layers__()`` method of the collections if 
+        they exist, and adds them to the dependencies for this new layer.  It 
+        also merges all of the layers from all of the dependent collections 
+        together into the new layers for this graph. 
+ 
+        Parameters 
+        ---------- 
+        name : str 
+            The name of the new layer 
+        layer : Mapping 
+            The graph layer itself 
+        dependencies : List of Dask collections 
+            A list of other dask collections (like arrays or dataframes) that 
+            have graphs themselves 
+ 
+        Examples 
+        -------- 
+ 
+        In typical usage we make a new task layer, and then pass that layer 
+        along with all dependent collections to this method. 
+ 
+        &gt;&gt;&gt; def add(self, other): 
+        ...     name = 'add-' + tokenize(self, other) 
+        ...     layer = {(name, i): (add, input_key, other) 
+        ...              for i, input_key in enumerate(self.__dask_keys__())} 
+        ...     graph = HighLevelGraph.from_collections(name, layer, dependencies=[self]) 
+        ...     return new_collection(name, graph) 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">len(dependencies) == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">cls._from_collection(name</span><span class="s0">, </span><span class="s1">layer</span><span class="s0">, </span><span class="s1">dependencies[</span><span class="s5">0</span><span class="s1">])</span>
+        <span class="s1">layers = {name: layer}</span>
+        <span class="s1">name_dep: set[str] = set()</span>
+        <span class="s1">deps: dict[str</span><span class="s0">, </span><span class="s1">set[str]] = {name: name_dep}</span>
+        <span class="s0">for </span><span class="s1">collection </span><span class="s0">in </span><span class="s1">toolz.unique(dependencies</span><span class="s0">, </span><span class="s1">key=id):</span>
+            <span class="s0">if </span><span class="s1">is_dask_collection(collection):</span>
+                <span class="s1">graph = collection.__dask_graph__()</span>
+                <span class="s0">if </span><span class="s1">isinstance(graph</span><span class="s0">, </span><span class="s1">HighLevelGraph):</span>
+                    <span class="s1">layers.update(graph.layers)</span>
+                    <span class="s1">deps.update(graph.dependencies)</span>
+                    <span class="s1">name_dep |= set(collection.__dask_layers__())</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">key = _get_some_layer_name(collection)</span>
+                    <span class="s1">layers[key] = graph</span>
+                    <span class="s1">name_dep.add(key)</span>
+                    <span class="s1">deps[key] = set()</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">TypeError(type(collection))</span>
+
+        <span class="s0">return </span><span class="s1">cls(layers</span><span class="s0">, </span><span class="s1">deps)</span>
+
+    <span class="s0">def </span><span class="s1">__getitem__(self</span><span class="s0">, </span><span class="s1">key: Key) -&gt; Any:</span>
+        <span class="s4"># Attempt O(1) direct access first, under the assumption that layer names match</span>
+        <span class="s4"># either the keys (Scalar, Item, Delayed) or the first element of the key tuples</span>
+        <span class="s4"># (Array, Bag, DataFrame, Series). This assumption is not always true.</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self.layers[key][key]  </span><span class="s4"># type: ignore</span>
+        <span class="s0">except </span><span class="s1">KeyError:</span>
+            <span class="s0">pass</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self.layers[key[</span><span class="s5">0</span><span class="s1">]][key]  </span><span class="s4"># type: ignore</span>
+        <span class="s0">except </span><span class="s1">(KeyError</span><span class="s0">, </span><span class="s1">IndexError</span><span class="s0">, </span><span class="s1">TypeError):</span>
+            <span class="s0">pass</span>
+
+        <span class="s4"># Fall back to O(n) access</span>
+        <span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">self.layers.values():</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s0">return </span><span class="s1">d[key]</span>
+            <span class="s0">except </span><span class="s1">KeyError:</span>
+                <span class="s0">pass</span>
+
+        <span class="s0">raise </span><span class="s1">KeyError(key)</span>
+
+    <span class="s0">def </span><span class="s1">__len__(self) -&gt; int:</span>
+        <span class="s4"># NOTE: this will double-count keys that are duplicated between layers, so it's</span>
+        <span class="s4"># possible that `len(hlg) &gt; len(hlg.to_dict())`. However, duplicate keys should</span>
+        <span class="s4"># not occur through normal use, and their existence would usually be a bug.</span>
+        <span class="s4"># So we ignore this case in favor of better performance.</span>
+        <span class="s4"># https://github.com/dask/dask/issues/7271</span>
+        <span class="s0">return </span><span class="s1">sum(len(layer) </span><span class="s0">for </span><span class="s1">layer </span><span class="s0">in </span><span class="s1">self.layers.values())</span>
+
+    <span class="s0">def </span><span class="s1">__iter__(self) -&gt; Iterator[Key]:</span>
+        <span class="s0">return </span><span class="s1">iter(self.to_dict())</span>
+
+    <span class="s0">def </span><span class="s1">to_dict(self) -&gt; dict[Key</span><span class="s0">, </span><span class="s1">Any]:</span>
+        <span class="s2">&quot;&quot;&quot;Efficiently convert to plain dict. This method is faster than dict(self).&quot;&quot;&quot;</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self._to_dict</span>
+        <span class="s0">except </span><span class="s1">AttributeError:</span>
+            <span class="s1">out = self._to_dict = ensure_dict(self)</span>
+            <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">keys(self) -&gt; KeysView:</span>
+        <span class="s2">&quot;&quot;&quot;Get all keys of all the layers. 
+ 
+        This will in many cases materialize layers, which makes it a relatively 
+        expensive operation. See :meth:`get_all_external_keys` for a faster alternative. 
+        &quot;&quot;&quot;</span>
+        <span class="s0">return </span><span class="s1">self.to_dict().keys()</span>
+
+    <span class="s0">def </span><span class="s1">get_all_external_keys(self) -&gt; set[Key]:</span>
+        <span class="s2">&quot;&quot;&quot;Get all output keys of all layers 
+ 
+        This will in most cases _not_ materialize any layers, which makes 
+        it a relative cheap operation. 
+ 
+        Returns 
+        ------- 
+        keys: set 
+            A set of all external keys 
+        &quot;&quot;&quot;</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">self._all_external_keys</span>
+        <span class="s0">except </span><span class="s1">AttributeError:</span>
+            <span class="s1">keys: set = set()</span>
+            <span class="s0">for </span><span class="s1">layer </span><span class="s0">in </span><span class="s1">self.layers.values():</span>
+                <span class="s4"># Note: don't use `keys |= ...`, because the RHS is a</span>
+                <span class="s4"># collections.abc.Set rather than a real set, and this will</span>
+                <span class="s4"># cause a whole new set to be constructed.</span>
+                <span class="s1">keys.update(layer.get_output_keys())</span>
+            <span class="s1">self._all_external_keys = keys</span>
+            <span class="s0">return </span><span class="s1">keys</span>
+
+    <span class="s0">def </span><span class="s1">items(self) -&gt; ItemsView[Key</span><span class="s0">, </span><span class="s1">Any]:</span>
+        <span class="s0">return </span><span class="s1">self.to_dict().items()</span>
+
+    <span class="s0">def </span><span class="s1">values(self) -&gt; ValuesView[Any]:</span>
+        <span class="s0">return </span><span class="s1">self.to_dict().values()</span>
+
+    <span class="s0">def </span><span class="s1">get_all_dependencies(self) -&gt; dict[Key</span><span class="s0">, </span><span class="s1">set[Key]]:</span>
+        <span class="s2">&quot;&quot;&quot;Get dependencies of all keys 
+ 
+        This will in most cases materialize all layers, which makes 
+        it an expensive operation. 
+ 
+        Returns 
+        ------- 
+        map: Mapping 
+            A map that maps each key to its dependencies 
+        &quot;&quot;&quot;</span>
+        <span class="s1">all_keys = self.keys()</span>
+        <span class="s1">missing_keys = all_keys - self.key_dependencies.keys()</span>
+        <span class="s0">if </span><span class="s1">missing_keys:</span>
+            <span class="s0">for </span><span class="s1">layer </span><span class="s0">in </span><span class="s1">self.layers.values():</span>
+                <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">missing_keys &amp; layer.keys():</span>
+                    <span class="s1">self.key_dependencies[k] = layer.get_dependencies(k</span><span class="s0">, </span><span class="s1">all_keys)</span>
+        <span class="s0">return </span><span class="s1">self.key_dependencies</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">dependents(self) -&gt; dict[str</span><span class="s0">, </span><span class="s1">set[str]]:</span>
+        <span class="s0">return </span><span class="s1">reverse_dict(self.dependencies)</span>
+
+    <span class="s0">def </span><span class="s1">copy(self) -&gt; HighLevelGraph:</span>
+        <span class="s0">return </span><span class="s1">HighLevelGraph(</span>
+            <span class="s1">ensure_dict(self.layers</span><span class="s0">, </span><span class="s1">copy=</span><span class="s0">True</span><span class="s1">)</span><span class="s0">,</span>
+            <span class="s1">ensure_dict(self.dependencies</span><span class="s0">, </span><span class="s1">copy=</span><span class="s0">True</span><span class="s1">)</span><span class="s0">,</span>
+            <span class="s1">self.key_dependencies.copy()</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">merge(cls</span><span class="s0">, </span><span class="s1">*graphs: Graph) -&gt; HighLevelGraph:</span>
+        <span class="s1">layers: dict[str</span><span class="s0">, </span><span class="s1">Graph] = {}</span>
+        <span class="s1">dependencies: dict[str</span><span class="s0">, </span><span class="s1">set[str]] = {}</span>
+        <span class="s0">for </span><span class="s1">g </span><span class="s0">in </span><span class="s1">graphs:</span>
+            <span class="s0">if </span><span class="s1">isinstance(g</span><span class="s0">, </span><span class="s1">HighLevelGraph):</span>
+                <span class="s1">layers.update(g.layers)</span>
+                <span class="s1">dependencies.update(g.dependencies)</span>
+            <span class="s0">elif </span><span class="s1">isinstance(g</span><span class="s0">, </span><span class="s1">Mapping):</span>
+                <span class="s1">layers[str(id(g))] = g</span>
+                <span class="s1">dependencies[str(id(g))] = set()</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">TypeError(g)</span>
+        <span class="s0">return </span><span class="s1">cls(layers</span><span class="s0">, </span><span class="s1">dependencies)</span>
+
+    <span class="s0">def </span><span class="s1">visualize(self</span><span class="s0">, </span><span class="s1">filename=</span><span class="s3">&quot;dask-hlg.svg&quot;</span><span class="s0">, </span><span class="s1">format=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Visualize this dask high level graph. 
+ 
+        Requires ``graphviz`` to be installed. 
+ 
+        Parameters 
+        ---------- 
+        filename : str or None, optional 
+            The name of the file to write to disk. If the provided `filename` 
+            doesn't include an extension, '.png' will be used by default. 
+            If `filename` is None, no file will be written, and the graph is 
+            rendered in the Jupyter notebook only. 
+        format : {'png', 'pdf', 'dot', 'svg', 'jpeg', 'jpg'}, optional 
+            Format in which to write output file. Default is 'svg'. 
+        color : {None, 'layer_type'}, optional (default: None) 
+            Options to color nodes. 
+            - None, no colors. 
+            - layer_type, color nodes based on the layer type. 
+        **kwargs 
+           Additional keyword arguments to forward to ``to_graphviz``. 
+ 
+        Examples 
+        -------- 
+        &gt;&gt;&gt; x.dask.visualize(filename='dask.svg')  # doctest: +SKIP 
+        &gt;&gt;&gt; x.dask.visualize(filename='dask.svg', color='layer_type')  # doctest: +SKIP 
+ 
+        Returns 
+        ------- 
+        result : IPython.diplay.Image, IPython.display.SVG, or None 
+            See dask.dot.dot_graph for more information. 
+ 
+        See Also 
+        -------- 
+        dask.dot.dot_graph 
+        dask.base.visualize # low level variant 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">from </span><span class="s1">dask.dot </span><span class="s0">import </span><span class="s1">graphviz_to_file</span>
+
+        <span class="s1">g = to_graphviz(self</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">graphviz_to_file(g</span><span class="s0">, </span><span class="s1">filename</span><span class="s0">, </span><span class="s1">format)</span>
+        <span class="s0">return </span><span class="s1">g</span>
+
+    <span class="s0">def </span><span class="s1">_toposort_layers(self) -&gt; list[str]:</span>
+        <span class="s2">&quot;&quot;&quot;Sort the layers in a high level graph topologically 
+ 
+        Parameters 
+        ---------- 
+        hlg : HighLevelGraph 
+            The high level graph's layers to sort 
+ 
+        Returns 
+        ------- 
+        sorted: list 
+            List of layer names sorted topologically 
+        &quot;&quot;&quot;</span>
+        <span class="s1">degree = {k: len(v) </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">self.dependencies.items()}</span>
+        <span class="s1">reverse_deps: dict[str</span><span class="s0">, </span><span class="s1">list[str]] = {k: [] </span><span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">self.dependencies}</span>
+        <span class="s1">ready = []</span>
+        <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">self.dependencies.items():</span>
+            <span class="s0">for </span><span class="s1">dep </span><span class="s0">in </span><span class="s1">v:</span>
+                <span class="s1">reverse_deps[dep].append(k)</span>
+            <span class="s0">if not </span><span class="s1">v:</span>
+                <span class="s1">ready.append(k)</span>
+        <span class="s1">ret = []</span>
+        <span class="s0">while </span><span class="s1">len(ready) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">layer = ready.pop()</span>
+            <span class="s1">ret.append(layer)</span>
+            <span class="s0">for </span><span class="s1">rdep </span><span class="s0">in </span><span class="s1">reverse_deps[layer]:</span>
+                <span class="s1">degree[rdep] -= </span><span class="s5">1</span>
+                <span class="s0">if </span><span class="s1">degree[rdep] == </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">ready.append(rdep)</span>
+        <span class="s0">return </span><span class="s1">ret</span>
+
+    <span class="s0">def </span><span class="s1">cull(self</span><span class="s0">, </span><span class="s1">keys: Iterable[Key]) -&gt; HighLevelGraph:</span>
+        <span class="s2">&quot;&quot;&quot;Return new HighLevelGraph with only the tasks required to calculate keys. 
+ 
+        In other words, remove unnecessary tasks from dask. 
+ 
+        Parameters 
+        ---------- 
+        keys 
+            iterable of keys or nested list of keys such as the output of 
+            ``__dask_keys__()`` 
+ 
+        Returns 
+        ------- 
+        hlg: HighLevelGraph 
+            Culled high level graph 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">dask.layers </span><span class="s0">import </span><span class="s1">Blockwise</span>
+
+        <span class="s1">keys_set = set(flatten(keys))</span>
+
+        <span class="s1">all_ext_keys = self.get_all_external_keys()</span>
+        <span class="s1">ret_layers: dict = {}</span>
+        <span class="s1">ret_key_deps: dict = {}</span>
+        <span class="s0">for </span><span class="s1">layer_name </span><span class="s0">in </span><span class="s1">reversed(self._toposort_layers()):</span>
+            <span class="s1">layer = self.layers[layer_name]</span>
+            <span class="s4"># Let's cull the layer to produce its part of `keys`.</span>
+            <span class="s4"># Note: use .intersection rather than &amp; because the RHS is</span>
+            <span class="s4"># a collections.abc.Set rather than a real set, and using &amp;</span>
+            <span class="s4"># would take time proportional to the size of the LHS, which</span>
+            <span class="s4"># if there is no culling can be much bigger than the RHS.</span>
+            <span class="s1">output_keys = keys_set.intersection(layer.get_output_keys())</span>
+            <span class="s0">if </span><span class="s1">output_keys:</span>
+                <span class="s1">culled_layer</span><span class="s0">, </span><span class="s1">culled_deps = layer.cull(output_keys</span><span class="s0">, </span><span class="s1">all_ext_keys)</span>
+                <span class="s4"># Update `keys` with all layer's external key dependencies, which</span>
+                <span class="s4"># are all the layer's dependencies (`culled_deps`) excluding</span>
+                <span class="s4"># the layer's output keys.</span>
+                <span class="s1">external_deps = set()</span>
+                <span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">culled_deps.values():</span>
+                    <span class="s1">external_deps |= d</span>
+                <span class="s1">external_deps -= culled_layer.get_output_keys()</span>
+                <span class="s1">keys_set |= external_deps</span>
+
+                <span class="s4"># Save the culled layer and its key dependencies</span>
+                <span class="s1">ret_layers[layer_name] = culled_layer</span>
+                <span class="s0">if </span><span class="s1">(</span>
+                    <span class="s1">isinstance(layer</span><span class="s0">, </span><span class="s1">Blockwise)</span>
+                    <span class="s0">or </span><span class="s1">isinstance(layer</span><span class="s0">, </span><span class="s1">MaterializedLayer)</span>
+                    <span class="s0">or </span><span class="s1">(layer.is_materialized() </span><span class="s0">and </span><span class="s1">(len(layer) == len(culled_deps)))</span>
+                <span class="s1">):</span>
+                    <span class="s4"># Don't use culled_deps to update ret_key_deps</span>
+                    <span class="s4"># unless they are &quot;direct&quot; key dependencies.</span>
+                    <span class="s4">#</span>
+                    <span class="s4"># Note that `MaterializedLayer` is &quot;safe&quot;, because</span>
+                    <span class="s4"># its `cull` method will return a complete dict of</span>
+                    <span class="s4"># direct dependencies for all keys in its subgraph.</span>
+                    <span class="s4"># See: https://github.com/dask/dask/issues/9389</span>
+                    <span class="s4"># for performance motivation</span>
+                    <span class="s1">ret_key_deps.update(culled_deps)</span>
+
+        <span class="s4"># Converting dict_keys to a real set lets Python optimise the set</span>
+        <span class="s4"># intersection to iterate over the smaller of the two sets.</span>
+        <span class="s1">ret_layers_keys = set(ret_layers.keys())</span>
+        <span class="s1">ret_dependencies = {</span>
+            <span class="s1">layer_name: self.dependencies[layer_name] &amp; ret_layers_keys</span>
+            <span class="s0">for </span><span class="s1">layer_name </span><span class="s0">in </span><span class="s1">ret_layers</span>
+        <span class="s1">}</span>
+
+        <span class="s0">return </span><span class="s1">HighLevelGraph(ret_layers</span><span class="s0">, </span><span class="s1">ret_dependencies</span><span class="s0">, </span><span class="s1">ret_key_deps)</span>
+
+    <span class="s0">def </span><span class="s1">cull_layers(self</span><span class="s0">, </span><span class="s1">layers: Iterable[str]) -&gt; HighLevelGraph:</span>
+        <span class="s2">&quot;&quot;&quot;Return a new HighLevelGraph with only the given layers and their 
+        dependencies. Internally, layers are not modified. 
+ 
+        This is a variant of :meth:`HighLevelGraph.cull` which is much faster and does 
+        not risk creating a collision between two layers with the same name and 
+        different content when two culled graphs are merged later on. 
+ 
+        Returns 
+        ------- 
+        hlg: HighLevelGraph 
+            Culled high level graph 
+        &quot;&quot;&quot;</span>
+        <span class="s1">to_visit = set(layers)</span>
+        <span class="s1">ret_layers = {}</span>
+        <span class="s1">ret_dependencies = {}</span>
+        <span class="s0">while </span><span class="s1">to_visit:</span>
+            <span class="s1">k = to_visit.pop()</span>
+            <span class="s1">ret_layers[k] = self.layers[k]</span>
+            <span class="s1">ret_dependencies[k] = self.dependencies[k]</span>
+            <span class="s1">to_visit |= ret_dependencies[k] - ret_dependencies.keys()</span>
+
+        <span class="s0">return </span><span class="s1">HighLevelGraph(ret_layers</span><span class="s0">, </span><span class="s1">ret_dependencies)</span>
+
+    <span class="s0">def </span><span class="s1">validate(self) -&gt; </span><span class="s0">None</span><span class="s1">:</span>
+        <span class="s4"># Check dependencies</span>
+        <span class="s0">for </span><span class="s1">layer_name</span><span class="s0">, </span><span class="s1">deps </span><span class="s0">in </span><span class="s1">self.dependencies.items():</span>
+            <span class="s0">if </span><span class="s1">layer_name </span><span class="s0">not in </span><span class="s1">self.layers:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">f&quot;dependencies[</span><span class="s0">{</span><span class="s1">repr(layer_name)</span><span class="s0">}</span><span class="s3">] not found in layers&quot;</span>
+                <span class="s1">)</span>
+            <span class="s0">for </span><span class="s1">dep </span><span class="s0">in </span><span class="s1">deps:</span>
+                <span class="s0">if </span><span class="s1">dep </span><span class="s0">not in </span><span class="s1">self.dependencies:</span>
+                    <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">repr(dep)</span><span class="s0">} </span><span class="s3">not found in dependencies&quot;</span><span class="s1">)</span>
+
+        <span class="s0">for </span><span class="s1">layer </span><span class="s0">in </span><span class="s1">self.layers.values():</span>
+            <span class="s0">assert </span><span class="s1">hasattr(layer</span><span class="s0">, </span><span class="s3">&quot;annotations&quot;</span><span class="s1">)</span>
+
+        <span class="s4"># Re-calculate all layer dependencies</span>
+        <span class="s1">dependencies = compute_layer_dependencies(self.layers)</span>
+
+        <span class="s4"># Check keys</span>
+        <span class="s1">dep_key1 = self.dependencies.keys()</span>
+        <span class="s1">dep_key2 = dependencies.keys()</span>
+        <span class="s0">if </span><span class="s1">dep_key1 != dep_key2:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">f&quot;incorrect dependencies keys </span><span class="s0">{</span><span class="s1">set(dep_key1)</span><span class="s0">!r} </span><span class="s3">&quot;</span>
+                <span class="s3">f&quot;expected </span><span class="s0">{</span><span class="s1">set(dep_key2)</span><span class="s0">!r}</span><span class="s3">&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s4"># Check values</span>
+        <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">dep_key1:</span>
+            <span class="s0">if </span><span class="s1">self.dependencies[k] != dependencies[k]:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">f&quot;incorrect dependencies[</span><span class="s0">{</span><span class="s1">repr(k)</span><span class="s0">}</span><span class="s3">]: </span><span class="s0">{</span><span class="s1">repr(self.dependencies[k])</span><span class="s0">} </span><span class="s3">&quot;</span>
+                    <span class="s3">f&quot;expected </span><span class="s0">{</span><span class="s1">repr(dependencies[k])</span><span class="s0">}</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__repr__(self) -&gt; str:</span>
+        <span class="s1">representation = </span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">type(self).__name__</span><span class="s0">} </span><span class="s3">with </span><span class="s0">{</span><span class="s1">len(self.layers)</span><span class="s0">} </span><span class="s3">layers.</span><span class="s0">\n</span><span class="s3">&quot;</span>
+        <span class="s1">representation += </span><span class="s3">f&quot;&lt;</span><span class="s0">{</span><span class="s1">self.__class__.__module__</span><span class="s0">}</span><span class="s3">.</span><span class="s0">{</span><span class="s1">self.__class__.__name__</span><span class="s0">} </span><span class="s3">object at </span><span class="s0">{</span><span class="s1">hex(id(self))</span><span class="s0">}</span><span class="s3">&gt;</span><span class="s0">\n</span><span class="s3">&quot;</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">layerkey </span><span class="s0">in </span><span class="s1">enumerate(self._toposort_layers()):</span>
+            <span class="s1">representation += </span><span class="s3">f&quot; </span><span class="s0">{</span><span class="s1">i</span><span class="s0">}</span><span class="s3">. </span><span class="s0">{</span><span class="s1">layerkey</span><span class="s0">}\n</span><span class="s3">&quot;</span>
+        <span class="s0">return </span><span class="s1">representation</span>
+
+    <span class="s0">def </span><span class="s1">_repr_html_(self) -&gt; str:</span>
+        <span class="s0">return </span><span class="s1">get_template(</span><span class="s3">&quot;highlevelgraph.html.j2&quot;</span><span class="s1">).render(</span>
+            <span class="s1">type=type(self).__name__</span><span class="s0">,</span>
+            <span class="s1">layers=self.layers</span><span class="s0">,</span>
+            <span class="s1">toposort=self._toposort_layers()</span><span class="s0">,</span>
+            <span class="s1">layer_dependencies=self.dependencies</span><span class="s0">,</span>
+            <span class="s1">n_outputs=len(self.get_all_external_keys())</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">to_graphviz(</span>
+    <span class="s1">hg</span><span class="s0">,</span>
+    <span class="s1">data_attributes=</span><span class="s0">None,</span>
+    <span class="s1">function_attributes=</span><span class="s0">None,</span>
+    <span class="s1">rankdir=</span><span class="s3">&quot;BT&quot;</span><span class="s0">,</span>
+    <span class="s1">graph_attr=</span><span class="s0">None,</span>
+    <span class="s1">node_attr=</span><span class="s0">None,</span>
+    <span class="s1">edge_attr=</span><span class="s0">None,</span>
+    <span class="s1">**kwargs</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s0">from </span><span class="s1">dask.dot </span><span class="s0">import </span><span class="s1">label</span><span class="s0">, </span><span class="s1">name</span>
+
+    <span class="s1">graphviz = import_required(</span>
+        <span class="s3">&quot;graphviz&quot;</span><span class="s0">,</span>
+        <span class="s3">&quot;Drawing dask graphs with the graphviz visualization engine requires the `graphviz` &quot;</span>
+        <span class="s3">&quot;python library and the `graphviz` system library.</span><span class="s0">\n\n</span><span class="s3">&quot;</span>
+        <span class="s3">&quot;Please either conda or pip install as follows:</span><span class="s0">\n\n</span><span class="s3">&quot;</span>
+        <span class="s3">&quot;  conda install python-graphviz     # either conda install</span><span class="s0">\n</span><span class="s3">&quot;</span>
+        <span class="s3">&quot;  python -m pip install graphviz    # or pip install and follow installation instructions&quot;</span><span class="s0">,</span>
+    <span class="s1">)</span>
+
+    <span class="s1">data_attributes = data_attributes </span><span class="s0">or </span><span class="s1">{}</span>
+    <span class="s1">function_attributes = function_attributes </span><span class="s0">or </span><span class="s1">{}</span>
+    <span class="s1">graph_attr = graph_attr </span><span class="s0">or </span><span class="s1">{}</span>
+    <span class="s1">node_attr = node_attr </span><span class="s0">or </span><span class="s1">{}</span>
+    <span class="s1">edge_attr = edge_attr </span><span class="s0">or </span><span class="s1">{}</span>
+
+    <span class="s1">graph_attr[</span><span class="s3">&quot;rankdir&quot;</span><span class="s1">] = rankdir</span>
+    <span class="s1">node_attr[</span><span class="s3">&quot;shape&quot;</span><span class="s1">] = </span><span class="s3">&quot;box&quot;</span>
+    <span class="s1">node_attr[</span><span class="s3">&quot;fontname&quot;</span><span class="s1">] = </span><span class="s3">&quot;helvetica&quot;</span>
+
+    <span class="s1">graph_attr.update(kwargs)</span>
+    <span class="s1">g = graphviz.Digraph(</span>
+        <span class="s1">graph_attr=graph_attr</span><span class="s0">, </span><span class="s1">node_attr=node_attr</span><span class="s0">, </span><span class="s1">edge_attr=edge_attr</span>
+    <span class="s1">)</span>
+
+    <span class="s1">n_tasks = {}</span>
+    <span class="s0">for </span><span class="s1">layer </span><span class="s0">in </span><span class="s1">hg.dependencies:</span>
+        <span class="s1">n_tasks[layer] = len(hg.layers[layer])</span>
+
+    <span class="s1">min_tasks = min(n_tasks.values())</span>
+    <span class="s1">max_tasks = max(n_tasks.values())</span>
+
+    <span class="s1">cache = {}</span>
+
+    <span class="s1">color = kwargs.get(</span><span class="s3">&quot;color&quot;</span><span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">color == </span><span class="s3">&quot;layer_type&quot;</span><span class="s1">:</span>
+        <span class="s1">layer_colors = {</span>
+            <span class="s3">&quot;DataFrameIOLayer&quot;</span><span class="s1">: [</span><span class="s3">&quot;#CCC7F9&quot;</span><span class="s0">, False</span><span class="s1">]</span><span class="s0">,  </span><span class="s4"># purple</span>
+            <span class="s3">&quot;ShuffleLayer&quot;</span><span class="s1">: [</span><span class="s3">&quot;#F9CCC7&quot;</span><span class="s0">, False</span><span class="s1">]</span><span class="s0">,  </span><span class="s4"># rose</span>
+            <span class="s3">&quot;SimpleShuffleLayer&quot;</span><span class="s1">: [</span><span class="s3">&quot;#F9CCC7&quot;</span><span class="s0">, False</span><span class="s1">]</span><span class="s0">,  </span><span class="s4"># rose</span>
+            <span class="s3">&quot;ArrayOverlayLayer&quot;</span><span class="s1">: [</span><span class="s3">&quot;#FFD9F2&quot;</span><span class="s0">, False</span><span class="s1">]</span><span class="s0">,  </span><span class="s4"># pink</span>
+            <span class="s3">&quot;BroadcastJoinLayer&quot;</span><span class="s1">: [</span><span class="s3">&quot;#D9F2FF&quot;</span><span class="s0">, False</span><span class="s1">]</span><span class="s0">,  </span><span class="s4"># blue</span>
+            <span class="s3">&quot;Blockwise&quot;</span><span class="s1">: [</span><span class="s3">&quot;#D9FFE6&quot;</span><span class="s0">, False</span><span class="s1">]</span><span class="s0">,  </span><span class="s4"># green</span>
+            <span class="s3">&quot;BlockwiseLayer&quot;</span><span class="s1">: [</span><span class="s3">&quot;#D9FFE6&quot;</span><span class="s0">, False</span><span class="s1">]</span><span class="s0">,  </span><span class="s4"># green</span>
+            <span class="s3">&quot;MaterializedLayer&quot;</span><span class="s1">: [</span><span class="s3">&quot;#DBDEE5&quot;</span><span class="s0">, False</span><span class="s1">]</span><span class="s0">,  </span><span class="s4"># gray</span>
+        <span class="s1">}</span>
+
+    <span class="s0">for </span><span class="s1">layer </span><span class="s0">in </span><span class="s1">hg.dependencies:</span>
+        <span class="s1">layer_name = name(layer)</span>
+        <span class="s1">attrs = data_attributes.get(layer</span><span class="s0">, </span><span class="s1">{})</span>
+
+        <span class="s1">node_label = label(layer</span><span class="s0">, </span><span class="s1">cache=cache)</span>
+        <span class="s1">node_size = (</span>
+            <span class="s5">20</span>
+            <span class="s0">if </span><span class="s1">max_tasks == min_tasks</span>
+            <span class="s0">else </span><span class="s1">int(</span><span class="s5">20 </span><span class="s1">+ ((n_tasks[layer] - min_tasks) / (max_tasks - min_tasks)) * </span><span class="s5">20</span><span class="s1">)</span>
+        <span class="s1">)</span>
+
+        <span class="s1">layer_type = str(type(hg.layers[layer]).__name__)</span>
+        <span class="s1">node_tooltips = (</span>
+            <span class="s3">f&quot;A </span><span class="s0">{</span><span class="s1">layer_type.replace(</span><span class="s3">'Layer'</span><span class="s0">, </span><span class="s3">''</span><span class="s1">)</span><span class="s0">} </span><span class="s3">Layer with </span><span class="s0">{</span><span class="s1">n_tasks[layer]</span><span class="s0">} </span><span class="s3">Tasks.</span><span class="s0">\n</span><span class="s3">&quot;</span>
+        <span class="s1">)</span>
+
+        <span class="s1">layer_ca = hg.layers[layer].collection_annotations</span>
+        <span class="s0">if </span><span class="s1">layer_ca:</span>
+            <span class="s0">if </span><span class="s1">layer_ca.get(</span><span class="s3">&quot;type&quot;</span><span class="s1">) == </span><span class="s3">&quot;dask.array.core.Array&quot;</span><span class="s1">:</span>
+                <span class="s1">node_tooltips += (</span>
+                    <span class="s3">f&quot;Array Shape: </span><span class="s0">{</span><span class="s1">layer_ca.get(</span><span class="s3">'shape'</span><span class="s1">)</span><span class="s0">}\n</span><span class="s3">&quot;</span>
+                    <span class="s3">f&quot;Data Type: </span><span class="s0">{</span><span class="s1">layer_ca.get(</span><span class="s3">'dtype'</span><span class="s1">)</span><span class="s0">}\n</span><span class="s3">&quot;</span>
+                    <span class="s3">f&quot;Chunk Size: </span><span class="s0">{</span><span class="s1">layer_ca.get(</span><span class="s3">'chunksize'</span><span class="s1">)</span><span class="s0">}\n</span><span class="s3">&quot;</span>
+                    <span class="s3">f&quot;Chunk Type: </span><span class="s0">{</span><span class="s1">layer_ca.get(</span><span class="s3">'chunk_type'</span><span class="s1">)</span><span class="s0">}\n</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+
+            <span class="s0">if </span><span class="s1">layer_ca.get(</span><span class="s3">&quot;type&quot;</span><span class="s1">) == </span><span class="s3">&quot;dask.dataframe.core.DataFrame&quot;</span><span class="s1">:</span>
+                <span class="s1">dftype = {</span><span class="s3">&quot;pandas.core.frame.DataFrame&quot;</span><span class="s1">: </span><span class="s3">&quot;pandas&quot;</span><span class="s1">}</span>
+                <span class="s1">cols = layer_ca.get(</span><span class="s3">&quot;columns&quot;</span><span class="s1">)</span>
+
+                <span class="s1">node_tooltips += (</span>
+                    <span class="s3">f&quot;Number of Partitions: </span><span class="s0">{</span><span class="s1">layer_ca.get(</span><span class="s3">'npartitions'</span><span class="s1">)</span><span class="s0">}\n</span><span class="s3">&quot;</span>
+                    <span class="s3">f&quot;DataFrame Type: </span><span class="s0">{</span><span class="s1">dftype.get(layer_ca.get(</span><span class="s3">'dataframe_type'</span><span class="s1">))</span><span class="s0">}\n</span><span class="s3">&quot;</span>
+                    <span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">len(cols)</span><span class="s0">} </span><span class="s3">DataFrame Columns: </span><span class="s0">{</span><span class="s1">str(cols) </span><span class="s0">if </span><span class="s1">len(str(cols)) &lt;= </span><span class="s5">40 </span><span class="s0">else </span><span class="s3">'[...]'</span><span class="s0">}\n</span><span class="s3">&quot;</span>
+                <span class="s1">)</span>
+
+        <span class="s1">attrs.setdefault(</span><span class="s3">&quot;label&quot;</span><span class="s0">, </span><span class="s1">str(node_label))</span>
+        <span class="s1">attrs.setdefault(</span><span class="s3">&quot;fontsize&quot;</span><span class="s0">, </span><span class="s1">str(node_size))</span>
+        <span class="s1">attrs.setdefault(</span><span class="s3">&quot;tooltip&quot;</span><span class="s0">, </span><span class="s1">str(node_tooltips))</span>
+
+        <span class="s0">if </span><span class="s1">color == </span><span class="s3">&quot;layer_type&quot;</span><span class="s1">:</span>
+            <span class="s1">node_color = layer_colors.get(layer_type)[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s1">layer_colors.get(layer_type)[</span><span class="s5">1</span><span class="s1">] = </span><span class="s0">True</span>
+
+            <span class="s1">attrs.setdefault(</span><span class="s3">&quot;fillcolor&quot;</span><span class="s0">, </span><span class="s1">str(node_color))</span>
+            <span class="s1">attrs.setdefault(</span><span class="s3">&quot;style&quot;</span><span class="s0">, </span><span class="s3">&quot;filled&quot;</span><span class="s1">)</span>
+
+        <span class="s1">g.node(layer_name</span><span class="s0">, </span><span class="s1">**attrs)</span>
+
+    <span class="s0">for </span><span class="s1">layer</span><span class="s0">, </span><span class="s1">deps </span><span class="s0">in </span><span class="s1">hg.dependencies.items():</span>
+        <span class="s1">layer_name = name(layer)</span>
+        <span class="s0">for </span><span class="s1">dep </span><span class="s0">in </span><span class="s1">deps:</span>
+            <span class="s1">dep_name = name(dep)</span>
+            <span class="s1">g.edge(dep_name</span><span class="s0">, </span><span class="s1">layer_name)</span>
+
+    <span class="s0">if </span><span class="s1">color == </span><span class="s3">&quot;layer_type&quot;</span><span class="s1">:</span>
+        <span class="s1">legend_title = </span><span class="s3">&quot;Key&quot;</span>
+
+        <span class="s1">legend_label = (</span>
+            <span class="s3">'&lt;&lt;TABLE BORDER=&quot;0&quot; CELLBORDER=&quot;1&quot; CELLSPACING=&quot;0&quot; CELLPADDING=&quot;5&quot;&gt;'</span>
+            <span class="s3">&quot;&lt;TR&gt;&lt;TD&gt;&lt;B&gt;Legend: Layer types&lt;/B&gt;&lt;/TD&gt;&lt;/TR&gt;&quot;</span>
+        <span class="s1">)</span>
+
+        <span class="s0">for </span><span class="s1">layer_type</span><span class="s0">, </span><span class="s1">color </span><span class="s0">in </span><span class="s1">layer_colors.items():</span>
+            <span class="s0">if </span><span class="s1">color[</span><span class="s5">1</span><span class="s1">]:</span>
+                <span class="s1">legend_label += </span><span class="s3">f'&lt;TR&gt;&lt;TD BGCOLOR=&quot;</span><span class="s0">{</span><span class="s1">color[</span><span class="s5">0</span><span class="s1">]</span><span class="s0">}</span><span class="s3">&quot;&gt;</span><span class="s0">{</span><span class="s1">layer_type</span><span class="s0">}</span><span class="s3">&lt;/TD&gt;&lt;/TR&gt;'</span>
+
+        <span class="s1">legend_label += </span><span class="s3">&quot;&lt;/TABLE&gt;&gt;&quot;</span>
+
+        <span class="s1">attrs = data_attributes.get(legend_title</span><span class="s0">, </span><span class="s1">{})</span>
+        <span class="s1">attrs.setdefault(</span><span class="s3">&quot;label&quot;</span><span class="s0">, </span><span class="s1">str(legend_label))</span>
+        <span class="s1">attrs.setdefault(</span><span class="s3">&quot;fontsize&quot;</span><span class="s0">, </span><span class="s3">&quot;20&quot;</span><span class="s1">)</span>
+        <span class="s1">attrs.setdefault(</span><span class="s3">&quot;margin&quot;</span><span class="s0">, </span><span class="s3">&quot;0&quot;</span><span class="s1">)</span>
+
+        <span class="s1">g.node(legend_title</span><span class="s0">, </span><span class="s1">**attrs)</span>
+
+    <span class="s0">return </span><span class="s1">g</span>
+
+
+<span class="s0">def </span><span class="s1">_get_some_layer_name(collection) -&gt; str:</span>
+    <span class="s2">&quot;&quot;&quot;Somehow get a unique name for a Layer from a non-HighLevelGraph dask mapping&quot;&quot;&quot;</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">(name</span><span class="s0">,</span><span class="s1">) = collection.__dask_layers__()</span>
+        <span class="s0">return </span><span class="s1">name</span>
+    <span class="s0">except </span><span class="s1">(AttributeError</span><span class="s0">, </span><span class="s1">ValueError):</span>
+        <span class="s4"># collection does not define the optional __dask_layers__ method</span>
+        <span class="s4"># or it spuriously returns more than one layer</span>
+        <span class="s0">return </span><span class="s1">str(id(collection))</span>
+</pre>
+</body>
+</html>

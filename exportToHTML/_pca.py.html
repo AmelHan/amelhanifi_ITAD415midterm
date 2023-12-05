@@ -1,0 +1,723 @@
+<html>
+<head>
+<title>_pca.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_pca.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; Principal Component Analysis. 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># Author: Alexandre Gramfort &lt;alexandre.gramfort@inria.fr&gt;</span>
+<span class="s2">#         Olivier Grisel &lt;olivier.grisel@ensta.org&gt;</span>
+<span class="s2">#         Mathieu Blondel &lt;mathieu@mblondel.org&gt;</span>
+<span class="s2">#         Denis A. Engemann &lt;denis-alexander.engemann@inria.fr&gt;</span>
+<span class="s2">#         Michael Eickenberg &lt;michael.eickenberg@inria.fr&gt;</span>
+<span class="s2">#         Giorgio Patrini &lt;giorgio.patrini@anu.edu.au&gt;</span>
+<span class="s2">#</span>
+<span class="s2"># License: BSD 3 clause</span>
+
+<span class="s3">from </span><span class="s1">math </span><span class="s3">import </span><span class="s1">log</span><span class="s3">, </span><span class="s1">sqrt</span>
+<span class="s3">from </span><span class="s1">numbers </span><span class="s3">import </span><span class="s1">Integral</span><span class="s3">, </span><span class="s1">Real</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">linalg</span>
+<span class="s3">from </span><span class="s1">scipy.sparse </span><span class="s3">import </span><span class="s1">issparse</span>
+<span class="s3">from </span><span class="s1">scipy.sparse.linalg </span><span class="s3">import </span><span class="s1">svds</span>
+<span class="s3">from </span><span class="s1">scipy.special </span><span class="s3">import </span><span class="s1">gammaln</span>
+
+<span class="s3">from </span><span class="s1">..base </span><span class="s3">import </span><span class="s1">_fit_context</span>
+<span class="s3">from </span><span class="s1">..utils </span><span class="s3">import </span><span class="s1">check_random_state</span>
+<span class="s3">from </span><span class="s1">..utils._arpack </span><span class="s3">import </span><span class="s1">_init_arpack_v0</span>
+<span class="s3">from </span><span class="s1">..utils._param_validation </span><span class="s3">import </span><span class="s1">Interval</span><span class="s3">, </span><span class="s1">RealNotInt</span><span class="s3">, </span><span class="s1">StrOptions</span>
+<span class="s3">from </span><span class="s1">..utils.deprecation </span><span class="s3">import </span><span class="s1">deprecated</span>
+<span class="s3">from </span><span class="s1">..utils.extmath </span><span class="s3">import </span><span class="s1">fast_logdet</span><span class="s3">, </span><span class="s1">randomized_svd</span><span class="s3">, </span><span class="s1">stable_cumsum</span><span class="s3">, </span><span class="s1">svd_flip</span>
+<span class="s3">from </span><span class="s1">..utils.validation </span><span class="s3">import </span><span class="s1">check_is_fitted</span>
+<span class="s3">from </span><span class="s1">._base </span><span class="s3">import </span><span class="s1">_BasePCA</span>
+
+
+<span class="s3">def </span><span class="s1">_assess_dimension(spectrum</span><span class="s3">, </span><span class="s1">rank</span><span class="s3">, </span><span class="s1">n_samples):</span>
+    <span class="s0">&quot;&quot;&quot;Compute the log-likelihood of a rank ``rank`` dataset. 
+ 
+    The dataset is assumed to be embedded in gaussian noise of shape(n, 
+    dimf) having spectrum ``spectrum``. This implements the method of 
+    T. P. Minka. 
+ 
+    Parameters 
+    ---------- 
+    spectrum : ndarray of shape (n_features,) 
+        Data spectrum. 
+    rank : int 
+        Tested rank value. It should be strictly lower than n_features, 
+        otherwise the method isn't specified (division by zero in equation 
+        (31) from the paper). 
+    n_samples : int 
+        Number of samples. 
+ 
+    Returns 
+    ------- 
+    ll : float 
+        The log-likelihood. 
+ 
+    References 
+    ---------- 
+    This implements the method of `Thomas P. Minka: 
+    Automatic Choice of Dimensionality for PCA. NIPS 2000: 598-604 
+    &lt;https://proceedings.neurips.cc/paper/2000/file/7503cfacd12053d309b6bed5c89de212-Paper.pdf&gt;`_ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">n_features = spectrum.shape[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s3">if not </span><span class="s4">1 </span><span class="s1">&lt;= rank &lt; n_features:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;the tested rank should be in [1, n_features - 1]&quot;</span><span class="s1">)</span>
+
+    <span class="s1">eps = </span><span class="s4">1e-15</span>
+
+    <span class="s3">if </span><span class="s1">spectrum[rank - </span><span class="s4">1</span><span class="s1">] &lt; eps:</span>
+        <span class="s2"># When the tested rank is associated with a small eigenvalue, there's</span>
+        <span class="s2"># no point in computing the log-likelihood: it's going to be very</span>
+        <span class="s2"># small and won't be the max anyway. Also, it can lead to numerical</span>
+        <span class="s2"># issues below when computing pa, in particular in log((spectrum[i] -</span>
+        <span class="s2"># spectrum[j]) because this will take the log of something very small.</span>
+        <span class="s3">return </span><span class="s1">-np.inf</span>
+
+    <span class="s1">pu = -rank * log(</span><span class="s4">2.0</span><span class="s1">)</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">rank + </span><span class="s4">1</span><span class="s1">):</span>
+        <span class="s1">pu += (</span>
+            <span class="s1">gammaln((n_features - i + </span><span class="s4">1</span><span class="s1">) / </span><span class="s4">2.0</span><span class="s1">)</span>
+            <span class="s1">- log(np.pi) * (n_features - i + </span><span class="s4">1</span><span class="s1">) / </span><span class="s4">2.0</span>
+        <span class="s1">)</span>
+
+    <span class="s1">pl = np.sum(np.log(spectrum[:rank]))</span>
+    <span class="s1">pl = -pl * n_samples / </span><span class="s4">2.0</span>
+
+    <span class="s1">v = max(eps</span><span class="s3">, </span><span class="s1">np.sum(spectrum[rank:]) / (n_features - rank))</span>
+    <span class="s1">pv = -np.log(v) * n_samples * (n_features - rank) / </span><span class="s4">2.0</span>
+
+    <span class="s1">m = n_features * rank - rank * (rank + </span><span class="s4">1.0</span><span class="s1">) / </span><span class="s4">2.0</span>
+    <span class="s1">pp = log(</span><span class="s4">2.0 </span><span class="s1">* np.pi) * (m + rank) / </span><span class="s4">2.0</span>
+
+    <span class="s1">pa = </span><span class="s4">0.0</span>
+    <span class="s1">spectrum_ = spectrum.copy()</span>
+    <span class="s1">spectrum_[rank:n_features] = v</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(rank):</span>
+        <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(i + </span><span class="s4">1</span><span class="s3">, </span><span class="s1">len(spectrum)):</span>
+            <span class="s1">pa += log(</span>
+                <span class="s1">(spectrum[i] - spectrum[j]) * (</span><span class="s4">1.0 </span><span class="s1">/ spectrum_[j] - </span><span class="s4">1.0 </span><span class="s1">/ spectrum_[i])</span>
+            <span class="s1">) + log(n_samples)</span>
+
+    <span class="s1">ll = pu + pl + pv + pp - pa / </span><span class="s4">2.0 </span><span class="s1">- rank * log(n_samples) / </span><span class="s4">2.0</span>
+
+    <span class="s3">return </span><span class="s1">ll</span>
+
+
+<span class="s3">def </span><span class="s1">_infer_dimension(spectrum</span><span class="s3">, </span><span class="s1">n_samples):</span>
+    <span class="s0">&quot;&quot;&quot;Infers the dimension of a dataset with a given spectrum. 
+ 
+    The returned value will be in [1, n_features - 1]. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">ll = np.empty_like(spectrum)</span>
+    <span class="s1">ll[</span><span class="s4">0</span><span class="s1">] = -np.inf  </span><span class="s2"># we don't want to return n_components = 0</span>
+    <span class="s3">for </span><span class="s1">rank </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">spectrum.shape[</span><span class="s4">0</span><span class="s1">]):</span>
+        <span class="s1">ll[rank] = _assess_dimension(spectrum</span><span class="s3">, </span><span class="s1">rank</span><span class="s3">, </span><span class="s1">n_samples)</span>
+    <span class="s3">return </span><span class="s1">ll.argmax()</span>
+
+
+<span class="s3">class </span><span class="s1">PCA(_BasePCA):</span>
+    <span class="s0">&quot;&quot;&quot;Principal component analysis (PCA). 
+ 
+    Linear dimensionality reduction using Singular Value Decomposition of the 
+    data to project it to a lower dimensional space. The input data is centered 
+    but not scaled for each feature before applying the SVD. 
+ 
+    It uses the LAPACK implementation of the full SVD or a randomized truncated 
+    SVD by the method of Halko et al. 2009, depending on the shape of the input 
+    data and the number of components to extract. 
+ 
+    It can also use the scipy.sparse.linalg ARPACK implementation of the 
+    truncated SVD. 
+ 
+    Notice that this class does not support sparse input. See 
+    :class:`TruncatedSVD` for an alternative with sparse data. 
+ 
+    Read more in the :ref:`User Guide &lt;PCA&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    n_components : int, float or 'mle', default=None 
+        Number of components to keep. 
+        if n_components is not set all components are kept:: 
+ 
+            n_components == min(n_samples, n_features) 
+ 
+        If ``n_components == 'mle'`` and ``svd_solver == 'full'``, Minka's 
+        MLE is used to guess the dimension. Use of ``n_components == 'mle'`` 
+        will interpret ``svd_solver == 'auto'`` as ``svd_solver == 'full'``. 
+ 
+        If ``0 &lt; n_components &lt; 1`` and ``svd_solver == 'full'``, select the 
+        number of components such that the amount of variance that needs to be 
+        explained is greater than the percentage specified by n_components. 
+ 
+        If ``svd_solver == 'arpack'``, the number of components must be 
+        strictly less than the minimum of n_features and n_samples. 
+ 
+        Hence, the None case results in:: 
+ 
+            n_components == min(n_samples, n_features) - 1 
+ 
+    copy : bool, default=True 
+        If False, data passed to fit are overwritten and running 
+        fit(X).transform(X) will not yield the expected results, 
+        use fit_transform(X) instead. 
+ 
+    whiten : bool, default=False 
+        When True (False by default) the `components_` vectors are multiplied 
+        by the square root of n_samples and then divided by the singular values 
+        to ensure uncorrelated outputs with unit component-wise variances. 
+ 
+        Whitening will remove some information from the transformed signal 
+        (the relative variance scales of the components) but can sometime 
+        improve the predictive accuracy of the downstream estimators by 
+        making their data respect some hard-wired assumptions. 
+ 
+    svd_solver : {'auto', 'full', 'arpack', 'randomized'}, default='auto' 
+        If auto : 
+            The solver is selected by a default policy based on `X.shape` and 
+            `n_components`: if the input data is larger than 500x500 and the 
+            number of components to extract is lower than 80% of the smallest 
+            dimension of the data, then the more efficient 'randomized' 
+            method is enabled. Otherwise the exact full SVD is computed and 
+            optionally truncated afterwards. 
+        If full : 
+            run exact full SVD calling the standard LAPACK solver via 
+            `scipy.linalg.svd` and select the components by postprocessing 
+        If arpack : 
+            run SVD truncated to n_components calling ARPACK solver via 
+            `scipy.sparse.linalg.svds`. It requires strictly 
+            0 &lt; n_components &lt; min(X.shape) 
+        If randomized : 
+            run randomized SVD by the method of Halko et al. 
+ 
+        .. versionadded:: 0.18.0 
+ 
+    tol : float, default=0.0 
+        Tolerance for singular values computed by svd_solver == 'arpack'. 
+        Must be of range [0.0, infinity). 
+ 
+        .. versionadded:: 0.18.0 
+ 
+    iterated_power : int or 'auto', default='auto' 
+        Number of iterations for the power method computed by 
+        svd_solver == 'randomized'. 
+        Must be of range [0, infinity). 
+ 
+        .. versionadded:: 0.18.0 
+ 
+    n_oversamples : int, default=10 
+        This parameter is only relevant when `svd_solver=&quot;randomized&quot;`. 
+        It corresponds to the additional number of random vectors to sample the 
+        range of `X` so as to ensure proper conditioning. See 
+        :func:`~sklearn.utils.extmath.randomized_svd` for more details. 
+ 
+        .. versionadded:: 1.1 
+ 
+    power_iteration_normalizer : {'auto', 'QR', 'LU', 'none'}, default='auto' 
+        Power iteration normalizer for randomized SVD solver. 
+        Not used by ARPACK. See :func:`~sklearn.utils.extmath.randomized_svd` 
+        for more details. 
+ 
+        .. versionadded:: 1.1 
+ 
+    random_state : int, RandomState instance or None, default=None 
+        Used when the 'arpack' or 'randomized' solvers are used. Pass an int 
+        for reproducible results across multiple function calls. 
+        See :term:`Glossary &lt;random_state&gt;`. 
+ 
+        .. versionadded:: 0.18.0 
+ 
+    Attributes 
+    ---------- 
+    components_ : ndarray of shape (n_components, n_features) 
+        Principal axes in feature space, representing the directions of 
+        maximum variance in the data. Equivalently, the right singular 
+        vectors of the centered input data, parallel to its eigenvectors. 
+        The components are sorted by decreasing ``explained_variance_``. 
+ 
+    explained_variance_ : ndarray of shape (n_components,) 
+        The amount of variance explained by each of the selected components. 
+        The variance estimation uses `n_samples - 1` degrees of freedom. 
+ 
+        Equal to n_components largest eigenvalues 
+        of the covariance matrix of X. 
+ 
+        .. versionadded:: 0.18 
+ 
+    explained_variance_ratio_ : ndarray of shape (n_components,) 
+        Percentage of variance explained by each of the selected components. 
+ 
+        If ``n_components`` is not set then all components are stored and the 
+        sum of the ratios is equal to 1.0. 
+ 
+    singular_values_ : ndarray of shape (n_components,) 
+        The singular values corresponding to each of the selected components. 
+        The singular values are equal to the 2-norms of the ``n_components`` 
+        variables in the lower-dimensional space. 
+ 
+        .. versionadded:: 0.19 
+ 
+    mean_ : ndarray of shape (n_features,) 
+        Per-feature empirical mean, estimated from the training set. 
+ 
+        Equal to `X.mean(axis=0)`. 
+ 
+    n_components_ : int 
+        The estimated number of components. When n_components is set 
+        to 'mle' or a number between 0 and 1 (with svd_solver == 'full') this 
+        number is estimated from input data. Otherwise it equals the parameter 
+        n_components, or the lesser value of n_features and n_samples 
+        if n_components is None. 
+ 
+    n_features_ : int 
+        Number of features in the training data. 
+ 
+    n_samples_ : int 
+        Number of samples in the training data. 
+ 
+    noise_variance_ : float 
+        The estimated noise covariance following the Probabilistic PCA model 
+        from Tipping and Bishop 1999. See &quot;Pattern Recognition and 
+        Machine Learning&quot; by C. Bishop, 12.2.1 p. 574 or 
+        http://www.miketipping.com/papers/met-mppca.pdf. It is required to 
+        compute the estimated data covariance and score samples. 
+ 
+        Equal to the average of (min(n_features, n_samples) - n_components) 
+        smallest eigenvalues of the covariance matrix of X. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    KernelPCA : Kernel Principal Component Analysis. 
+    SparsePCA : Sparse Principal Component Analysis. 
+    TruncatedSVD : Dimensionality reduction using truncated SVD. 
+    IncrementalPCA : Incremental Principal Component Analysis. 
+ 
+    References 
+    ---------- 
+    For n_components == 'mle', this class uses the method from: 
+    `Minka, T. P.. &quot;Automatic choice of dimensionality for PCA&quot;. 
+    In NIPS, pp. 598-604 &lt;https://tminka.github.io/papers/pca/minka-pca.pdf&gt;`_ 
+ 
+    Implements the probabilistic PCA model from: 
+    `Tipping, M. E., and Bishop, C. M. (1999). &quot;Probabilistic principal 
+    component analysis&quot;. Journal of the Royal Statistical Society: 
+    Series B (Statistical Methodology), 61(3), 611-622. 
+    &lt;http://www.miketipping.com/papers/met-mppca.pdf&gt;`_ 
+    via the score and score_samples methods. 
+ 
+    For svd_solver == 'arpack', refer to `scipy.sparse.linalg.svds`. 
+ 
+    For svd_solver == 'randomized', see: 
+    :doi:`Halko, N., Martinsson, P. G., and Tropp, J. A. (2011). 
+    &quot;Finding structure with randomness: Probabilistic algorithms for 
+    constructing approximate matrix decompositions&quot;. 
+    SIAM review, 53(2), 217-288. 
+    &lt;10.1137/090771806&gt;` 
+    and also 
+    :doi:`Martinsson, P. G., Rokhlin, V., and Tygert, M. (2011). 
+    &quot;A randomized algorithm for the decomposition of matrices&quot;. 
+    Applied and Computational Harmonic Analysis, 30(1), 47-68. 
+    &lt;10.1016/j.acha.2010.02.003&gt;` 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from sklearn.decomposition import PCA 
+    &gt;&gt;&gt; X = np.array([[-1, -1], [-2, -1], [-3, -2], [1, 1], [2, 1], [3, 2]]) 
+    &gt;&gt;&gt; pca = PCA(n_components=2) 
+    &gt;&gt;&gt; pca.fit(X) 
+    PCA(n_components=2) 
+    &gt;&gt;&gt; print(pca.explained_variance_ratio_) 
+    [0.9924... 0.0075...] 
+    &gt;&gt;&gt; print(pca.singular_values_) 
+    [6.30061... 0.54980...] 
+ 
+    &gt;&gt;&gt; pca = PCA(n_components=2, svd_solver='full') 
+    &gt;&gt;&gt; pca.fit(X) 
+    PCA(n_components=2, svd_solver='full') 
+    &gt;&gt;&gt; print(pca.explained_variance_ratio_) 
+    [0.9924... 0.00755...] 
+    &gt;&gt;&gt; print(pca.singular_values_) 
+    [6.30061... 0.54980...] 
+ 
+    &gt;&gt;&gt; pca = PCA(n_components=1, svd_solver='arpack') 
+    &gt;&gt;&gt; pca.fit(X) 
+    PCA(n_components=1, svd_solver='arpack') 
+    &gt;&gt;&gt; print(pca.explained_variance_ratio_) 
+    [0.99244...] 
+    &gt;&gt;&gt; print(pca.singular_values_) 
+    [6.30061...] 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span>
+        <span class="s5">&quot;n_components&quot;</span><span class="s1">: [</span>
+            <span class="s1">Interval(Integral</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, None, </span><span class="s1">closed=</span><span class="s5">&quot;left&quot;</span><span class="s1">)</span><span class="s3">,</span>
+            <span class="s1">Interval(RealNotInt</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">closed=</span><span class="s5">&quot;neither&quot;</span><span class="s1">)</span><span class="s3">,</span>
+            <span class="s1">StrOptions({</span><span class="s5">&quot;mle&quot;</span><span class="s1">})</span><span class="s3">,</span>
+            <span class="s3">None,</span>
+        <span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;copy&quot;</span><span class="s1">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;whiten&quot;</span><span class="s1">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;svd_solver&quot;</span><span class="s1">: [StrOptions({</span><span class="s5">&quot;auto&quot;</span><span class="s3">, </span><span class="s5">&quot;full&quot;</span><span class="s3">, </span><span class="s5">&quot;arpack&quot;</span><span class="s3">, </span><span class="s5">&quot;randomized&quot;</span><span class="s1">})]</span><span class="s3">,</span>
+        <span class="s5">&quot;tol&quot;</span><span class="s1">: [Interval(Real</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, None, </span><span class="s1">closed=</span><span class="s5">&quot;left&quot;</span><span class="s1">)]</span><span class="s3">,</span>
+        <span class="s5">&quot;iterated_power&quot;</span><span class="s1">: [</span>
+            <span class="s1">StrOptions({</span><span class="s5">&quot;auto&quot;</span><span class="s1">})</span><span class="s3">,</span>
+            <span class="s1">Interval(Integral</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, None, </span><span class="s1">closed=</span><span class="s5">&quot;left&quot;</span><span class="s1">)</span><span class="s3">,</span>
+        <span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;n_oversamples&quot;</span><span class="s1">: [Interval(Integral</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, None, </span><span class="s1">closed=</span><span class="s5">&quot;left&quot;</span><span class="s1">)]</span><span class="s3">,</span>
+        <span class="s5">&quot;power_iteration_normalizer&quot;</span><span class="s1">: [StrOptions({</span><span class="s5">&quot;auto&quot;</span><span class="s3">, </span><span class="s5">&quot;QR&quot;</span><span class="s3">, </span><span class="s5">&quot;LU&quot;</span><span class="s3">, </span><span class="s5">&quot;none&quot;</span><span class="s1">})]</span><span class="s3">,</span>
+        <span class="s5">&quot;random_state&quot;</span><span class="s1">: [</span><span class="s5">&quot;random_state&quot;</span><span class="s1">]</span><span class="s3">,</span>
+    <span class="s1">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">n_components=</span><span class="s3">None,</span>
+        <span class="s1">*</span><span class="s3">,</span>
+        <span class="s1">copy=</span><span class="s3">True,</span>
+        <span class="s1">whiten=</span><span class="s3">False,</span>
+        <span class="s1">svd_solver=</span><span class="s5">&quot;auto&quot;</span><span class="s3">,</span>
+        <span class="s1">tol=</span><span class="s4">0.0</span><span class="s3">,</span>
+        <span class="s1">iterated_power=</span><span class="s5">&quot;auto&quot;</span><span class="s3">,</span>
+        <span class="s1">n_oversamples=</span><span class="s4">10</span><span class="s3">,</span>
+        <span class="s1">power_iteration_normalizer=</span><span class="s5">&quot;auto&quot;</span><span class="s3">,</span>
+        <span class="s1">random_state=</span><span class="s3">None,</span>
+    <span class="s1">):</span>
+        <span class="s1">self.n_components = n_components</span>
+        <span class="s1">self.copy = copy</span>
+        <span class="s1">self.whiten = whiten</span>
+        <span class="s1">self.svd_solver = svd_solver</span>
+        <span class="s1">self.tol = tol</span>
+        <span class="s1">self.iterated_power = iterated_power</span>
+        <span class="s1">self.n_oversamples = n_oversamples</span>
+        <span class="s1">self.power_iteration_normalizer = power_iteration_normalizer</span>
+        <span class="s1">self.random_state = random_state</span>
+
+    <span class="s2"># TODO(1.4): remove in 1.4</span>
+    <span class="s2"># mypy error: Decorated property not supported</span>
+    <span class="s1">@deprecated(  </span><span class="s2"># type: ignore</span>
+        <span class="s5">&quot;Attribute `n_features_` was deprecated in version 1.2 and will be &quot;</span>
+        <span class="s5">&quot;removed in 1.4. Use `n_features_in_` instead.&quot;</span>
+    <span class="s1">)</span>
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">n_features_(self):</span>
+        <span class="s3">return </span><span class="s1">self.n_features_in_</span>
+
+    <span class="s1">@_fit_context(prefer_skip_nested_validation=</span><span class="s3">True</span><span class="s1">)</span>
+    <span class="s3">def </span><span class="s1">fit(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the model with X. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training data, where `n_samples` is the number of samples 
+            and `n_features` is the number of features. 
+ 
+        y : Ignored 
+            Ignored. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Returns the instance itself. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self._fit(X)</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s1">@_fit_context(prefer_skip_nested_validation=</span><span class="s3">True</span><span class="s1">)</span>
+    <span class="s3">def </span><span class="s1">fit_transform(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the model with X and apply the dimensionality reduction on X. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training data, where `n_samples` is the number of samples 
+            and `n_features` is the number of features. 
+ 
+        y : Ignored 
+            Ignored. 
+ 
+        Returns 
+        ------- 
+        X_new : ndarray of shape (n_samples, n_components) 
+            Transformed values. 
+ 
+        Notes 
+        ----- 
+        This method returns a Fortran-ordered array. To convert it to a 
+        C-ordered array, use 'np.ascontiguousarray'. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">U</span><span class="s3">, </span><span class="s1">S</span><span class="s3">, </span><span class="s1">Vt = self._fit(X)</span>
+        <span class="s1">U = U[:</span><span class="s3">, </span><span class="s1">: self.n_components_]</span>
+
+        <span class="s3">if </span><span class="s1">self.whiten:</span>
+            <span class="s2"># X_new = X * V / S * sqrt(n_samples) = U * sqrt(n_samples)</span>
+            <span class="s1">U *= sqrt(X.shape[</span><span class="s4">0</span><span class="s1">] - </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s2"># X_new = X * V = U * S * Vt * V = U * S</span>
+            <span class="s1">U *= S[: self.n_components_]</span>
+
+        <span class="s3">return </span><span class="s1">U</span>
+
+    <span class="s3">def </span><span class="s1">_fit(self</span><span class="s3">, </span><span class="s1">X):</span>
+        <span class="s0">&quot;&quot;&quot;Dispatch to the right submethod depending on the chosen solver.&quot;&quot;&quot;</span>
+
+        <span class="s2"># Raise an error for sparse input.</span>
+        <span class="s2"># This is more informative than the generic one raised by check_array.</span>
+        <span class="s3">if </span><span class="s1">issparse(X):</span>
+            <span class="s3">raise </span><span class="s1">TypeError(</span>
+                <span class="s5">&quot;PCA does not support sparse input. See &quot;</span>
+                <span class="s5">&quot;TruncatedSVD for a possible alternative.&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">X = self._validate_data(</span>
+            <span class="s1">X</span><span class="s3">, </span><span class="s1">dtype=[np.float64</span><span class="s3">, </span><span class="s1">np.float32]</span><span class="s3">, </span><span class="s1">ensure_2d=</span><span class="s3">True, </span><span class="s1">copy=self.copy</span>
+        <span class="s1">)</span>
+
+        <span class="s2"># Handle n_components==None</span>
+        <span class="s3">if </span><span class="s1">self.n_components </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">self.svd_solver != </span><span class="s5">&quot;arpack&quot;</span><span class="s1">:</span>
+                <span class="s1">n_components = min(X.shape)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">n_components = min(X.shape) - </span><span class="s4">1</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">n_components = self.n_components</span>
+
+        <span class="s2"># Handle svd_solver</span>
+        <span class="s1">self._fit_svd_solver = self.svd_solver</span>
+        <span class="s3">if </span><span class="s1">self._fit_svd_solver == </span><span class="s5">&quot;auto&quot;</span><span class="s1">:</span>
+            <span class="s2"># Small problem or n_components == 'mle', just call full PCA</span>
+            <span class="s3">if </span><span class="s1">max(X.shape) &lt;= </span><span class="s4">500 </span><span class="s3">or </span><span class="s1">n_components == </span><span class="s5">&quot;mle&quot;</span><span class="s1">:</span>
+                <span class="s1">self._fit_svd_solver = </span><span class="s5">&quot;full&quot;</span>
+            <span class="s3">elif </span><span class="s4">1 </span><span class="s1">&lt;= n_components &lt; </span><span class="s4">0.8 </span><span class="s1">* min(X.shape):</span>
+                <span class="s1">self._fit_svd_solver = </span><span class="s5">&quot;randomized&quot;</span>
+            <span class="s2"># This is also the case of n_components in (0,1)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">self._fit_svd_solver = </span><span class="s5">&quot;full&quot;</span>
+
+        <span class="s2"># Call different fits for either full or truncated SVD</span>
+        <span class="s3">if </span><span class="s1">self._fit_svd_solver == </span><span class="s5">&quot;full&quot;</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">self._fit_full(X</span><span class="s3">, </span><span class="s1">n_components)</span>
+        <span class="s3">elif </span><span class="s1">self._fit_svd_solver </span><span class="s3">in </span><span class="s1">[</span><span class="s5">&quot;arpack&quot;</span><span class="s3">, </span><span class="s5">&quot;randomized&quot;</span><span class="s1">]:</span>
+            <span class="s3">return </span><span class="s1">self._fit_truncated(X</span><span class="s3">, </span><span class="s1">n_components</span><span class="s3">, </span><span class="s1">self._fit_svd_solver)</span>
+
+    <span class="s3">def </span><span class="s1">_fit_full(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">n_components):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the model by computing full SVD on X.&quot;&quot;&quot;</span>
+        <span class="s1">n_samples</span><span class="s3">, </span><span class="s1">n_features = X.shape</span>
+
+        <span class="s3">if </span><span class="s1">n_components == </span><span class="s5">&quot;mle&quot;</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">n_samples &lt; n_features:</span>
+                <span class="s3">raise </span><span class="s1">ValueError(</span>
+                    <span class="s5">&quot;n_components='mle' is only supported if n_samples &gt;= n_features&quot;</span>
+                <span class="s1">)</span>
+        <span class="s3">elif not </span><span class="s4">0 </span><span class="s1">&lt;= n_components &lt;= min(n_samples</span><span class="s3">, </span><span class="s1">n_features):</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;n_components=%r must be between 0 and &quot;</span>
+                <span class="s5">&quot;min(n_samples, n_features)=%r with &quot;</span>
+                <span class="s5">&quot;svd_solver='full'&quot; </span><span class="s1">% (n_components</span><span class="s3">, </span><span class="s1">min(n_samples</span><span class="s3">, </span><span class="s1">n_features))</span>
+            <span class="s1">)</span>
+
+        <span class="s2"># Center data</span>
+        <span class="s1">self.mean_ = np.mean(X</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s1">X -= self.mean_</span>
+
+        <span class="s1">U</span><span class="s3">, </span><span class="s1">S</span><span class="s3">, </span><span class="s1">Vt = linalg.svd(X</span><span class="s3">, </span><span class="s1">full_matrices=</span><span class="s3">False</span><span class="s1">)</span>
+        <span class="s2"># flip eigenvectors' sign to enforce deterministic output</span>
+        <span class="s1">U</span><span class="s3">, </span><span class="s1">Vt = svd_flip(U</span><span class="s3">, </span><span class="s1">Vt)</span>
+
+        <span class="s1">components_ = Vt</span>
+
+        <span class="s2"># Get variance explained by singular values</span>
+        <span class="s1">explained_variance_ = (S**</span><span class="s4">2</span><span class="s1">) / (n_samples - </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">total_var = explained_variance_.sum()</span>
+        <span class="s1">explained_variance_ratio_ = explained_variance_ / total_var</span>
+        <span class="s1">singular_values_ = S.copy()  </span><span class="s2"># Store the singular values.</span>
+
+        <span class="s2"># Postprocess the number of components required</span>
+        <span class="s3">if </span><span class="s1">n_components == </span><span class="s5">&quot;mle&quot;</span><span class="s1">:</span>
+            <span class="s1">n_components = _infer_dimension(explained_variance_</span><span class="s3">, </span><span class="s1">n_samples)</span>
+        <span class="s3">elif </span><span class="s4">0 </span><span class="s1">&lt; n_components &lt; </span><span class="s4">1.0</span><span class="s1">:</span>
+            <span class="s2"># number of components for which the cumulated explained</span>
+            <span class="s2"># variance percentage is superior to the desired threshold</span>
+            <span class="s2"># side='right' ensures that number of features selected</span>
+            <span class="s2"># their variance is always greater than n_components float</span>
+            <span class="s2"># passed. More discussion in issue: #15669</span>
+            <span class="s1">ratio_cumsum = stable_cumsum(explained_variance_ratio_)</span>
+            <span class="s1">n_components = np.searchsorted(ratio_cumsum</span><span class="s3">, </span><span class="s1">n_components</span><span class="s3">, </span><span class="s1">side=</span><span class="s5">&quot;right&quot;</span><span class="s1">) + </span><span class="s4">1</span>
+        <span class="s2"># Compute noise covariance using Probabilistic PCA model</span>
+        <span class="s2"># The sigma2 maximum likelihood (cf. eq. 12.46)</span>
+        <span class="s3">if </span><span class="s1">n_components &lt; min(n_features</span><span class="s3">, </span><span class="s1">n_samples):</span>
+            <span class="s1">self.noise_variance_ = explained_variance_[n_components:].mean()</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.noise_variance_ = </span><span class="s4">0.0</span>
+
+        <span class="s1">self.n_samples_ = n_samples</span>
+        <span class="s1">self.components_ = components_[:n_components]</span>
+        <span class="s1">self.n_components_ = n_components</span>
+        <span class="s1">self.explained_variance_ = explained_variance_[:n_components]</span>
+        <span class="s1">self.explained_variance_ratio_ = explained_variance_ratio_[:n_components]</span>
+        <span class="s1">self.singular_values_ = singular_values_[:n_components]</span>
+
+        <span class="s3">return </span><span class="s1">U</span><span class="s3">, </span><span class="s1">S</span><span class="s3">, </span><span class="s1">Vt</span>
+
+    <span class="s3">def </span><span class="s1">_fit_truncated(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">n_components</span><span class="s3">, </span><span class="s1">svd_solver):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the model by computing truncated SVD (by ARPACK or randomized) 
+        on X. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">n_samples</span><span class="s3">, </span><span class="s1">n_features = X.shape</span>
+
+        <span class="s3">if </span><span class="s1">isinstance(n_components</span><span class="s3">, </span><span class="s1">str):</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;n_components=%r cannot be a string with svd_solver='%s'&quot;</span>
+                <span class="s1">% (n_components</span><span class="s3">, </span><span class="s1">svd_solver)</span>
+            <span class="s1">)</span>
+        <span class="s3">elif not </span><span class="s4">1 </span><span class="s1">&lt;= n_components &lt;= min(n_samples</span><span class="s3">, </span><span class="s1">n_features):</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;n_components=%r must be between 1 and &quot;</span>
+                <span class="s5">&quot;min(n_samples, n_features)=%r with &quot;</span>
+                <span class="s5">&quot;svd_solver='%s'&quot;</span>
+                <span class="s1">% (n_components</span><span class="s3">, </span><span class="s1">min(n_samples</span><span class="s3">, </span><span class="s1">n_features)</span><span class="s3">, </span><span class="s1">svd_solver)</span>
+            <span class="s1">)</span>
+        <span class="s3">elif </span><span class="s1">svd_solver == </span><span class="s5">&quot;arpack&quot; </span><span class="s3">and </span><span class="s1">n_components == min(n_samples</span><span class="s3">, </span><span class="s1">n_features):</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;n_components=%r must be strictly less than &quot;</span>
+                <span class="s5">&quot;min(n_samples, n_features)=%r with &quot;</span>
+                <span class="s5">&quot;svd_solver='%s'&quot;</span>
+                <span class="s1">% (n_components</span><span class="s3">, </span><span class="s1">min(n_samples</span><span class="s3">, </span><span class="s1">n_features)</span><span class="s3">, </span><span class="s1">svd_solver)</span>
+            <span class="s1">)</span>
+
+        <span class="s1">random_state = check_random_state(self.random_state)</span>
+
+        <span class="s2"># Center data</span>
+        <span class="s1">self.mean_ = np.mean(X</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s1">X -= self.mean_</span>
+
+        <span class="s3">if </span><span class="s1">svd_solver == </span><span class="s5">&quot;arpack&quot;</span><span class="s1">:</span>
+            <span class="s1">v0 = _init_arpack_v0(min(X.shape)</span><span class="s3">, </span><span class="s1">random_state)</span>
+            <span class="s1">U</span><span class="s3">, </span><span class="s1">S</span><span class="s3">, </span><span class="s1">Vt = svds(X</span><span class="s3">, </span><span class="s1">k=n_components</span><span class="s3">, </span><span class="s1">tol=self.tol</span><span class="s3">, </span><span class="s1">v0=v0)</span>
+            <span class="s2"># svds doesn't abide by scipy.linalg.svd/randomized_svd</span>
+            <span class="s2"># conventions, so reverse its outputs.</span>
+            <span class="s1">S = S[::-</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s2"># flip eigenvectors' sign to enforce deterministic output</span>
+            <span class="s1">U</span><span class="s3">, </span><span class="s1">Vt = svd_flip(U[:</span><span class="s3">, </span><span class="s1">::-</span><span class="s4">1</span><span class="s1">]</span><span class="s3">, </span><span class="s1">Vt[::-</span><span class="s4">1</span><span class="s1">])</span>
+
+        <span class="s3">elif </span><span class="s1">svd_solver == </span><span class="s5">&quot;randomized&quot;</span><span class="s1">:</span>
+            <span class="s2"># sign flipping is done inside</span>
+            <span class="s1">U</span><span class="s3">, </span><span class="s1">S</span><span class="s3">, </span><span class="s1">Vt = randomized_svd(</span>
+                <span class="s1">X</span><span class="s3">,</span>
+                <span class="s1">n_components=n_components</span><span class="s3">,</span>
+                <span class="s1">n_oversamples=self.n_oversamples</span><span class="s3">,</span>
+                <span class="s1">n_iter=self.iterated_power</span><span class="s3">,</span>
+                <span class="s1">power_iteration_normalizer=self.power_iteration_normalizer</span><span class="s3">,</span>
+                <span class="s1">flip_sign=</span><span class="s3">True,</span>
+                <span class="s1">random_state=random_state</span><span class="s3">,</span>
+            <span class="s1">)</span>
+
+        <span class="s1">self.n_samples_ = n_samples</span>
+        <span class="s1">self.components_ = Vt</span>
+        <span class="s1">self.n_components_ = n_components</span>
+
+        <span class="s2"># Get variance explained by singular values</span>
+        <span class="s1">self.explained_variance_ = (S**</span><span class="s4">2</span><span class="s1">) / (n_samples - </span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s2"># Workaround in-place variance calculation since at the time numpy</span>
+        <span class="s2"># did not have a way to calculate variance in-place.</span>
+        <span class="s1">N = X.shape[</span><span class="s4">0</span><span class="s1">] - </span><span class="s4">1</span>
+        <span class="s1">np.square(X</span><span class="s3">, </span><span class="s1">out=X)</span>
+        <span class="s1">np.sum(X</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s3">, </span><span class="s1">out=X[</span><span class="s4">0</span><span class="s1">])</span>
+        <span class="s1">total_var = (X[</span><span class="s4">0</span><span class="s1">] / N).sum()</span>
+
+        <span class="s1">self.explained_variance_ratio_ = self.explained_variance_ / total_var</span>
+        <span class="s1">self.singular_values_ = S.copy()  </span><span class="s2"># Store the singular values.</span>
+
+        <span class="s3">if </span><span class="s1">self.n_components_ &lt; min(n_features</span><span class="s3">, </span><span class="s1">n_samples):</span>
+            <span class="s1">self.noise_variance_ = total_var - self.explained_variance_.sum()</span>
+            <span class="s1">self.noise_variance_ /= min(n_features</span><span class="s3">, </span><span class="s1">n_samples) - n_components</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.noise_variance_ = </span><span class="s4">0.0</span>
+
+        <span class="s3">return </span><span class="s1">U</span><span class="s3">, </span><span class="s1">S</span><span class="s3">, </span><span class="s1">Vt</span>
+
+    <span class="s3">def </span><span class="s1">score_samples(self</span><span class="s3">, </span><span class="s1">X):</span>
+        <span class="s0">&quot;&quot;&quot;Return the log-likelihood of each sample. 
+ 
+        See. &quot;Pattern Recognition and Machine Learning&quot; 
+        by C. Bishop, 12.2.1 p. 574 
+        or http://www.miketipping.com/papers/met-mppca.pdf 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            The data. 
+ 
+        Returns 
+        ------- 
+        ll : ndarray of shape (n_samples,) 
+            Log-likelihood of each sample under the current model. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted(self)</span>
+
+        <span class="s1">X = self._validate_data(X</span><span class="s3">, </span><span class="s1">dtype=[np.float64</span><span class="s3">, </span><span class="s1">np.float32]</span><span class="s3">, </span><span class="s1">reset=</span><span class="s3">False</span><span class="s1">)</span>
+        <span class="s1">Xr = X - self.mean_</span>
+        <span class="s1">n_features = X.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">precision = self.get_precision()</span>
+        <span class="s1">log_like = -</span><span class="s4">0.5 </span><span class="s1">* (Xr * (np.dot(Xr</span><span class="s3">, </span><span class="s1">precision))).sum(axis=</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">log_like -= </span><span class="s4">0.5 </span><span class="s1">* (n_features * log(</span><span class="s4">2.0 </span><span class="s1">* np.pi) - fast_logdet(precision))</span>
+        <span class="s3">return </span><span class="s1">log_like</span>
+
+    <span class="s3">def </span><span class="s1">score(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Return the average log-likelihood of all samples. 
+ 
+        See. &quot;Pattern Recognition and Machine Learning&quot; 
+        by C. Bishop, 12.2.1 p. 574 
+        or http://www.miketipping.com/papers/met-mppca.pdf 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            The data. 
+ 
+        y : Ignored 
+            Ignored. 
+ 
+        Returns 
+        ------- 
+        ll : float 
+            Average log-likelihood of the samples under the current model. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">np.mean(self.score_samples(X))</span>
+
+    <span class="s3">def </span><span class="s1">_more_tags(self):</span>
+        <span class="s3">return </span><span class="s1">{</span><span class="s5">&quot;preserves_dtype&quot;</span><span class="s1">: [np.float64</span><span class="s3">, </span><span class="s1">np.float32]}</span>
+</pre>
+</body>
+</html>

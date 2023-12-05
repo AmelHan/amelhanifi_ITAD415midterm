@@ -1,0 +1,453 @@
+<html>
+<head>
+<title>bayes_mi.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+bayes_mi.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">import </span><span class="s1">pandas </span><span class="s0">as </span><span class="s1">pd</span>
+<span class="s0">from </span><span class="s1">statsmodels.base.model </span><span class="s0">import </span><span class="s1">LikelihoodModelResults</span>
+
+
+<span class="s0">class </span><span class="s1">BayesGaussMI:</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Bayesian Imputation using a Gaussian model. 
+ 
+    The approach is Bayesian.  The goal is to sample from the joint 
+    distribution of the mean vector, covariance matrix, and missing 
+    data values given the observed data values.  Conjugate priors for 
+    the population mean and covariance matrix are used.  Gibbs 
+    sampling is used to update the mean vector, covariance matrix, and 
+    missing data values in turn.  After burn-in, the imputed complete 
+    data sets from the Gibbs chain can be used in multiple imputation 
+    analyses (MI). 
+ 
+    Parameters 
+    ---------- 
+    data : ndarray 
+        The array of data to be imputed.  Values in the array equal to 
+        NaN are imputed. 
+    mean_prior : ndarray, optional 
+        The covariance matrix of the Gaussian prior distribution for 
+        the mean vector.  If not provided, the identity matrix is 
+        used. 
+    cov_prior : ndarray, optional 
+        The center matrix for the inverse Wishart prior distribution 
+        for the covariance matrix.  If not provided, the identity 
+        matrix is used. 
+    cov_prior_df : positive float 
+        The degrees of freedom of the inverse Wishart prior 
+        distribution for the covariance matrix.  Defaults to 1. 
+ 
+    Examples 
+    -------- 
+    A basic example with OLS. Data is generated assuming 10% is missing at 
+    random. 
+ 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; x = np.random.standard_normal((1000, 2)) 
+    &gt;&gt;&gt; x.flat[np.random.sample(2000) &lt; 0.1] = np.nan 
+ 
+    The imputer is used with ``MI``. 
+ 
+    &gt;&gt;&gt; import statsmodels.api as sm 
+    &gt;&gt;&gt; def model_args_fn(x): 
+    ...     # Return endog, exog from x 
+    ...    return x[:, 0], x[:, 1:] 
+    &gt;&gt;&gt; imp = sm.BayesGaussMI(x) 
+    &gt;&gt;&gt; mi = sm.MI(imp, sm.OLS, model_args_fn) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">data</span><span class="s0">, </span><span class="s1">mean_prior=</span><span class="s0">None, </span><span class="s1">cov_prior=</span><span class="s0">None, </span><span class="s1">cov_prior_df=</span><span class="s3">1</span><span class="s1">):</span>
+
+        <span class="s1">self.exog_names = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">type(data) </span><span class="s0">is </span><span class="s1">pd.DataFrame:</span>
+            <span class="s1">self.exog_names = data.columns</span>
+
+        <span class="s1">data = np.require(data</span><span class="s0">, </span><span class="s1">requirements=</span><span class="s4">&quot;W&quot;</span><span class="s1">)</span>
+        <span class="s1">self.data = data</span>
+        <span class="s1">self._data = data</span>
+        <span class="s1">self.mask = np.isnan(data)</span>
+        <span class="s1">self.nobs = self.mask.shape[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">self.nvar = self.mask.shape[</span><span class="s3">1</span><span class="s1">]</span>
+
+        <span class="s5"># Identify all distinct missing data patterns</span>
+        <span class="s1">z = </span><span class="s3">1 </span><span class="s1">+ np.log(</span><span class="s3">1 </span><span class="s1">+ np.arange(self.mask.shape[</span><span class="s3">1</span><span class="s1">]))</span>
+        <span class="s1">c = np.dot(self.mask</span><span class="s0">, </span><span class="s1">z)</span>
+        <span class="s1">rowmap = {}</span>
+        <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">enumerate(c):</span>
+            <span class="s0">if </span><span class="s1">v == </span><span class="s3">0</span><span class="s1">:</span>
+                <span class="s5"># No missing values</span>
+                <span class="s0">continue</span>
+            <span class="s0">if </span><span class="s1">v </span><span class="s0">not in </span><span class="s1">rowmap:</span>
+                <span class="s1">rowmap[v] = []</span>
+            <span class="s1">rowmap[v].append(i)</span>
+        <span class="s1">self.patterns = [np.asarray(v) </span><span class="s0">for </span><span class="s1">v </span><span class="s0">in </span><span class="s1">rowmap.values()]</span>
+
+        <span class="s5"># Simple starting values for mean and covariance</span>
+        <span class="s1">p = self._data.shape[</span><span class="s3">1</span><span class="s1">]</span>
+        <span class="s1">self.cov = np.eye(p)</span>
+        <span class="s1">mean = []</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(p):</span>
+            <span class="s1">v = self._data[:</span><span class="s0">, </span><span class="s1">i]</span>
+            <span class="s1">v = v[np.isfinite(v)]</span>
+            <span class="s0">if </span><span class="s1">len(v) == </span><span class="s3">0</span><span class="s1">:</span>
+                <span class="s1">msg = </span><span class="s4">&quot;Column %d has no observed values&quot; </span><span class="s1">% i</span>
+                <span class="s0">raise </span><span class="s1">ValueError(msg)</span>
+            <span class="s1">mean.append(v.mean())</span>
+        <span class="s1">self.mean = np.asarray(mean)</span>
+
+        <span class="s5"># Default covariance matrix of the (Gaussian) mean prior</span>
+        <span class="s0">if </span><span class="s1">mean_prior </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">mean_prior = np.eye(p)</span>
+        <span class="s1">self.mean_prior = mean_prior</span>
+
+        <span class="s5"># Default center matrix of the (inverse Wishart) covariance prior</span>
+        <span class="s0">if </span><span class="s1">cov_prior </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">cov_prior = np.eye(p)</span>
+        <span class="s1">self.cov_prior = cov_prior</span>
+
+        <span class="s5"># Degrees of freedom for the (inverse Wishart) covariance prior</span>
+        <span class="s1">self.cov_prior_df = cov_prior_df</span>
+
+    <span class="s0">def </span><span class="s1">update(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Cycle through all Gibbs updates. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">self.update_data()</span>
+
+        <span class="s5"># Need to update data first</span>
+        <span class="s1">self.update_mean()</span>
+        <span class="s1">self.update_cov()</span>
+
+    <span class="s0">def </span><span class="s1">update_data(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Gibbs update of the missing data values. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">for </span><span class="s1">ix </span><span class="s0">in </span><span class="s1">self.patterns:</span>
+
+            <span class="s1">i = ix[</span><span class="s3">0</span><span class="s1">]</span>
+            <span class="s1">ix_miss = np.flatnonzero(self.mask[i</span><span class="s0">, </span><span class="s1">:])</span>
+            <span class="s1">ix_obs = np.flatnonzero(~self.mask[i</span><span class="s0">, </span><span class="s1">:])</span>
+
+            <span class="s1">mm = self.mean[ix_miss]</span>
+            <span class="s1">mo = self.mean[ix_obs]</span>
+
+            <span class="s1">voo = self.cov[ix_obs</span><span class="s0">, </span><span class="s1">:][:</span><span class="s0">, </span><span class="s1">ix_obs]</span>
+            <span class="s1">vmm = self.cov[ix_miss</span><span class="s0">, </span><span class="s1">:][:</span><span class="s0">, </span><span class="s1">ix_miss]</span>
+            <span class="s1">vmo = self.cov[ix_miss</span><span class="s0">, </span><span class="s1">:][:</span><span class="s0">, </span><span class="s1">ix_obs]</span>
+
+            <span class="s1">r = self._data[ix</span><span class="s0">, </span><span class="s1">:][:</span><span class="s0">, </span><span class="s1">ix_obs] - mo</span>
+            <span class="s1">cm = mm + np.dot(vmo</span><span class="s0">, </span><span class="s1">np.linalg.solve(voo</span><span class="s0">, </span><span class="s1">r.T)).T</span>
+            <span class="s1">cv = vmm - np.dot(vmo</span><span class="s0">, </span><span class="s1">np.linalg.solve(voo</span><span class="s0">, </span><span class="s1">vmo.T))</span>
+
+            <span class="s1">cs = np.linalg.cholesky(cv)</span>
+            <span class="s1">u = np.random.normal(size=(len(ix)</span><span class="s0">, </span><span class="s1">len(ix_miss)))</span>
+            <span class="s1">self._data[np.ix_(ix</span><span class="s0">, </span><span class="s1">ix_miss)] = cm + np.dot(u</span><span class="s0">, </span><span class="s1">cs.T)</span>
+
+        <span class="s5"># Set the user-visible data set.</span>
+        <span class="s0">if </span><span class="s1">self.exog_names </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">self.data = pd.DataFrame(</span>
+                           <span class="s1">self._data</span><span class="s0">,</span>
+                           <span class="s1">columns=self.exog_names</span><span class="s0">,</span>
+                           <span class="s1">copy=</span><span class="s0">False</span><span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.data = self._data</span>
+
+    <span class="s0">def </span><span class="s1">update_mean(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Gibbs update of the mean vector. 
+ 
+        Do not call until update_data has been called once. 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># https://stats.stackexchange.com/questions/28744/multivariate-normal-posterior</span>
+
+        <span class="s5"># Posterior covariance matrix of the mean</span>
+        <span class="s1">cm = np.linalg.solve(self.cov/self.nobs + self.mean_prior</span><span class="s0">,</span>
+                             <span class="s1">self.mean_prior / self.nobs)</span>
+        <span class="s1">cm = np.dot(self.cov</span><span class="s0">, </span><span class="s1">cm)</span>
+
+        <span class="s5"># Posterior mean of the mean</span>
+        <span class="s1">vm = np.linalg.solve(self.cov</span><span class="s0">, </span><span class="s1">self._data.sum(</span><span class="s3">0</span><span class="s1">))</span>
+        <span class="s1">vm = np.dot(cm</span><span class="s0">, </span><span class="s1">vm)</span>
+
+        <span class="s5"># Sample</span>
+        <span class="s1">r = np.linalg.cholesky(cm)</span>
+        <span class="s1">self.mean = vm + np.dot(r</span><span class="s0">, </span><span class="s1">np.random.normal(</span><span class="s3">0</span><span class="s0">, </span><span class="s3">1</span><span class="s0">, </span><span class="s1">self.nvar))</span>
+
+    <span class="s0">def </span><span class="s1">update_cov(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Gibbs update of the covariance matrix. 
+ 
+        Do not call until update_data has been called once. 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># https://stats.stackexchange.com/questions/50844/estimating-the-covariance-posterior-distribution-of-a-multivariate-gaussian</span>
+
+        <span class="s1">r = self._data - self.mean</span>
+        <span class="s1">gr = np.dot(r.T</span><span class="s0">, </span><span class="s1">r)</span>
+        <span class="s1">a = gr + self.cov_prior</span>
+        <span class="s1">df = int(np.ceil(self.nobs + self.cov_prior_df))</span>
+
+        <span class="s1">r = np.linalg.cholesky(np.linalg.inv(a))</span>
+        <span class="s1">x = np.dot(np.random.normal(size=(df</span><span class="s0">, </span><span class="s1">self.nvar))</span><span class="s0">, </span><span class="s1">r.T)</span>
+        <span class="s1">ma = np.dot(x.T</span><span class="s0">, </span><span class="s1">x)</span>
+        <span class="s1">self.cov = np.linalg.inv(ma)</span>
+
+
+<span class="s0">class </span><span class="s1">MI:</span>
+    <span class="s2">&quot;&quot;&quot; 
+    MI performs multiple imputation using a provided imputer object. 
+ 
+    Parameters 
+    ---------- 
+    imp : object 
+        An imputer class, such as BayesGaussMI. 
+    model : model class 
+        Any statsmodels model class. 
+    model_args_fn : function 
+        A function taking an imputed dataset as input and returning 
+        endog, exog.  If the model is fit using a formula, returns 
+        a DataFrame used to build the model.  Optional when a formula 
+        is used. 
+    model_kwds_fn : function, optional 
+        A function taking an imputed dataset as input and returning 
+        a dictionary of model keyword arguments. 
+    formula : str, optional 
+        If provided, the model is constructed using the `from_formula` 
+        class method, otherwise the `__init__` method is used. 
+    fit_args : list-like, optional 
+        List of arguments to be passed to the fit method 
+    fit_kwds : dict-like, optional 
+        Keyword arguments to be passed to the fit method 
+    xfunc : function mapping ndarray to ndarray 
+        A function that is applied to the complete data matrix 
+        prior to fitting the model 
+    burn : int 
+        Number of burn-in iterations 
+    nrep : int 
+        Number of imputed data sets to use in the analysis 
+    skip : int 
+        Number of Gibbs iterations to skip between successive 
+        multiple imputation fits. 
+ 
+    Notes 
+    ----- 
+    The imputer object must have an 'update' method, and a 'data' 
+    attribute that contains the current imputed dataset. 
+ 
+    xfunc can be used to introduce domain constraints, e.g. when 
+    imputing binary data the imputed continuous values can be rounded 
+    to 0/1. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">imp</span><span class="s0">, </span><span class="s1">model</span><span class="s0">, </span><span class="s1">model_args_fn=</span><span class="s0">None, </span><span class="s1">model_kwds_fn=</span><span class="s0">None,</span>
+                 <span class="s1">formula=</span><span class="s0">None, </span><span class="s1">fit_args=</span><span class="s0">None, </span><span class="s1">fit_kwds=</span><span class="s0">None, </span><span class="s1">xfunc=</span><span class="s0">None,</span>
+                 <span class="s1">burn=</span><span class="s3">100</span><span class="s0">, </span><span class="s1">nrep=</span><span class="s3">20</span><span class="s0">, </span><span class="s1">skip=</span><span class="s3">10</span><span class="s1">):</span>
+
+        <span class="s5"># The imputer</span>
+        <span class="s1">self.imp = imp</span>
+
+        <span class="s5"># The number of imputed data sets to skip between each imputed</span>
+        <span class="s5"># data set tha that is used in the analysis.</span>
+        <span class="s1">self.skip = skip</span>
+
+        <span class="s5"># The model class</span>
+        <span class="s1">self.model = model</span>
+        <span class="s1">self.formula = formula</span>
+
+        <span class="s0">if </span><span class="s1">model_args_fn </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">def </span><span class="s1">f(x):</span>
+                <span class="s0">return </span><span class="s1">[]</span>
+            <span class="s1">model_args_fn = f</span>
+        <span class="s1">self.model_args_fn = model_args_fn</span>
+
+        <span class="s0">if </span><span class="s1">model_kwds_fn </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">def </span><span class="s1">f(x):</span>
+                <span class="s0">return </span><span class="s1">{}</span>
+            <span class="s1">model_kwds_fn = f</span>
+        <span class="s1">self.model_kwds_fn = model_kwds_fn</span>
+
+        <span class="s0">if </span><span class="s1">fit_args </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">def </span><span class="s1">f(x):</span>
+                <span class="s0">return </span><span class="s1">[]</span>
+            <span class="s1">fit_args = f</span>
+        <span class="s1">self.fit_args = fit_args</span>
+
+        <span class="s0">if </span><span class="s1">fit_kwds </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">def </span><span class="s1">f(x):</span>
+                <span class="s0">return </span><span class="s1">{}</span>
+            <span class="s1">fit_kwds = f</span>
+        <span class="s1">self.fit_kwds = fit_kwds</span>
+
+        <span class="s1">self.xfunc = xfunc</span>
+        <span class="s1">self.nrep = nrep</span>
+        <span class="s1">self.skip = skip</span>
+
+        <span class="s5"># Burn-in</span>
+        <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">range(burn):</span>
+            <span class="s1">imp.update()</span>
+
+    <span class="s0">def </span><span class="s1">fit(self</span><span class="s0">, </span><span class="s1">results_cb=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Impute datasets, fit models, and pool results. 
+ 
+        Parameters 
+        ---------- 
+        results_cb : function, optional 
+            If provided, each results instance r is passed through `results_cb`, 
+            then appended to the `results` attribute of the MIResults object. 
+            To save complete results, use `results_cb=lambda x: x`.  The default 
+            behavior is to save no results. 
+ 
+        Returns 
+        ------- 
+        A MIResults object. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">par</span><span class="s0">, </span><span class="s1">cov = []</span><span class="s0">, </span><span class="s1">[]</span>
+        <span class="s1">all_results = []</span>
+
+        <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">range(self.nrep):</span>
+
+            <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">range(self.skip+</span><span class="s3">1</span><span class="s1">):</span>
+                <span class="s1">self.imp.update()</span>
+
+            <span class="s1">da = self.imp.data</span>
+
+            <span class="s0">if </span><span class="s1">self.xfunc </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">da = self.xfunc(da)</span>
+
+            <span class="s0">if </span><span class="s1">self.formula </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s1">model = self.model(*self.model_args_fn(da)</span><span class="s0">,</span>
+                                   <span class="s1">**self.model_kwds_fn(da))</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">model = self.model.from_formula(</span>
+                          <span class="s1">self.formula</span><span class="s0">, </span><span class="s1">*self.model_args_fn(da)</span><span class="s0">,</span>
+                          <span class="s1">**self.model_kwds_fn(da))</span>
+
+            <span class="s1">result = model.fit(*self.fit_args(da)</span><span class="s0">, </span><span class="s1">**self.fit_kwds(da))</span>
+
+            <span class="s0">if </span><span class="s1">results_cb </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">all_results.append(results_cb(result))</span>
+
+            <span class="s1">par.append(np.asarray(result.params.copy()))</span>
+            <span class="s1">cov.append(np.asarray(result.cov_params().copy()))</span>
+
+        <span class="s1">params</span><span class="s0">, </span><span class="s1">cov_params</span><span class="s0">, </span><span class="s1">fmi = self._combine(par</span><span class="s0">, </span><span class="s1">cov)</span>
+
+        <span class="s1">r = MIResults(self</span><span class="s0">, </span><span class="s1">model</span><span class="s0">, </span><span class="s1">params</span><span class="s0">, </span><span class="s1">cov_params)</span>
+        <span class="s1">r.fmi = fmi</span>
+
+        <span class="s1">r.results = all_results</span>
+
+        <span class="s0">return </span><span class="s1">r</span>
+
+    <span class="s0">def </span><span class="s1">_combine(self</span><span class="s0">, </span><span class="s1">par</span><span class="s0">, </span><span class="s1">cov):</span>
+        <span class="s5"># Helper function to apply &quot;Rubin's combining rule&quot;</span>
+
+        <span class="s1">par = np.asarray(par)</span>
+
+        <span class="s5"># Number of imputations</span>
+        <span class="s1">m = par.shape[</span><span class="s3">0</span><span class="s1">]</span>
+
+        <span class="s5"># Point estimate</span>
+        <span class="s1">params = par.mean(</span><span class="s3">0</span><span class="s1">)</span>
+
+        <span class="s5"># Within-imputation covariance</span>
+        <span class="s1">wcov = sum(cov) / len(cov)</span>
+
+        <span class="s5"># Between-imputation covariance</span>
+        <span class="s1">bcov = np.cov(par.T)</span>
+        <span class="s1">bcov = np.atleast_2d(bcov)</span>
+
+        <span class="s5"># Overall covariance</span>
+        <span class="s1">covp = wcov + (</span><span class="s3">1 </span><span class="s1">+ </span><span class="s3">1</span><span class="s1">/float(m))*bcov</span>
+
+        <span class="s5"># Fraction of missing information</span>
+        <span class="s1">fmi = (</span><span class="s3">1 </span><span class="s1">+ </span><span class="s3">1</span><span class="s1">/float(m)) * np.diag(bcov) / np.diag(covp)</span>
+
+        <span class="s0">return </span><span class="s1">params</span><span class="s0">, </span><span class="s1">covp</span><span class="s0">, </span><span class="s1">fmi</span>
+
+
+<span class="s0">class </span><span class="s1">MIResults(LikelihoodModelResults):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    A results class for multiple imputation (MI). 
+ 
+    Parameters 
+    ---------- 
+    mi : MI instance 
+        The MI object that produced the results 
+    model : instance of statsmodels model class 
+        This can be any instance from the multiple imputation runs. 
+        It is used to get class information, the specific parameter 
+        and data values are not used. 
+    params : array_like 
+        The overall multiple imputation parameter estimates. 
+    normalized_cov_params : array_like (2d) 
+        The overall variance covariance matrix of the estimates. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">mi</span><span class="s0">, </span><span class="s1">model</span><span class="s0">, </span><span class="s1">params</span><span class="s0">, </span><span class="s1">normalized_cov_params):</span>
+
+        <span class="s1">super(MIResults</span><span class="s0">, </span><span class="s1">self).__init__(model</span><span class="s0">, </span><span class="s1">params</span><span class="s0">, </span><span class="s1">normalized_cov_params)</span>
+        <span class="s1">self.mi = mi</span>
+        <span class="s1">self._model = model</span>
+
+    <span class="s0">def </span><span class="s1">summary(self</span><span class="s0">, </span><span class="s1">title=</span><span class="s0">None, </span><span class="s1">alpha=</span><span class="s3">.05</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Summarize the results of running multiple imputation. 
+ 
+        Parameters 
+        ---------- 
+        title : str, optional 
+            Title for the top table. If not None, then this replaces 
+            the default title 
+        alpha : float 
+            Significance level for the confidence intervals 
+ 
+        Returns 
+        ------- 
+        smry : Summary instance 
+            This holds the summary tables and text, which can be 
+            printed or converted to various output formats. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">from </span><span class="s1">statsmodels.iolib </span><span class="s0">import </span><span class="s1">summary2</span>
+
+        <span class="s1">smry = summary2.Summary()</span>
+        <span class="s1">float_format = </span><span class="s4">&quot;%8.3f&quot;</span>
+
+        <span class="s1">info = {}</span>
+        <span class="s1">info[</span><span class="s4">&quot;Method:&quot;</span><span class="s1">] = </span><span class="s4">&quot;MI&quot;</span>
+        <span class="s1">info[</span><span class="s4">&quot;Model:&quot;</span><span class="s1">] = self.mi.model.__name__</span>
+        <span class="s1">info[</span><span class="s4">&quot;Dependent variable:&quot;</span><span class="s1">] = self._model.endog_names</span>
+        <span class="s1">info[</span><span class="s4">&quot;Sample size:&quot;</span><span class="s1">] = </span><span class="s4">&quot;%d&quot; </span><span class="s1">% self.mi.imp.data.shape[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">info[</span><span class="s4">&quot;Num. imputations&quot;</span><span class="s1">] = </span><span class="s4">&quot;%d&quot; </span><span class="s1">% self.mi.nrep</span>
+
+        <span class="s1">smry.add_dict(info</span><span class="s0">, </span><span class="s1">align=</span><span class="s4">'l'</span><span class="s0">, </span><span class="s1">float_format=float_format)</span>
+
+        <span class="s1">param = summary2.summary_params(self</span><span class="s0">, </span><span class="s1">alpha=alpha)</span>
+        <span class="s1">param[</span><span class="s4">&quot;FMI&quot;</span><span class="s1">] = self.fmi</span>
+
+        <span class="s1">smry.add_df(param</span><span class="s0">, </span><span class="s1">float_format=float_format)</span>
+        <span class="s1">smry.add_title(title=title</span><span class="s0">, </span><span class="s1">results=self)</span>
+
+        <span class="s0">return </span><span class="s1">smry</span>
+</pre>
+</body>
+</html>

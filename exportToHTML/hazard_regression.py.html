@@ -1,0 +1,1781 @@
+<html>
+<head>
+<title>hazard_regression.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+hazard_regression.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Implementation of proportional hazards regression models for duration 
+data that may be censored (&quot;Cox models&quot;). 
+ 
+References 
+---------- 
+T Therneau (1996).  Extending the Cox model.  Technical report. 
+http://www.mayo.edu/research/documents/biostat-58pdf/DOC-10027288 
+ 
+G Rodriguez (2005).  Non-parametric estimation in survival models. 
+http://data.princeton.edu/pop509/NonParametricSurvival.pdf 
+ 
+B Gillespie (2006).  Checking the assumptions in the Cox proportional 
+hazards model. 
+http://www.mwsug.org/proceedings/2006/stats/MWSUG-2006-SD08.pdf 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.base </span><span class="s2">import </span><span class="s1">model</span>
+<span class="s2">import </span><span class="s1">statsmodels.base.model </span><span class="s2">as </span><span class="s1">base</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.decorators </span><span class="s2">import </span><span class="s1">cache_readonly</span>
+<span class="s2">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s2">import </span><span class="s1">Appender</span>
+
+
+<span class="s1">_predict_docstring = </span><span class="s3">&quot;&quot;&quot; 
+    Returns predicted values from the proportional hazards 
+    regression model. 
+ 
+    Parameters 
+    ----------%(params_doc)s 
+    exog : array_like 
+        Data to use as `exog` in forming predictions.  If not 
+        provided, the `exog` values from the model used to fit the 
+        data are used.%(cov_params_doc)s 
+    endog : array_like 
+        Duration (time) values at which the predictions are made. 
+        Only used if pred_type is either 'cumhaz' or 'surv'.  If 
+        using model `exog`, defaults to model `endog` (time), but 
+        may be provided explicitly to make predictions at 
+        alternative times. 
+    strata : array_like 
+        A vector of stratum values used to form the predictions. 
+        Not used (may be 'None') if pred_type is 'lhr' or 'hr'. 
+        If `exog` is None, the model stratum values are used.  If 
+        `exog` is not None and pred_type is 'surv' or 'cumhaz', 
+        stratum values must be provided (unless there is only one 
+        stratum). 
+    offset : array_like 
+        Offset values used to create the predicted values. 
+    pred_type : str 
+        If 'lhr', returns log hazard ratios, if 'hr' returns 
+        hazard ratios, if 'surv' returns the survival function, if 
+        'cumhaz' returns the cumulative hazard function. 
+    pred_only : bool 
+        If True, returns only an array of predicted values.  Otherwise 
+        returns a bunch containing the predicted values and standard 
+        errors. 
+ 
+    Returns 
+    ------- 
+    A bunch containing two fields: `predicted_values` and 
+    `standard_errors`. 
+ 
+    Notes 
+    ----- 
+    Standard errors are only returned when predicting the log 
+    hazard ratio (pred_type is 'lhr'). 
+ 
+    Types `surv` and `cumhaz` require estimation of the cumulative 
+    hazard function. 
+&quot;&quot;&quot;</span>
+
+<span class="s1">_predict_params_doc = </span><span class="s3">&quot;&quot;&quot; 
+    params : array_like 
+        The proportional hazards model parameters.&quot;&quot;&quot;</span>
+
+<span class="s1">_predict_cov_params_docstring = </span><span class="s3">&quot;&quot;&quot; 
+    cov_params : array_like 
+        The covariance matrix of the estimated `params` vector, 
+        used to obtain prediction errors if pred_type='lhr', 
+        otherwise optional.&quot;&quot;&quot;</span>
+
+
+
+<span class="s2">class </span><span class="s1">PHSurvivalTime:</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">time</span><span class="s2">, </span><span class="s1">status</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">strata=</span><span class="s2">None, </span><span class="s1">entry=</span><span class="s2">None,</span>
+                 <span class="s1">offset=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Represent a collection of survival times with possible 
+        stratification and left truncation. 
+ 
+        Parameters 
+        ---------- 
+        time : array_like 
+            The times at which either the event (failure) occurs or 
+            the observation is censored. 
+        status : array_like 
+            Indicates whether the event (failure) occurs at `time` 
+            (`status` is 1), or if `time` is a censoring time (`status` 
+            is 0). 
+        exog : array_like 
+            The exogeneous (covariate) data matrix, cases are rows and 
+            variables are columns. 
+        strata : array_like 
+            Grouping variable defining the strata.  If None, all 
+            observations are in a single stratum. 
+        entry : array_like 
+            Entry (left truncation) times.  The observation is not 
+            part of the risk set for times before the entry time.  If 
+            None, the entry time is treated as being zero, which 
+            gives no left truncation.  The entry time must be less 
+            than or equal to `time`. 
+        offset : array_like 
+            An optional array of offsets 
+        &quot;&quot;&quot;</span>
+
+        <span class="s4"># Default strata</span>
+        <span class="s2">if </span><span class="s1">strata </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">strata = np.zeros(len(time)</span><span class="s2">, </span><span class="s1">dtype=np.int32)</span>
+
+        <span class="s4"># Default entry times</span>
+        <span class="s2">if </span><span class="s1">entry </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">entry = np.zeros(len(time))</span>
+
+        <span class="s4"># Parameter validity checks.</span>
+        <span class="s1">self._check(time</span><span class="s2">, </span><span class="s1">status</span><span class="s2">, </span><span class="s1">strata</span><span class="s2">, </span><span class="s1">entry)</span>
+
+        <span class="s4"># Get the row indices for the cases in each stratum</span>
+        <span class="s1">stu = np.unique(strata)</span>
+        <span class="s1">sth = {x: [] </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">stu}</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">k </span><span class="s2">in </span><span class="s1">enumerate(strata):</span>
+            <span class="s1">sth[k].append(i)</span>
+        <span class="s1">stratum_rows = [np.asarray(sth[k]</span><span class="s2">, </span><span class="s1">dtype=np.int32) </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">stu]</span>
+        <span class="s1">stratum_names = stu</span>
+
+        <span class="s4"># Remove strata with no events</span>
+        <span class="s1">ix = [i </span><span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">ix </span><span class="s2">in </span><span class="s1">enumerate(stratum_rows) </span><span class="s2">if </span><span class="s1">status[ix].sum() &gt; </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">self.nstrat_orig = len(stratum_rows)</span>
+        <span class="s1">stratum_rows = [stratum_rows[i] </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">ix]</span>
+        <span class="s1">stratum_names = [stratum_names[i] </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">ix]</span>
+
+        <span class="s4"># The number of strata</span>
+        <span class="s1">nstrat = len(stratum_rows)</span>
+        <span class="s1">self.nstrat = nstrat</span>
+
+        <span class="s4"># Remove subjects whose entry time occurs after the last event</span>
+        <span class="s4"># in their stratum.</span>
+        <span class="s2">for </span><span class="s1">stx</span><span class="s2">,</span><span class="s1">ix </span><span class="s2">in </span><span class="s1">enumerate(stratum_rows):</span>
+            <span class="s1">last_failure = max(time[ix][status[ix] == </span><span class="s5">1</span><span class="s1">])</span>
+
+            <span class="s4"># Stata uses &lt; here, R uses &lt;=</span>
+            <span class="s1">ii = [i </span><span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">t </span><span class="s2">in </span><span class="s1">enumerate(entry[ix]) </span><span class="s2">if</span>
+                  <span class="s1">t &lt;= last_failure]</span>
+            <span class="s1">stratum_rows[stx] = stratum_rows[stx][ii]</span>
+
+        <span class="s4"># Remove subjects who are censored before the first event in</span>
+        <span class="s4"># their stratum.</span>
+        <span class="s2">for </span><span class="s1">stx</span><span class="s2">,</span><span class="s1">ix </span><span class="s2">in </span><span class="s1">enumerate(stratum_rows):</span>
+            <span class="s1">first_failure = min(time[ix][status[ix] == </span><span class="s5">1</span><span class="s1">])</span>
+
+            <span class="s1">ii = [i </span><span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">t </span><span class="s2">in </span><span class="s1">enumerate(time[ix]) </span><span class="s2">if</span>
+                  <span class="s1">t &gt;= first_failure]</span>
+            <span class="s1">stratum_rows[stx] = stratum_rows[stx][ii]</span>
+
+        <span class="s4"># Order by time within each stratum</span>
+        <span class="s2">for </span><span class="s1">stx</span><span class="s2">,</span><span class="s1">ix </span><span class="s2">in </span><span class="s1">enumerate(stratum_rows):</span>
+            <span class="s1">ii = np.argsort(time[ix])</span>
+            <span class="s1">stratum_rows[stx] = stratum_rows[stx][ii]</span>
+
+        <span class="s2">if </span><span class="s1">offset </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.offset_s = []</span>
+            <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(nstrat):</span>
+                <span class="s1">self.offset_s.append(offset[stratum_rows[stx]])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.offset_s = </span><span class="s2">None</span>
+
+        <span class="s4"># Number of informative subjects</span>
+        <span class="s1">self.n_obs = sum([len(ix) </span><span class="s2">for </span><span class="s1">ix </span><span class="s2">in </span><span class="s1">stratum_rows])</span>
+
+        <span class="s1">self.stratum_rows = stratum_rows</span>
+        <span class="s1">self.stratum_names = stratum_names</span>
+
+        <span class="s4"># Split everything by stratum</span>
+        <span class="s1">self.time_s = self._split(time)</span>
+        <span class="s1">self.exog_s = self._split(exog)</span>
+        <span class="s1">self.status_s = self._split(status)</span>
+        <span class="s1">self.entry_s = self._split(entry)</span>
+
+        <span class="s4"># Precalculate some indices needed to fit Cox models.</span>
+        <span class="s4"># Distinct failure times within a stratum are always taken to</span>
+        <span class="s4"># be sorted in ascending order.</span>
+        <span class="s4">#</span>
+        <span class="s4"># ufailt_ix[stx][k] is a list of indices for subjects who fail</span>
+        <span class="s4"># at the k^th sorted unique failure time in stratum stx</span>
+        <span class="s4">#</span>
+        <span class="s4"># risk_enter[stx][k] is a list of indices for subjects who</span>
+        <span class="s4"># enter the risk set at the k^th sorted unique failure time in</span>
+        <span class="s4"># stratum stx</span>
+        <span class="s4">#</span>
+        <span class="s4"># risk_exit[stx][k] is a list of indices for subjects who exit</span>
+        <span class="s4"># the risk set at the k^th sorted unique failure time in</span>
+        <span class="s4"># stratum stx</span>
+        <span class="s1">self.ufailt_ix</span><span class="s2">, </span><span class="s1">self.risk_enter</span><span class="s2">, </span><span class="s1">self.risk_exit</span><span class="s2">, </span><span class="s1">self.ufailt =\</span>
+            <span class="s1">[]</span><span class="s2">, </span><span class="s1">[]</span><span class="s2">, </span><span class="s1">[]</span><span class="s2">, </span><span class="s1">[]</span>
+
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(self.nstrat):</span>
+
+            <span class="s4"># All failure times</span>
+            <span class="s1">ift = np.flatnonzero(self.status_s[stx] == </span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s1">ft = self.time_s[stx][ift]</span>
+
+            <span class="s4"># Unique failure times</span>
+            <span class="s1">uft = np.unique(ft)</span>
+            <span class="s1">nuft = len(uft)</span>
+
+            <span class="s4"># Indices of cases that fail at each unique failure time</span>
+            <span class="s4">#uft_map = {x:i for i,x in enumerate(uft)} # requires &gt;=2.7</span>
+            <span class="s1">uft_map = dict([(x</span><span class="s2">, </span><span class="s1">i) </span><span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">x </span><span class="s2">in </span><span class="s1">enumerate(uft)]) </span><span class="s4"># 2.6</span>
+            <span class="s1">uft_ix = [[] </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range(nuft)]</span>
+            <span class="s2">for </span><span class="s1">ix</span><span class="s2">,</span><span class="s1">ti </span><span class="s2">in </span><span class="s1">zip(ift</span><span class="s2">,</span><span class="s1">ft):</span>
+                <span class="s1">uft_ix[uft_map[ti]].append(ix)</span>
+
+            <span class="s4"># Indices of cases (failed or censored) that enter the</span>
+            <span class="s4"># risk set at each unique failure time.</span>
+            <span class="s1">risk_enter1 = [[] </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range(nuft)]</span>
+            <span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">t </span><span class="s2">in </span><span class="s1">enumerate(self.time_s[stx]):</span>
+                <span class="s1">ix = np.searchsorted(uft</span><span class="s2">, </span><span class="s1">t</span><span class="s2">, </span><span class="s3">&quot;right&quot;</span><span class="s1">) - </span><span class="s5">1</span>
+                <span class="s2">if </span><span class="s1">ix &gt;= </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">risk_enter1[ix].append(i)</span>
+
+            <span class="s4"># Indices of cases (failed or censored) that exit the</span>
+            <span class="s4"># risk set at each unique failure time.</span>
+            <span class="s1">risk_exit1 = [[] </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range(nuft)]</span>
+            <span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">t </span><span class="s2">in </span><span class="s1">enumerate(self.entry_s[stx]):</span>
+                <span class="s1">ix = np.searchsorted(uft</span><span class="s2">, </span><span class="s1">t)</span>
+                <span class="s1">risk_exit1[ix].append(i)</span>
+
+            <span class="s1">self.ufailt.append(uft)</span>
+            <span class="s1">self.ufailt_ix.append([np.asarray(x</span><span class="s2">, </span><span class="s1">dtype=np.int32)</span>
+                                   <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">uft_ix])</span>
+            <span class="s1">self.risk_enter.append([np.asarray(x</span><span class="s2">, </span><span class="s1">dtype=np.int32)</span>
+                                    <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">risk_enter1])</span>
+            <span class="s1">self.risk_exit.append([np.asarray(x</span><span class="s2">, </span><span class="s1">dtype=np.int32)</span>
+                                   <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">risk_exit1])</span>
+
+    <span class="s2">def </span><span class="s1">_split(self</span><span class="s2">, </span><span class="s1">x):</span>
+        <span class="s1">v = []</span>
+        <span class="s2">if </span><span class="s1">x.ndim == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s2">for </span><span class="s1">ix </span><span class="s2">in </span><span class="s1">self.stratum_rows:</span>
+                <span class="s1">v.append(x[ix])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">for </span><span class="s1">ix </span><span class="s2">in </span><span class="s1">self.stratum_rows:</span>
+                <span class="s1">v.append(x[ix</span><span class="s2">, </span><span class="s1">:])</span>
+        <span class="s2">return </span><span class="s1">v</span>
+
+    <span class="s2">def </span><span class="s1">_check(self</span><span class="s2">, </span><span class="s1">time</span><span class="s2">, </span><span class="s1">status</span><span class="s2">, </span><span class="s1">strata</span><span class="s2">, </span><span class="s1">entry):</span>
+        <span class="s1">n1</span><span class="s2">, </span><span class="s1">n2</span><span class="s2">, </span><span class="s1">n3</span><span class="s2">, </span><span class="s1">n4 = len(time)</span><span class="s2">, </span><span class="s1">len(status)</span><span class="s2">, </span><span class="s1">len(strata)</span><span class="s2">,</span><span class="s1">\</span>
+            <span class="s1">len(entry)</span>
+        <span class="s1">nv = [n1</span><span class="s2">, </span><span class="s1">n2</span><span class="s2">, </span><span class="s1">n3</span><span class="s2">, </span><span class="s1">n4]</span>
+        <span class="s2">if </span><span class="s1">max(nv) != min(nv):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;endog, status, strata, and &quot; </span><span class="s1">+</span>
+                             <span class="s3">&quot;entry must all have the same length&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">min(time) &lt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;endog must be non-negative&quot;</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">min(entry) &lt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;entry time must be non-negative&quot;</span><span class="s1">)</span>
+
+        <span class="s4"># In Stata, this is entry &gt;= time, in R it is &gt;.</span>
+        <span class="s2">if </span><span class="s1">np.any(entry &gt; time):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;entry times may not occur &quot; </span><span class="s1">+</span>
+                             <span class="s3">&quot;after event or censoring times&quot;</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">PHReg(model.LikelihoodModel):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Cox Proportional Hazards Regression Model 
+ 
+    The Cox PH Model is for right censored data. 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        The observed times (event or censoring) 
+    exog : 2D array_like 
+        The covariates or exogeneous variables 
+    status : array_like 
+        The censoring status values; status=1 indicates that an 
+        event occurred (e.g. failure or death), status=0 indicates 
+        that the observation was right censored. If None, defaults 
+        to status=1 for all cases. 
+    entry : array_like 
+        The entry times, if left truncation occurs 
+    strata : array_like 
+        Stratum labels.  If None, all observations are taken to be 
+        in a single stratum. 
+    ties : str 
+        The method used to handle tied times, must be either 'breslow' 
+        or 'efron'. 
+    offset : array_like 
+        Array of offset values 
+    missing : str 
+        The method used to handle missing data 
+ 
+    Notes 
+    ----- 
+    Proportional hazards regression models should not include an 
+    explicit or implicit intercept.  The effect of an intercept is 
+    not identified using the partial likelihood approach. 
+ 
+    `endog`, `event`, `strata`, `entry`, and the first dimension 
+    of `exog` all must have the same length 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">status=</span><span class="s2">None, </span><span class="s1">entry=</span><span class="s2">None,</span>
+                 <span class="s1">strata=</span><span class="s2">None, </span><span class="s1">offset=</span><span class="s2">None, </span><span class="s1">ties=</span><span class="s3">'breslow'</span><span class="s2">,</span>
+                 <span class="s1">missing=</span><span class="s3">'drop'</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+
+        <span class="s4"># Default is no censoring</span>
+        <span class="s2">if </span><span class="s1">status </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">status = np.ones(len(endog))</span>
+
+        <span class="s1">super(PHReg</span><span class="s2">, </span><span class="s1">self).__init__(endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">status=status</span><span class="s2">,</span>
+                                    <span class="s1">entry=entry</span><span class="s2">, </span><span class="s1">strata=strata</span><span class="s2">,</span>
+                                    <span class="s1">offset=offset</span><span class="s2">, </span><span class="s1">missing=missing</span><span class="s2">,</span>
+                                    <span class="s1">**kwargs)</span>
+
+        <span class="s4"># endog and exog are automatically converted, but these are</span>
+        <span class="s4"># not</span>
+        <span class="s2">if </span><span class="s1">self.status </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.status = np.asarray(self.status)</span>
+        <span class="s2">if </span><span class="s1">self.entry </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.entry = np.asarray(self.entry)</span>
+        <span class="s2">if </span><span class="s1">self.strata </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.strata = np.asarray(self.strata)</span>
+        <span class="s2">if </span><span class="s1">self.offset </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.offset = np.asarray(self.offset)</span>
+
+        <span class="s1">self.surv = PHSurvivalTime(self.endog</span><span class="s2">, </span><span class="s1">self.status</span><span class="s2">,</span>
+                                    <span class="s1">self.exog</span><span class="s2">, </span><span class="s1">self.strata</span><span class="s2">,</span>
+                                    <span class="s1">self.entry</span><span class="s2">, </span><span class="s1">self.offset)</span>
+        <span class="s1">self.nobs = len(self.endog)</span>
+        <span class="s1">self.groups = </span><span class="s2">None</span>
+
+        <span class="s4"># TODO: not used?</span>
+        <span class="s1">self.missing = missing</span>
+
+        <span class="s1">self.df_resid = float(self.exog.shape[</span><span class="s5">0</span><span class="s1">] -</span>
+                              <span class="s1">np.linalg.matrix_rank(self.exog))</span>
+        <span class="s1">self.df_model = float(np.linalg.matrix_rank(self.exog))</span>
+
+        <span class="s1">ties = ties.lower()</span>
+        <span class="s2">if </span><span class="s1">ties </span><span class="s2">not in </span><span class="s1">(</span><span class="s3">&quot;efron&quot;</span><span class="s2">, </span><span class="s3">&quot;breslow&quot;</span><span class="s1">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;`ties` must be either `efron` or &quot; </span><span class="s1">+</span>
+                             <span class="s3">&quot;`breslow`&quot;</span><span class="s1">)</span>
+
+        <span class="s1">self.ties = ties</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">from_formula(cls</span><span class="s2">, </span><span class="s1">formula</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">status=</span><span class="s2">None, </span><span class="s1">entry=</span><span class="s2">None,</span>
+                     <span class="s1">strata=</span><span class="s2">None, </span><span class="s1">offset=</span><span class="s2">None, </span><span class="s1">subset=</span><span class="s2">None,</span>
+                     <span class="s1">ties=</span><span class="s3">'breslow'</span><span class="s2">, </span><span class="s1">missing=</span><span class="s3">'drop'</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Create a proportional hazards regression model from a formula 
+        and dataframe. 
+ 
+        Parameters 
+        ---------- 
+        formula : str or generic Formula object 
+            The formula specifying the model 
+        data : array_like 
+            The data for the model. See Notes. 
+        status : array_like 
+            The censoring status values; status=1 indicates that an 
+            event occurred (e.g. failure or death), status=0 indicates 
+            that the observation was right censored. If None, defaults 
+            to status=1 for all cases. 
+        entry : array_like 
+            The entry times, if left truncation occurs 
+        strata : array_like 
+            Stratum labels.  If None, all observations are taken to be 
+            in a single stratum. 
+        offset : array_like 
+            Array of offset values 
+        subset : array_like 
+            An array-like object of booleans, integers, or index 
+            values that indicate the subset of df to use in the 
+            model. Assumes df is a `pandas.DataFrame` 
+        ties : str 
+            The method used to handle tied times, must be either 'breslow' 
+            or 'efron'. 
+        missing : str 
+            The method used to handle missing data 
+        args : extra arguments 
+            These are passed to the model 
+        kwargs : extra keyword arguments 
+            These are passed to the model with one exception. The 
+            ``eval_env`` keyword is passed to patsy. It can be either a 
+            :class:`patsy:patsy.EvalEnvironment` object or an integer 
+            indicating the depth of the namespace to use. For example, the 
+            default ``eval_env=0`` uses the calling namespace. If you wish 
+            to use a &quot;clean&quot; environment set ``eval_env=-1``. 
+ 
+        Returns 
+        ------- 
+        model : PHReg model instance 
+        &quot;&quot;&quot;</span>
+
+        <span class="s4"># Allow array arguments to be passed by column name.</span>
+        <span class="s2">if </span><span class="s1">isinstance(status</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s1">status = data[status]</span>
+        <span class="s2">if </span><span class="s1">isinstance(entry</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s1">entry = data[entry]</span>
+        <span class="s2">if </span><span class="s1">isinstance(strata</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s1">strata = data[strata]</span>
+        <span class="s2">if </span><span class="s1">isinstance(offset</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s1">offset = data[offset]</span>
+
+        <span class="s2">import </span><span class="s1">re</span>
+        <span class="s1">terms = re.split(</span><span class="s3">r&quot;[+\-~]&quot;</span><span class="s2">, </span><span class="s1">formula)</span>
+        <span class="s2">for </span><span class="s1">term </span><span class="s2">in </span><span class="s1">terms:</span>
+            <span class="s1">term = term.strip()</span>
+            <span class="s2">if </span><span class="s1">term </span><span class="s2">in </span><span class="s1">(</span><span class="s3">&quot;0&quot;</span><span class="s2">, </span><span class="s3">&quot;1&quot;</span><span class="s1">):</span>
+                <span class="s2">import </span><span class="s1">warnings</span>
+                <span class="s1">warnings.warn(</span><span class="s3">&quot;PHReg formulas should not include any '0' or '1' terms&quot;</span><span class="s1">)</span>
+
+        <span class="s1">mod = super(PHReg</span><span class="s2">, </span><span class="s1">cls).from_formula(formula</span><span class="s2">, </span><span class="s1">data</span><span class="s2">,</span>
+                    <span class="s1">status=status</span><span class="s2">, </span><span class="s1">entry=entry</span><span class="s2">, </span><span class="s1">strata=strata</span><span class="s2">,</span>
+                    <span class="s1">offset=offset</span><span class="s2">, </span><span class="s1">subset=subset</span><span class="s2">, </span><span class="s1">ties=ties</span><span class="s2">,</span>
+                    <span class="s1">missing=missing</span><span class="s2">, </span><span class="s1">drop_cols=[</span><span class="s3">&quot;Intercept&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">,</span>
+                    <span class="s1">**kwargs)</span>
+
+        <span class="s2">return </span><span class="s1">mod</span>
+
+    <span class="s2">def </span><span class="s1">fit(self</span><span class="s2">, </span><span class="s1">groups=</span><span class="s2">None, </span><span class="s1">**args):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Fit a proportional hazards regression model. 
+ 
+        Parameters 
+        ---------- 
+        groups : array_like 
+            Labels indicating groups of observations that may be 
+            dependent.  If present, the standard errors account for 
+            this dependence. Does not affect fitted values. 
+ 
+        Returns 
+        ------- 
+        PHRegResults 
+            Returns a results instance. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s4"># TODO process for missing values</span>
+        <span class="s2">if </span><span class="s1">groups </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">len(groups) != len(self.endog):</span>
+                <span class="s1">msg = (</span><span class="s3">&quot;len(groups) = %d and len(endog) = %d differ&quot; </span><span class="s1">%</span>
+                       <span class="s1">(len(groups)</span><span class="s2">, </span><span class="s1">len(self.endog)))</span>
+                <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+            <span class="s1">self.groups = np.asarray(groups)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.groups = </span><span class="s2">None</span>
+
+        <span class="s2">if </span><span class="s3">'disp' </span><span class="s2">not in </span><span class="s1">args:</span>
+            <span class="s1">args[</span><span class="s3">'disp'</span><span class="s1">] = </span><span class="s2">False</span>
+
+        <span class="s1">fit_rslts = super(PHReg</span><span class="s2">, </span><span class="s1">self).fit(**args)</span>
+
+        <span class="s2">if </span><span class="s1">self.groups </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">cov_params = fit_rslts.cov_params()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">cov_params = self.robust_covariance(fit_rslts.params)</span>
+
+        <span class="s1">results = PHRegResults(self</span><span class="s2">, </span><span class="s1">fit_rslts.params</span><span class="s2">, </span><span class="s1">cov_params)</span>
+
+        <span class="s2">return </span><span class="s1">results</span>
+
+    <span class="s2">def </span><span class="s1">fit_regularized(self</span><span class="s2">, </span><span class="s1">method=</span><span class="s3">&quot;elastic_net&quot;</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s5">0.</span><span class="s2">,</span>
+                        <span class="s1">start_params=</span><span class="s2">None, </span><span class="s1">refit=</span><span class="s2">False, </span><span class="s1">**kwargs):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Return a regularized fit to a linear regression model. 
+ 
+        Parameters 
+        ---------- 
+        method : {'elastic_net'} 
+            Only the `elastic_net` approach is currently implemented. 
+        alpha : scalar or array_like 
+            The penalty weight.  If a scalar, the same penalty weight 
+            applies to all variables in the model.  If a vector, it 
+            must have the same length as `params`, and contains a 
+            penalty weight for each coefficient. 
+        start_params : array_like 
+            Starting values for `params`. 
+        refit : bool 
+            If True, the model is refit using only the variables that 
+            have non-zero coefficients in the regularized fit.  The 
+            refitted model is not regularized. 
+        **kwargs 
+            Additional keyword arguments used to fit the model. 
+ 
+        Returns 
+        ------- 
+        PHRegResults 
+            Returns a results instance. 
+ 
+        Notes 
+        ----- 
+        The penalty is the ``elastic net`` penalty, which is a 
+        combination of L1 and L2 penalties. 
+ 
+        The function that is minimized is: 
+ 
+        .. math:: 
+ 
+            -loglike/n + alpha*((1-L1\_wt)*|params|_2^2/2 + L1\_wt*|params|_1) 
+ 
+        where :math:`|*|_1` and :math:`|*|_2` are the L1 and L2 norms. 
+ 
+        Post-estimation results are based on the same data used to 
+        select variables, hence may be subject to overfitting biases. 
+ 
+        The elastic_net method uses the following keyword arguments: 
+ 
+        maxiter : int 
+            Maximum number of iterations 
+        L1_wt  : float 
+            Must be in [0, 1].  The L1 penalty has weight L1_wt and the 
+            L2 penalty has weight 1 - L1_wt. 
+        cnvrg_tol : float 
+            Convergence threshold for line searches 
+        zero_tol : float 
+            Coefficients below this threshold are treated as zero. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">from </span><span class="s1">statsmodels.base.elastic_net </span><span class="s2">import </span><span class="s1">fit_elasticnet</span>
+
+        <span class="s2">if </span><span class="s1">method != </span><span class="s3">&quot;elastic_net&quot;</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;method for fit_regularized must be elastic_net&quot;</span><span class="s1">)</span>
+
+        <span class="s1">defaults = {</span><span class="s3">&quot;maxiter&quot; </span><span class="s1">: </span><span class="s5">50</span><span class="s2">, </span><span class="s3">&quot;L1_wt&quot; </span><span class="s1">: </span><span class="s5">1</span><span class="s2">, </span><span class="s3">&quot;cnvrg_tol&quot; </span><span class="s1">: </span><span class="s5">1e-10</span><span class="s2">,</span>
+                    <span class="s3">&quot;zero_tol&quot; </span><span class="s1">: </span><span class="s5">1e-10</span><span class="s1">}</span>
+        <span class="s1">defaults.update(kwargs)</span>
+
+        <span class="s2">return </span><span class="s1">fit_elasticnet(self</span><span class="s2">, </span><span class="s1">method=method</span><span class="s2">,</span>
+                              <span class="s1">alpha=alpha</span><span class="s2">,</span>
+                              <span class="s1">start_params=start_params</span><span class="s2">,</span>
+                              <span class="s1">refit=refit</span><span class="s2">,</span>
+                              <span class="s1">**defaults)</span>
+
+
+    <span class="s2">def </span><span class="s1">loglike(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the log partial likelihood function evaluated at 
+        `params`. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">self.ties == </span><span class="s3">&quot;breslow&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.breslow_loglike(params)</span>
+        <span class="s2">elif </span><span class="s1">self.ties == </span><span class="s3">&quot;efron&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.efron_loglike(params)</span>
+
+    <span class="s2">def </span><span class="s1">score(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the score function evaluated at `params`. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">self.ties == </span><span class="s3">&quot;breslow&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.breslow_gradient(params)</span>
+        <span class="s2">elif </span><span class="s1">self.ties == </span><span class="s3">&quot;efron&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.efron_gradient(params)</span>
+
+    <span class="s2">def </span><span class="s1">hessian(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the Hessian matrix of the log partial likelihood 
+        function evaluated at `params`. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">self.ties == </span><span class="s3">&quot;breslow&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.breslow_hessian(params)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.efron_hessian(params)</span>
+
+    <span class="s2">def </span><span class="s1">breslow_loglike(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the value of the log partial likelihood function 
+        evaluated at `params`, using the Breslow method to handle tied 
+        times. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">surv = self.surv</span>
+
+        <span class="s1">like = </span><span class="s5">0.</span>
+
+        <span class="s4"># Loop over strata</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+
+            <span class="s1">uft_ix = surv.ufailt_ix[stx]</span>
+            <span class="s1">exog_s = surv.exog_s[stx]</span>
+            <span class="s1">nuft = len(uft_ix)</span>
+
+            <span class="s1">linpred = np.dot(exog_s</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">surv.offset_s </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">linpred += surv.offset_s[stx]</span>
+            <span class="s1">linpred -= linpred.max()</span>
+            <span class="s1">e_linpred = np.exp(linpred)</span>
+
+            <span class="s1">xp0 = </span><span class="s5">0.</span>
+
+            <span class="s4"># Iterate backward through the unique failure times.</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nuft)[::-</span><span class="s5">1</span><span class="s1">]:</span>
+
+                <span class="s4"># Update for new cases entering the risk set.</span>
+                <span class="s1">ix = surv.risk_enter[stx][i]</span>
+                <span class="s1">xp0 += e_linpred[ix].sum()</span>
+
+                <span class="s4"># Account for all cases that fail at this point.</span>
+                <span class="s1">ix = uft_ix[i]</span>
+                <span class="s1">like += (linpred[ix] - np.log(xp0)).sum()</span>
+
+                <span class="s4"># Update for cases leaving the risk set.</span>
+                <span class="s1">ix = surv.risk_exit[stx][i]</span>
+                <span class="s1">xp0 -= e_linpred[ix].sum()</span>
+
+        <span class="s2">return </span><span class="s1">like</span>
+
+    <span class="s2">def </span><span class="s1">efron_loglike(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the value of the log partial likelihood function 
+        evaluated at `params`, using the Efron method to handle tied 
+        times. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">surv = self.surv</span>
+
+        <span class="s1">like = </span><span class="s5">0.</span>
+
+        <span class="s4"># Loop over strata</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+
+            <span class="s4"># exog and linear predictor for this stratum</span>
+            <span class="s1">exog_s = surv.exog_s[stx]</span>
+            <span class="s1">linpred = np.dot(exog_s</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">surv.offset_s </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">linpred += surv.offset_s[stx]</span>
+            <span class="s1">linpred -= linpred.max()</span>
+            <span class="s1">e_linpred = np.exp(linpred)</span>
+
+            <span class="s1">xp0 = </span><span class="s5">0.</span>
+
+            <span class="s4"># Iterate backward through the unique failure times.</span>
+            <span class="s1">uft_ix = surv.ufailt_ix[stx]</span>
+            <span class="s1">nuft = len(uft_ix)</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nuft)[::-</span><span class="s5">1</span><span class="s1">]:</span>
+
+                <span class="s4"># Update for new cases entering the risk set.</span>
+                <span class="s1">ix = surv.risk_enter[stx][i]</span>
+                <span class="s1">xp0 += e_linpred[ix].sum()</span>
+                <span class="s1">xp0f = e_linpred[uft_ix[i]].sum()</span>
+
+                <span class="s4"># Account for all cases that fail at this point.</span>
+                <span class="s1">ix = uft_ix[i]</span>
+                <span class="s1">like += linpred[ix].sum()</span>
+
+                <span class="s1">m = len(ix)</span>
+                <span class="s1">J = np.arange(m</span><span class="s2">, </span><span class="s1">dtype=np.float64) / m</span>
+                <span class="s1">like -= np.log(xp0 - J*xp0f).sum()</span>
+
+                <span class="s4"># Update for cases leaving the risk set.</span>
+                <span class="s1">ix = surv.risk_exit[stx][i]</span>
+                <span class="s1">xp0 -= e_linpred[ix].sum()</span>
+
+        <span class="s2">return </span><span class="s1">like</span>
+
+    <span class="s2">def </span><span class="s1">breslow_gradient(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the gradient of the log partial likelihood, using the 
+        Breslow method to handle tied times. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">surv = self.surv</span>
+
+        <span class="s1">grad = </span><span class="s5">0.</span>
+
+        <span class="s4"># Loop over strata</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+
+            <span class="s4"># Indices of subjects in the stratum</span>
+            <span class="s1">strat_ix = surv.stratum_rows[stx]</span>
+
+            <span class="s4"># Unique failure times in the stratum</span>
+            <span class="s1">uft_ix = surv.ufailt_ix[stx]</span>
+            <span class="s1">nuft = len(uft_ix)</span>
+
+            <span class="s4"># exog and linear predictor for the stratum</span>
+            <span class="s1">exog_s = surv.exog_s[stx]</span>
+            <span class="s1">linpred = np.dot(exog_s</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">surv.offset_s </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">linpred += surv.offset_s[stx]</span>
+            <span class="s1">linpred -= linpred.max()</span>
+            <span class="s1">e_linpred = np.exp(linpred)</span>
+
+            <span class="s1">xp0</span><span class="s2">, </span><span class="s1">xp1 = </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.</span>
+
+            <span class="s4"># Iterate backward through the unique failure times.</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nuft)[::-</span><span class="s5">1</span><span class="s1">]:</span>
+
+                <span class="s4"># Update for new cases entering the risk set.</span>
+                <span class="s1">ix = surv.risk_enter[stx][i]</span>
+                <span class="s2">if </span><span class="s1">len(ix) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">v = exog_s[ix</span><span class="s2">,</span><span class="s1">:]</span>
+                    <span class="s1">xp0 += e_linpred[ix].sum()</span>
+                    <span class="s1">xp1 += (e_linpred[ix][:</span><span class="s2">,None</span><span class="s1">] * v).sum(</span><span class="s5">0</span><span class="s1">)</span>
+
+                <span class="s4"># Account for all cases that fail at this point.</span>
+                <span class="s1">ix = uft_ix[i]</span>
+                <span class="s1">grad += (exog_s[ix</span><span class="s2">,</span><span class="s1">:] - xp1 / xp0).sum(</span><span class="s5">0</span><span class="s1">)</span>
+
+                <span class="s4"># Update for cases leaving the risk set.</span>
+                <span class="s1">ix = surv.risk_exit[stx][i]</span>
+                <span class="s2">if </span><span class="s1">len(ix) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">v = exog_s[ix</span><span class="s2">,</span><span class="s1">:]</span>
+                    <span class="s1">xp0 -= e_linpred[ix].sum()</span>
+                    <span class="s1">xp1 -= (e_linpred[ix][:</span><span class="s2">,None</span><span class="s1">] * v).sum(</span><span class="s5">0</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">grad</span>
+
+    <span class="s2">def </span><span class="s1">efron_gradient(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the gradient of the log partial likelihood evaluated 
+        at `params`, using the Efron method to handle tied times. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">surv = self.surv</span>
+
+        <span class="s1">grad = </span><span class="s5">0.</span>
+
+        <span class="s4"># Loop over strata</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+
+            <span class="s4"># Indices of cases in the stratum</span>
+            <span class="s1">strat_ix = surv.stratum_rows[stx]</span>
+
+            <span class="s4"># exog and linear predictor of the stratum</span>
+            <span class="s1">exog_s = surv.exog_s[stx]</span>
+            <span class="s1">linpred = np.dot(exog_s</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">surv.offset_s </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">linpred += surv.offset_s[stx]</span>
+            <span class="s1">linpred -= linpred.max()</span>
+            <span class="s1">e_linpred = np.exp(linpred)</span>
+
+            <span class="s1">xp0</span><span class="s2">, </span><span class="s1">xp1 = </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.</span>
+
+            <span class="s4"># Iterate backward through the unique failure times.</span>
+            <span class="s1">uft_ix = surv.ufailt_ix[stx]</span>
+            <span class="s1">nuft = len(uft_ix)</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nuft)[::-</span><span class="s5">1</span><span class="s1">]:</span>
+
+                <span class="s4"># Update for new cases entering the risk set.</span>
+                <span class="s1">ix = surv.risk_enter[stx][i]</span>
+                <span class="s2">if </span><span class="s1">len(ix) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">v = exog_s[ix</span><span class="s2">,</span><span class="s1">:]</span>
+                    <span class="s1">xp0 += e_linpred[ix].sum()</span>
+                    <span class="s1">xp1 += (e_linpred[ix][:</span><span class="s2">,None</span><span class="s1">] * v).sum(</span><span class="s5">0</span><span class="s1">)</span>
+                <span class="s1">ixf = uft_ix[i]</span>
+                <span class="s2">if </span><span class="s1">len(ixf) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">v = exog_s[ixf</span><span class="s2">,</span><span class="s1">:]</span>
+                    <span class="s1">xp0f = e_linpred[ixf].sum()</span>
+                    <span class="s1">xp1f = (e_linpred[ixf][:</span><span class="s2">,None</span><span class="s1">] * v).sum(</span><span class="s5">0</span><span class="s1">)</span>
+
+                    <span class="s4"># Consider all cases that fail at this point.</span>
+                    <span class="s1">grad += v.sum(</span><span class="s5">0</span><span class="s1">)</span>
+
+                    <span class="s1">m = len(ixf)</span>
+                    <span class="s1">J = np.arange(m</span><span class="s2">, </span><span class="s1">dtype=np.float64) / m</span>
+                    <span class="s1">numer = xp1 - np.outer(J</span><span class="s2">, </span><span class="s1">xp1f)</span>
+                    <span class="s1">denom = xp0 - np.outer(J</span><span class="s2">, </span><span class="s1">xp0f)</span>
+                    <span class="s1">ratio = numer / denom</span>
+                    <span class="s1">rsum = ratio.sum(</span><span class="s5">0</span><span class="s1">)</span>
+                    <span class="s1">grad -= rsum</span>
+
+                <span class="s4"># Update for cases leaving the risk set.</span>
+                <span class="s1">ix = surv.risk_exit[stx][i]</span>
+                <span class="s2">if </span><span class="s1">len(ix) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">v = exog_s[ix</span><span class="s2">,</span><span class="s1">:]</span>
+                    <span class="s1">xp0 -= e_linpred[ix].sum()</span>
+                    <span class="s1">xp1 -= (e_linpred[ix][:</span><span class="s2">,None</span><span class="s1">] * v).sum(</span><span class="s5">0</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">grad</span>
+
+    <span class="s2">def </span><span class="s1">breslow_hessian(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the Hessian of the log partial likelihood evaluated at 
+        `params`, using the Breslow method to handle tied times. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">surv = self.surv</span>
+
+        <span class="s1">hess = </span><span class="s5">0.</span>
+
+        <span class="s4"># Loop over strata</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+
+            <span class="s1">uft_ix = surv.ufailt_ix[stx]</span>
+            <span class="s1">nuft = len(uft_ix)</span>
+
+            <span class="s1">exog_s = surv.exog_s[stx]</span>
+
+            <span class="s1">linpred = np.dot(exog_s</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">surv.offset_s </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">linpred += surv.offset_s[stx]</span>
+            <span class="s1">linpred -= linpred.max()</span>
+            <span class="s1">e_linpred = np.exp(linpred)</span>
+
+            <span class="s1">xp0</span><span class="s2">, </span><span class="s1">xp1</span><span class="s2">, </span><span class="s1">xp2 = </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.</span>
+
+            <span class="s4"># Iterate backward through the unique failure times.</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nuft)[::-</span><span class="s5">1</span><span class="s1">]:</span>
+
+                <span class="s4"># Update for new cases entering the risk set.</span>
+                <span class="s1">ix = surv.risk_enter[stx][i]</span>
+                <span class="s2">if </span><span class="s1">len(ix) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">xp0 += e_linpred[ix].sum()</span>
+                    <span class="s1">v = exog_s[ix</span><span class="s2">,</span><span class="s1">:]</span>
+                    <span class="s1">xp1 += (e_linpred[ix][:</span><span class="s2">,None</span><span class="s1">] * v).sum(</span><span class="s5">0</span><span class="s1">)</span>
+                    <span class="s1">elx = e_linpred[ix]</span>
+                    <span class="s1">xp2 += np.einsum(</span><span class="s3">&quot;ij,ik,i-&gt;jk&quot;</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">elx)</span>
+
+                <span class="s4"># Account for all cases that fail at this point.</span>
+                <span class="s1">m = len(uft_ix[i])</span>
+                <span class="s1">hess += m*(xp2 / xp0  - np.outer(xp1</span><span class="s2">, </span><span class="s1">xp1) / xp0**</span><span class="s5">2</span><span class="s1">)</span>
+
+                <span class="s4"># Update for new cases entering the risk set.</span>
+                <span class="s1">ix = surv.risk_exit[stx][i]</span>
+                <span class="s2">if </span><span class="s1">len(ix) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">xp0 -= e_linpred[ix].sum()</span>
+                    <span class="s1">v = exog_s[ix</span><span class="s2">,</span><span class="s1">:]</span>
+                    <span class="s1">xp1 -= (e_linpred[ix][:</span><span class="s2">,None</span><span class="s1">] * v).sum(</span><span class="s5">0</span><span class="s1">)</span>
+                    <span class="s1">elx = e_linpred[ix]</span>
+                    <span class="s1">xp2 -= np.einsum(</span><span class="s3">&quot;ij,ik,i-&gt;jk&quot;</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">elx)</span>
+        <span class="s2">return </span><span class="s1">-hess</span>
+
+    <span class="s2">def </span><span class="s1">efron_hessian(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the Hessian matrix of the partial log-likelihood 
+        evaluated at `params`, using the Efron method to handle tied 
+        times. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">surv = self.surv</span>
+
+        <span class="s1">hess = </span><span class="s5">0.</span>
+
+        <span class="s4"># Loop over strata</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+
+            <span class="s1">exog_s = surv.exog_s[stx]</span>
+
+            <span class="s1">linpred = np.dot(exog_s</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">surv.offset_s </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">linpred += surv.offset_s[stx]</span>
+            <span class="s1">linpred -= linpred.max()</span>
+            <span class="s1">e_linpred = np.exp(linpred)</span>
+
+            <span class="s1">xp0</span><span class="s2">, </span><span class="s1">xp1</span><span class="s2">, </span><span class="s1">xp2 = </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.</span>
+
+            <span class="s4"># Iterate backward through the unique failure times.</span>
+            <span class="s1">uft_ix = surv.ufailt_ix[stx]</span>
+            <span class="s1">nuft = len(uft_ix)</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nuft)[::-</span><span class="s5">1</span><span class="s1">]:</span>
+
+                <span class="s4"># Update for new cases entering the risk set.</span>
+                <span class="s1">ix = surv.risk_enter[stx][i]</span>
+                <span class="s2">if </span><span class="s1">len(ix) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">xp0 += e_linpred[ix].sum()</span>
+                    <span class="s1">v = exog_s[ix</span><span class="s2">,</span><span class="s1">:]</span>
+                    <span class="s1">xp1 += (e_linpred[ix][:</span><span class="s2">,None</span><span class="s1">] * v).sum(</span><span class="s5">0</span><span class="s1">)</span>
+                    <span class="s1">elx = e_linpred[ix]</span>
+                    <span class="s1">xp2 += np.einsum(</span><span class="s3">&quot;ij,ik,i-&gt;jk&quot;</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">elx)</span>
+
+                <span class="s1">ixf = uft_ix[i]</span>
+                <span class="s2">if </span><span class="s1">len(ixf) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">v = exog_s[ixf</span><span class="s2">,</span><span class="s1">:]</span>
+                    <span class="s1">xp0f = e_linpred[ixf].sum()</span>
+                    <span class="s1">xp1f = (e_linpred[ixf][:</span><span class="s2">,None</span><span class="s1">] * v).sum(</span><span class="s5">0</span><span class="s1">)</span>
+                    <span class="s1">elx = e_linpred[ixf]</span>
+                    <span class="s1">xp2f = np.einsum(</span><span class="s3">&quot;ij,ik,i-&gt;jk&quot;</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">elx)</span>
+
+                <span class="s4"># Account for all cases that fail at this point.</span>
+                <span class="s1">m = len(uft_ix[i])</span>
+                <span class="s1">J = np.arange(m</span><span class="s2">, </span><span class="s1">dtype=np.float64) / m</span>
+                <span class="s1">c0 = xp0 - J*xp0f</span>
+                <span class="s1">hess += xp2 * np.sum(</span><span class="s5">1 </span><span class="s1">/ c0)</span>
+                <span class="s1">hess -= xp2f * np.sum(J / c0)</span>
+                <span class="s1">mat = (xp1[</span><span class="s2">None, </span><span class="s1">:] - np.outer(J</span><span class="s2">, </span><span class="s1">xp1f)) / c0[:</span><span class="s2">, None</span><span class="s1">]</span>
+                <span class="s1">hess -= np.einsum(</span><span class="s3">&quot;ij,ik-&gt;jk&quot;</span><span class="s2">, </span><span class="s1">mat</span><span class="s2">, </span><span class="s1">mat)</span>
+
+                <span class="s4"># Update for new cases entering the risk set.</span>
+                <span class="s1">ix = surv.risk_exit[stx][i]</span>
+                <span class="s2">if </span><span class="s1">len(ix) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s1">xp0 -= e_linpred[ix].sum()</span>
+                    <span class="s1">v = exog_s[ix</span><span class="s2">,</span><span class="s1">:]</span>
+                    <span class="s1">xp1 -= (e_linpred[ix][:</span><span class="s2">,None</span><span class="s1">] * v).sum(</span><span class="s5">0</span><span class="s1">)</span>
+                    <span class="s1">elx = e_linpred[ix]</span>
+                    <span class="s1">xp2 -= np.einsum(</span><span class="s3">&quot;ij,ik,i-&gt;jk&quot;</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">v</span><span class="s2">, </span><span class="s1">elx)</span>
+
+        <span class="s2">return </span><span class="s1">-hess</span>
+
+    <span class="s2">def </span><span class="s1">robust_covariance(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns a covariance matrix for the proportional hazards model 
+        regresion coefficient estimates that is robust to certain 
+        forms of model misspecification. 
+ 
+        Parameters 
+        ---------- 
+        params : ndarray 
+            The parameter vector at which the covariance matrix is 
+            calculated. 
+ 
+        Returns 
+        ------- 
+        The robust covariance matrix as a square ndarray. 
+ 
+        Notes 
+        ----- 
+        This function uses the `groups` argument to determine groups 
+        within which observations may be dependent.  The covariance 
+        matrix is calculated using the Huber-White &quot;sandwich&quot; approach. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">self.groups </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;`groups` must be specified to calculate the robust covariance matrix&quot;</span><span class="s1">)</span>
+
+        <span class="s1">hess = self.hessian(params)</span>
+
+        <span class="s1">score_obs = self.score_residuals(params)</span>
+
+        <span class="s4"># Collapse</span>
+        <span class="s1">grads = {}</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s2">,</span><span class="s1">g </span><span class="s2">in </span><span class="s1">enumerate(self.groups):</span>
+            <span class="s2">if </span><span class="s1">g </span><span class="s2">not in </span><span class="s1">grads:</span>
+                <span class="s1">grads[g] = </span><span class="s5">0.</span>
+            <span class="s1">grads[g] += score_obs[i</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">grads = np.asarray(list(grads.values()))</span>
+
+        <span class="s1">mat = grads[</span><span class="s2">None, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:]</span>
+        <span class="s1">mat = mat.T * mat</span>
+        <span class="s1">mat = mat.sum(</span><span class="s5">1</span><span class="s1">)</span>
+
+        <span class="s1">hess_inv = np.linalg.inv(hess)</span>
+        <span class="s1">cmat = np.dot(hess_inv</span><span class="s2">, </span><span class="s1">np.dot(mat</span><span class="s2">, </span><span class="s1">hess_inv))</span>
+
+        <span class="s2">return </span><span class="s1">cmat</span>
+
+    <span class="s2">def </span><span class="s1">score_residuals(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the score residuals calculated at a given vector of 
+        parameters. 
+ 
+        Parameters 
+        ---------- 
+        params : ndarray 
+            The parameter vector at which the score residuals are 
+            calculated. 
+ 
+        Returns 
+        ------- 
+        The score residuals, returned as a ndarray having the same 
+        shape as `exog`. 
+ 
+        Notes 
+        ----- 
+        Observations in a stratum with no observed events have undefined 
+        score residuals, and contain NaN in the returned matrix. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">surv = self.surv</span>
+
+        <span class="s1">score_resid = np.zeros(self.exog.shape</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+
+        <span class="s4"># Use to set undefined values to NaN.</span>
+        <span class="s1">mask = np.zeros(self.exog.shape[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=np.int32)</span>
+
+        <span class="s1">w_avg = self.weighted_covariate_averages(params)</span>
+
+        <span class="s4"># Loop over strata</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+
+            <span class="s1">uft_ix = surv.ufailt_ix[stx]</span>
+            <span class="s1">exog_s = surv.exog_s[stx]</span>
+            <span class="s1">nuft = len(uft_ix)</span>
+            <span class="s1">strat_ix = surv.stratum_rows[stx]</span>
+
+            <span class="s1">xp0 = </span><span class="s5">0.</span>
+
+            <span class="s1">linpred = np.dot(exog_s</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">surv.offset_s </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">linpred += surv.offset_s[stx]</span>
+            <span class="s1">linpred -= linpred.max()</span>
+            <span class="s1">e_linpred = np.exp(linpred)</span>
+
+            <span class="s1">at_risk_ix = set()</span>
+
+            <span class="s4"># Iterate backward through the unique failure times.</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nuft)[::-</span><span class="s5">1</span><span class="s1">]:</span>
+
+                <span class="s4"># Update for new cases entering the risk set.</span>
+                <span class="s1">ix = surv.risk_enter[stx][i]</span>
+                <span class="s1">at_risk_ix |= set(ix)</span>
+                <span class="s1">xp0 += e_linpred[ix].sum()</span>
+
+                <span class="s1">atr_ix = list(at_risk_ix)</span>
+                <span class="s1">leverage = exog_s[atr_ix</span><span class="s2">, </span><span class="s1">:] - w_avg[stx][i</span><span class="s2">, </span><span class="s1">:]</span>
+
+                <span class="s4"># Event indicators</span>
+                <span class="s1">d = np.zeros(exog_s.shape[</span><span class="s5">0</span><span class="s1">])</span>
+                <span class="s1">d[uft_ix[i]] = </span><span class="s5">1</span>
+
+                <span class="s4"># The increment in the cumulative hazard</span>
+                <span class="s1">dchaz = len(uft_ix[i]) / xp0</span>
+
+                <span class="s4"># Piece of the martingale residual</span>
+                <span class="s1">mrp = d[atr_ix] - e_linpred[atr_ix] * dchaz</span>
+
+                <span class="s4"># Update the score residuals</span>
+                <span class="s1">ii = strat_ix[atr_ix]</span>
+                <span class="s1">score_resid[ii</span><span class="s2">,</span><span class="s1">:] += leverage * mrp[:</span><span class="s2">, None</span><span class="s1">]</span>
+                <span class="s1">mask[ii] = </span><span class="s5">1</span>
+
+                <span class="s4"># Update for cases leaving the risk set.</span>
+                <span class="s1">ix = surv.risk_exit[stx][i]</span>
+                <span class="s1">at_risk_ix -= set(ix)</span>
+                <span class="s1">xp0 -= e_linpred[ix].sum()</span>
+
+        <span class="s1">jj = np.flatnonzero(mask == </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">len(jj) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">score_resid[jj</span><span class="s2">, </span><span class="s1">:] = np.nan</span>
+
+        <span class="s2">return </span><span class="s1">score_resid</span>
+
+    <span class="s2">def </span><span class="s1">weighted_covariate_averages(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the hazard-weighted average of covariate values for 
+        subjects who are at-risk at a particular time. 
+ 
+        Parameters 
+        ---------- 
+        params : ndarray 
+            Parameter vector 
+ 
+        Returns 
+        ------- 
+        averages : list of ndarrays 
+            averages[stx][i,:] is a row vector containing the weighted 
+            average values (for all the covariates) of at-risk 
+            subjects a the i^th largest observed failure time in 
+            stratum `stx`, using the hazard multipliers as weights. 
+ 
+        Notes 
+        ----- 
+        Used to calculate leverages and score residuals. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">surv = self.surv</span>
+
+        <span class="s1">averages = []</span>
+        <span class="s1">xp0</span><span class="s2">, </span><span class="s1">xp1 = </span><span class="s5">0.</span><span class="s2">, </span><span class="s5">0.</span>
+
+        <span class="s4"># Loop over strata</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+
+            <span class="s1">uft_ix = surv.ufailt_ix[stx]</span>
+            <span class="s1">exog_s = surv.exog_s[stx]</span>
+            <span class="s1">nuft = len(uft_ix)</span>
+
+            <span class="s1">average_s = np.zeros((len(uft_ix)</span><span class="s2">, </span><span class="s1">exog_s.shape[</span><span class="s5">1</span><span class="s1">])</span><span class="s2">,</span>
+                                  <span class="s1">dtype=np.float64)</span>
+
+            <span class="s1">linpred = np.dot(exog_s</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">surv.offset_s </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">linpred += surv.offset_s[stx]</span>
+            <span class="s1">linpred -= linpred.max()</span>
+            <span class="s1">e_linpred = np.exp(linpred)</span>
+
+            <span class="s4"># Iterate backward through the unique failure times.</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nuft)[::-</span><span class="s5">1</span><span class="s1">]:</span>
+
+                <span class="s4"># Update for new cases entering the risk set.</span>
+                <span class="s1">ix = surv.risk_enter[stx][i]</span>
+                <span class="s1">xp0 += e_linpred[ix].sum()</span>
+                <span class="s1">xp1 += np.dot(e_linpred[ix]</span><span class="s2">, </span><span class="s1">exog_s[ix</span><span class="s2">, </span><span class="s1">:])</span>
+
+                <span class="s1">average_s[i</span><span class="s2">, </span><span class="s1">:] = xp1 / xp0</span>
+
+                <span class="s4"># Update for cases leaving the risk set.</span>
+                <span class="s1">ix = surv.risk_exit[stx][i]</span>
+                <span class="s1">xp0 -= e_linpred[ix].sum()</span>
+                <span class="s1">xp1 -= np.dot(e_linpred[ix]</span><span class="s2">, </span><span class="s1">exog_s[ix</span><span class="s2">, </span><span class="s1">:])</span>
+
+            <span class="s1">averages.append(average_s)</span>
+
+        <span class="s2">return </span><span class="s1">averages</span>
+
+    <span class="s2">def </span><span class="s1">baseline_cumulative_hazard(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimate the baseline cumulative hazard and survival 
+        functions. 
+ 
+        Parameters 
+        ---------- 
+        params : ndarray 
+            The model parameters. 
+ 
+        Returns 
+        ------- 
+        A list of triples (time, hazard, survival) containing the time 
+        values and corresponding cumulative hazard and survival 
+        function values for each stratum. 
+ 
+        Notes 
+        ----- 
+        Uses the Nelson-Aalen estimator. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s4"># TODO: some disagreements with R, not the same algorithm but</span>
+        <span class="s4"># hard to deduce what R is doing.  Our results are reasonable.</span>
+
+        <span class="s1">surv = self.surv</span>
+        <span class="s1">rslt = []</span>
+
+        <span class="s4"># Loop over strata</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+
+            <span class="s1">uft = surv.ufailt[stx]</span>
+            <span class="s1">uft_ix = surv.ufailt_ix[stx]</span>
+            <span class="s1">exog_s = surv.exog_s[stx]</span>
+            <span class="s1">nuft = len(uft_ix)</span>
+
+            <span class="s1">linpred = np.dot(exog_s</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">surv.offset_s </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">linpred += surv.offset_s[stx]</span>
+            <span class="s1">e_linpred = np.exp(linpred)</span>
+
+            <span class="s1">xp0 = </span><span class="s5">0.</span>
+            <span class="s1">h0 = np.zeros(nuft</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+
+            <span class="s4"># Iterate backward through the unique failure times.</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nuft)[::-</span><span class="s5">1</span><span class="s1">]:</span>
+
+                <span class="s4"># Update for new cases entering the risk set.</span>
+                <span class="s1">ix = surv.risk_enter[stx][i]</span>
+                <span class="s1">xp0 += e_linpred[ix].sum()</span>
+
+                <span class="s4"># Account for all cases that fail at this point.</span>
+                <span class="s1">ix = uft_ix[i]</span>
+                <span class="s1">h0[i] = len(ix) / xp0</span>
+
+                <span class="s4"># Update for cases leaving the risk set.</span>
+                <span class="s1">ix = surv.risk_exit[stx][i]</span>
+                <span class="s1">xp0 -= e_linpred[ix].sum()</span>
+
+            <span class="s1">cumhaz = np.cumsum(h0) - h0</span>
+            <span class="s1">current_strata_surv = np.exp(-cumhaz)</span>
+            <span class="s1">rslt.append([uft</span><span class="s2">, </span><span class="s1">cumhaz</span><span class="s2">, </span><span class="s1">current_strata_surv])</span>
+
+        <span class="s2">return </span><span class="s1">rslt</span>
+
+    <span class="s2">def </span><span class="s1">baseline_cumulative_hazard_function(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns a function that calculates the baseline cumulative 
+        hazard function for each stratum. 
+ 
+        Parameters 
+        ---------- 
+        params : ndarray 
+            The model parameters. 
+ 
+        Returns 
+        ------- 
+        A dict mapping stratum names to the estimated baseline 
+        cumulative hazard function. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">from </span><span class="s1">scipy.interpolate </span><span class="s2">import </span><span class="s1">interp1d</span>
+        <span class="s1">surv = self.surv</span>
+        <span class="s1">base = self.baseline_cumulative_hazard(params)</span>
+
+        <span class="s1">cumhaz_f = {}</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+            <span class="s1">time_h = base[stx][</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s1">cumhaz = base[stx][</span><span class="s5">1</span><span class="s1">]</span>
+            <span class="s1">time_h = np.r_[-np.inf</span><span class="s2">, </span><span class="s1">time_h</span><span class="s2">, </span><span class="s1">np.inf]</span>
+            <span class="s1">cumhaz = np.r_[cumhaz[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">cumhaz</span><span class="s2">, </span><span class="s1">cumhaz[-</span><span class="s5">1</span><span class="s1">]]</span>
+            <span class="s1">func = interp1d(time_h</span><span class="s2">, </span><span class="s1">cumhaz</span><span class="s2">, </span><span class="s1">kind=</span><span class="s3">'zero'</span><span class="s1">)</span>
+            <span class="s1">cumhaz_f[self.surv.stratum_names[stx]] = func</span>
+
+        <span class="s2">return </span><span class="s1">cumhaz_f</span>
+
+    <span class="s1">@Appender(_predict_docstring % {</span>
+        <span class="s3">'params_doc'</span><span class="s1">: _predict_params_doc</span><span class="s2">,</span>
+        <span class="s3">'cov_params_doc'</span><span class="s1">: _predict_cov_params_docstring})</span>
+    <span class="s2">def </span><span class="s1">predict(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">exog=</span><span class="s2">None, </span><span class="s1">cov_params=</span><span class="s2">None, </span><span class="s1">endog=</span><span class="s2">None,</span>
+                <span class="s1">strata=</span><span class="s2">None, </span><span class="s1">offset=</span><span class="s2">None, </span><span class="s1">pred_type=</span><span class="s3">&quot;lhr&quot;</span><span class="s2">, </span><span class="s1">pred_only=</span><span class="s2">False</span><span class="s1">):</span>
+
+        <span class="s4"># This function breaks mediation, because it does not simply</span>
+        <span class="s4"># return the predicted values as an array.</span>
+
+        <span class="s1">pred_type = pred_type.lower()</span>
+        <span class="s2">if </span><span class="s1">pred_type </span><span class="s2">not in </span><span class="s1">[</span><span class="s3">&quot;lhr&quot;</span><span class="s2">, </span><span class="s3">&quot;hr&quot;</span><span class="s2">, </span><span class="s3">&quot;surv&quot;</span><span class="s2">, </span><span class="s3">&quot;cumhaz&quot;</span><span class="s1">]:</span>
+            <span class="s1">msg = </span><span class="s3">&quot;Type %s not allowed for prediction&quot; </span><span class="s1">% pred_type</span>
+            <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+
+        <span class="s2">class </span><span class="s1">bunch:</span>
+            <span class="s1">predicted_values = </span><span class="s2">None</span>
+            <span class="s1">standard_errors = </span><span class="s2">None</span>
+        <span class="s1">ret_val = bunch()</span>
+
+        <span class="s4"># Do not do anything with offset here because we want to allow</span>
+        <span class="s4"># different offsets to be specified even if exog is the model</span>
+        <span class="s4"># exog.</span>
+        <span class="s1">exog_provided = </span><span class="s2">True</span>
+        <span class="s2">if </span><span class="s1">exog </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">exog = self.exog</span>
+            <span class="s1">exog_provided = </span><span class="s2">False</span>
+
+        <span class="s1">lhr = np.dot(exog</span><span class="s2">, </span><span class="s1">params)</span>
+        <span class="s2">if </span><span class="s1">offset </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">lhr += offset</span>
+        <span class="s4"># Never use self.offset unless we are also using self.exog</span>
+        <span class="s2">elif </span><span class="s1">self.offset </span><span class="s2">is not None and not </span><span class="s1">exog_provided:</span>
+            <span class="s1">lhr += self.offset</span>
+
+        <span class="s4"># Handle lhr and hr prediction first, since they do not make</span>
+        <span class="s4"># use of the hazard function.</span>
+
+        <span class="s2">if </span><span class="s1">pred_type == </span><span class="s3">&quot;lhr&quot;</span><span class="s1">:</span>
+            <span class="s1">ret_val.predicted_values = lhr</span>
+            <span class="s2">if </span><span class="s1">cov_params </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">mat = np.dot(exog</span><span class="s2">, </span><span class="s1">cov_params)</span>
+                <span class="s1">va = (mat * exog).sum(</span><span class="s5">1</span><span class="s1">)</span>
+                <span class="s1">ret_val.standard_errors = np.sqrt(va)</span>
+            <span class="s2">if </span><span class="s1">pred_only:</span>
+                <span class="s2">return </span><span class="s1">ret_val.predicted_values</span>
+            <span class="s2">return </span><span class="s1">ret_val</span>
+
+        <span class="s1">hr = np.exp(lhr)</span>
+
+        <span class="s2">if </span><span class="s1">pred_type == </span><span class="s3">&quot;hr&quot;</span><span class="s1">:</span>
+            <span class="s1">ret_val.predicted_values = hr</span>
+            <span class="s2">if </span><span class="s1">pred_only:</span>
+                <span class="s2">return </span><span class="s1">ret_val.predicted_values</span>
+            <span class="s2">return </span><span class="s1">ret_val</span>
+
+        <span class="s4"># Makes sure endog is defined</span>
+        <span class="s2">if </span><span class="s1">endog </span><span class="s2">is None and </span><span class="s1">exog_provided:</span>
+            <span class="s1">msg = </span><span class="s3">&quot;If `exog` is provided `endog` must be provided.&quot;</span>
+            <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+        <span class="s4"># Use model endog if using model exog</span>
+        <span class="s2">elif </span><span class="s1">endog </span><span class="s2">is None and not </span><span class="s1">exog_provided:</span>
+            <span class="s1">endog = self.endog</span>
+
+        <span class="s4"># Make sure strata is defined</span>
+        <span class="s2">if </span><span class="s1">strata </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">exog_provided </span><span class="s2">and </span><span class="s1">self.surv.nstrat &gt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;`strata` must be provided&quot;</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">self.strata </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">strata = [self.surv.stratum_names[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span><span class="s1">] * len(endog)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">strata = self.strata</span>
+
+        <span class="s1">cumhaz = np.nan * np.ones(len(endog)</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">stv = np.unique(strata)</span>
+        <span class="s1">bhaz = self.baseline_cumulative_hazard_function(params)</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">stv:</span>
+            <span class="s1">ix = np.flatnonzero(strata == stx)</span>
+            <span class="s1">func = bhaz[stx]</span>
+            <span class="s1">cumhaz[ix] = func(endog[ix]) * hr[ix]</span>
+
+        <span class="s2">if </span><span class="s1">pred_type == </span><span class="s3">&quot;cumhaz&quot;</span><span class="s1">:</span>
+            <span class="s1">ret_val.predicted_values = cumhaz</span>
+
+        <span class="s2">elif </span><span class="s1">pred_type == </span><span class="s3">&quot;surv&quot;</span><span class="s1">:</span>
+            <span class="s1">ret_val.predicted_values = np.exp(-cumhaz)</span>
+
+        <span class="s2">if </span><span class="s1">pred_only:</span>
+            <span class="s2">return </span><span class="s1">ret_val.predicted_values</span>
+
+        <span class="s2">return </span><span class="s1">ret_val</span>
+
+    <span class="s2">def </span><span class="s1">get_distribution(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">scale=</span><span class="s5">1.0</span><span class="s2">, </span><span class="s1">exog=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns a scipy distribution object corresponding to the 
+        distribution of uncensored endog (duration) values for each 
+        case. 
+ 
+        Parameters 
+        ---------- 
+        params : array_like 
+            The proportional hazards model parameters. 
+        scale : float 
+            Present for compatibility, not used. 
+        exog : array_like 
+            A design matrix, defaults to model.exog. 
+ 
+        Returns 
+        ------- 
+        A list of objects of type scipy.stats.distributions.rv_discrete 
+ 
+        Notes 
+        ----- 
+        The distributions are obtained from a simple discrete estimate 
+        of the survivor function that puts all mass on the observed 
+        failure times within a stratum. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">surv = self.surv</span>
+        <span class="s1">bhaz = self.baseline_cumulative_hazard(params)</span>
+
+        <span class="s4"># The arguments to rv_discrete_float, first obtained by</span>
+        <span class="s4"># stratum</span>
+        <span class="s1">pk</span><span class="s2">, </span><span class="s1">xk = []</span><span class="s2">, </span><span class="s1">[]</span>
+
+        <span class="s2">if </span><span class="s1">exog </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">exog_split = surv.exog_s</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">exog_split = self.surv._split(exog)</span>
+
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(self.surv.nstrat):</span>
+
+            <span class="s1">exog_s = exog_split[stx]</span>
+
+            <span class="s1">linpred = np.dot(exog_s</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">surv.offset_s </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">linpred += surv.offset_s[stx]</span>
+            <span class="s1">e_linpred = np.exp(linpred)</span>
+
+            <span class="s4"># The unique failure times for this stratum (the support</span>
+            <span class="s4"># of the distribution).</span>
+            <span class="s1">pts = bhaz[stx][</span><span class="s5">0</span><span class="s1">]</span>
+
+            <span class="s4"># The individual cumulative hazards for everyone in this</span>
+            <span class="s4"># stratum.</span>
+            <span class="s1">ichaz = np.outer(e_linpred</span><span class="s2">, </span><span class="s1">bhaz[stx][</span><span class="s5">1</span><span class="s1">])</span>
+
+            <span class="s4"># The individual survival functions.</span>
+            <span class="s1">usurv = np.exp(-ichaz)</span>
+            <span class="s1">z = np.zeros((usurv.shape[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">1</span><span class="s1">))</span>
+            <span class="s1">usurv = np.concatenate((usurv</span><span class="s2">, </span><span class="s1">z)</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">1</span><span class="s1">)</span>
+
+            <span class="s4"># The individual survival probability masses.</span>
+            <span class="s1">probs = -np.diff(usurv</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+
+            <span class="s1">pk.append(probs)</span>
+            <span class="s1">xk.append(np.outer(np.ones(probs.shape[</span><span class="s5">0</span><span class="s1">])</span><span class="s2">, </span><span class="s1">pts))</span>
+
+        <span class="s4"># Pad to make all strata have the same shape</span>
+        <span class="s1">mxc = max([x.shape[</span><span class="s5">1</span><span class="s1">] </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">xk])</span>
+        <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range(self.surv.nstrat):</span>
+            <span class="s2">if </span><span class="s1">xk[k].shape[</span><span class="s5">1</span><span class="s1">] &lt; mxc:</span>
+                <span class="s1">xk1 = np.zeros((xk[k].shape[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">mxc))</span>
+                <span class="s1">pk1 = np.zeros((pk[k].shape[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">mxc))</span>
+                <span class="s1">xk1[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">:xk[k].shape[</span><span class="s5">1</span><span class="s1">]] = xk[k]</span>
+                <span class="s1">pk1[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">:pk[k].shape[</span><span class="s5">1</span><span class="s1">]] = pk[k]</span>
+                <span class="s1">xk[k]</span><span class="s2">, </span><span class="s1">pk[k] = xk1</span><span class="s2">, </span><span class="s1">pk1</span>
+
+        <span class="s4"># Put the support points and probabilities into single matrices</span>
+        <span class="s1">xka = np.nan * np.ones((len(self.endog)</span><span class="s2">, </span><span class="s1">mxc))</span>
+        <span class="s1">pka = np.ones((len(self.endog)</span><span class="s2">, </span><span class="s1">mxc)</span><span class="s2">, </span><span class="s1">dtype=np.float64) / mxc</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(self.surv.nstrat):</span>
+            <span class="s1">ix = self.surv.stratum_rows[stx]</span>
+            <span class="s1">xka[ix</span><span class="s2">, </span><span class="s1">:] = xk[stx]</span>
+            <span class="s1">pka[ix</span><span class="s2">, </span><span class="s1">:] = pk[stx]</span>
+
+        <span class="s1">dist = rv_discrete_float(xka</span><span class="s2">, </span><span class="s1">pka)</span>
+
+        <span class="s2">return </span><span class="s1">dist</span>
+
+
+<span class="s2">class </span><span class="s1">PHRegResults(base.LikelihoodModelResults):</span>
+    <span class="s0">''' 
+    Class to contain results of fitting a Cox proportional hazards 
+    survival model. 
+ 
+    PHregResults inherits from statsmodels.LikelihoodModelResults 
+ 
+    Parameters 
+    ---------- 
+    See statsmodels.LikelihoodModelResults 
+ 
+    Attributes 
+    ---------- 
+    model : class instance 
+        PHreg model instance that called fit. 
+    normalized_cov_params : ndarray 
+        The sampling covariance matrix of the estimates 
+    params : ndarray 
+        The coefficients of the fitted model.  Each coefficient is the 
+        log hazard ratio corresponding to a 1 unit difference in a 
+        single covariate while holding the other covariates fixed. 
+    bse : ndarray 
+        The standard errors of the fitted parameters. 
+ 
+    See Also 
+    -------- 
+    statsmodels.LikelihoodModelResults 
+    '''</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">model</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">cov_params</span><span class="s2">, </span><span class="s1">scale=</span><span class="s5">1.</span><span class="s2">, </span><span class="s1">covariance_type=</span><span class="s3">&quot;naive&quot;</span><span class="s1">):</span>
+
+        <span class="s4"># There is no scale parameter, but we need it for</span>
+        <span class="s4"># meta-procedures that work with results.</span>
+
+        <span class="s1">self.covariance_type = covariance_type</span>
+        <span class="s1">self.df_resid = model.df_resid</span>
+        <span class="s1">self.df_model = model.df_model</span>
+
+        <span class="s1">super(PHRegResults</span><span class="s2">, </span><span class="s1">self).__init__(model</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">scale=</span><span class="s5">1.</span><span class="s2">,</span>
+           <span class="s1">normalized_cov_params=cov_params)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">standard_errors(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the standard errors of the parameter estimates. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">np.sqrt(np.diag(self.cov_params()))</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">bse(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns the standard errors of the parameter estimates. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.standard_errors</span>
+
+    <span class="s2">def </span><span class="s1">get_distribution(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns a scipy distribution object corresponding to the 
+        distribution of uncensored endog (duration) values for each 
+        case. 
+ 
+        Returns 
+        ------- 
+        A list of objects of type scipy.stats.distributions.rv_discrete 
+ 
+        Notes 
+        ----- 
+        The distributions are obtained from a simple discrete estimate 
+        of the survivor function that puts all mass on the observed 
+        failure times within a stratum. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">self.model.get_distribution(self.params)</span>
+
+    <span class="s1">@Appender(_predict_docstring % {</span><span class="s3">'params_doc'</span><span class="s1">: </span><span class="s3">''</span><span class="s2">, </span><span class="s3">'cov_params_doc'</span><span class="s1">: </span><span class="s3">''</span><span class="s1">})</span>
+    <span class="s2">def </span><span class="s1">predict(self</span><span class="s2">, </span><span class="s1">endog=</span><span class="s2">None, </span><span class="s1">exog=</span><span class="s2">None, </span><span class="s1">strata=</span><span class="s2">None,</span>
+                <span class="s1">offset=</span><span class="s2">None, </span><span class="s1">transform=</span><span class="s2">True, </span><span class="s1">pred_type=</span><span class="s3">&quot;lhr&quot;</span><span class="s1">):</span>
+        <span class="s2">return </span><span class="s1">super(PHRegResults</span><span class="s2">, </span><span class="s1">self).predict(exog=exog</span><span class="s2">,</span>
+                                                 <span class="s1">transform=transform</span><span class="s2">,</span>
+                                                 <span class="s1">cov_params=self.cov_params()</span><span class="s2">,</span>
+                                                 <span class="s1">endog=endog</span><span class="s2">,</span>
+                                                 <span class="s1">strata=strata</span><span class="s2">,</span>
+                                                 <span class="s1">offset=offset</span><span class="s2">,</span>
+                                                 <span class="s1">pred_type=pred_type)</span>
+
+    <span class="s2">def </span><span class="s1">_group_stats(self</span><span class="s2">, </span><span class="s1">groups):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Descriptive statistics of the groups. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">gsizes = np.unique(groups</span><span class="s2">, </span><span class="s1">return_counts=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">gsizes = gsizes[</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">gsizes.min()</span><span class="s2">, </span><span class="s1">gsizes.max()</span><span class="s2">, </span><span class="s1">gsizes.mean()</span><span class="s2">, </span><span class="s1">len(gsizes)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">weighted_covariate_averages(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The average covariate values within the at-risk set at each 
+        event time point, weighted by hazard. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.model.weighted_covariate_averages(self.params)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">score_residuals(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A matrix containing the score residuals. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.model.score_residuals(self.params)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">baseline_cumulative_hazard(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A list (corresponding to the strata) containing the baseline 
+        cumulative hazard function evaluated at the event points. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.model.baseline_cumulative_hazard(self.params)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">baseline_cumulative_hazard_function(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A list (corresponding to the strata) containing function 
+        objects that calculate the cumulative hazard function. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.model.baseline_cumulative_hazard_function(self.params)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">schoenfeld_residuals(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        A matrix containing the Schoenfeld residuals. 
+ 
+        Notes 
+        ----- 
+        Schoenfeld residuals for censored observations are set to zero. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">surv = self.model.surv</span>
+        <span class="s1">w_avg = self.weighted_covariate_averages</span>
+
+        <span class="s4"># Initialize at NaN since rows that belong to strata with no</span>
+        <span class="s4"># events have undefined residuals.</span>
+        <span class="s1">sch_resid = np.nan*np.ones(self.model.exog.shape</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+
+        <span class="s4"># Loop over strata</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+
+            <span class="s1">uft = surv.ufailt[stx]</span>
+            <span class="s1">exog_s = surv.exog_s[stx]</span>
+            <span class="s1">time_s = surv.time_s[stx]</span>
+            <span class="s1">strat_ix = surv.stratum_rows[stx]</span>
+
+            <span class="s1">ii = np.searchsorted(uft</span><span class="s2">, </span><span class="s1">time_s)</span>
+
+            <span class="s4"># These subjects are censored after the last event in</span>
+            <span class="s4"># their stratum, so have empty risk sets and undefined</span>
+            <span class="s4"># residuals.</span>
+            <span class="s1">jj = np.flatnonzero(ii &lt; len(uft))</span>
+
+            <span class="s1">sch_resid[strat_ix[jj]</span><span class="s2">, </span><span class="s1">:] = exog_s[jj</span><span class="s2">, </span><span class="s1">:] - w_avg[stx][ii[jj]</span><span class="s2">, </span><span class="s1">:]</span>
+
+        <span class="s1">jj = np.flatnonzero(self.model.status == </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">sch_resid[jj</span><span class="s2">, </span><span class="s1">:] = np.nan</span>
+
+        <span class="s2">return </span><span class="s1">sch_resid</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">martingale_residuals(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The martingale residuals. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">surv = self.model.surv</span>
+
+        <span class="s4"># Initialize at NaN since rows that belong to strata with no</span>
+        <span class="s4"># events have undefined residuals.</span>
+        <span class="s1">mart_resid = np.nan*np.ones(len(self.model.endog)</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+
+        <span class="s1">cumhaz_f_list = self.baseline_cumulative_hazard_function</span>
+
+        <span class="s4"># Loop over strata</span>
+        <span class="s2">for </span><span class="s1">stx </span><span class="s2">in </span><span class="s1">range(surv.nstrat):</span>
+
+            <span class="s1">cumhaz_f = cumhaz_f_list[stx]</span>
+
+            <span class="s1">exog_s = surv.exog_s[stx]</span>
+            <span class="s1">time_s = surv.time_s[stx]</span>
+
+            <span class="s1">linpred = np.dot(exog_s</span><span class="s2">, </span><span class="s1">self.params)</span>
+            <span class="s2">if </span><span class="s1">surv.offset_s </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">linpred += surv.offset_s[stx]</span>
+            <span class="s1">e_linpred = np.exp(linpred)</span>
+
+            <span class="s1">ii = surv.stratum_rows[stx]</span>
+            <span class="s1">chaz = cumhaz_f(time_s)</span>
+            <span class="s1">mart_resid[ii] = self.model.status[ii] - e_linpred * chaz</span>
+
+        <span class="s2">return </span><span class="s1">mart_resid</span>
+
+    <span class="s2">def </span><span class="s1">summary(self</span><span class="s2">, </span><span class="s1">yname=</span><span class="s2">None, </span><span class="s1">xname=</span><span class="s2">None, </span><span class="s1">title=</span><span class="s2">None, </span><span class="s1">alpha=</span><span class="s5">.05</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Summarize the proportional hazards regression results. 
+ 
+        Parameters 
+        ---------- 
+        yname : str, optional 
+            Default is `y` 
+        xname : list[str], optional 
+            Names for the exogenous variables, default is `x#` for ## in p the 
+            number of regressors. Must match the number of parameters in 
+            the model 
+        title : str, optional 
+            Title for the top table. If not None, then this replaces 
+            the default title 
+        alpha : float 
+            significance level for the confidence intervals 
+ 
+        Returns 
+        ------- 
+        smry : Summary instance 
+            this holds the summary tables and text, which can be 
+            printed or converted to various output formats. 
+ 
+        See Also 
+        -------- 
+        statsmodels.iolib.summary2.Summary : class to hold summary results 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">from </span><span class="s1">statsmodels.iolib </span><span class="s2">import </span><span class="s1">summary2</span>
+        <span class="s1">smry = summary2.Summary()</span>
+        <span class="s1">float_format = </span><span class="s3">&quot;%8.3f&quot;</span>
+
+        <span class="s1">info = {}</span>
+        <span class="s1">info[</span><span class="s3">&quot;Model:&quot;</span><span class="s1">] = </span><span class="s3">&quot;PH Reg&quot;</span>
+        <span class="s2">if </span><span class="s1">yname </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">yname = self.model.endog_names</span>
+        <span class="s1">info[</span><span class="s3">&quot;Dependent variable:&quot;</span><span class="s1">] = yname</span>
+        <span class="s1">info[</span><span class="s3">&quot;Ties:&quot;</span><span class="s1">] = self.model.ties.capitalize()</span>
+        <span class="s1">info[</span><span class="s3">&quot;Sample size:&quot;</span><span class="s1">] = str(self.model.surv.n_obs)</span>
+        <span class="s1">info[</span><span class="s3">&quot;Num. events:&quot;</span><span class="s1">] = str(int(sum(self.model.status)))</span>
+
+        <span class="s2">if </span><span class="s1">self.model.groups </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">mn</span><span class="s2">, </span><span class="s1">mx</span><span class="s2">, </span><span class="s1">avg</span><span class="s2">, </span><span class="s1">num = self._group_stats(self.model.groups)</span>
+            <span class="s1">info[</span><span class="s3">&quot;Num groups:&quot;</span><span class="s1">] = </span><span class="s3">&quot;%.0f&quot; </span><span class="s1">% num</span>
+            <span class="s1">info[</span><span class="s3">&quot;Min group size:&quot;</span><span class="s1">] = </span><span class="s3">&quot;%.0f&quot; </span><span class="s1">% mn</span>
+            <span class="s1">info[</span><span class="s3">&quot;Max group size:&quot;</span><span class="s1">] = </span><span class="s3">&quot;%.0f&quot; </span><span class="s1">% mx</span>
+            <span class="s1">info[</span><span class="s3">&quot;Avg group size:&quot;</span><span class="s1">] = </span><span class="s3">&quot;%.1f&quot; </span><span class="s1">% avg</span>
+
+        <span class="s2">if </span><span class="s1">self.model.strata </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">mn</span><span class="s2">, </span><span class="s1">mx</span><span class="s2">, </span><span class="s1">avg</span><span class="s2">, </span><span class="s1">num = self._group_stats(self.model.strata)</span>
+            <span class="s1">info[</span><span class="s3">&quot;Num strata:&quot;</span><span class="s1">] = </span><span class="s3">&quot;%.0f&quot; </span><span class="s1">% num</span>
+            <span class="s1">info[</span><span class="s3">&quot;Min stratum size:&quot;</span><span class="s1">] = </span><span class="s3">&quot;%.0f&quot; </span><span class="s1">% mn</span>
+            <span class="s1">info[</span><span class="s3">&quot;Max stratum size:&quot;</span><span class="s1">] = </span><span class="s3">&quot;%.0f&quot; </span><span class="s1">% mx</span>
+            <span class="s1">info[</span><span class="s3">&quot;Avg stratum size:&quot;</span><span class="s1">] = </span><span class="s3">&quot;%.1f&quot; </span><span class="s1">% avg</span>
+
+        <span class="s1">smry.add_dict(info</span><span class="s2">, </span><span class="s1">align=</span><span class="s3">'l'</span><span class="s2">, </span><span class="s1">float_format=float_format)</span>
+
+        <span class="s1">param = summary2.summary_params(self</span><span class="s2">, </span><span class="s1">alpha=alpha)</span>
+        <span class="s1">param = param.rename(columns={</span><span class="s3">&quot;Coef.&quot;</span><span class="s1">: </span><span class="s3">&quot;log HR&quot;</span><span class="s2">,</span>
+                                      <span class="s3">&quot;Std.Err.&quot;</span><span class="s1">: </span><span class="s3">&quot;log HR SE&quot;</span><span class="s1">})</span>
+        <span class="s1">param.insert(</span><span class="s5">2</span><span class="s2">, </span><span class="s3">&quot;HR&quot;</span><span class="s2">, </span><span class="s1">np.exp(param[</span><span class="s3">&quot;log HR&quot;</span><span class="s1">]))</span>
+        <span class="s1">a = </span><span class="s3">&quot;[%.3f&quot; </span><span class="s1">% (alpha / </span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">param.loc[:</span><span class="s2">, </span><span class="s1">a] = np.exp(param.loc[:</span><span class="s2">, </span><span class="s1">a])</span>
+        <span class="s1">a = </span><span class="s3">&quot;%.3f]&quot; </span><span class="s1">% (</span><span class="s5">1 </span><span class="s1">- alpha / </span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">param.loc[:</span><span class="s2">, </span><span class="s1">a] = np.exp(param.loc[:</span><span class="s2">, </span><span class="s1">a])</span>
+        <span class="s2">if </span><span class="s1">xname </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">param.index = xname</span>
+        <span class="s1">smry.add_df(param</span><span class="s2">, </span><span class="s1">float_format=float_format)</span>
+        <span class="s1">smry.add_title(title=title</span><span class="s2">, </span><span class="s1">results=self)</span>
+        <span class="s1">smry.add_text(</span><span class="s3">&quot;Confidence intervals are for the hazard ratios&quot;</span><span class="s1">)</span>
+
+        <span class="s1">dstrat = self.model.surv.nstrat_orig - self.model.surv.nstrat</span>
+        <span class="s2">if </span><span class="s1">dstrat &gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">dstrat == </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">smry.add_text(</span><span class="s3">&quot;1 stratum dropped for having no events&quot;</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">smry.add_text(</span><span class="s3">&quot;%d strata dropped for having no events&quot; </span><span class="s1">% dstrat)</span>
+
+        <span class="s2">if </span><span class="s1">self.model.entry </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">n_entry = sum(self.model.entry != </span><span class="s5">0</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">n_entry == </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">smry.add_text(</span><span class="s3">&quot;1 observation has a positive entry time&quot;</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">smry.add_text(</span><span class="s3">&quot;%d observations have positive entry times&quot; </span><span class="s1">% n_entry)</span>
+
+        <span class="s2">if </span><span class="s1">self.model.groups </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">smry.add_text(</span><span class="s3">&quot;Standard errors account for dependence within groups&quot;</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">&quot;regularized&quot;</span><span class="s1">):</span>
+            <span class="s1">smry.add_text(</span><span class="s3">&quot;Standard errors do not account for the regularization&quot;</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">smry</span>
+
+
+<span class="s2">class </span><span class="s1">rv_discrete_float:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A class representing a collection of discrete distributions. 
+ 
+    Parameters 
+    ---------- 
+    xk : 2d array_like 
+        The support points, should be non-decreasing within each 
+        row. 
+    pk : 2d array_like 
+        The probabilities, should sum to one within each row. 
+ 
+    Notes 
+    ----- 
+    Each row of `xk`, and the corresponding row of `pk` describe a 
+    discrete distribution. 
+ 
+    `xk` and `pk` should both be two-dimensional ndarrays.  Each row 
+    of `pk` should sum to 1. 
+ 
+    This class is used as a substitute for scipy.distributions. 
+    rv_discrete, since that class does not allow non-integer support 
+    points, or vectorized operations. 
+ 
+    Only a limited number of methods are implemented here compared to 
+    the other scipy distribution classes. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">xk</span><span class="s2">, </span><span class="s1">pk):</span>
+
+        <span class="s1">self.xk = xk</span>
+        <span class="s1">self.pk = pk</span>
+        <span class="s1">self.cpk = np.cumsum(self.pk</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">rvs(self</span><span class="s2">, </span><span class="s1">n=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns a random sample from the discrete distribution. 
+ 
+        A vector is returned containing a single draw from each row of 
+        `xk`, using the probabilities of the corresponding row of `pk` 
+ 
+        Parameters 
+        ---------- 
+        n : not used 
+            Present for signature compatibility 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">n = self.xk.shape[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">u = np.random.uniform(size=n)</span>
+
+        <span class="s1">ix = (self.cpk &lt; u[:</span><span class="s2">, None</span><span class="s1">]).sum(</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">ii = np.arange(n</span><span class="s2">, </span><span class="s1">dtype=np.int32)</span>
+        <span class="s2">return </span><span class="s1">self.xk[(ii</span><span class="s2">,</span><span class="s1">ix)]</span>
+
+    <span class="s2">def </span><span class="s1">mean(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns a vector containing the mean values of the discrete 
+        distributions. 
+ 
+        A vector is returned containing the mean value of each row of 
+        `xk`, using the probabilities in the corresponding row of 
+        `pk`. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">(self.xk * self.pk).sum(</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">var(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns a vector containing the variances of the discrete 
+        distributions. 
+ 
+        A vector is returned containing the variance for each row of 
+        `xk`, using the probabilities in the corresponding row of 
+        `pk`. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">mn = self.mean()</span>
+        <span class="s1">xkc = self.xk - mn[:</span><span class="s2">, None</span><span class="s1">]</span>
+
+        <span class="s2">return </span><span class="s1">(self.pk * (self.xk - xkc)**</span><span class="s5">2</span><span class="s1">).sum(</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">std(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Returns a vector containing the standard deviations of the 
+        discrete distributions. 
+ 
+        A vector is returned containing the standard deviation for 
+        each row of `xk`, using the probabilities in the corresponding 
+        row of `pk`. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">return </span><span class="s1">np.sqrt(self.var())</span>
+</pre>
+</body>
+</html>

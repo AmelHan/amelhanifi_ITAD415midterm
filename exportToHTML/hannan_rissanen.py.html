@@ -1,0 +1,452 @@
+<html>
+<head>
+<title>hannan_rissanen.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+hannan_rissanen.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Hannan-Rissanen procedure for estimating ARMA(p,q) model parameters. 
+ 
+Author: Chad Fulton 
+License: BSD-3 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">scipy.signal </span><span class="s2">import </span><span class="s1">lfilter</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.tools </span><span class="s2">import </span><span class="s1">Bunch</span>
+<span class="s2">from </span><span class="s1">statsmodels.regression.linear_model </span><span class="s2">import </span><span class="s1">OLS</span><span class="s2">, </span><span class="s1">yule_walker</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.tsatools </span><span class="s2">import </span><span class="s1">lagmat</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.tsa.arima.specification </span><span class="s2">import </span><span class="s1">SARIMAXSpecification</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.arima.params </span><span class="s2">import </span><span class="s1">SARIMAXParams</span>
+
+
+<span class="s2">def </span><span class="s1">hannan_rissanen(endog</span><span class="s2">, </span><span class="s1">ar_order=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">ma_order=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">demean=</span><span class="s2">True,</span>
+                    <span class="s1">initial_ar_order=</span><span class="s2">None, </span><span class="s1">unbiased=</span><span class="s2">None,</span>
+                    <span class="s1">fixed_params=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Estimate ARMA parameters using Hannan-Rissanen procedure. 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        Input time series array, assumed to be stationary. 
+    ar_order : int or list of int 
+        Autoregressive order 
+    ma_order : int or list of int 
+        Moving average order 
+    demean : bool, optional 
+        Whether to estimate and remove the mean from the process prior to 
+        fitting the ARMA coefficients. Default is True. 
+    initial_ar_order : int, optional 
+        Order of long autoregressive process used for initial computation of 
+        residuals. 
+    unbiased : bool, optional 
+        Whether or not to apply the bias correction step. Default is True if 
+        the estimated coefficients from the previous step imply a stationary 
+        and invertible process and False otherwise. 
+    fixed_params : dict, optional 
+        Dictionary with names of fixed parameters as keys (e.g. 'ar.L1', 
+        'ma.L2'), which correspond to SARIMAXSpecification.param_names. 
+        Dictionary values are the values of the associated fixed parameters. 
+ 
+    Returns 
+    ------- 
+    parameters : SARIMAXParams object 
+    other_results : Bunch 
+        Includes three components: `spec`, containing the 
+        `SARIMAXSpecification` instance corresponding to the input arguments; 
+        `initial_ar_order`, containing the autoregressive lag order used in the 
+        first step; and `resid`, which contains the computed residuals from the 
+        last step. 
+ 
+    Notes 
+    ----- 
+    The primary reference is [1]_, section 5.1.4, which describes a three-step 
+    procedure that we implement here. 
+ 
+    1. Fit a large-order AR model via Yule-Walker to estimate residuals 
+    2. Compute AR and MA estimates via least squares 
+    3. (Unless the estimated coefficients from step (2) are non-stationary / 
+       non-invertible or `unbiased=False`) Perform bias correction 
+ 
+    The order used for the AR model in the first step may be given as an 
+    argument. If it is not, we compute it as suggested by [2]_. 
+ 
+    The estimate of the variance that we use is computed from the residuals 
+    of the least-squares regression and not from the innovations algorithm. 
+    This is because our fast implementation of the innovations algorithm is 
+    only valid for stationary processes, and the Hannan-Rissanen procedure may 
+    produce estimates that imply non-stationary processes. To avoid 
+    inconsistency, we never compute this latter variance here, even if it is 
+    possible. See test_hannan_rissanen::test_brockwell_davis_example_517 for 
+    an example of how to compute this variance manually. 
+ 
+    This procedure assumes that the series is stationary, but if this is not 
+    true, it is still possible that this procedure will return parameters that 
+    imply a non-stationary / non-invertible process. 
+ 
+    Note that the third stage will only be applied if the parameters from the 
+    second stage imply a stationary / invertible model. If `unbiased=True` is 
+    given, then non-stationary / non-invertible parameters in the second stage 
+    will throw an exception. 
+ 
+    References 
+    ---------- 
+    .. [1] Brockwell, Peter J., and Richard A. Davis. 2016. 
+       Introduction to Time Series and Forecasting. Springer. 
+    .. [2] Gomez, Victor, and Agustin Maravall. 2001. 
+       &quot;Automatic Modeling Methods for Univariate Series.&quot; 
+       A Course in Time Series Analysis, 171–201. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">spec = SARIMAXSpecification(endog</span><span class="s2">, </span><span class="s1">ar_order=ar_order</span><span class="s2">, </span><span class="s1">ma_order=ma_order)</span>
+
+    <span class="s1">fixed_params = _validate_fixed_params(fixed_params</span><span class="s2">, </span><span class="s1">spec.param_names)</span>
+
+    <span class="s1">endog = spec.endog</span>
+    <span class="s2">if </span><span class="s1">demean:</span>
+        <span class="s1">endog = endog - endog.mean()</span>
+
+    <span class="s1">p = SARIMAXParams(spec=spec)</span>
+
+    <span class="s1">nobs = len(endog)</span>
+    <span class="s1">max_ar_order = spec.max_ar_order</span>
+    <span class="s1">max_ma_order = spec.max_ma_order</span>
+
+    <span class="s4"># Default initial_ar_order is as suggested by Gomez and Maravall (2001)</span>
+    <span class="s2">if </span><span class="s1">initial_ar_order </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">initial_ar_order = max(np.floor(np.log(nobs)**</span><span class="s3">2</span><span class="s1">).astype(int)</span><span class="s2">,</span>
+                               <span class="s3">2 </span><span class="s1">* max(max_ar_order</span><span class="s2">, </span><span class="s1">max_ma_order))</span>
+    <span class="s4"># Create a spec, just to validate the initial autoregressive order</span>
+    <span class="s1">_ = SARIMAXSpecification(endog</span><span class="s2">, </span><span class="s1">ar_order=initial_ar_order)</span>
+
+    <span class="s4"># Unpack fixed and free ar/ma lags, ix, and params (fixed only)</span>
+    <span class="s1">params_info = _package_fixed_and_free_params_info(</span>
+        <span class="s1">fixed_params</span><span class="s2">, </span><span class="s1">spec.ar_lags</span><span class="s2">, </span><span class="s1">spec.ma_lags</span>
+    <span class="s1">)</span>
+
+    <span class="s4"># Compute lagged endog</span>
+    <span class="s1">lagged_endog = lagmat(endog</span><span class="s2">, </span><span class="s1">max_ar_order</span><span class="s2">, </span><span class="s1">trim=</span><span class="s5">'both'</span><span class="s1">)</span>
+
+    <span class="s4"># If no AR or MA components, this is just a variance computation</span>
+    <span class="s1">mod = </span><span class="s2">None</span>
+    <span class="s2">if </span><span class="s1">max_ma_order == </span><span class="s3">0 </span><span class="s2">and </span><span class="s1">max_ar_order == </span><span class="s3">0</span><span class="s1">:</span>
+        <span class="s1">p.sigma2 = np.var(endog</span><span class="s2">, </span><span class="s1">ddof=</span><span class="s3">0</span><span class="s1">)</span>
+        <span class="s1">resid = endog.copy()</span>
+    <span class="s4"># If no MA component, this is just CSS</span>
+    <span class="s2">elif </span><span class="s1">max_ma_order == </span><span class="s3">0</span><span class="s1">:</span>
+        <span class="s4"># extract 1) lagged_endog with free params; 2) lagged_endog with fixed</span>
+        <span class="s4"># params; 3) endog residual after applying fixed params if applicable</span>
+        <span class="s1">X_with_free_params = lagged_endog[:</span><span class="s2">, </span><span class="s1">params_info.free_ar_ix]</span>
+        <span class="s1">X_with_fixed_params = lagged_endog[:</span><span class="s2">, </span><span class="s1">params_info.fixed_ar_ix]</span>
+        <span class="s1">y = endog[max_ar_order:]</span>
+        <span class="s2">if </span><span class="s1">X_with_fixed_params.shape[</span><span class="s3">1</span><span class="s1">] != </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s1">y = y - X_with_fixed_params.dot(params_info.fixed_ar_params)</span>
+
+        <span class="s4"># no free ar params -&gt; variance computation on the endog residual</span>
+        <span class="s2">if </span><span class="s1">X_with_free_params.shape[</span><span class="s3">1</span><span class="s1">] == </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s1">p.ar_params = params_info.fixed_ar_params</span>
+            <span class="s1">p.sigma2 = np.var(y</span><span class="s2">, </span><span class="s1">ddof=</span><span class="s3">0</span><span class="s1">)</span>
+            <span class="s1">resid = y.copy()</span>
+        <span class="s4"># otherwise OLS with endog residual (after applying fixed params) as y,</span>
+        <span class="s4"># and lagged_endog with free params as X</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">mod = OLS(y</span><span class="s2">, </span><span class="s1">X_with_free_params)</span>
+            <span class="s1">res = mod.fit()</span>
+            <span class="s1">resid = res.resid</span>
+            <span class="s1">p.sigma2 = res.scale</span>
+            <span class="s1">p.ar_params = _stitch_fixed_and_free_params(</span>
+                <span class="s1">fixed_ar_or_ma_lags=params_info.fixed_ar_lags</span><span class="s2">,</span>
+                <span class="s1">fixed_ar_or_ma_params=params_info.fixed_ar_params</span><span class="s2">,</span>
+                <span class="s1">free_ar_or_ma_lags=params_info.free_ar_lags</span><span class="s2">,</span>
+                <span class="s1">free_ar_or_ma_params=res.params</span><span class="s2">,</span>
+                <span class="s1">spec_ar_or_ma_lags=spec.ar_lags</span>
+            <span class="s1">)</span>
+    <span class="s4"># Otherwise ARMA model</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s4"># Step 1: Compute long AR model via Yule-Walker, get residuals</span>
+        <span class="s1">initial_ar_params</span><span class="s2">, </span><span class="s1">_ = yule_walker(</span>
+            <span class="s1">endog</span><span class="s2">, </span><span class="s1">order=initial_ar_order</span><span class="s2">, </span><span class="s1">method=</span><span class="s5">'mle'</span><span class="s1">)</span>
+        <span class="s1">X = lagmat(endog</span><span class="s2">, </span><span class="s1">initial_ar_order</span><span class="s2">, </span><span class="s1">trim=</span><span class="s5">'both'</span><span class="s1">)</span>
+        <span class="s1">y = endog[initial_ar_order:]</span>
+        <span class="s1">resid = y - X.dot(initial_ar_params)</span>
+
+        <span class="s4"># Get lagged residuals for `exog` in least-squares regression</span>
+        <span class="s1">lagged_resid = lagmat(resid</span><span class="s2">, </span><span class="s1">max_ma_order</span><span class="s2">, </span><span class="s1">trim=</span><span class="s5">'both'</span><span class="s1">)</span>
+
+        <span class="s4"># Step 2: estimate ARMA model via least squares</span>
+        <span class="s1">ix = initial_ar_order + max_ma_order - max_ar_order</span>
+        <span class="s1">X_with_free_params = np.c_[</span>
+            <span class="s1">lagged_endog[ix:</span><span class="s2">, </span><span class="s1">params_info.free_ar_ix]</span><span class="s2">,</span>
+            <span class="s1">lagged_resid[:</span><span class="s2">, </span><span class="s1">params_info.free_ma_ix]</span>
+        <span class="s1">]</span>
+        <span class="s1">X_with_fixed_params = np.c_[</span>
+            <span class="s1">lagged_endog[ix:</span><span class="s2">, </span><span class="s1">params_info.fixed_ar_ix]</span><span class="s2">,</span>
+            <span class="s1">lagged_resid[:</span><span class="s2">, </span><span class="s1">params_info.fixed_ma_ix]</span>
+        <span class="s1">]</span>
+        <span class="s1">y = endog[initial_ar_order + max_ma_order:]</span>
+        <span class="s2">if </span><span class="s1">X_with_fixed_params.shape[</span><span class="s3">1</span><span class="s1">] != </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s1">y = y - X_with_fixed_params.dot(</span>
+                <span class="s1">np.r_[params_info.fixed_ar_params</span><span class="s2">, </span><span class="s1">params_info.fixed_ma_params]</span>
+            <span class="s1">)</span>
+
+        <span class="s4"># Step 2.1: no free ar params -&gt; variance computation on the endog</span>
+        <span class="s4"># residual</span>
+        <span class="s2">if </span><span class="s1">X_with_free_params.shape[</span><span class="s3">1</span><span class="s1">] == </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s1">p.ar_params = params_info.fixed_ar_params</span>
+            <span class="s1">p.ma_params = params_info.fixed_ma_params</span>
+            <span class="s1">p.sigma2 = np.var(y</span><span class="s2">, </span><span class="s1">ddof=</span><span class="s3">0</span><span class="s1">)</span>
+            <span class="s1">resid = y.copy()</span>
+        <span class="s4"># Step 2.2: otherwise OLS with endog residual (after applying fixed</span>
+        <span class="s4"># params) as y, and lagged_endog and lagged_resid with free params as X</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">mod = OLS(y</span><span class="s2">, </span><span class="s1">X_with_free_params)</span>
+            <span class="s1">res = mod.fit()</span>
+            <span class="s1">k_free_ar_params = len(params_info.free_ar_lags)</span>
+            <span class="s1">p.ar_params = _stitch_fixed_and_free_params(</span>
+                <span class="s1">fixed_ar_or_ma_lags=params_info.fixed_ar_lags</span><span class="s2">,</span>
+                <span class="s1">fixed_ar_or_ma_params=params_info.fixed_ar_params</span><span class="s2">,</span>
+                <span class="s1">free_ar_or_ma_lags=params_info.free_ar_lags</span><span class="s2">,</span>
+                <span class="s1">free_ar_or_ma_params=res.params[:k_free_ar_params]</span><span class="s2">,</span>
+                <span class="s1">spec_ar_or_ma_lags=spec.ar_lags</span>
+            <span class="s1">)</span>
+            <span class="s1">p.ma_params = _stitch_fixed_and_free_params(</span>
+                <span class="s1">fixed_ar_or_ma_lags=params_info.fixed_ma_lags</span><span class="s2">,</span>
+                <span class="s1">fixed_ar_or_ma_params=params_info.fixed_ma_params</span><span class="s2">,</span>
+                <span class="s1">free_ar_or_ma_lags=params_info.free_ma_lags</span><span class="s2">,</span>
+                <span class="s1">free_ar_or_ma_params=res.params[k_free_ar_params:]</span><span class="s2">,</span>
+                <span class="s1">spec_ar_or_ma_lags=spec.ma_lags</span>
+            <span class="s1">)</span>
+            <span class="s1">resid = res.resid</span>
+            <span class="s1">p.sigma2 = res.scale</span>
+
+        <span class="s4"># Step 3: bias correction (if requested)</span>
+
+        <span class="s4"># Step 3.1: validate `unbiased` argument and handle setting the default</span>
+        <span class="s2">if </span><span class="s1">unbiased </span><span class="s2">is True</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">len(fixed_params) != </span><span class="s3">0</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">NotImplementedError(</span>
+                    <span class="s5">&quot;Third step of Hannan-Rissanen estimation to remove &quot;</span>
+                    <span class="s5">&quot;parameter bias is not yet implemented for the case &quot;</span>
+                    <span class="s5">&quot;with fixed parameters.&quot;</span>
+                <span class="s1">)</span>
+            <span class="s2">elif not </span><span class="s1">(p.is_stationary </span><span class="s2">and </span><span class="s1">p.is_invertible):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span>
+                    <span class="s5">&quot;Cannot perform third step of Hannan-Rissanen estimation &quot;</span>
+                    <span class="s5">&quot;to remove parameter bias, because parameters estimated &quot;</span>
+                    <span class="s5">&quot;from the second step are non-stationary or &quot;</span>
+                    <span class="s5">&quot;non-invertible.&quot;</span>
+                <span class="s1">)</span>
+        <span class="s2">elif </span><span class="s1">unbiased </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">len(fixed_params) != </span><span class="s3">0</span><span class="s1">:</span>
+                <span class="s1">unbiased = </span><span class="s2">False</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">unbiased = p.is_stationary </span><span class="s2">and </span><span class="s1">p.is_invertible</span>
+
+        <span class="s4"># Step 3.2: bias correction</span>
+        <span class="s2">if </span><span class="s1">unbiased </span><span class="s2">is True</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">mod </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;Must have free parameters to use unbiased&quot;</span><span class="s1">)</span>
+            <span class="s1">Z = np.zeros_like(endog)</span>
+
+            <span class="s1">ar_coef = p.ar_poly.coef</span>
+            <span class="s1">ma_coef = p.ma_poly.coef</span>
+
+            <span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">range(nobs):</span>
+                <span class="s2">if </span><span class="s1">t &gt;= max(max_ar_order</span><span class="s2">, </span><span class="s1">max_ma_order):</span>
+                    <span class="s4"># Note: in the case of non-consecutive lag orders, the</span>
+                    <span class="s4"># polynomials have the appropriate zeros so we don't</span>
+                    <span class="s4"># need to subset `endog[t - max_ar_order:t]` or</span>
+                    <span class="s4"># Z[t - max_ma_order:t]</span>
+                    <span class="s1">tmp_ar = np.dot(</span>
+                        <span class="s1">-ar_coef[</span><span class="s3">1</span><span class="s1">:]</span><span class="s2">, </span><span class="s1">endog[t - max_ar_order:t][::-</span><span class="s3">1</span><span class="s1">])</span>
+                    <span class="s1">tmp_ma = np.dot(ma_coef[</span><span class="s3">1</span><span class="s1">:]</span><span class="s2">,</span>
+                                    <span class="s1">Z[t - max_ma_order:t][::-</span><span class="s3">1</span><span class="s1">])</span>
+                    <span class="s1">Z[t] = endog[t] - tmp_ar - tmp_ma</span>
+
+            <span class="s1">V = lfilter([</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ar_coef</span><span class="s2">, </span><span class="s1">Z)</span>
+            <span class="s1">W = lfilter(np.r_[</span><span class="s3">1</span><span class="s2">, </span><span class="s1">-ma_coef[</span><span class="s3">1</span><span class="s1">:]]</span><span class="s2">, </span><span class="s1">[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">Z)</span>
+
+            <span class="s1">lagged_V = lagmat(V</span><span class="s2">, </span><span class="s1">max_ar_order</span><span class="s2">, </span><span class="s1">trim=</span><span class="s5">'both'</span><span class="s1">)</span>
+            <span class="s1">lagged_W = lagmat(W</span><span class="s2">, </span><span class="s1">max_ma_order</span><span class="s2">, </span><span class="s1">trim=</span><span class="s5">'both'</span><span class="s1">)</span>
+
+            <span class="s1">exog = np.c_[</span>
+                <span class="s1">lagged_V[</span>
+                    <span class="s1">max(max_ma_order - max_ar_order</span><span class="s2">, </span><span class="s3">0</span><span class="s1">):</span><span class="s2">,</span>
+                    <span class="s1">params_info.free_ar_ix</span>
+                <span class="s1">]</span><span class="s2">,</span>
+                <span class="s1">lagged_W[</span>
+                    <span class="s1">max(max_ar_order - max_ma_order</span><span class="s2">, </span><span class="s3">0</span><span class="s1">):</span><span class="s2">,</span>
+                    <span class="s1">params_info.free_ma_ix</span>
+                <span class="s1">]</span>
+            <span class="s1">]</span>
+
+            <span class="s1">mod_unbias = OLS(Z[max(max_ar_order</span><span class="s2">, </span><span class="s1">max_ma_order):]</span><span class="s2">, </span><span class="s1">exog)</span>
+            <span class="s1">res_unbias = mod_unbias.fit()</span>
+
+            <span class="s1">p.ar_params = (</span>
+                <span class="s1">p.ar_params + res_unbias.params[:spec.k_ar_params])</span>
+            <span class="s1">p.ma_params = (</span>
+                <span class="s1">p.ma_params + res_unbias.params[spec.k_ar_params:])</span>
+
+            <span class="s4"># Recompute sigma2</span>
+            <span class="s1">resid = mod.endog - mod.exog.dot(</span>
+                <span class="s1">np.r_[p.ar_params</span><span class="s2">, </span><span class="s1">p.ma_params])</span>
+            <span class="s1">p.sigma2 = np.inner(resid</span><span class="s2">, </span><span class="s1">resid) / len(resid)</span>
+
+    <span class="s4"># TODO: Gomez and Maravall (2001) or Gomez (1998)</span>
+    <span class="s4"># propose one more step here to further improve MA estimates</span>
+
+    <span class="s4"># Construct results</span>
+    <span class="s1">other_results = Bunch({</span>
+        <span class="s5">'spec'</span><span class="s1">: spec</span><span class="s2">,</span>
+        <span class="s5">'initial_ar_order'</span><span class="s1">: initial_ar_order</span><span class="s2">,</span>
+        <span class="s5">'resid'</span><span class="s1">: resid</span>
+    <span class="s1">})</span>
+    <span class="s2">return </span><span class="s1">p</span><span class="s2">, </span><span class="s1">other_results</span>
+
+
+<span class="s2">def </span><span class="s1">_validate_fixed_params(fixed_params</span><span class="s2">, </span><span class="s1">spec_param_names):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Check that keys in fixed_params are a subset of spec.param_names except 
+    &quot;sigma2&quot; 
+ 
+    Parameters 
+    ---------- 
+    fixed_params : dict 
+    spec_param_names : list of string 
+        SARIMAXSpecification.param_names 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">fixed_params </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">fixed_params = {}</span>
+
+    <span class="s2">assert </span><span class="s1">isinstance(fixed_params</span><span class="s2">, </span><span class="s1">dict)</span>
+
+    <span class="s1">fixed_param_names = set(fixed_params.keys())</span>
+    <span class="s1">valid_param_names = set(spec_param_names) - {</span><span class="s5">&quot;sigma2&quot;</span><span class="s1">}</span>
+
+    <span class="s1">invalid_param_names = fixed_param_names - valid_param_names</span>
+
+    <span class="s2">if </span><span class="s1">len(invalid_param_names) &gt; </span><span class="s3">0</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span>
+            <span class="s5">f&quot;Invalid fixed parameter(s): </span><span class="s2">{</span><span class="s1">sorted(list(invalid_param_names))</span><span class="s2">}</span><span class="s5">.&quot;</span>
+            <span class="s5">f&quot; Please select among </span><span class="s2">{</span><span class="s1">sorted(list(valid_param_names))</span><span class="s2">}</span><span class="s5">.&quot;</span>
+        <span class="s1">)</span>
+
+    <span class="s2">return </span><span class="s1">fixed_params</span>
+
+
+<span class="s2">def </span><span class="s1">_package_fixed_and_free_params_info(fixed_params</span><span class="s2">, </span><span class="s1">spec_ar_lags</span><span class="s2">,</span>
+                                        <span class="s1">spec_ma_lags):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Parameters 
+    ---------- 
+    fixed_params : dict 
+    spec_ar_lags : list of int 
+        SARIMAXSpecification.ar_lags 
+    spec_ma_lags : list of int 
+        SARIMAXSpecification.ma_lags 
+ 
+    Returns 
+    ------- 
+    Bunch with 
+    (lags) fixed_ar_lags, fixed_ma_lags, free_ar_lags, free_ma_lags; 
+    (ix) fixed_ar_ix, fixed_ma_ix, free_ar_ix, free_ma_ix; 
+    (params) fixed_ar_params, free_ma_params 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># unpack fixed lags and params</span>
+    <span class="s1">fixed_ar_lags_and_params = []</span>
+    <span class="s1">fixed_ma_lags_and_params = []</span>
+    <span class="s2">for </span><span class="s1">key</span><span class="s2">, </span><span class="s1">val </span><span class="s2">in </span><span class="s1">fixed_params.items():</span>
+        <span class="s1">lag = int(key.split(</span><span class="s5">&quot;.&quot;</span><span class="s1">)[-</span><span class="s3">1</span><span class="s1">].lstrip(</span><span class="s5">&quot;L&quot;</span><span class="s1">))</span>
+        <span class="s2">if </span><span class="s1">key.startswith(</span><span class="s5">&quot;ar&quot;</span><span class="s1">):</span>
+            <span class="s1">fixed_ar_lags_and_params.append((lag</span><span class="s2">, </span><span class="s1">val))</span>
+        <span class="s2">elif </span><span class="s1">key.startswith(</span><span class="s5">&quot;ma&quot;</span><span class="s1">):</span>
+            <span class="s1">fixed_ma_lags_and_params.append((lag</span><span class="s2">, </span><span class="s1">val))</span>
+
+    <span class="s1">fixed_ar_lags_and_params.sort()</span>
+    <span class="s1">fixed_ma_lags_and_params.sort()</span>
+
+    <span class="s1">fixed_ar_lags = [lag </span><span class="s2">for </span><span class="s1">lag</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">fixed_ar_lags_and_params]</span>
+    <span class="s1">fixed_ar_params = np.array([val </span><span class="s2">for </span><span class="s1">_</span><span class="s2">, </span><span class="s1">val </span><span class="s2">in </span><span class="s1">fixed_ar_lags_and_params])</span>
+
+    <span class="s1">fixed_ma_lags = [lag </span><span class="s2">for </span><span class="s1">lag</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">fixed_ma_lags_and_params]</span>
+    <span class="s1">fixed_ma_params = np.array([val </span><span class="s2">for </span><span class="s1">_</span><span class="s2">, </span><span class="s1">val </span><span class="s2">in </span><span class="s1">fixed_ma_lags_and_params])</span>
+
+    <span class="s4"># unpack free lags</span>
+    <span class="s1">free_ar_lags = [lag </span><span class="s2">for </span><span class="s1">lag </span><span class="s2">in </span><span class="s1">spec_ar_lags</span>
+                    <span class="s2">if </span><span class="s1">lag </span><span class="s2">not in </span><span class="s1">set(fixed_ar_lags)]</span>
+    <span class="s1">free_ma_lags = [lag </span><span class="s2">for </span><span class="s1">lag </span><span class="s2">in </span><span class="s1">spec_ma_lags</span>
+                    <span class="s2">if </span><span class="s1">lag </span><span class="s2">not in </span><span class="s1">set(fixed_ma_lags)]</span>
+
+    <span class="s4"># get ix for indexing purposes: `ar_ix`, and `ma_ix` below, are to account</span>
+    <span class="s4"># for non-consecutive lags; for indexing purposes, must have dtype int</span>
+    <span class="s1">free_ar_ix = np.array(free_ar_lags</span><span class="s2">, </span><span class="s1">dtype=int) - </span><span class="s3">1</span>
+    <span class="s1">free_ma_ix = np.array(free_ma_lags</span><span class="s2">, </span><span class="s1">dtype=int) - </span><span class="s3">1</span>
+    <span class="s1">fixed_ar_ix = np.array(fixed_ar_lags</span><span class="s2">, </span><span class="s1">dtype=int) - </span><span class="s3">1</span>
+    <span class="s1">fixed_ma_ix = np.array(fixed_ma_lags</span><span class="s2">, </span><span class="s1">dtype=int) - </span><span class="s3">1</span>
+
+    <span class="s2">return </span><span class="s1">Bunch(</span>
+        <span class="s4"># lags</span>
+        <span class="s1">fixed_ar_lags=fixed_ar_lags</span><span class="s2">, </span><span class="s1">fixed_ma_lags=fixed_ma_lags</span><span class="s2">,</span>
+        <span class="s1">free_ar_lags=free_ar_lags</span><span class="s2">, </span><span class="s1">free_ma_lags=free_ma_lags</span><span class="s2">,</span>
+        <span class="s4"># ixs</span>
+        <span class="s1">fixed_ar_ix=fixed_ar_ix</span><span class="s2">, </span><span class="s1">fixed_ma_ix=fixed_ma_ix</span><span class="s2">,</span>
+        <span class="s1">free_ar_ix=free_ar_ix</span><span class="s2">, </span><span class="s1">free_ma_ix=free_ma_ix</span><span class="s2">,</span>
+        <span class="s4"># fixed params</span>
+        <span class="s1">fixed_ar_params=fixed_ar_params</span><span class="s2">, </span><span class="s1">fixed_ma_params=fixed_ma_params</span><span class="s2">,</span>
+    <span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_stitch_fixed_and_free_params(fixed_ar_or_ma_lags</span><span class="s2">, </span><span class="s1">fixed_ar_or_ma_params</span><span class="s2">,</span>
+                                  <span class="s1">free_ar_or_ma_lags</span><span class="s2">, </span><span class="s1">free_ar_or_ma_params</span><span class="s2">,</span>
+                                  <span class="s1">spec_ar_or_ma_lags):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Stitch together fixed and free params, by the order of lags, for setting 
+    SARIMAXParams.ma_params or SARIMAXParams.ar_params 
+ 
+    Parameters 
+    ---------- 
+    fixed_ar_or_ma_lags : list or np.array 
+    fixed_ar_or_ma_params : list or np.array 
+        fixed_ar_or_ma_params corresponds with fixed_ar_or_ma_lags 
+    free_ar_or_ma_lags : list or np.array 
+    free_ar_or_ma_params : list or np.array 
+        free_ar_or_ma_params corresponds with free_ar_or_ma_lags 
+    spec_ar_or_ma_lags : list 
+        SARIMAXSpecification.ar_lags or SARIMAXSpecification.ma_lags 
+ 
+    Returns 
+    ------- 
+    list of fixed and free params by the order of lags 
+    &quot;&quot;&quot;</span>
+    <span class="s2">assert </span><span class="s1">len(fixed_ar_or_ma_lags) == len(fixed_ar_or_ma_params)</span>
+    <span class="s2">assert </span><span class="s1">len(free_ar_or_ma_lags) == len(free_ar_or_ma_params)</span>
+
+    <span class="s1">all_lags = np.r_[fixed_ar_or_ma_lags</span><span class="s2">, </span><span class="s1">free_ar_or_ma_lags]</span>
+    <span class="s1">all_params = np.r_[fixed_ar_or_ma_params</span><span class="s2">, </span><span class="s1">free_ar_or_ma_params]</span>
+    <span class="s2">assert </span><span class="s1">set(all_lags) == set(spec_ar_or_ma_lags)</span>
+
+    <span class="s1">lag_to_param_map = dict(zip(all_lags</span><span class="s2">, </span><span class="s1">all_params))</span>
+
+    <span class="s4"># Sort params by the order of their corresponding lags in</span>
+    <span class="s4"># spec_ar_or_ma_lags (e.g. SARIMAXSpecification.ar_lags or</span>
+    <span class="s4"># SARIMAXSpecification.ma_lags)</span>
+    <span class="s1">all_params_sorted = [lag_to_param_map[lag] </span><span class="s2">for </span><span class="s1">lag </span><span class="s2">in </span><span class="s1">spec_ar_or_ma_lags]</span>
+    <span class="s2">return </span><span class="s1">all_params_sorted</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,258 @@
+<html>
+<head>
+<title>queues.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #629755; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+queues.py</font>
+</center></td></tr></table>
+<pre><span class="s0">###############################################################################</span>
+<span class="s0"># Queue and SimpleQueue implementation for loky</span>
+<span class="s0">#</span>
+<span class="s0"># authors: Thomas Moreau, Olivier Grisel</span>
+<span class="s0">#</span>
+<span class="s0"># based on multiprocessing/queues.py (16/02/2017)</span>
+<span class="s0"># * Add some custom reducers for the Queues/SimpleQueue to tweak the</span>
+<span class="s0">#   pickling process. (overload Queue._feed/SimpleQueue.put)</span>
+<span class="s0">#</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">errno</span>
+<span class="s2">import </span><span class="s1">weakref</span>
+<span class="s2">import </span><span class="s1">threading</span>
+<span class="s2">from </span><span class="s1">multiprocessing </span><span class="s2">import </span><span class="s1">util</span>
+<span class="s2">from </span><span class="s1">multiprocessing.queues </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">Full</span><span class="s2">,</span>
+    <span class="s1">Queue </span><span class="s2">as </span><span class="s1">mp_Queue</span><span class="s2">,</span>
+    <span class="s1">SimpleQueue </span><span class="s2">as </span><span class="s1">mp_SimpleQueue</span><span class="s2">,</span>
+    <span class="s1">_sentinel</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s2">from </span><span class="s1">multiprocessing.context </span><span class="s2">import </span><span class="s1">assert_spawning</span>
+
+<span class="s2">from </span><span class="s1">.reduction </span><span class="s2">import </span><span class="s1">dumps</span>
+
+
+<span class="s1">__all__ = [</span><span class="s3">&quot;Queue&quot;</span><span class="s2">, </span><span class="s3">&quot;SimpleQueue&quot;</span><span class="s2">, </span><span class="s3">&quot;Full&quot;</span><span class="s1">]</span>
+
+
+<span class="s2">class </span><span class="s1">Queue(mp_Queue):</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">maxsize=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">reducers=</span><span class="s2">None, </span><span class="s1">ctx=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">super().__init__(maxsize=maxsize</span><span class="s2">, </span><span class="s1">ctx=ctx)</span>
+        <span class="s1">self._reducers = reducers</span>
+
+    <span class="s0"># Use custom queue set/get state to be able to reduce the custom reducers</span>
+    <span class="s2">def </span><span class="s1">__getstate__(self):</span>
+        <span class="s1">assert_spawning(self)</span>
+        <span class="s2">return </span><span class="s1">(</span>
+            <span class="s1">self._ignore_epipe</span><span class="s2">,</span>
+            <span class="s1">self._maxsize</span><span class="s2">,</span>
+            <span class="s1">self._reader</span><span class="s2">,</span>
+            <span class="s1">self._writer</span><span class="s2">,</span>
+            <span class="s1">self._reducers</span><span class="s2">,</span>
+            <span class="s1">self._rlock</span><span class="s2">,</span>
+            <span class="s1">self._wlock</span><span class="s2">,</span>
+            <span class="s1">self._sem</span><span class="s2">,</span>
+            <span class="s1">self._opid</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__setstate__(self</span><span class="s2">, </span><span class="s1">state):</span>
+        <span class="s1">(</span>
+            <span class="s1">self._ignore_epipe</span><span class="s2">,</span>
+            <span class="s1">self._maxsize</span><span class="s2">,</span>
+            <span class="s1">self._reader</span><span class="s2">,</span>
+            <span class="s1">self._writer</span><span class="s2">,</span>
+            <span class="s1">self._reducers</span><span class="s2">,</span>
+            <span class="s1">self._rlock</span><span class="s2">,</span>
+            <span class="s1">self._wlock</span><span class="s2">,</span>
+            <span class="s1">self._sem</span><span class="s2">,</span>
+            <span class="s1">self._opid</span><span class="s2">,</span>
+        <span class="s1">) = state</span>
+        <span class="s2">if </span><span class="s1">sys.version_info &gt;= (</span><span class="s4">3</span><span class="s2">, </span><span class="s4">9</span><span class="s1">):</span>
+            <span class="s1">self._reset()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._after_fork()</span>
+
+    <span class="s0"># Overload _start_thread to correctly call our custom _feed</span>
+    <span class="s2">def </span><span class="s1">_start_thread(self):</span>
+        <span class="s1">util.debug(</span><span class="s3">&quot;Queue._start_thread()&quot;</span><span class="s1">)</span>
+
+        <span class="s0"># Start thread which transfers data from buffer to pipe</span>
+        <span class="s1">self._buffer.clear()</span>
+        <span class="s1">self._thread = threading.Thread(</span>
+            <span class="s1">target=Queue._feed</span><span class="s2">,</span>
+            <span class="s1">args=(</span>
+                <span class="s1">self._buffer</span><span class="s2">,</span>
+                <span class="s1">self._notempty</span><span class="s2">,</span>
+                <span class="s1">self._send_bytes</span><span class="s2">,</span>
+                <span class="s1">self._wlock</span><span class="s2">,</span>
+                <span class="s1">self._writer.close</span><span class="s2">,</span>
+                <span class="s1">self._reducers</span><span class="s2">,</span>
+                <span class="s1">self._ignore_epipe</span><span class="s2">,</span>
+                <span class="s1">self._on_queue_feeder_error</span><span class="s2">,</span>
+                <span class="s1">self._sem</span><span class="s2">,</span>
+            <span class="s1">)</span><span class="s2">,</span>
+            <span class="s1">name=</span><span class="s3">&quot;QueueFeederThread&quot;</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s1">self._thread.daemon = </span><span class="s2">True</span>
+
+        <span class="s1">util.debug(</span><span class="s3">&quot;doing self._thread.start()&quot;</span><span class="s1">)</span>
+        <span class="s1">self._thread.start()</span>
+        <span class="s1">util.debug(</span><span class="s3">&quot;... done self._thread.start()&quot;</span><span class="s1">)</span>
+
+        <span class="s0"># On process exit we will wait for data to be flushed to pipe.</span>
+        <span class="s0">#</span>
+        <span class="s0"># However, if this process created the queue then all</span>
+        <span class="s0"># processes which use the queue will be descendants of this</span>
+        <span class="s0"># process.  Therefore waiting for the queue to be flushed</span>
+        <span class="s0"># is pointless once all the child processes have been joined.</span>
+        <span class="s1">created_by_this_process = self._opid == os.getpid()</span>
+        <span class="s2">if not </span><span class="s1">self._joincancelled </span><span class="s2">and not </span><span class="s1">created_by_this_process:</span>
+            <span class="s1">self._jointhread = util.Finalize(</span>
+                <span class="s1">self._thread</span><span class="s2">,</span>
+                <span class="s1">Queue._finalize_join</span><span class="s2">,</span>
+                <span class="s1">[weakref.ref(self._thread)]</span><span class="s2">,</span>
+                <span class="s1">exitpriority=-</span><span class="s4">5</span><span class="s2">,</span>
+            <span class="s1">)</span>
+
+        <span class="s0"># Send sentinel to the thread queue object when garbage collected</span>
+        <span class="s1">self._close = util.Finalize(</span>
+            <span class="s1">self</span><span class="s2">,</span>
+            <span class="s1">Queue._finalize_close</span><span class="s2">,</span>
+            <span class="s1">[self._buffer</span><span class="s2">, </span><span class="s1">self._notempty]</span><span class="s2">,</span>
+            <span class="s1">exitpriority=</span><span class="s4">10</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0"># Overload the _feed methods to use our custom pickling strategy.</span>
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">_feed(</span>
+        <span class="s1">buffer</span><span class="s2">,</span>
+        <span class="s1">notempty</span><span class="s2">,</span>
+        <span class="s1">send_bytes</span><span class="s2">,</span>
+        <span class="s1">writelock</span><span class="s2">,</span>
+        <span class="s1">close</span><span class="s2">,</span>
+        <span class="s1">reducers</span><span class="s2">,</span>
+        <span class="s1">ignore_epipe</span><span class="s2">,</span>
+        <span class="s1">onerror</span><span class="s2">,</span>
+        <span class="s1">queue_sem</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s1">util.debug(</span><span class="s3">&quot;starting thread to feed data to pipe&quot;</span><span class="s1">)</span>
+        <span class="s1">nacquire = notempty.acquire</span>
+        <span class="s1">nrelease = notempty.release</span>
+        <span class="s1">nwait = notempty.wait</span>
+        <span class="s1">bpopleft = buffer.popleft</span>
+        <span class="s1">sentinel = _sentinel</span>
+        <span class="s2">if </span><span class="s1">sys.platform != </span><span class="s3">&quot;win32&quot;</span><span class="s1">:</span>
+            <span class="s1">wacquire = writelock.acquire</span>
+            <span class="s1">wrelease = writelock.release</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">wacquire = </span><span class="s2">None</span>
+
+        <span class="s2">while True</span><span class="s1">:</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">nacquire()</span>
+                <span class="s2">try</span><span class="s1">:</span>
+                    <span class="s2">if not </span><span class="s1">buffer:</span>
+                        <span class="s1">nwait()</span>
+                <span class="s2">finally</span><span class="s1">:</span>
+                    <span class="s1">nrelease()</span>
+                <span class="s2">try</span><span class="s1">:</span>
+                    <span class="s2">while True</span><span class="s1">:</span>
+                        <span class="s1">obj = bpopleft()</span>
+                        <span class="s2">if </span><span class="s1">obj </span><span class="s2">is </span><span class="s1">sentinel:</span>
+                            <span class="s1">util.debug(</span><span class="s3">&quot;feeder thread got sentinel -- exiting&quot;</span><span class="s1">)</span>
+                            <span class="s1">close()</span>
+                            <span class="s2">return</span>
+
+                        <span class="s0"># serialize the data before acquiring the lock</span>
+                        <span class="s1">obj_ = dumps(obj</span><span class="s2">, </span><span class="s1">reducers=reducers)</span>
+                        <span class="s2">if </span><span class="s1">wacquire </span><span class="s2">is None</span><span class="s1">:</span>
+                            <span class="s1">send_bytes(obj_)</span>
+                        <span class="s2">else</span><span class="s1">:</span>
+                            <span class="s1">wacquire()</span>
+                            <span class="s2">try</span><span class="s1">:</span>
+                                <span class="s1">send_bytes(obj_)</span>
+                            <span class="s2">finally</span><span class="s1">:</span>
+                                <span class="s1">wrelease()</span>
+                        <span class="s0"># Remove references early to avoid leaking memory</span>
+                        <span class="s2">del </span><span class="s1">obj</span><span class="s2">, </span><span class="s1">obj_</span>
+                <span class="s2">except </span><span class="s1">IndexError:</span>
+                    <span class="s2">pass</span>
+            <span class="s2">except </span><span class="s1">BaseException </span><span class="s2">as </span><span class="s1">e:</span>
+                <span class="s2">if </span><span class="s1">ignore_epipe </span><span class="s2">and </span><span class="s1">getattr(e</span><span class="s2">, </span><span class="s3">&quot;errno&quot;</span><span class="s2">, </span><span class="s4">0</span><span class="s1">) == errno.EPIPE:</span>
+                    <span class="s2">return</span>
+                <span class="s0"># Since this runs in a daemon thread the resources it uses</span>
+                <span class="s0"># may be become unusable while the process is cleaning up.</span>
+                <span class="s0"># We ignore errors which happen after the process has</span>
+                <span class="s0"># started to cleanup.</span>
+                <span class="s2">if </span><span class="s1">util.is_exiting():</span>
+                    <span class="s1">util.info(</span><span class="s3">f&quot;error in queue thread: </span><span class="s2">{</span><span class="s1">e</span><span class="s2">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+                    <span class="s2">return</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">queue_sem.release()</span>
+                    <span class="s1">onerror(e</span><span class="s2">, </span><span class="s1">obj)</span>
+
+    <span class="s2">def </span><span class="s1">_on_queue_feeder_error(self</span><span class="s2">, </span><span class="s1">e</span><span class="s2">, </span><span class="s1">obj):</span>
+        <span class="s5">&quot;&quot;&quot; 
+        Private API hook called when feeding data in the background thread 
+        raises an exception.  For overriding by concurrent.futures. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">import </span><span class="s1">traceback</span>
+
+        <span class="s1">traceback.print_exc()</span>
+
+
+<span class="s2">class </span><span class="s1">SimpleQueue(mp_SimpleQueue):</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">reducers=</span><span class="s2">None, </span><span class="s1">ctx=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">super().__init__(ctx=ctx)</span>
+
+        <span class="s0"># Add possiblity to use custom reducers</span>
+        <span class="s1">self._reducers = reducers</span>
+
+    <span class="s2">def </span><span class="s1">close(self):</span>
+        <span class="s1">self._reader.close()</span>
+        <span class="s1">self._writer.close()</span>
+
+    <span class="s0"># Use custom queue set/get state to be able to reduce the custom reducers</span>
+    <span class="s2">def </span><span class="s1">__getstate__(self):</span>
+        <span class="s1">assert_spawning(self)</span>
+        <span class="s2">return </span><span class="s1">(</span>
+            <span class="s1">self._reader</span><span class="s2">,</span>
+            <span class="s1">self._writer</span><span class="s2">,</span>
+            <span class="s1">self._reducers</span><span class="s2">,</span>
+            <span class="s1">self._rlock</span><span class="s2">,</span>
+            <span class="s1">self._wlock</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__setstate__(self</span><span class="s2">, </span><span class="s1">state):</span>
+        <span class="s1">(</span>
+            <span class="s1">self._reader</span><span class="s2">,</span>
+            <span class="s1">self._writer</span><span class="s2">,</span>
+            <span class="s1">self._reducers</span><span class="s2">,</span>
+            <span class="s1">self._rlock</span><span class="s2">,</span>
+            <span class="s1">self._wlock</span><span class="s2">,</span>
+        <span class="s1">) = state</span>
+
+    <span class="s0"># Overload put to use our customizable reducer</span>
+    <span class="s2">def </span><span class="s1">put(self</span><span class="s2">, </span><span class="s1">obj):</span>
+        <span class="s0"># serialize the data before acquiring the lock</span>
+        <span class="s1">obj = dumps(obj</span><span class="s2">, </span><span class="s1">reducers=self._reducers)</span>
+        <span class="s2">if </span><span class="s1">self._wlock </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s0"># writes to a message oriented win32 pipe are atomic</span>
+            <span class="s1">self._writer.send_bytes(obj)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">with </span><span class="s1">self._wlock:</span>
+                <span class="s1">self._writer.send_bytes(obj)</span>
+</pre>
+</body>
+</html>

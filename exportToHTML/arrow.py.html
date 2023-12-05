@@ -1,0 +1,319 @@
+<html>
+<head>
+<title>arrow.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+arrow.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">errno</span>
+<span class="s0">import </span><span class="s1">io</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">secrets</span>
+<span class="s0">import </span><span class="s1">shutil</span>
+<span class="s0">from </span><span class="s1">contextlib </span><span class="s0">import </span><span class="s1">suppress</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">cached_property</span><span class="s0">, </span><span class="s1">wraps</span>
+
+<span class="s0">from </span><span class="s1">fsspec.spec </span><span class="s0">import </span><span class="s1">AbstractFileSystem</span>
+<span class="s0">from </span><span class="s1">fsspec.utils </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">get_package_version_without_import</span><span class="s0">,</span>
+    <span class="s1">infer_storage_options</span><span class="s0">,</span>
+    <span class="s1">mirror_from</span><span class="s0">,</span>
+    <span class="s1">tokenize</span><span class="s0">,</span>
+<span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">wrap_exceptions(func):</span>
+    <span class="s1">@wraps(func)</span>
+    <span class="s0">def </span><span class="s1">wrapper(*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">func(*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s0">except </span><span class="s1">OSError </span><span class="s0">as </span><span class="s1">exception:</span>
+            <span class="s0">if not </span><span class="s1">exception.args:</span>
+                <span class="s0">raise</span>
+
+            <span class="s1">message</span><span class="s0">, </span><span class="s1">*args = exception.args</span>
+            <span class="s0">if </span><span class="s1">isinstance(message</span><span class="s0">, </span><span class="s1">str) </span><span class="s0">and </span><span class="s2">&quot;does not exist&quot; </span><span class="s0">in </span><span class="s1">message:</span>
+                <span class="s0">raise </span><span class="s1">FileNotFoundError(errno.ENOENT</span><span class="s0">, </span><span class="s1">message) </span><span class="s0">from </span><span class="s1">exception</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise</span>
+
+    <span class="s0">return </span><span class="s1">wrapper</span>
+
+
+<span class="s1">PYARROW_VERSION = </span><span class="s0">None</span>
+
+
+<span class="s0">class </span><span class="s1">ArrowFSWrapper(AbstractFileSystem):</span>
+    <span class="s3">&quot;&quot;&quot;FSSpec-compatible wrapper of pyarrow.fs.FileSystem. 
+ 
+    Parameters 
+    ---------- 
+    fs : pyarrow.fs.FileSystem 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">root_marker = </span><span class="s2">&quot;/&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">fs</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">global </span><span class="s1">PYARROW_VERSION</span>
+        <span class="s1">PYARROW_VERSION = get_package_version_without_import(</span><span class="s2">&quot;pyarrow&quot;</span><span class="s1">)</span>
+        <span class="s1">self.fs = fs</span>
+        <span class="s1">super().__init__(**kwargs)</span>
+
+    <span class="s1">@property</span>
+    <span class="s0">def </span><span class="s1">protocol(self):</span>
+        <span class="s0">return </span><span class="s1">self.fs.type_name</span>
+
+    <span class="s1">@cached_property</span>
+    <span class="s0">def </span><span class="s1">fsid(self):</span>
+        <span class="s0">return </span><span class="s2">&quot;hdfs_&quot; </span><span class="s1">+ tokenize(self.fs.host</span><span class="s0">, </span><span class="s1">self.fs.port)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_strip_protocol(cls</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">ops = infer_storage_options(path)</span>
+        <span class="s1">path = ops[</span><span class="s2">&quot;path&quot;</span><span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">path.startswith(</span><span class="s2">&quot;//&quot;</span><span class="s1">):</span>
+            <span class="s4"># special case for &quot;hdfs://path&quot; (without the triple slash)</span>
+            <span class="s1">path = path[</span><span class="s5">1</span><span class="s1">:]</span>
+        <span class="s0">return </span><span class="s1">path</span>
+
+    <span class="s0">def </span><span class="s1">ls(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">False, </span><span class="s1">**kwargs):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s0">from </span><span class="s1">pyarrow.fs </span><span class="s0">import </span><span class="s1">FileSelector</span>
+
+        <span class="s1">entries = [</span>
+            <span class="s1">self._make_entry(entry)</span>
+            <span class="s0">for </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">self.fs.get_file_info(FileSelector(path))</span>
+        <span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">detail:</span>
+            <span class="s0">return </span><span class="s1">entries</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return </span><span class="s1">[entry[</span><span class="s2">&quot;name&quot;</span><span class="s1">] </span><span class="s0">for </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">entries]</span>
+
+    <span class="s0">def </span><span class="s1">info(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">[info] = self.fs.get_file_info([path])</span>
+        <span class="s0">return </span><span class="s1">self._make_entry(info)</span>
+
+    <span class="s0">def </span><span class="s1">exists(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s0">try</span><span class="s1">:</span>
+            <span class="s1">self.info(path)</span>
+        <span class="s0">except </span><span class="s1">FileNotFoundError:</span>
+            <span class="s0">return False</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">return True</span>
+
+    <span class="s0">def </span><span class="s1">_make_entry(self</span><span class="s0">, </span><span class="s1">info):</span>
+        <span class="s0">from </span><span class="s1">pyarrow.fs </span><span class="s0">import </span><span class="s1">FileType</span>
+
+        <span class="s0">if </span><span class="s1">info.type </span><span class="s0">is </span><span class="s1">FileType.Directory:</span>
+            <span class="s1">kind = </span><span class="s2">&quot;directory&quot;</span>
+        <span class="s0">elif </span><span class="s1">info.type </span><span class="s0">is </span><span class="s1">FileType.File:</span>
+            <span class="s1">kind = </span><span class="s2">&quot;file&quot;</span>
+        <span class="s0">elif </span><span class="s1">info.type </span><span class="s0">is </span><span class="s1">FileType.NotFound:</span>
+            <span class="s0">raise </span><span class="s1">FileNotFoundError(errno.ENOENT</span><span class="s0">, </span><span class="s1">os.strerror(errno.ENOENT)</span><span class="s0">, </span><span class="s1">info.path)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">kind = </span><span class="s2">&quot;other&quot;</span>
+
+        <span class="s0">return </span><span class="s1">{</span>
+            <span class="s2">&quot;name&quot;</span><span class="s1">: info.path</span><span class="s0">,</span>
+            <span class="s2">&quot;size&quot;</span><span class="s1">: info.size</span><span class="s0">,</span>
+            <span class="s2">&quot;type&quot;</span><span class="s1">: kind</span><span class="s0">,</span>
+            <span class="s2">&quot;mtime&quot;</span><span class="s1">: info.mtime</span><span class="s0">,</span>
+        <span class="s1">}</span>
+
+    <span class="s1">@wrap_exceptions</span>
+    <span class="s0">def </span><span class="s1">cp_file(self</span><span class="s0">, </span><span class="s1">path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">path1 = self._strip_protocol(path1).rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+        <span class="s1">path2 = self._strip_protocol(path2).rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+
+        <span class="s0">with </span><span class="s1">self._open(path1</span><span class="s0">, </span><span class="s2">&quot;rb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">lstream:</span>
+            <span class="s1">tmp_fname = </span><span class="s2">f&quot;</span><span class="s0">{</span><span class="s1">path2</span><span class="s0">}</span><span class="s2">.tmp.</span><span class="s0">{</span><span class="s1">secrets.token_hex(</span><span class="s5">6</span><span class="s1">)</span><span class="s0">}</span><span class="s2">&quot;</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s0">with </span><span class="s1">self.open(tmp_fname</span><span class="s0">, </span><span class="s2">&quot;wb&quot;</span><span class="s1">) </span><span class="s0">as </span><span class="s1">rstream:</span>
+                    <span class="s1">shutil.copyfileobj(lstream</span><span class="s0">, </span><span class="s1">rstream)</span>
+                <span class="s1">self.fs.move(tmp_fname</span><span class="s0">, </span><span class="s1">path2)</span>
+            <span class="s0">except </span><span class="s1">BaseException:  </span><span class="s4"># noqa</span>
+                <span class="s0">with </span><span class="s1">suppress(FileNotFoundError):</span>
+                    <span class="s1">self.fs.delete_file(tmp_fname)</span>
+                <span class="s0">raise</span>
+
+    <span class="s1">@wrap_exceptions</span>
+    <span class="s0">def </span><span class="s1">mv(self</span><span class="s0">, </span><span class="s1">path1</span><span class="s0">, </span><span class="s1">path2</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">path1 = self._strip_protocol(path1).rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+        <span class="s1">path2 = self._strip_protocol(path2).rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+        <span class="s1">self.fs.move(path1</span><span class="s0">, </span><span class="s1">path2)</span>
+
+    <span class="s1">mv_file = mv</span>
+
+    <span class="s1">@wrap_exceptions</span>
+    <span class="s0">def </span><span class="s1">rm_file(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">self.fs.delete_file(path)</span>
+
+    <span class="s1">@wrap_exceptions</span>
+    <span class="s0">def </span><span class="s1">rm(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False, </span><span class="s1">maxdepth=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">path = self._strip_protocol(path).rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">self.isdir(path):</span>
+            <span class="s0">if </span><span class="s1">recursive:</span>
+                <span class="s1">self.fs.delete_dir(path)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Can't delete directories without recursive=False&quot;</span><span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.fs.delete_file(path)</span>
+
+    <span class="s1">@wrap_exceptions</span>
+    <span class="s0">def </span><span class="s1">_open(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">block_size=</span><span class="s0">None, </span><span class="s1">seekable=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+        <span class="s0">if </span><span class="s1">mode == </span><span class="s2">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">seekable:</span>
+                <span class="s1">method = self.fs.open_input_file</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">method = self.fs.open_input_stream</span>
+        <span class="s0">elif </span><span class="s1">mode == </span><span class="s2">&quot;wb&quot;</span><span class="s1">:</span>
+            <span class="s1">method = self.fs.open_output_stream</span>
+        <span class="s0">elif </span><span class="s1">mode == </span><span class="s2">&quot;ab&quot;</span><span class="s1">:</span>
+            <span class="s1">method = self.fs.open_append_stream</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">f&quot;unsupported mode for Arrow filesystem: </span><span class="s0">{</span><span class="s1">mode</span><span class="s0">!r}</span><span class="s2">&quot;</span><span class="s1">)</span>
+
+        <span class="s1">_kwargs = {}</span>
+        <span class="s0">if </span><span class="s1">mode != </span><span class="s2">&quot;rb&quot; </span><span class="s0">or not </span><span class="s1">seekable:</span>
+            <span class="s0">if </span><span class="s1">int(PYARROW_VERSION.split(</span><span class="s2">&quot;.&quot;</span><span class="s1">)[</span><span class="s5">0</span><span class="s1">]) &gt;= </span><span class="s5">4</span><span class="s1">:</span>
+                <span class="s4"># disable compression auto-detection</span>
+                <span class="s1">_kwargs[</span><span class="s2">&quot;compression&quot;</span><span class="s1">] = </span><span class="s0">None</span>
+        <span class="s1">stream = method(path</span><span class="s0">, </span><span class="s1">**_kwargs)</span>
+
+        <span class="s0">return </span><span class="s1">ArrowFile(self</span><span class="s0">, </span><span class="s1">stream</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode</span><span class="s0">, </span><span class="s1">block_size</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s1">@wrap_exceptions</span>
+    <span class="s0">def </span><span class="s1">mkdir(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">create_parents=</span><span class="s0">True, </span><span class="s1">**kwargs):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s0">if </span><span class="s1">create_parents:</span>
+            <span class="s1">self.makedirs(path</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.fs.create_dir(path</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">False</span><span class="s1">)</span>
+
+    <span class="s1">@wrap_exceptions</span>
+    <span class="s0">def </span><span class="s1">makedirs(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">self.fs.create_dir(path</span><span class="s0">, </span><span class="s1">recursive=</span><span class="s0">True</span><span class="s1">)</span>
+
+    <span class="s1">@wrap_exceptions</span>
+    <span class="s0">def </span><span class="s1">rmdir(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s1">self.fs.delete_dir(path)</span>
+
+    <span class="s1">@wrap_exceptions</span>
+    <span class="s0">def </span><span class="s1">modified(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s0">return </span><span class="s1">self.fs.get_file_info(path).mtime</span>
+
+    <span class="s0">def </span><span class="s1">cat_file(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">start=</span><span class="s0">None, </span><span class="s1">end=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">kwargs[</span><span class="s2">&quot;seekable&quot;</span><span class="s1">] = start </span><span class="s0">not in </span><span class="s1">[</span><span class="s0">None, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s0">return </span><span class="s1">super().cat_file(path</span><span class="s0">, </span><span class="s1">start=</span><span class="s0">None, </span><span class="s1">end=</span><span class="s0">None, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">get_file(self</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">kwargs[</span><span class="s2">&quot;seekable&quot;</span><span class="s1">] = </span><span class="s0">False</span>
+        <span class="s1">super().get_file(rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s1">@mirror_from(</span>
+    <span class="s2">&quot;stream&quot;</span><span class="s0">,</span>
+    <span class="s1">[</span>
+        <span class="s2">&quot;read&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;seek&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;tell&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;write&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;readable&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;writable&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;close&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;size&quot;</span><span class="s0">,</span>
+        <span class="s2">&quot;seekable&quot;</span><span class="s0">,</span>
+    <span class="s1">]</span><span class="s0">,</span>
+<span class="s1">)</span>
+<span class="s0">class </span><span class="s1">ArrowFile(io.IOBase):</span>
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">fs</span><span class="s0">, </span><span class="s1">stream</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode</span><span class="s0">, </span><span class="s1">block_size=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">self.path = path</span>
+        <span class="s1">self.mode = mode</span>
+
+        <span class="s1">self.fs = fs</span>
+        <span class="s1">self.stream = stream</span>
+
+        <span class="s1">self.blocksize = self.block_size = block_size</span>
+        <span class="s1">self.kwargs = kwargs</span>
+
+    <span class="s0">def </span><span class="s1">__enter__(self):</span>
+        <span class="s0">return </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">__exit__(self</span><span class="s0">, </span><span class="s1">*args):</span>
+        <span class="s0">return </span><span class="s1">self.close()</span>
+
+
+<span class="s0">class </span><span class="s1">HadoopFileSystem(ArrowFSWrapper):</span>
+    <span class="s3">&quot;&quot;&quot;A wrapper on top of the pyarrow.fs.HadoopFileSystem 
+    to connect it's interface with fsspec&quot;&quot;&quot;</span>
+
+    <span class="s1">protocol = </span><span class="s2">&quot;hdfs&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">host=</span><span class="s2">&quot;default&quot;</span><span class="s0">,</span>
+        <span class="s1">port=</span><span class="s5">0</span><span class="s0">,</span>
+        <span class="s1">user=</span><span class="s0">None,</span>
+        <span class="s1">kerb_ticket=</span><span class="s0">None,</span>
+        <span class="s1">extra_conf=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot; 
+ 
+        Parameters 
+        ---------- 
+        host: str 
+            Hostname, IP or &quot;default&quot; to try to read from Hadoop config 
+        port: int 
+            Port to connect on, or default from Hadoop config if 0 
+        user: str or None 
+            If given, connect as this username 
+        kerb_ticket: str or None 
+            If given, use this ticket for authentication 
+        extra_conf: None or dict 
+            Passed on to HadoopFileSystem 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">pyarrow.fs </span><span class="s0">import </span><span class="s1">HadoopFileSystem</span>
+
+        <span class="s1">fs = HadoopFileSystem(</span>
+            <span class="s1">host=host</span><span class="s0">,</span>
+            <span class="s1">port=port</span><span class="s0">,</span>
+            <span class="s1">user=user</span><span class="s0">,</span>
+            <span class="s1">kerb_ticket=kerb_ticket</span><span class="s0">,</span>
+            <span class="s1">extra_conf=extra_conf</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s1">super().__init__(fs=fs</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s0">def </span><span class="s1">_get_kwargs_from_urls(path):</span>
+        <span class="s1">ops = infer_storage_options(path)</span>
+        <span class="s1">out = {}</span>
+        <span class="s0">if </span><span class="s1">ops.get(</span><span class="s2">&quot;host&quot;</span><span class="s0">, None</span><span class="s1">):</span>
+            <span class="s1">out[</span><span class="s2">&quot;host&quot;</span><span class="s1">] = ops[</span><span class="s2">&quot;host&quot;</span><span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">ops.get(</span><span class="s2">&quot;username&quot;</span><span class="s0">, None</span><span class="s1">):</span>
+            <span class="s1">out[</span><span class="s2">&quot;user&quot;</span><span class="s1">] = ops[</span><span class="s2">&quot;username&quot;</span><span class="s1">]</span>
+        <span class="s0">if </span><span class="s1">ops.get(</span><span class="s2">&quot;port&quot;</span><span class="s0">, None</span><span class="s1">):</span>
+            <span class="s1">out[</span><span class="s2">&quot;port&quot;</span><span class="s1">] = ops[</span><span class="s2">&quot;port&quot;</span><span class="s1">]</span>
+        <span class="s0">return </span><span class="s1">out</span>
+</pre>
+</body>
+</html>

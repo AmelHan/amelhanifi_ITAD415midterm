@@ -1,0 +1,1510 @@
+<html>
+<head>
+<title>test_memory.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_memory.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Test the memory module. 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># Author: Gael Varoquaux &lt;gael dot varoquaux at normalesup dot org&gt;</span>
+<span class="s2"># Copyright (c) 2009 Gael Varoquaux</span>
+<span class="s2"># License: BSD Style, 3 clauses.</span>
+
+<span class="s3">import </span><span class="s1">functools</span>
+<span class="s3">import </span><span class="s1">gc</span>
+<span class="s3">import </span><span class="s1">logging</span>
+<span class="s3">import </span><span class="s1">shutil</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">import </span><span class="s1">os.path</span>
+<span class="s3">import </span><span class="s1">pathlib</span>
+<span class="s3">import </span><span class="s1">pickle</span>
+<span class="s3">import </span><span class="s1">sys</span>
+<span class="s3">import </span><span class="s1">time</span>
+<span class="s3">import </span><span class="s1">datetime</span>
+<span class="s3">import </span><span class="s1">textwrap</span>
+
+<span class="s3">import </span><span class="s1">pytest</span>
+
+<span class="s3">from </span><span class="s1">joblib.memory </span><span class="s3">import </span><span class="s1">Memory</span>
+<span class="s3">from </span><span class="s1">joblib.memory </span><span class="s3">import </span><span class="s1">expires_after</span>
+<span class="s3">from </span><span class="s1">joblib.memory </span><span class="s3">import </span><span class="s1">MemorizedFunc</span><span class="s3">, </span><span class="s1">NotMemorizedFunc</span>
+<span class="s3">from </span><span class="s1">joblib.memory </span><span class="s3">import </span><span class="s1">MemorizedResult</span><span class="s3">, </span><span class="s1">NotMemorizedResult</span>
+<span class="s3">from </span><span class="s1">joblib.memory </span><span class="s3">import </span><span class="s1">_FUNCTION_HASHES</span>
+<span class="s3">from </span><span class="s1">joblib.memory </span><span class="s3">import </span><span class="s1">register_store_backend</span><span class="s3">, </span><span class="s1">_STORE_BACKENDS</span>
+<span class="s3">from </span><span class="s1">joblib.memory </span><span class="s3">import </span><span class="s1">_build_func_identifier</span><span class="s3">, </span><span class="s1">_store_backend_factory</span>
+<span class="s3">from </span><span class="s1">joblib.memory </span><span class="s3">import </span><span class="s1">JobLibCollisionWarning</span>
+<span class="s3">from </span><span class="s1">joblib.parallel </span><span class="s3">import </span><span class="s1">Parallel</span><span class="s3">, </span><span class="s1">delayed</span>
+<span class="s3">from </span><span class="s1">joblib._store_backends </span><span class="s3">import </span><span class="s1">StoreBackendBase</span><span class="s3">, </span><span class="s1">FileSystemStoreBackend</span>
+<span class="s3">from </span><span class="s1">joblib.test.common </span><span class="s3">import </span><span class="s1">with_numpy</span><span class="s3">, </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">joblib.test.common </span><span class="s3">import </span><span class="s1">with_multiprocessing</span>
+<span class="s3">from </span><span class="s1">joblib.testing </span><span class="s3">import </span><span class="s1">parametrize</span><span class="s3">, </span><span class="s1">raises</span><span class="s3">, </span><span class="s1">warns</span>
+<span class="s3">from </span><span class="s1">joblib.hashing </span><span class="s3">import </span><span class="s1">hash</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># Module-level variables for the tests</span>
+<span class="s3">def </span><span class="s1">f(x</span><span class="s3">, </span><span class="s1">y=</span><span class="s4">1</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; A module-level function for testing purposes. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">x ** </span><span class="s4">2 </span><span class="s1">+ y</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># Helper function for the tests</span>
+<span class="s3">def </span><span class="s1">check_identity_lazy(func</span><span class="s3">, </span><span class="s1">accumulator</span><span class="s3">, </span><span class="s1">location):</span>
+    <span class="s0">&quot;&quot;&quot; Given a function and an accumulator (a list that grows every 
+        time the function is called), check that the function can be 
+        decorated by memory to be a lazy identity. 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># Call each function with several arguments, and check that it is</span>
+    <span class="s2"># evaluated only once per argument.</span>
+    <span class="s1">memory = Memory(location=location</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">func = memory.cache(func)</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">3</span><span class="s1">):</span>
+        <span class="s3">for </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">2</span><span class="s1">):</span>
+            <span class="s3">assert </span><span class="s1">func(i) == i</span>
+            <span class="s3">assert </span><span class="s1">len(accumulator) == i + </span><span class="s4">1</span>
+
+
+<span class="s3">def </span><span class="s1">corrupt_single_cache_item(memory):</span>
+    <span class="s1">single_cache_item</span><span class="s3">, </span><span class="s1">= memory.store_backend.get_items()</span>
+    <span class="s1">output_filename = os.path.join(single_cache_item.path</span><span class="s3">, </span><span class="s5">'output.pkl'</span><span class="s1">)</span>
+    <span class="s3">with </span><span class="s1">open(output_filename</span><span class="s3">, </span><span class="s5">'w'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">f:</span>
+        <span class="s1">f.write(</span><span class="s5">'garbage'</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">monkeypatch_cached_func_warn(func</span><span class="s3">, </span><span class="s1">monkeypatch_fixture):</span>
+    <span class="s2"># Need monkeypatch because pytest does not</span>
+    <span class="s2"># capture stdlib logging output (see</span>
+    <span class="s2"># https://github.com/pytest-dev/pytest/issues/2079)</span>
+
+    <span class="s1">recorded = []</span>
+
+    <span class="s3">def </span><span class="s1">append_to_record(item):</span>
+        <span class="s1">recorded.append(item)</span>
+    <span class="s1">monkeypatch_fixture.setattr(func</span><span class="s3">, </span><span class="s5">'warn'</span><span class="s3">, </span><span class="s1">append_to_record)</span>
+    <span class="s3">return </span><span class="s1">recorded</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># Tests</span>
+<span class="s3">def </span><span class="s1">test_memory_integration(tmpdir):</span>
+    <span class="s0">&quot;&quot;&quot; Simple test of memory lazy evaluation. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">accumulator = list()</span>
+
+    <span class="s2"># Rmk: this function has the same name than a module-level function,</span>
+    <span class="s2"># thus it serves as a test to see that both are identified</span>
+    <span class="s2"># as different.</span>
+    <span class="s3">def </span><span class="s1">f(arg):</span>
+        <span class="s1">accumulator.append(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">arg</span>
+
+    <span class="s1">check_identity_lazy(f</span><span class="s3">, </span><span class="s1">accumulator</span><span class="s3">, </span><span class="s1">tmpdir.strpath)</span>
+
+    <span class="s2"># Now test clearing</span>
+    <span class="s3">for </span><span class="s1">compress </span><span class="s3">in </span><span class="s1">(</span><span class="s3">False, True</span><span class="s1">):</span>
+        <span class="s3">for </span><span class="s1">mmap_mode </span><span class="s3">in </span><span class="s1">(</span><span class="s5">'r'</span><span class="s3">, None</span><span class="s1">):</span>
+            <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">10</span><span class="s3">,</span>
+                            <span class="s1">mmap_mode=mmap_mode</span><span class="s3">, </span><span class="s1">compress=compress)</span>
+            <span class="s2"># First clear the cache directory, to check that our code can</span>
+            <span class="s2"># handle that</span>
+            <span class="s2"># NOTE: this line would raise an exception, as the database file is</span>
+            <span class="s2"># still open; we ignore the error since we want to test what</span>
+            <span class="s2"># happens if the directory disappears</span>
+            <span class="s1">shutil.rmtree(tmpdir.strpath</span><span class="s3">, </span><span class="s1">ignore_errors=</span><span class="s3">True</span><span class="s1">)</span>
+            <span class="s1">g = memory.cache(f)</span>
+            <span class="s1">g(</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s1">g.clear(warn=</span><span class="s3">False</span><span class="s1">)</span>
+            <span class="s1">current_accumulator = len(accumulator)</span>
+            <span class="s1">out = g(</span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s3">assert </span><span class="s1">len(accumulator) == current_accumulator + </span><span class="s4">1</span>
+        <span class="s2"># Also, check that Memory.eval works similarly</span>
+        <span class="s3">assert </span><span class="s1">memory.eval(f</span><span class="s3">, </span><span class="s4">1</span><span class="s1">) == out</span>
+        <span class="s3">assert </span><span class="s1">len(accumulator) == current_accumulator + </span><span class="s4">1</span>
+
+    <span class="s2"># Now do a smoke test with a function defined in __main__, as the name</span>
+    <span class="s2"># mangling rules are more complex</span>
+    <span class="s1">f.__module__ = </span><span class="s5">'__main__'</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">memory.cache(f)(</span><span class="s4">1</span><span class="s1">)</span>
+
+
+<span class="s1">@parametrize(</span><span class="s5">&quot;call_before_reducing&quot;</span><span class="s3">, </span><span class="s1">[</span><span class="s3">True, False</span><span class="s1">])</span>
+<span class="s3">def </span><span class="s1">test_parallel_call_cached_function_defined_in_jupyter(</span>
+    <span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">call_before_reducing</span>
+<span class="s1">):</span>
+    <span class="s2"># Calling an interactively defined memory.cache()'d function inside a</span>
+    <span class="s2"># Parallel call used to clear the existing cache related to the said</span>
+    <span class="s2"># function (https://github.com/joblib/joblib/issues/1035)</span>
+
+    <span class="s2"># This tests checks that this is no longer the case.</span>
+
+    <span class="s2"># TODO: test that the cache related to the function cache persists across</span>
+    <span class="s2"># ipython sessions (provided that no code change were made to the</span>
+    <span class="s2"># function's source)?</span>
+
+    <span class="s2"># The first part of the test makes the necessary low-level calls to emulate</span>
+    <span class="s2"># the definition of a function in an jupyter notebook cell. Joblib has</span>
+    <span class="s2"># some custom code to treat functions defined specifically in jupyter</span>
+    <span class="s2"># notebooks/ipython session -- we want to test this code, which requires</span>
+    <span class="s2"># the emulation to be rigorous.</span>
+    <span class="s3">for </span><span class="s1">session_no </span><span class="s3">in </span><span class="s1">[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">1</span><span class="s1">]:</span>
+        <span class="s1">ipython_cell_source = </span><span class="s5">''' 
+        def f(x): 
+            return x 
+        '''</span>
+
+        <span class="s1">ipython_cell_id = </span><span class="s5">'&lt;ipython-input-{}-000000000000&gt;'</span><span class="s1">.format(session_no)</span>
+
+        <span class="s1">exec(</span>
+            <span class="s1">compile(</span>
+                <span class="s1">textwrap.dedent(ipython_cell_source)</span><span class="s3">,</span>
+                <span class="s1">filename=ipython_cell_id</span><span class="s3">,</span>
+                <span class="s1">mode=</span><span class="s5">'exec'</span>
+            <span class="s1">)</span>
+        <span class="s1">)</span>
+        <span class="s2"># f is now accessible in the locals mapping - but for some unknown</span>
+        <span class="s2"># reason, f = locals()['f'] throws a KeyError at runtime, we need to</span>
+        <span class="s2"># bind locals()['f'] to a different name in the local namespace</span>
+        <span class="s1">aliased_f = locals()[</span><span class="s5">'f'</span><span class="s1">]</span>
+        <span class="s1">aliased_f.__module__ = </span><span class="s5">&quot;__main__&quot;</span>
+
+        <span class="s2"># Preliminary sanity checks, and tests checking that joblib properly</span>
+        <span class="s2"># identified f as an interactive function defined in a jupyter notebook</span>
+        <span class="s3">assert </span><span class="s1">aliased_f(</span><span class="s4">1</span><span class="s1">) == </span><span class="s4">1</span>
+        <span class="s3">assert </span><span class="s1">aliased_f.__code__.co_filename == ipython_cell_id</span>
+
+        <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s1">cached_f = memory.cache(aliased_f)</span>
+
+        <span class="s3">assert </span><span class="s1">len(os.listdir(tmpdir / </span><span class="s5">'joblib'</span><span class="s1">)) == </span><span class="s4">1</span>
+        <span class="s1">f_cache_relative_directory = os.listdir(tmpdir / </span><span class="s5">'joblib'</span><span class="s1">)[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s3">assert </span><span class="s5">'ipython-input' </span><span class="s3">in </span><span class="s1">f_cache_relative_directory</span>
+
+        <span class="s1">f_cache_directory = tmpdir / </span><span class="s5">'joblib' </span><span class="s1">/ f_cache_relative_directory</span>
+
+        <span class="s3">if </span><span class="s1">session_no == </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s2"># The cache should be empty as cached_f has not been called yet.</span>
+            <span class="s3">assert </span><span class="s1">os.listdir(f_cache_directory) == [</span><span class="s5">'f'</span><span class="s1">]</span>
+            <span class="s3">assert </span><span class="s1">os.listdir(f_cache_directory / </span><span class="s5">'f'</span><span class="s1">) == []</span>
+
+            <span class="s3">if </span><span class="s1">call_before_reducing:</span>
+                <span class="s1">cached_f(</span><span class="s4">3</span><span class="s1">)</span>
+                <span class="s2"># Two files were just created, func_code.py, and a folder</span>
+                <span class="s2"># containing the information (inputs hash/ouptput) of</span>
+                <span class="s2"># cached_f(3)</span>
+                <span class="s3">assert </span><span class="s1">len(os.listdir(f_cache_directory / </span><span class="s5">'f'</span><span class="s1">)) == </span><span class="s4">2</span>
+
+                <span class="s2"># Now, testing  #1035: when calling a cached function, joblib</span>
+                <span class="s2"># used to dynamically inspect the underlying function to</span>
+                <span class="s2"># extract its source code (to verify it matches the source code</span>
+                <span class="s2"># of the function as last inspected by joblib) -- however,</span>
+                <span class="s2"># source code introspection fails for dynamic functions sent to</span>
+                <span class="s2"># child processes - which would eventually make joblib clear</span>
+                <span class="s2"># the cache associated to f</span>
+                <span class="s1">res = Parallel(n_jobs=</span><span class="s4">2</span><span class="s1">)(delayed(cached_f)(i) </span><span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">[</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s1">])</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s2"># Submit the function to the joblib child processes, although</span>
+                <span class="s2"># the function has never been called in the parent yet. This</span>
+                <span class="s2"># triggers a specific code branch inside</span>
+                <span class="s2"># MemorizedFunc.__reduce__.</span>
+                <span class="s1">res = Parallel(n_jobs=</span><span class="s4">2</span><span class="s1">)(delayed(cached_f)(i) </span><span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">[</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s1">])</span>
+                <span class="s3">assert </span><span class="s1">len(os.listdir(f_cache_directory / </span><span class="s5">'f'</span><span class="s1">)) == </span><span class="s4">3</span>
+
+                <span class="s1">cached_f(</span><span class="s4">3</span><span class="s1">)</span>
+
+            <span class="s2"># Making sure f's cache does not get cleared after the parallel</span>
+            <span class="s2"># calls, and contains ALL cached functions calls (f(1), f(2), f(3))</span>
+            <span class="s2"># and 'func_code.py'</span>
+            <span class="s3">assert </span><span class="s1">len(os.listdir(f_cache_directory / </span><span class="s5">'f'</span><span class="s1">)) == </span><span class="s4">4</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s2"># For the second session, there should be an already existing cache</span>
+            <span class="s3">assert </span><span class="s1">len(os.listdir(f_cache_directory / </span><span class="s5">'f'</span><span class="s1">)) == </span><span class="s4">4</span>
+
+            <span class="s1">cached_f(</span><span class="s4">3</span><span class="s1">)</span>
+
+            <span class="s2"># The previous cache should not be invalidated after calling the</span>
+            <span class="s2"># function in a new session</span>
+            <span class="s3">assert </span><span class="s1">len(os.listdir(f_cache_directory / </span><span class="s5">'f'</span><span class="s1">)) == </span><span class="s4">4</span>
+
+
+<span class="s3">def </span><span class="s1">test_no_memory():</span>
+    <span class="s0">&quot;&quot;&quot; Test memory with location=None: no memoize &quot;&quot;&quot;</span>
+    <span class="s1">accumulator = list()</span>
+
+    <span class="s3">def </span><span class="s1">ff(arg):</span>
+        <span class="s1">accumulator.append(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">arg</span>
+
+    <span class="s1">memory = Memory(location=</span><span class="s3">None, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">gg = memory.cache(ff)</span>
+    <span class="s3">for </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">4</span><span class="s1">):</span>
+        <span class="s1">current_accumulator = len(accumulator)</span>
+        <span class="s1">gg(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s3">assert </span><span class="s1">len(accumulator) == current_accumulator + </span><span class="s4">1</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_kwarg(tmpdir):</span>
+    <span class="s0">&quot; Test memory with a function with keyword arguments.&quot;</span>
+    <span class="s1">accumulator = list()</span>
+
+    <span class="s3">def </span><span class="s1">g(arg1=</span><span class="s3">None, </span><span class="s1">arg2=</span><span class="s4">1</span><span class="s1">):</span>
+        <span class="s1">accumulator.append(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">arg1</span>
+
+    <span class="s1">check_identity_lazy(g</span><span class="s3">, </span><span class="s1">accumulator</span><span class="s3">, </span><span class="s1">tmpdir.strpath)</span>
+
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">g = memory.cache(g)</span>
+    <span class="s2"># Smoke test with an explicit keyword argument:</span>
+    <span class="s3">assert </span><span class="s1">g(arg1=</span><span class="s4">30</span><span class="s3">, </span><span class="s1">arg2=</span><span class="s4">2</span><span class="s1">) == </span><span class="s4">30</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_lambda(tmpdir):</span>
+    <span class="s0">&quot; Test memory with a function with a lambda.&quot;</span>
+    <span class="s1">accumulator = list()</span>
+
+    <span class="s3">def </span><span class="s1">helper(x):</span>
+        <span class="s0">&quot;&quot;&quot; A helper function to define l as a lambda. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">accumulator.append(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">x</span>
+
+    <span class="s1">check_identity_lazy(</span><span class="s3">lambda </span><span class="s1">x: helper(x)</span><span class="s3">, </span><span class="s1">accumulator</span><span class="s3">, </span><span class="s1">tmpdir.strpath)</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_name_collision(tmpdir):</span>
+    <span class="s0">&quot; Check that name collisions with functions will raise warnings&quot;</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s1">@memory.cache</span>
+    <span class="s3">def </span><span class="s1">name_collision(x):</span>
+        <span class="s0">&quot;&quot;&quot; A first function called name_collision 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">x</span>
+
+    <span class="s1">a = name_collision</span>
+
+    <span class="s1">@memory.cache</span>
+    <span class="s3">def </span><span class="s1">name_collision(x):</span>
+        <span class="s0">&quot;&quot;&quot; A second function called name_collision 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">x</span>
+
+    <span class="s1">b = name_collision</span>
+
+    <span class="s3">with </span><span class="s1">warns(JobLibCollisionWarning) </span><span class="s3">as </span><span class="s1">warninfo:</span>
+        <span class="s1">a(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">b(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s3">assert </span><span class="s1">len(warninfo) == </span><span class="s4">1</span>
+    <span class="s3">assert </span><span class="s5">&quot;collision&quot; </span><span class="s3">in </span><span class="s1">str(warninfo[</span><span class="s4">0</span><span class="s1">].message)</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_warning_lambda_collisions(tmpdir):</span>
+    <span class="s2"># Check that multiple use of lambda will raise collisions</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">a = memory.cache(</span><span class="s3">lambda </span><span class="s1">x: x)</span>
+    <span class="s1">b = memory.cache(</span><span class="s3">lambda </span><span class="s1">x: x + </span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s3">with </span><span class="s1">warns(JobLibCollisionWarning) </span><span class="s3">as </span><span class="s1">warninfo:</span>
+        <span class="s3">assert </span><span class="s1">a(</span><span class="s4">0</span><span class="s1">) == </span><span class="s4">0</span>
+        <span class="s3">assert </span><span class="s1">b(</span><span class="s4">1</span><span class="s1">) == </span><span class="s4">2</span>
+        <span class="s3">assert </span><span class="s1">a(</span><span class="s4">1</span><span class="s1">) == </span><span class="s4">1</span>
+
+    <span class="s2"># In recent Python versions, we can retrieve the code of lambdas,</span>
+    <span class="s2"># thus nothing is raised</span>
+    <span class="s3">assert </span><span class="s1">len(warninfo) == </span><span class="s4">4</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_warning_collision_detection(tmpdir):</span>
+    <span class="s2"># Check that collisions impossible to detect will raise appropriate</span>
+    <span class="s2"># warnings.</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">a1 = eval(</span><span class="s5">'lambda x: x'</span><span class="s1">)</span>
+    <span class="s1">a1 = memory.cache(a1)</span>
+    <span class="s1">b1 = eval(</span><span class="s5">'lambda x: x+1'</span><span class="s1">)</span>
+    <span class="s1">b1 = memory.cache(b1)</span>
+
+    <span class="s3">with </span><span class="s1">warns(JobLibCollisionWarning) </span><span class="s3">as </span><span class="s1">warninfo:</span>
+        <span class="s1">a1(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">b1(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">a1(</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s3">assert </span><span class="s1">len(warninfo) == </span><span class="s4">2</span>
+    <span class="s3">assert </span><span class="s5">&quot;cannot detect&quot; </span><span class="s3">in </span><span class="s1">str(warninfo[</span><span class="s4">0</span><span class="s1">].message).lower()</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_partial(tmpdir):</span>
+    <span class="s0">&quot; Test memory with functools.partial.&quot;</span>
+    <span class="s1">accumulator = list()</span>
+
+    <span class="s3">def </span><span class="s1">func(x</span><span class="s3">, </span><span class="s1">y):</span>
+        <span class="s0">&quot;&quot;&quot; A helper function to define l as a lambda. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">accumulator.append(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">y</span>
+
+    <span class="s3">import </span><span class="s1">functools</span>
+    <span class="s1">function = functools.partial(func</span><span class="s3">, </span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s1">check_identity_lazy(function</span><span class="s3">, </span><span class="s1">accumulator</span><span class="s3">, </span><span class="s1">tmpdir.strpath)</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_eval(tmpdir):</span>
+    <span class="s0">&quot; Smoke test memory with a function with a function defined in an eval.&quot;</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s1">m = eval(</span><span class="s5">'lambda x: x'</span><span class="s1">)</span>
+    <span class="s1">mm = memory.cache(m)</span>
+
+    <span class="s3">assert </span><span class="s1">mm(</span><span class="s4">1</span><span class="s1">) == </span><span class="s4">1</span>
+
+
+<span class="s3">def </span><span class="s1">count_and_append(x=[]):</span>
+    <span class="s0">&quot;&quot;&quot; A function with a side effect in its arguments. 
+ 
+        Return the length of its argument and append one element. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">len_x = len(x)</span>
+    <span class="s1">x.append(</span><span class="s3">None</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">len_x</span>
+
+
+<span class="s3">def </span><span class="s1">test_argument_change(tmpdir):</span>
+    <span class="s0">&quot;&quot;&quot; Check that if a function has a side effect in its arguments, it 
+        should use the hash of changing arguments. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">func = memory.cache(count_and_append)</span>
+    <span class="s2"># call the function for the first time, is should cache it with</span>
+    <span class="s2"># argument x=[]</span>
+    <span class="s3">assert </span><span class="s1">func() == </span><span class="s4">0</span>
+    <span class="s2"># the second time the argument is x=[None], which is not cached</span>
+    <span class="s2"># yet, so the functions should be called a second time</span>
+    <span class="s3">assert </span><span class="s1">func() == </span><span class="s4">1</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s1">@parametrize(</span><span class="s5">'mmap_mode'</span><span class="s3">, </span><span class="s1">[</span><span class="s3">None, </span><span class="s5">'r'</span><span class="s1">])</span>
+<span class="s3">def </span><span class="s1">test_memory_numpy(tmpdir</span><span class="s3">, </span><span class="s1">mmap_mode):</span>
+    <span class="s0">&quot; Test memory with a function with numpy arrays.&quot;</span>
+    <span class="s1">accumulator = list()</span>
+
+    <span class="s3">def </span><span class="s1">n(arg=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s1">accumulator.append(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">arg</span>
+
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">mmap_mode=mmap_mode</span><span class="s3">,</span>
+                    <span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">cached_n = memory.cache(n)</span>
+
+    <span class="s1">rnd = np.random.RandomState(</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">3</span><span class="s1">):</span>
+        <span class="s1">a = rnd.random_sample((</span><span class="s4">10</span><span class="s3">, </span><span class="s4">10</span><span class="s1">))</span>
+        <span class="s3">for </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">3</span><span class="s1">):</span>
+            <span class="s3">assert </span><span class="s1">np.all(cached_n(a) == a)</span>
+            <span class="s3">assert </span><span class="s1">len(accumulator) == i + </span><span class="s4">1</span>
+
+
+<span class="s1">@with_numpy</span>
+<span class="s3">def </span><span class="s1">test_memory_numpy_check_mmap_mode(tmpdir</span><span class="s3">, </span><span class="s1">monkeypatch):</span>
+    <span class="s0">&quot;&quot;&quot;Check that mmap_mode is respected even at the first call&quot;&quot;&quot;</span>
+
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">mmap_mode=</span><span class="s5">'r'</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s1">@memory.cache()</span>
+    <span class="s3">def </span><span class="s1">twice(a):</span>
+        <span class="s3">return </span><span class="s1">a * </span><span class="s4">2</span>
+
+    <span class="s1">a = np.ones(</span><span class="s4">3</span><span class="s1">)</span>
+
+    <span class="s1">b = twice(a)</span>
+    <span class="s1">c = twice(a)</span>
+
+    <span class="s3">assert </span><span class="s1">isinstance(c</span><span class="s3">, </span><span class="s1">np.memmap)</span>
+    <span class="s3">assert </span><span class="s1">c.mode == </span><span class="s5">'r'</span>
+
+    <span class="s3">assert </span><span class="s1">isinstance(b</span><span class="s3">, </span><span class="s1">np.memmap)</span>
+    <span class="s3">assert </span><span class="s1">b.mode == </span><span class="s5">'r'</span>
+
+    <span class="s2"># Corrupts the file,  Deleting b and c mmaps</span>
+    <span class="s2"># is necessary to be able edit the file</span>
+    <span class="s3">del </span><span class="s1">b</span>
+    <span class="s3">del </span><span class="s1">c</span>
+    <span class="s1">gc.collect()</span>
+    <span class="s1">corrupt_single_cache_item(memory)</span>
+
+    <span class="s2"># Make sure that corrupting the file causes recomputation and that</span>
+    <span class="s2"># a warning is issued.</span>
+    <span class="s1">recorded_warnings = monkeypatch_cached_func_warn(twice</span><span class="s3">, </span><span class="s1">monkeypatch)</span>
+    <span class="s1">d = twice(a)</span>
+    <span class="s3">assert </span><span class="s1">len(recorded_warnings) == </span><span class="s4">1</span>
+    <span class="s1">exception_msg = </span><span class="s5">'Exception while loading results'</span>
+    <span class="s3">assert </span><span class="s1">exception_msg </span><span class="s3">in </span><span class="s1">recorded_warnings[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s2"># Asserts that the recomputation returns a mmap</span>
+    <span class="s3">assert </span><span class="s1">isinstance(d</span><span class="s3">, </span><span class="s1">np.memmap)</span>
+    <span class="s3">assert </span><span class="s1">d.mode == </span><span class="s5">'r'</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_exception(tmpdir):</span>
+    <span class="s0">&quot;&quot;&quot; Smoketest the exception handling of Memory. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s3">class </span><span class="s1">MyException(Exception):</span>
+        <span class="s3">pass</span>
+
+    <span class="s1">@memory.cache</span>
+    <span class="s3">def </span><span class="s1">h(exc=</span><span class="s4">0</span><span class="s1">):</span>
+        <span class="s3">if </span><span class="s1">exc:</span>
+            <span class="s3">raise </span><span class="s1">MyException</span>
+
+    <span class="s2"># Call once, to initialise the cache</span>
+    <span class="s1">h()</span>
+
+    <span class="s3">for </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">3</span><span class="s1">):</span>
+        <span class="s2"># Call 3 times, to be sure that the Exception is always raised</span>
+        <span class="s3">with </span><span class="s1">raises(MyException):</span>
+            <span class="s1">h(</span><span class="s4">1</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_ignore(tmpdir):</span>
+    <span class="s0">&quot; Test the ignore feature of memory &quot;</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">accumulator = list()</span>
+
+    <span class="s1">@memory.cache(ignore=[</span><span class="s5">'y'</span><span class="s1">])</span>
+    <span class="s3">def </span><span class="s1">z(x</span><span class="s3">, </span><span class="s1">y=</span><span class="s4">1</span><span class="s1">):</span>
+        <span class="s1">accumulator.append(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s3">assert </span><span class="s1">z.ignore == [</span><span class="s5">'y'</span><span class="s1">]</span>
+
+    <span class="s1">z(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">y=</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">len(accumulator) == </span><span class="s4">1</span>
+    <span class="s1">z(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">y=</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">len(accumulator) == </span><span class="s4">1</span>
+    <span class="s1">z(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">y=</span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">len(accumulator) == </span><span class="s4">1</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_ignore_decorated(tmpdir):</span>
+    <span class="s0">&quot; Test the ignore feature of memory on a decorated function &quot;</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">accumulator = list()</span>
+
+    <span class="s3">def </span><span class="s1">decorate(f):</span>
+        <span class="s1">@functools.wraps(f)</span>
+        <span class="s3">def </span><span class="s1">wrapped(*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+            <span class="s3">return </span><span class="s1">f(*args</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+        <span class="s3">return </span><span class="s1">wrapped</span>
+
+    <span class="s1">@memory.cache(ignore=[</span><span class="s5">'y'</span><span class="s1">])</span>
+    <span class="s1">@decorate</span>
+    <span class="s3">def </span><span class="s1">z(x</span><span class="s3">, </span><span class="s1">y=</span><span class="s4">1</span><span class="s1">):</span>
+        <span class="s1">accumulator.append(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s3">assert </span><span class="s1">z.ignore == [</span><span class="s5">'y'</span><span class="s1">]</span>
+
+    <span class="s1">z(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">y=</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">len(accumulator) == </span><span class="s4">1</span>
+    <span class="s1">z(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">y=</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">len(accumulator) == </span><span class="s4">1</span>
+    <span class="s1">z(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">y=</span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">len(accumulator) == </span><span class="s4">1</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_args_as_kwargs(tmpdir):</span>
+    <span class="s0">&quot;&quot;&quot;Non-regression test against 0.12.0 changes. 
+ 
+    https://github.com/joblib/joblib/pull/751 
+    &quot;&quot;&quot;</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s1">@memory.cache</span>
+    <span class="s3">def </span><span class="s1">plus_one(a):</span>
+        <span class="s3">return </span><span class="s1">a + </span><span class="s4">1</span>
+
+    <span class="s2"># It's possible to call a positional arg as a kwarg.</span>
+    <span class="s3">assert </span><span class="s1">plus_one(</span><span class="s4">1</span><span class="s1">) == </span><span class="s4">2</span>
+    <span class="s3">assert </span><span class="s1">plus_one(a=</span><span class="s4">1</span><span class="s1">) == </span><span class="s4">2</span>
+
+    <span class="s2"># However, a positional argument that joblib hadn't seen</span>
+    <span class="s2"># before would cause a failure if it was passed as a kwarg.</span>
+    <span class="s3">assert </span><span class="s1">plus_one(a=</span><span class="s4">2</span><span class="s1">) == </span><span class="s4">3</span>
+
+
+<span class="s1">@parametrize(</span><span class="s5">'ignore, verbose, mmap_mode'</span><span class="s3">, </span><span class="s1">[([</span><span class="s5">'x'</span><span class="s1">]</span><span class="s3">, </span><span class="s4">100</span><span class="s3">, </span><span class="s5">'r'</span><span class="s1">)</span><span class="s3">,</span>
+                                            <span class="s1">([]</span><span class="s3">, </span><span class="s4">10</span><span class="s3">, None</span><span class="s1">)])</span>
+<span class="s3">def </span><span class="s1">test_partial_decoration(tmpdir</span><span class="s3">, </span><span class="s1">ignore</span><span class="s3">, </span><span class="s1">verbose</span><span class="s3">, </span><span class="s1">mmap_mode):</span>
+    <span class="s0">&quot;Check cache may be called with kwargs before decorating&quot;</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s1">@memory.cache(ignore=ignore</span><span class="s3">, </span><span class="s1">verbose=verbose</span><span class="s3">, </span><span class="s1">mmap_mode=mmap_mode)</span>
+    <span class="s3">def </span><span class="s1">z(x):</span>
+        <span class="s3">pass</span>
+
+    <span class="s3">assert </span><span class="s1">z.ignore == ignore</span>
+    <span class="s3">assert </span><span class="s1">z._verbose == verbose</span>
+    <span class="s3">assert </span><span class="s1">z.mmap_mode == mmap_mode</span>
+
+
+<span class="s3">def </span><span class="s1">test_func_dir(tmpdir):</span>
+    <span class="s2"># Test the creation of the memory cache directory for the function.</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">path = __name__.split(</span><span class="s5">'.'</span><span class="s1">)</span>
+    <span class="s1">path.append(</span><span class="s5">'f'</span><span class="s1">)</span>
+    <span class="s1">path = tmpdir.join(</span><span class="s5">'joblib'</span><span class="s3">, </span><span class="s1">*path).strpath</span>
+
+    <span class="s1">g = memory.cache(f)</span>
+    <span class="s2"># Test that the function directory is created on demand</span>
+    <span class="s1">func_id = _build_func_identifier(f)</span>
+    <span class="s1">location = os.path.join(g.store_backend.location</span><span class="s3">, </span><span class="s1">func_id)</span>
+    <span class="s3">assert </span><span class="s1">location == path</span>
+    <span class="s3">assert </span><span class="s1">os.path.exists(path)</span>
+    <span class="s3">assert </span><span class="s1">memory.location == os.path.dirname(g.store_backend.location)</span>
+
+    <span class="s2"># Test that the code is stored.</span>
+    <span class="s2"># For the following test to be robust to previous execution, we clear</span>
+    <span class="s2"># the in-memory store</span>
+    <span class="s1">_FUNCTION_HASHES.clear()</span>
+    <span class="s3">assert not </span><span class="s1">g._check_previous_func_code()</span>
+    <span class="s3">assert </span><span class="s1">os.path.exists(os.path.join(path</span><span class="s3">, </span><span class="s5">'func_code.py'</span><span class="s1">))</span>
+    <span class="s3">assert </span><span class="s1">g._check_previous_func_code()</span>
+
+    <span class="s2"># Test the robustness to failure of loading previous results.</span>
+    <span class="s1">func_id</span><span class="s3">, </span><span class="s1">args_id = g._get_output_identifiers(</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">output_dir = os.path.join(g.store_backend.location</span><span class="s3">, </span><span class="s1">func_id</span><span class="s3">, </span><span class="s1">args_id)</span>
+    <span class="s1">a = g(</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">os.path.exists(output_dir)</span>
+    <span class="s1">os.remove(os.path.join(output_dir</span><span class="s3">, </span><span class="s5">'output.pkl'</span><span class="s1">))</span>
+    <span class="s3">assert </span><span class="s1">a == g(</span><span class="s4">1</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">test_persistence(tmpdir):</span>
+    <span class="s2"># Test the memorized functions can be pickled and restored.</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">g = memory.cache(f)</span>
+    <span class="s1">output = g(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s1">h = pickle.loads(pickle.dumps(g))</span>
+
+    <span class="s1">func_id</span><span class="s3">, </span><span class="s1">args_id = h._get_output_identifiers(</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">output_dir = os.path.join(h.store_backend.location</span><span class="s3">, </span><span class="s1">func_id</span><span class="s3">, </span><span class="s1">args_id)</span>
+    <span class="s3">assert </span><span class="s1">os.path.exists(output_dir)</span>
+    <span class="s3">assert </span><span class="s1">output == h.store_backend.load_item([func_id</span><span class="s3">, </span><span class="s1">args_id])</span>
+    <span class="s1">memory2 = pickle.loads(pickle.dumps(memory))</span>
+    <span class="s3">assert </span><span class="s1">memory.store_backend.location == memory2.store_backend.location</span>
+
+    <span class="s2"># Smoke test that pickling a memory with location=None works</span>
+    <span class="s1">memory = Memory(location=</span><span class="s3">None, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">pickle.loads(pickle.dumps(memory))</span>
+    <span class="s1">g = memory.cache(f)</span>
+    <span class="s1">gp = pickle.loads(pickle.dumps(g))</span>
+    <span class="s1">gp(</span><span class="s4">1</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">test_check_call_in_cache(tmpdir):</span>
+    <span class="s3">for </span><span class="s1">func </span><span class="s3">in </span><span class="s1">(MemorizedFunc(f</span><span class="s3">, </span><span class="s1">tmpdir.strpath)</span><span class="s3">,</span>
+                 <span class="s1">Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">).cache(f)):</span>
+        <span class="s1">result = func.check_call_in_cache(</span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s3">assert not </span><span class="s1">result</span>
+        <span class="s3">assert </span><span class="s1">isinstance(result</span><span class="s3">, </span><span class="s1">bool)</span>
+        <span class="s3">assert </span><span class="s1">func(</span><span class="s4">2</span><span class="s1">) == </span><span class="s4">5</span>
+        <span class="s1">result = func.check_call_in_cache(</span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s3">assert </span><span class="s1">result</span>
+        <span class="s3">assert </span><span class="s1">isinstance(result</span><span class="s3">, </span><span class="s1">bool)</span>
+        <span class="s1">func.clear()</span>
+
+
+<span class="s3">def </span><span class="s1">test_call_and_shelve(tmpdir):</span>
+    <span class="s2"># Test MemorizedFunc outputting a reference to cache.</span>
+
+    <span class="s3">for </span><span class="s1">func</span><span class="s3">, </span><span class="s1">Result </span><span class="s3">in </span><span class="s1">zip((MemorizedFunc(f</span><span class="s3">, </span><span class="s1">tmpdir.strpath)</span><span class="s3">,</span>
+                             <span class="s1">NotMemorizedFunc(f)</span><span class="s3">,</span>
+                             <span class="s1">Memory(location=tmpdir.strpath</span><span class="s3">,</span>
+                                    <span class="s1">verbose=</span><span class="s4">0</span><span class="s1">).cache(f)</span><span class="s3">,</span>
+                             <span class="s1">Memory(location=</span><span class="s3">None</span><span class="s1">).cache(f)</span><span class="s3">,</span>
+                             <span class="s1">)</span><span class="s3">,</span>
+                            <span class="s1">(MemorizedResult</span><span class="s3">, </span><span class="s1">NotMemorizedResult</span><span class="s3">,</span>
+                             <span class="s1">MemorizedResult</span><span class="s3">, </span><span class="s1">NotMemorizedResult)):</span>
+        <span class="s3">assert </span><span class="s1">func(</span><span class="s4">2</span><span class="s1">) == </span><span class="s4">5</span>
+        <span class="s1">result = func.call_and_shelve(</span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s3">assert </span><span class="s1">isinstance(result</span><span class="s3">, </span><span class="s1">Result)</span>
+        <span class="s3">assert </span><span class="s1">result.get() == </span><span class="s4">5</span>
+
+        <span class="s1">result.clear()</span>
+        <span class="s3">with </span><span class="s1">raises(KeyError):</span>
+            <span class="s1">result.get()</span>
+        <span class="s1">result.clear()  </span><span class="s2"># Do nothing if there is no cache.</span>
+
+
+<span class="s3">def </span><span class="s1">test_call_and_shelve_argument_hash(tmpdir):</span>
+    <span class="s2"># Verify that a warning is raised when accessing arguments_hash</span>
+    <span class="s2"># attribute from MemorizedResult</span>
+    <span class="s1">func = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">).cache(f)</span>
+    <span class="s1">result = func.call_and_shelve(</span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">isinstance(result</span><span class="s3">, </span><span class="s1">MemorizedResult)</span>
+    <span class="s3">with </span><span class="s1">warns(DeprecationWarning) </span><span class="s3">as </span><span class="s1">w:</span>
+        <span class="s3">assert </span><span class="s1">result.argument_hash == result.args_id</span>
+    <span class="s3">assert </span><span class="s1">len(w) == </span><span class="s4">1</span>
+    <span class="s3">assert </span><span class="s5">&quot;The 'argument_hash' attribute has been deprecated&quot; </span><span class="s1">\</span>
+        <span class="s3">in </span><span class="s1">str(w[-</span><span class="s4">1</span><span class="s1">].message)</span>
+
+
+<span class="s3">def </span><span class="s1">test_call_and_shelve_lazily_load_stored_result(tmpdir):</span>
+    <span class="s0">&quot;&quot;&quot;Check call_and_shelve only load stored data if needed.&quot;&quot;&quot;</span>
+    <span class="s1">test_access_time_file = tmpdir.join(</span><span class="s5">'test_access'</span><span class="s1">)</span>
+    <span class="s1">test_access_time_file.write(</span><span class="s5">'test_access'</span><span class="s1">)</span>
+    <span class="s1">test_access_time = os.stat(test_access_time_file.strpath).st_atime</span>
+    <span class="s2"># check file system access time stats resolution is lower than test wait</span>
+    <span class="s2"># timings.</span>
+    <span class="s1">time.sleep(</span><span class="s4">0.5</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">test_access_time_file.read() == </span><span class="s5">'test_access'</span>
+
+    <span class="s3">if </span><span class="s1">test_access_time == os.stat(test_access_time_file.strpath).st_atime:</span>
+        <span class="s2"># Skip this test when access time cannot be retrieved with enough</span>
+        <span class="s2"># precision from the file system (e.g. NTFS on windows).</span>
+        <span class="s1">pytest.skip(</span><span class="s5">&quot;filesystem does not support fine-grained access time &quot;</span>
+                    <span class="s5">&quot;attribute&quot;</span><span class="s1">)</span>
+
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">func = memory.cache(f)</span>
+    <span class="s1">func_id</span><span class="s3">, </span><span class="s1">argument_hash = func._get_output_identifiers(</span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s1">result_path = os.path.join(memory.store_backend.location</span><span class="s3">,</span>
+                               <span class="s1">func_id</span><span class="s3">, </span><span class="s1">argument_hash</span><span class="s3">, </span><span class="s5">'output.pkl'</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">func(</span><span class="s4">2</span><span class="s1">) == </span><span class="s4">5</span>
+    <span class="s1">first_access_time = os.stat(result_path).st_atime</span>
+    <span class="s1">time.sleep(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s2"># Should not access the stored data</span>
+    <span class="s1">result = func.call_and_shelve(</span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">isinstance(result</span><span class="s3">, </span><span class="s1">MemorizedResult)</span>
+    <span class="s3">assert </span><span class="s1">os.stat(result_path).st_atime == first_access_time</span>
+    <span class="s1">time.sleep(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s2"># Read the stored data =&gt; last access time is greater than first_access</span>
+    <span class="s3">assert </span><span class="s1">result.get() == </span><span class="s4">5</span>
+    <span class="s3">assert </span><span class="s1">os.stat(result_path).st_atime &gt; first_access_time</span>
+
+
+<span class="s3">def </span><span class="s1">test_memorized_pickling(tmpdir):</span>
+    <span class="s3">for </span><span class="s1">func </span><span class="s3">in </span><span class="s1">(MemorizedFunc(f</span><span class="s3">, </span><span class="s1">tmpdir.strpath)</span><span class="s3">, </span><span class="s1">NotMemorizedFunc(f)):</span>
+        <span class="s1">filename = tmpdir.join(</span><span class="s5">'pickling_test.dat'</span><span class="s1">).strpath</span>
+        <span class="s1">result = func.call_and_shelve(</span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s3">with </span><span class="s1">open(filename</span><span class="s3">, </span><span class="s5">'wb'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">fp:</span>
+            <span class="s1">pickle.dump(result</span><span class="s3">, </span><span class="s1">fp)</span>
+        <span class="s3">with </span><span class="s1">open(filename</span><span class="s3">, </span><span class="s5">'rb'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">fp:</span>
+            <span class="s1">result2 = pickle.load(fp)</span>
+        <span class="s3">assert </span><span class="s1">result2.get() == result.get()</span>
+        <span class="s1">os.remove(filename)</span>
+
+
+<span class="s3">def </span><span class="s1">test_memorized_repr(tmpdir):</span>
+    <span class="s1">func = MemorizedFunc(f</span><span class="s3">, </span><span class="s1">tmpdir.strpath)</span>
+    <span class="s1">result = func.call_and_shelve(</span><span class="s4">2</span><span class="s1">)</span>
+
+    <span class="s1">func2 = MemorizedFunc(f</span><span class="s3">, </span><span class="s1">tmpdir.strpath)</span>
+    <span class="s1">result2 = func2.call_and_shelve(</span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">result.get() == result2.get()</span>
+    <span class="s3">assert </span><span class="s1">repr(func) == repr(func2)</span>
+
+    <span class="s2"># Smoke test with NotMemorizedFunc</span>
+    <span class="s1">func = NotMemorizedFunc(f)</span>
+    <span class="s1">repr(func)</span>
+    <span class="s1">repr(func.call_and_shelve(</span><span class="s4">2</span><span class="s1">))</span>
+
+    <span class="s2"># Smoke test for message output (increase code coverage)</span>
+    <span class="s1">func = MemorizedFunc(f</span><span class="s3">, </span><span class="s1">tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">11</span><span class="s3">, </span><span class="s1">timestamp=time.time())</span>
+    <span class="s1">result = func.call_and_shelve(</span><span class="s4">11</span><span class="s1">)</span>
+    <span class="s1">result.get()</span>
+
+    <span class="s1">func = MemorizedFunc(f</span><span class="s3">, </span><span class="s1">tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">11</span><span class="s1">)</span>
+    <span class="s1">result = func.call_and_shelve(</span><span class="s4">11</span><span class="s1">)</span>
+    <span class="s1">result.get()</span>
+
+    <span class="s1">func = MemorizedFunc(f</span><span class="s3">, </span><span class="s1">tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">5</span><span class="s3">, </span><span class="s1">timestamp=time.time())</span>
+    <span class="s1">result = func.call_and_shelve(</span><span class="s4">11</span><span class="s1">)</span>
+    <span class="s1">result.get()</span>
+
+    <span class="s1">func = MemorizedFunc(f</span><span class="s3">, </span><span class="s1">tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">5</span><span class="s1">)</span>
+    <span class="s1">result = func.call_and_shelve(</span><span class="s4">11</span><span class="s1">)</span>
+    <span class="s1">result.get()</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_file_modification(capsys</span><span class="s3">, </span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">monkeypatch):</span>
+    <span class="s2"># Test that modifying a Python file after loading it does not lead to</span>
+    <span class="s2"># Recomputation</span>
+    <span class="s1">dir_name = tmpdir.mkdir(</span><span class="s5">'tmp_import'</span><span class="s1">).strpath</span>
+    <span class="s1">filename = os.path.join(dir_name</span><span class="s3">, </span><span class="s5">'tmp_joblib_.py'</span><span class="s1">)</span>
+    <span class="s1">content = </span><span class="s5">'def f(x):</span><span class="s3">\n    </span><span class="s5">print(x)</span><span class="s3">\n    </span><span class="s5">return x</span><span class="s3">\n</span><span class="s5">'</span>
+    <span class="s3">with </span><span class="s1">open(filename</span><span class="s3">, </span><span class="s5">'w'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">module_file:</span>
+        <span class="s1">module_file.write(content)</span>
+
+    <span class="s2"># Load the module:</span>
+    <span class="s1">monkeypatch.syspath_prepend(dir_name)</span>
+    <span class="s3">import </span><span class="s1">tmp_joblib_ </span><span class="s3">as </span><span class="s1">tmp</span>
+
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">f = memory.cache(tmp.f)</span>
+    <span class="s2"># First call f a few times</span>
+    <span class="s1">f(</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">f(</span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s1">f(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s2"># Now modify the module where f is stored without modifying f</span>
+    <span class="s3">with </span><span class="s1">open(filename</span><span class="s3">, </span><span class="s5">'w'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">module_file:</span>
+        <span class="s1">module_file.write(</span><span class="s5">'</span><span class="s3">\n\n</span><span class="s5">' </span><span class="s1">+ content)</span>
+
+    <span class="s2"># And call f a couple more times</span>
+    <span class="s1">f(</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">f(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s2"># Flush the .pyc files</span>
+    <span class="s1">shutil.rmtree(dir_name)</span>
+    <span class="s1">os.mkdir(dir_name)</span>
+    <span class="s2"># Now modify the module where f is stored, modifying f</span>
+    <span class="s1">content = </span><span class="s5">'def f(x):</span><span class="s3">\n    </span><span class="s5">print(&quot;x=%s&quot; % x)</span><span class="s3">\n    </span><span class="s5">return x</span><span class="s3">\n</span><span class="s5">'</span>
+    <span class="s3">with </span><span class="s1">open(filename</span><span class="s3">, </span><span class="s5">'w'</span><span class="s1">) </span><span class="s3">as </span><span class="s1">module_file:</span>
+        <span class="s1">module_file.write(content)</span>
+
+    <span class="s2"># And call f more times prior to reloading: the cache should not be</span>
+    <span class="s2"># invalidated at this point as the active function definition has not</span>
+    <span class="s2"># changed in memory yet.</span>
+    <span class="s1">f(</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">f(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s2"># Now reload</span>
+    <span class="s1">sys.stdout.write(</span><span class="s5">'Reloading</span><span class="s3">\n</span><span class="s5">'</span><span class="s1">)</span>
+    <span class="s1">sys.modules.pop(</span><span class="s5">'tmp_joblib_'</span><span class="s1">)</span>
+    <span class="s3">import </span><span class="s1">tmp_joblib_ </span><span class="s3">as </span><span class="s1">tmp</span>
+    <span class="s1">f = memory.cache(tmp.f)</span>
+
+    <span class="s2"># And call f more times</span>
+    <span class="s1">f(</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">f(</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s1">out</span><span class="s3">, </span><span class="s1">err = capsys.readouterr()</span>
+    <span class="s3">assert </span><span class="s1">out == </span><span class="s5">'1</span><span class="s3">\n</span><span class="s5">2</span><span class="s3">\n</span><span class="s5">Reloading</span><span class="s3">\n</span><span class="s5">x=1</span><span class="s3">\n</span><span class="s5">'</span>
+
+
+<span class="s3">def </span><span class="s1">_function_to_cache(a</span><span class="s3">, </span><span class="s1">b):</span>
+    <span class="s2"># Just a place holder function to be mutated by tests</span>
+    <span class="s3">pass</span>
+
+
+<span class="s3">def </span><span class="s1">_sum(a</span><span class="s3">, </span><span class="s1">b):</span>
+    <span class="s3">return </span><span class="s1">a + b</span>
+
+
+<span class="s3">def </span><span class="s1">_product(a</span><span class="s3">, </span><span class="s1">b):</span>
+    <span class="s3">return </span><span class="s1">a * b</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_in_memory_function_code_change(tmpdir):</span>
+    <span class="s1">_function_to_cache.__code__ = _sum.__code__</span>
+
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">f = memory.cache(_function_to_cache)</span>
+
+    <span class="s3">assert </span><span class="s1">f(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s1">) == </span><span class="s4">3</span>
+    <span class="s3">assert </span><span class="s1">f(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s1">) == </span><span class="s4">3</span>
+
+    <span class="s3">with </span><span class="s1">warns(JobLibCollisionWarning):</span>
+        <span class="s2"># Check that inline function modification triggers a cache invalidation</span>
+        <span class="s1">_function_to_cache.__code__ = _product.__code__</span>
+        <span class="s3">assert </span><span class="s1">f(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s1">) == </span><span class="s4">2</span>
+        <span class="s3">assert </span><span class="s1">f(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s1">) == </span><span class="s4">2</span>
+
+
+<span class="s3">def </span><span class="s1">test_clear_memory_with_none_location():</span>
+    <span class="s1">memory = Memory(location=</span><span class="s3">None</span><span class="s1">)</span>
+    <span class="s1">memory.clear()</span>
+
+
+<span class="s3">def </span><span class="s1">func_with_kwonly_args(a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">kw1=</span><span class="s5">'kw1'</span><span class="s3">, </span><span class="s1">kw2=</span><span class="s5">'kw2'</span><span class="s1">):</span>
+    <span class="s3">return </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">kw1</span><span class="s3">, </span><span class="s1">kw2</span>
+
+
+<span class="s3">def </span><span class="s1">func_with_signature(a: int</span><span class="s3">, </span><span class="s1">b: float) -&gt; float:</span>
+    <span class="s3">return </span><span class="s1">a + b</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_func_with_kwonly_args(tmpdir):</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">func_cached = memory.cache(func_with_kwonly_args)</span>
+
+    <span class="s3">assert </span><span class="s1">func_cached(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s1">kw1=</span><span class="s4">3</span><span class="s1">) == (</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">, </span><span class="s5">'kw2'</span><span class="s1">)</span>
+
+    <span class="s2"># Making sure that providing a keyword-only argument by</span>
+    <span class="s2"># position raises an exception</span>
+    <span class="s3">with </span><span class="s1">raises(ValueError) </span><span class="s3">as </span><span class="s1">excinfo:</span>
+        <span class="s1">func_cached(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">, </span><span class="s1">kw2=</span><span class="s4">4</span><span class="s1">)</span>
+    <span class="s1">excinfo.match(</span><span class="s5">&quot;Keyword-only parameter 'kw1' was passed as positional &quot;</span>
+                  <span class="s5">&quot;parameter&quot;</span><span class="s1">)</span>
+
+    <span class="s2"># Keyword-only parameter passed by position with cached call</span>
+    <span class="s2"># should still raise ValueError</span>
+    <span class="s1">func_cached(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s1">kw1=</span><span class="s4">3</span><span class="s3">, </span><span class="s1">kw2=</span><span class="s4">4</span><span class="s1">)</span>
+
+    <span class="s3">with </span><span class="s1">raises(ValueError) </span><span class="s3">as </span><span class="s1">excinfo:</span>
+        <span class="s1">func_cached(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">, </span><span class="s1">kw2=</span><span class="s4">4</span><span class="s1">)</span>
+    <span class="s1">excinfo.match(</span><span class="s5">&quot;Keyword-only parameter 'kw1' was passed as positional &quot;</span>
+                  <span class="s5">&quot;parameter&quot;</span><span class="s1">)</span>
+
+    <span class="s2"># Test 'ignore' parameter</span>
+    <span class="s1">func_cached = memory.cache(func_with_kwonly_args</span><span class="s3">, </span><span class="s1">ignore=[</span><span class="s5">'kw2'</span><span class="s1">])</span>
+    <span class="s3">assert </span><span class="s1">func_cached(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s1">kw1=</span><span class="s4">3</span><span class="s3">, </span><span class="s1">kw2=</span><span class="s4">4</span><span class="s1">) == (</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">, </span><span class="s4">4</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">func_cached(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s1">kw1=</span><span class="s4">3</span><span class="s3">, </span><span class="s1">kw2=</span><span class="s5">'ignored'</span><span class="s1">) == (</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, </span><span class="s4">3</span><span class="s3">, </span><span class="s4">4</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_func_with_signature(tmpdir):</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">func_cached = memory.cache(func_with_signature)</span>
+
+    <span class="s3">assert </span><span class="s1">func_cached(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2.</span><span class="s1">) == </span><span class="s4">3.</span>
+
+
+<span class="s3">def </span><span class="s1">_setup_toy_cache(tmpdir</span><span class="s3">, </span><span class="s1">num_inputs=</span><span class="s4">10</span><span class="s1">):</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s1">@memory.cache()</span>
+    <span class="s3">def </span><span class="s1">get_1000_bytes(arg):</span>
+        <span class="s3">return </span><span class="s5">'a' </span><span class="s1">* </span><span class="s4">1000</span>
+
+    <span class="s1">inputs = list(range(num_inputs))</span>
+    <span class="s3">for </span><span class="s1">arg </span><span class="s3">in </span><span class="s1">inputs:</span>
+        <span class="s1">get_1000_bytes(arg)</span>
+
+    <span class="s1">func_id = _build_func_identifier(get_1000_bytes)</span>
+    <span class="s1">hash_dirnames = [get_1000_bytes._get_output_identifiers(arg)[</span><span class="s4">1</span><span class="s1">]</span>
+                     <span class="s3">for </span><span class="s1">arg </span><span class="s3">in </span><span class="s1">inputs]</span>
+
+    <span class="s1">full_hashdirs = [os.path.join(get_1000_bytes.store_backend.location</span><span class="s3">,</span>
+                                  <span class="s1">func_id</span><span class="s3">, </span><span class="s1">dirname)</span>
+                     <span class="s3">for </span><span class="s1">dirname </span><span class="s3">in </span><span class="s1">hash_dirnames]</span>
+    <span class="s3">return </span><span class="s1">memory</span><span class="s3">, </span><span class="s1">full_hashdirs</span><span class="s3">, </span><span class="s1">get_1000_bytes</span>
+
+
+<span class="s3">def </span><span class="s1">test__get_items(tmpdir):</span>
+    <span class="s1">memory</span><span class="s3">, </span><span class="s1">expected_hash_dirs</span><span class="s3">, </span><span class="s1">_ = _setup_toy_cache(tmpdir)</span>
+    <span class="s1">items = memory.store_backend.get_items()</span>
+    <span class="s1">hash_dirs = [ci.path </span><span class="s3">for </span><span class="s1">ci </span><span class="s3">in </span><span class="s1">items]</span>
+    <span class="s3">assert </span><span class="s1">set(hash_dirs) == set(expected_hash_dirs)</span>
+
+    <span class="s3">def </span><span class="s1">get_files_size(directory):</span>
+        <span class="s1">full_paths = [os.path.join(directory</span><span class="s3">, </span><span class="s1">fn)</span>
+                      <span class="s3">for </span><span class="s1">fn </span><span class="s3">in </span><span class="s1">os.listdir(directory)]</span>
+        <span class="s3">return </span><span class="s1">sum(os.path.getsize(fp) </span><span class="s3">for </span><span class="s1">fp </span><span class="s3">in </span><span class="s1">full_paths)</span>
+
+    <span class="s1">expected_hash_cache_sizes = [get_files_size(hash_dir)</span>
+                                 <span class="s3">for </span><span class="s1">hash_dir </span><span class="s3">in </span><span class="s1">hash_dirs]</span>
+    <span class="s1">hash_cache_sizes = [ci.size </span><span class="s3">for </span><span class="s1">ci </span><span class="s3">in </span><span class="s1">items]</span>
+    <span class="s3">assert </span><span class="s1">hash_cache_sizes == expected_hash_cache_sizes</span>
+
+    <span class="s1">output_filenames = [os.path.join(hash_dir</span><span class="s3">, </span><span class="s5">'output.pkl'</span><span class="s1">)</span>
+                        <span class="s3">for </span><span class="s1">hash_dir </span><span class="s3">in </span><span class="s1">hash_dirs]</span>
+
+    <span class="s1">expected_last_accesses = [</span>
+        <span class="s1">datetime.datetime.fromtimestamp(os.path.getatime(fn))</span>
+        <span class="s3">for </span><span class="s1">fn </span><span class="s3">in </span><span class="s1">output_filenames]</span>
+    <span class="s1">last_accesses = [ci.last_access </span><span class="s3">for </span><span class="s1">ci </span><span class="s3">in </span><span class="s1">items]</span>
+    <span class="s3">assert </span><span class="s1">last_accesses == expected_last_accesses</span>
+
+
+<span class="s3">def </span><span class="s1">test__get_items_to_delete(tmpdir):</span>
+    <span class="s1">memory</span><span class="s3">, </span><span class="s1">expected_hash_cachedirs</span><span class="s3">, </span><span class="s1">_ = _setup_toy_cache(tmpdir)</span>
+    <span class="s1">items = memory.store_backend.get_items()</span>
+    <span class="s2"># bytes_limit set to keep only one cache item (each hash cache</span>
+    <span class="s2"># folder is about 1000 bytes + metadata)</span>
+    <span class="s1">items_to_delete = memory.store_backend._get_items_to_delete(</span><span class="s5">'2K'</span><span class="s1">)</span>
+    <span class="s1">nb_hashes = len(expected_hash_cachedirs)</span>
+    <span class="s3">assert </span><span class="s1">set.issubset(set(items_to_delete)</span><span class="s3">, </span><span class="s1">set(items))</span>
+    <span class="s3">assert </span><span class="s1">len(items_to_delete) == nb_hashes - </span><span class="s4">1</span>
+
+    <span class="s2"># Sanity check bytes_limit=2048 is the same as bytes_limit='2K'</span>
+    <span class="s1">items_to_delete_2048b = memory.store_backend._get_items_to_delete(</span><span class="s4">2048</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">sorted(items_to_delete) == sorted(items_to_delete_2048b)</span>
+
+    <span class="s2"># bytes_limit greater than the size of the cache</span>
+    <span class="s1">items_to_delete_empty = memory.store_backend._get_items_to_delete(</span><span class="s5">'1M'</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">items_to_delete_empty == []</span>
+
+    <span class="s2"># All the cache items need to be deleted</span>
+    <span class="s1">bytes_limit_too_small = </span><span class="s4">500</span>
+    <span class="s1">items_to_delete_500b = memory.store_backend._get_items_to_delete(</span>
+        <span class="s1">bytes_limit_too_small</span>
+    <span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">set(items_to_delete_500b)</span><span class="s3">, </span><span class="s1">set(items)</span>
+
+    <span class="s2"># Test LRU property: surviving cache items should all have a more</span>
+    <span class="s2"># recent last_access that the ones that have been deleted</span>
+    <span class="s1">items_to_delete_6000b = memory.store_backend._get_items_to_delete(</span><span class="s4">6000</span><span class="s1">)</span>
+    <span class="s1">surviving_items = set(items).difference(items_to_delete_6000b)</span>
+
+    <span class="s3">assert </span><span class="s1">(max(ci.last_access </span><span class="s3">for </span><span class="s1">ci </span><span class="s3">in </span><span class="s1">items_to_delete_6000b) &lt;=</span>
+            <span class="s1">min(ci.last_access </span><span class="s3">for </span><span class="s1">ci </span><span class="s3">in </span><span class="s1">surviving_items))</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_reduce_size_bytes_limit(tmpdir):</span>
+    <span class="s1">memory</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_ = _setup_toy_cache(tmpdir)</span>
+    <span class="s1">ref_cache_items = memory.store_backend.get_items()</span>
+
+    <span class="s2"># By default memory.bytes_limit is None and reduce_size is a noop</span>
+    <span class="s1">memory.reduce_size()</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert </span><span class="s1">sorted(ref_cache_items) == sorted(cache_items)</span>
+
+    <span class="s2"># No cache items deleted if bytes_limit greater than the size of</span>
+    <span class="s2"># the cache</span>
+    <span class="s1">memory.reduce_size(bytes_limit=</span><span class="s5">'1M'</span><span class="s1">)</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert </span><span class="s1">sorted(ref_cache_items) == sorted(cache_items)</span>
+
+    <span class="s2"># bytes_limit is set so that only two cache items are kept</span>
+    <span class="s1">memory.reduce_size(bytes_limit=</span><span class="s5">'3K'</span><span class="s1">)</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert </span><span class="s1">set.issubset(set(cache_items)</span><span class="s3">, </span><span class="s1">set(ref_cache_items))</span>
+    <span class="s3">assert </span><span class="s1">len(cache_items) == </span><span class="s4">2</span>
+
+    <span class="s2"># bytes_limit set so that no cache item is kept</span>
+    <span class="s1">bytes_limit_too_small = </span><span class="s4">500</span>
+    <span class="s1">memory.reduce_size(bytes_limit=bytes_limit_too_small)</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert </span><span class="s1">cache_items == []</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_reduce_size_items_limit(tmpdir):</span>
+    <span class="s1">memory</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_ = _setup_toy_cache(tmpdir)</span>
+    <span class="s1">ref_cache_items = memory.store_backend.get_items()</span>
+
+    <span class="s2"># By default reduce_size is a noop</span>
+    <span class="s1">memory.reduce_size()</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert </span><span class="s1">sorted(ref_cache_items) == sorted(cache_items)</span>
+
+    <span class="s2"># No cache items deleted if items_limit greater than the size of</span>
+    <span class="s2"># the cache</span>
+    <span class="s1">memory.reduce_size(items_limit=</span><span class="s4">10</span><span class="s1">)</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert </span><span class="s1">sorted(ref_cache_items) == sorted(cache_items)</span>
+
+    <span class="s2"># items_limit is set so that only two cache items are kept</span>
+    <span class="s1">memory.reduce_size(items_limit=</span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert </span><span class="s1">set.issubset(set(cache_items)</span><span class="s3">, </span><span class="s1">set(ref_cache_items))</span>
+    <span class="s3">assert </span><span class="s1">len(cache_items) == </span><span class="s4">2</span>
+
+    <span class="s2"># item_limit set so that no cache item is kept</span>
+    <span class="s1">memory.reduce_size(items_limit=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert </span><span class="s1">cache_items == []</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_reduce_size_age_limit(tmpdir):</span>
+    <span class="s3">import </span><span class="s1">time</span>
+    <span class="s3">import </span><span class="s1">datetime</span>
+    <span class="s1">memory</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">put_cache = _setup_toy_cache(tmpdir)</span>
+    <span class="s1">ref_cache_items = memory.store_backend.get_items()</span>
+
+    <span class="s2"># By default reduce_size is a noop</span>
+    <span class="s1">memory.reduce_size()</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert </span><span class="s1">sorted(ref_cache_items) == sorted(cache_items)</span>
+
+    <span class="s2"># No cache items deleted if age_limit big.</span>
+    <span class="s1">memory.reduce_size(age_limit=datetime.timedelta(days=</span><span class="s4">1</span><span class="s1">))</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert </span><span class="s1">sorted(ref_cache_items) == sorted(cache_items)</span>
+
+    <span class="s2"># age_limit is set so that only two cache items are kept</span>
+    <span class="s1">time.sleep(</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">put_cache(-</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">put_cache(-</span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s1">memory.reduce_size(age_limit=datetime.timedelta(seconds=</span><span class="s4">1</span><span class="s1">))</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert not </span><span class="s1">set.issubset(set(cache_items)</span><span class="s3">, </span><span class="s1">set(ref_cache_items))</span>
+    <span class="s3">assert </span><span class="s1">len(cache_items) == </span><span class="s4">2</span>
+
+    <span class="s2"># age_limit set so that no cache item is kept</span>
+    <span class="s1">memory.reduce_size(age_limit=datetime.timedelta(seconds=</span><span class="s4">0</span><span class="s1">))</span>
+    <span class="s1">cache_items = memory.store_backend.get_items()</span>
+    <span class="s3">assert </span><span class="s1">cache_items == []</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_clear(tmpdir):</span>
+    <span class="s1">memory</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">g = _setup_toy_cache(tmpdir)</span>
+    <span class="s1">memory.clear()</span>
+
+    <span class="s3">assert </span><span class="s1">os.listdir(memory.store_backend.location) == []</span>
+
+    <span class="s2"># Check that the cache for functions hash is also reset.</span>
+    <span class="s3">assert not </span><span class="s1">g._check_previous_func_code(stacklevel=</span><span class="s4">4</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">fast_func_with_complex_output():</span>
+    <span class="s1">complex_obj = [</span><span class="s5">'a' </span><span class="s1">* </span><span class="s4">1000</span><span class="s1">] * </span><span class="s4">1000</span>
+    <span class="s3">return </span><span class="s1">complex_obj</span>
+
+
+<span class="s3">def </span><span class="s1">fast_func_with_conditional_complex_output(complex_output=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s1">complex_obj = {str(i): i </span><span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(int(</span><span class="s4">1e5</span><span class="s1">))}</span>
+    <span class="s3">return </span><span class="s1">complex_obj </span><span class="s3">if </span><span class="s1">complex_output </span><span class="s3">else </span><span class="s5">'simple output'</span>
+
+
+<span class="s1">@with_multiprocessing</span>
+<span class="s3">def </span><span class="s1">test_cached_function_race_condition_when_persisting_output(tmpdir</span><span class="s3">, </span><span class="s1">capfd):</span>
+    <span class="s2"># Test race condition where multiple processes are writing into</span>
+    <span class="s2"># the same output.pkl. See</span>
+    <span class="s2"># https://github.com/joblib/joblib/issues/490 for more details.</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath)</span>
+    <span class="s1">func_cached = memory.cache(fast_func_with_complex_output)</span>
+
+    <span class="s1">Parallel(n_jobs=</span><span class="s4">2</span><span class="s1">)(delayed(func_cached)() </span><span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">3</span><span class="s1">))</span>
+
+    <span class="s1">stdout</span><span class="s3">, </span><span class="s1">stderr = capfd.readouterr()</span>
+
+    <span class="s2"># Checking both stdout and stderr (ongoing PR #434 may change</span>
+    <span class="s2"># logging destination) to make sure there is no exception while</span>
+    <span class="s2"># loading the results</span>
+    <span class="s1">exception_msg = </span><span class="s5">'Exception while loading results'</span>
+    <span class="s3">assert </span><span class="s1">exception_msg </span><span class="s3">not in </span><span class="s1">stdout</span>
+    <span class="s3">assert </span><span class="s1">exception_msg </span><span class="s3">not in </span><span class="s1">stderr</span>
+
+
+<span class="s1">@with_multiprocessing</span>
+<span class="s3">def </span><span class="s1">test_cached_function_race_condition_when_persisting_output_2(tmpdir</span><span class="s3">,</span>
+                                                                 <span class="s1">capfd):</span>
+    <span class="s2"># Test race condition in first attempt at solving</span>
+    <span class="s2"># https://github.com/joblib/joblib/issues/490. The race condition</span>
+    <span class="s2"># was due to the delay between seeing the cache directory created</span>
+    <span class="s2"># (interpreted as the result being cached) and the output.pkl being</span>
+    <span class="s2"># pickled.</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath)</span>
+    <span class="s1">func_cached = memory.cache(fast_func_with_conditional_complex_output)</span>
+
+    <span class="s1">Parallel(n_jobs=</span><span class="s4">2</span><span class="s1">)(delayed(func_cached)(</span><span class="s3">True if </span><span class="s1">i % </span><span class="s4">2 </span><span class="s1">== </span><span class="s4">0 </span><span class="s3">else False</span><span class="s1">)</span>
+                       <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">3</span><span class="s1">))</span>
+
+    <span class="s1">stdout</span><span class="s3">, </span><span class="s1">stderr = capfd.readouterr()</span>
+
+    <span class="s2"># Checking both stdout and stderr (ongoing PR #434 may change</span>
+    <span class="s2"># logging destination) to make sure there is no exception while</span>
+    <span class="s2"># loading the results</span>
+    <span class="s1">exception_msg = </span><span class="s5">'Exception while loading results'</span>
+    <span class="s3">assert </span><span class="s1">exception_msg </span><span class="s3">not in </span><span class="s1">stdout</span>
+    <span class="s3">assert </span><span class="s1">exception_msg </span><span class="s3">not in </span><span class="s1">stderr</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_recomputes_after_an_error_while_loading_results(</span>
+        <span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">monkeypatch):</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath)</span>
+
+    <span class="s3">def </span><span class="s1">func(arg):</span>
+        <span class="s2"># This makes sure that the timestamp returned by two calls of</span>
+        <span class="s2"># func are different. This is needed on Windows where</span>
+        <span class="s2"># time.time resolution may not be accurate enough</span>
+        <span class="s1">time.sleep(</span><span class="s4">0.01</span><span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">arg</span><span class="s3">, </span><span class="s1">time.time()</span>
+
+    <span class="s1">cached_func = memory.cache(func)</span>
+    <span class="s1">input_arg = </span><span class="s5">'arg'</span>
+    <span class="s1">arg</span><span class="s3">, </span><span class="s1">timestamp = cached_func(input_arg)</span>
+
+    <span class="s2"># Make sure the function is correctly cached</span>
+    <span class="s3">assert </span><span class="s1">arg == input_arg</span>
+
+    <span class="s2"># Corrupting output.pkl to make sure that an error happens when</span>
+    <span class="s2"># loading the cached result</span>
+    <span class="s1">corrupt_single_cache_item(memory)</span>
+
+    <span class="s2"># Make sure that corrupting the file causes recomputation and that</span>
+    <span class="s2"># a warning is issued.</span>
+    <span class="s1">recorded_warnings = monkeypatch_cached_func_warn(cached_func</span><span class="s3">, </span><span class="s1">monkeypatch)</span>
+    <span class="s1">recomputed_arg</span><span class="s3">, </span><span class="s1">recomputed_timestamp = cached_func(arg)</span>
+    <span class="s3">assert </span><span class="s1">len(recorded_warnings) == </span><span class="s4">1</span>
+    <span class="s1">exception_msg = </span><span class="s5">'Exception while loading results'</span>
+    <span class="s3">assert </span><span class="s1">exception_msg </span><span class="s3">in </span><span class="s1">recorded_warnings[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s3">assert </span><span class="s1">recomputed_arg == arg</span>
+    <span class="s3">assert </span><span class="s1">recomputed_timestamp &gt; timestamp</span>
+
+    <span class="s2"># Corrupting output.pkl to make sure that an error happens when</span>
+    <span class="s2"># loading the cached result</span>
+    <span class="s1">corrupt_single_cache_item(memory)</span>
+    <span class="s1">reference = cached_func.call_and_shelve(arg)</span>
+    <span class="s3">try</span><span class="s1">:</span>
+        <span class="s1">reference.get()</span>
+        <span class="s3">raise </span><span class="s1">AssertionError(</span>
+            <span class="s5">&quot;It normally not possible to load a corrupted&quot;</span>
+            <span class="s5">&quot; MemorizedResult&quot;</span>
+        <span class="s1">)</span>
+    <span class="s3">except </span><span class="s1">KeyError </span><span class="s3">as </span><span class="s1">e:</span>
+        <span class="s1">message = </span><span class="s5">&quot;is corrupted&quot;</span>
+        <span class="s3">assert </span><span class="s1">message </span><span class="s3">in </span><span class="s1">str(e.args)</span>
+
+
+<span class="s3">class </span><span class="s1">IncompleteStoreBackend(StoreBackendBase):</span>
+    <span class="s0">&quot;&quot;&quot;This backend cannot be instantiated and should raise a TypeError.&quot;&quot;&quot;</span>
+    <span class="s3">pass</span>
+
+
+<span class="s3">class </span><span class="s1">DummyStoreBackend(StoreBackendBase):</span>
+    <span class="s0">&quot;&quot;&quot;A dummy store backend that does nothing.&quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">_open_item(self</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot;Open an item on store.&quot;&quot;&quot;</span>
+        <span class="s5">&quot;Does nothing&quot;</span>
+
+    <span class="s3">def </span><span class="s1">_item_exists(self</span><span class="s3">, </span><span class="s1">location):</span>
+        <span class="s0">&quot;&quot;&quot;Check if an item location exists.&quot;&quot;&quot;</span>
+        <span class="s5">&quot;Does nothing&quot;</span>
+
+    <span class="s3">def </span><span class="s1">_move_item(self</span><span class="s3">, </span><span class="s1">src</span><span class="s3">, </span><span class="s1">dst):</span>
+        <span class="s0">&quot;&quot;&quot;Move an item from src to dst in store.&quot;&quot;&quot;</span>
+        <span class="s5">&quot;Does nothing&quot;</span>
+
+    <span class="s3">def </span><span class="s1">create_location(self</span><span class="s3">, </span><span class="s1">location):</span>
+        <span class="s0">&quot;&quot;&quot;Create location on store.&quot;&quot;&quot;</span>
+        <span class="s5">&quot;Does nothing&quot;</span>
+
+    <span class="s3">def </span><span class="s1">exists(self</span><span class="s3">, </span><span class="s1">obj):</span>
+        <span class="s0">&quot;&quot;&quot;Check if an object exists in the store&quot;&quot;&quot;</span>
+        <span class="s3">return False</span>
+
+    <span class="s3">def </span><span class="s1">clear_location(self</span><span class="s3">, </span><span class="s1">obj):</span>
+        <span class="s0">&quot;&quot;&quot;Clear object on store&quot;&quot;&quot;</span>
+        <span class="s5">&quot;Does nothing&quot;</span>
+
+    <span class="s3">def </span><span class="s1">get_items(self):</span>
+        <span class="s0">&quot;&quot;&quot;Returns the whole list of items available in cache.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">[]</span>
+
+    <span class="s3">def </span><span class="s1">configure(self</span><span class="s3">, </span><span class="s1">location</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot;Configure the store&quot;&quot;&quot;</span>
+        <span class="s5">&quot;Does nothing&quot;</span>
+
+
+<span class="s1">@parametrize(</span><span class="s5">&quot;invalid_prefix&quot;</span><span class="s3">, </span><span class="s1">[</span><span class="s3">None, </span><span class="s1">dict()</span><span class="s3">, </span><span class="s1">list()])</span>
+<span class="s3">def </span><span class="s1">test_register_invalid_store_backends_key(invalid_prefix):</span>
+    <span class="s2"># verify the right exceptions are raised when passing a wrong backend key.</span>
+    <span class="s3">with </span><span class="s1">raises(ValueError) </span><span class="s3">as </span><span class="s1">excinfo:</span>
+        <span class="s1">register_store_backend(invalid_prefix</span><span class="s3">, None</span><span class="s1">)</span>
+    <span class="s1">excinfo.match(</span><span class="s5">r'Store backend name should be a string*'</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">test_register_invalid_store_backends_object():</span>
+    <span class="s2"># verify the right exceptions are raised when passing a wrong backend</span>
+    <span class="s2"># object.</span>
+    <span class="s3">with </span><span class="s1">raises(ValueError) </span><span class="s3">as </span><span class="s1">excinfo:</span>
+        <span class="s1">register_store_backend(</span><span class="s5">&quot;fs&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+    <span class="s1">excinfo.match(</span><span class="s5">r'Store backend should inherit StoreBackendBase*'</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_default_store_backend():</span>
+    <span class="s2"># test an unknown backend falls back into a FileSystemStoreBackend</span>
+    <span class="s3">with </span><span class="s1">raises(TypeError) </span><span class="s3">as </span><span class="s1">excinfo:</span>
+        <span class="s1">Memory(location=</span><span class="s5">'/tmp/joblib'</span><span class="s3">, </span><span class="s1">backend=</span><span class="s5">'unknown'</span><span class="s1">)</span>
+    <span class="s1">excinfo.match(</span><span class="s5">r&quot;Unknown location*&quot;</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">test_warning_on_unknown_location_type():</span>
+    <span class="s3">class </span><span class="s1">NonSupportedLocationClass:</span>
+        <span class="s3">pass</span>
+    <span class="s1">unsupported_location = NonSupportedLocationClass()</span>
+
+    <span class="s3">with </span><span class="s1">warns(UserWarning) </span><span class="s3">as </span><span class="s1">warninfo:</span>
+        <span class="s1">_store_backend_factory(</span><span class="s5">&quot;local&quot;</span><span class="s3">, </span><span class="s1">location=unsupported_location)</span>
+
+    <span class="s1">expected_mesage = (</span><span class="s5">&quot;Instantiating a backend using a &quot;</span>
+                       <span class="s5">&quot;NonSupportedLocationClass as a location is not &quot;</span>
+                       <span class="s5">&quot;supported by joblib&quot;</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">expected_mesage </span><span class="s3">in </span><span class="s1">str(warninfo[</span><span class="s4">0</span><span class="s1">].message)</span>
+
+
+<span class="s3">def </span><span class="s1">test_instanciate_incomplete_store_backend():</span>
+    <span class="s2"># Verify that registering an external incomplete store backend raises an</span>
+    <span class="s2"># exception when one tries to instantiate it.</span>
+    <span class="s1">backend_name = </span><span class="s5">&quot;isb&quot;</span>
+    <span class="s1">register_store_backend(backend_name</span><span class="s3">, </span><span class="s1">IncompleteStoreBackend)</span>
+    <span class="s3">assert </span><span class="s1">(backend_name</span><span class="s3">, </span><span class="s1">IncompleteStoreBackend) </span><span class="s3">in </span><span class="s1">_STORE_BACKENDS.items()</span>
+    <span class="s3">with </span><span class="s1">raises(TypeError) </span><span class="s3">as </span><span class="s1">excinfo:</span>
+        <span class="s1">_store_backend_factory(backend_name</span><span class="s3">, </span><span class="s5">&quot;fake_location&quot;</span><span class="s1">)</span>
+    <span class="s1">excinfo.match(</span><span class="s5">r&quot;Can't instantiate abstract class IncompleteStoreBackend &quot;</span>
+                  <span class="s5">&quot;(without an implementation for|with) abstract methods*&quot;</span><span class="s1">)</span>
+
+
+<span class="s3">def </span><span class="s1">test_dummy_store_backend():</span>
+    <span class="s2"># Verify that registering an external store backend works.</span>
+
+    <span class="s1">backend_name = </span><span class="s5">&quot;dsb&quot;</span>
+    <span class="s1">register_store_backend(backend_name</span><span class="s3">, </span><span class="s1">DummyStoreBackend)</span>
+    <span class="s3">assert </span><span class="s1">(backend_name</span><span class="s3">, </span><span class="s1">DummyStoreBackend) </span><span class="s3">in </span><span class="s1">_STORE_BACKENDS.items()</span>
+
+    <span class="s1">backend_obj = _store_backend_factory(backend_name</span><span class="s3">, </span><span class="s5">&quot;dummy_location&quot;</span><span class="s1">)</span>
+    <span class="s3">assert </span><span class="s1">isinstance(backend_obj</span><span class="s3">, </span><span class="s1">DummyStoreBackend)</span>
+
+
+<span class="s3">def </span><span class="s1">test_instanciate_store_backend_with_pathlib_path():</span>
+    <span class="s2"># Instantiate a FileSystemStoreBackend using a pathlib.Path object</span>
+    <span class="s1">path = pathlib.Path(</span><span class="s5">&quot;some_folder&quot;</span><span class="s1">)</span>
+    <span class="s1">backend_obj = _store_backend_factory(</span><span class="s5">&quot;local&quot;</span><span class="s3">, </span><span class="s1">path)</span>
+    <span class="s3">assert </span><span class="s1">backend_obj.location == </span><span class="s5">&quot;some_folder&quot;</span>
+
+
+<span class="s3">def </span><span class="s1">test_filesystem_store_backend_repr(tmpdir):</span>
+    <span class="s2"># Verify string representation of a filesystem store backend.</span>
+
+    <span class="s1">repr_pattern = </span><span class="s5">'FileSystemStoreBackend(location=&quot;{location}&quot;)'</span>
+    <span class="s1">backend = FileSystemStoreBackend()</span>
+    <span class="s3">assert </span><span class="s1">backend.location </span><span class="s3">is None</span>
+
+    <span class="s1">repr(backend)  </span><span class="s2"># Should not raise an exception</span>
+
+    <span class="s3">assert </span><span class="s1">str(backend) == repr_pattern.format(location=</span><span class="s3">None</span><span class="s1">)</span>
+
+    <span class="s2"># backend location is passed explicitly via the configure method (called</span>
+    <span class="s2"># by the internal _store_backend_factory function)</span>
+    <span class="s1">backend.configure(tmpdir.strpath)</span>
+
+    <span class="s3">assert </span><span class="s1">str(backend) == repr_pattern.format(location=tmpdir.strpath)</span>
+
+    <span class="s1">repr(backend)  </span><span class="s2"># Should not raise an exception</span>
+
+
+<span class="s3">def </span><span class="s1">test_memory_objects_repr(tmpdir):</span>
+    <span class="s2"># Verify printable reprs of MemorizedResult, MemorizedFunc and Memory.</span>
+
+    <span class="s3">def </span><span class="s1">my_func(a</span><span class="s3">, </span><span class="s1">b):</span>
+        <span class="s3">return </span><span class="s1">a + b</span>
+
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">memorized_func = memory.cache(my_func)</span>
+
+    <span class="s1">memorized_func_repr = </span><span class="s5">'MemorizedFunc(func={func}, location={location})'</span>
+
+    <span class="s3">assert </span><span class="s1">str(memorized_func) == memorized_func_repr.format(</span>
+        <span class="s1">func=my_func</span><span class="s3">,</span>
+        <span class="s1">location=memory.store_backend.location)</span>
+
+    <span class="s1">memorized_result = memorized_func.call_and_shelve(</span><span class="s4">42</span><span class="s3">, </span><span class="s4">42</span><span class="s1">)</span>
+
+    <span class="s1">memorized_result_repr = (</span><span class="s5">'MemorizedResult(location=&quot;{location}&quot;, '</span>
+                             <span class="s5">'func=&quot;{func}&quot;, args_id=&quot;{args_id}&quot;)'</span><span class="s1">)</span>
+
+    <span class="s3">assert </span><span class="s1">str(memorized_result) == memorized_result_repr.format(</span>
+        <span class="s1">location=memory.store_backend.location</span><span class="s3">,</span>
+        <span class="s1">func=memorized_result.func_id</span><span class="s3">,</span>
+        <span class="s1">args_id=memorized_result.args_id)</span>
+
+    <span class="s3">assert </span><span class="s1">str(memory) == </span><span class="s5">'Memory(location={location})'</span><span class="s1">.format(</span>
+        <span class="s1">location=memory.store_backend.location)</span>
+
+
+<span class="s3">def </span><span class="s1">test_memorized_result_pickle(tmpdir):</span>
+    <span class="s2"># Verify a MemoryResult object can be pickled/depickled. Non regression</span>
+    <span class="s2"># test introduced following issue</span>
+    <span class="s2"># https://github.com/joblib/joblib/issues/747</span>
+
+    <span class="s1">memory = Memory(location=tmpdir.strpath)</span>
+
+    <span class="s1">@memory.cache</span>
+    <span class="s3">def </span><span class="s1">g(x):</span>
+        <span class="s3">return </span><span class="s1">x**</span><span class="s4">2</span>
+
+    <span class="s1">memorized_result = g.call_and_shelve(</span><span class="s4">4</span><span class="s1">)</span>
+    <span class="s1">memorized_result_pickle = pickle.dumps(memorized_result)</span>
+    <span class="s1">memorized_result_loads = pickle.loads(memorized_result_pickle)</span>
+
+    <span class="s3">assert </span><span class="s1">memorized_result.store_backend.location == \</span>
+        <span class="s1">memorized_result_loads.store_backend.location</span>
+    <span class="s3">assert </span><span class="s1">memorized_result.func == memorized_result_loads.func</span>
+    <span class="s3">assert </span><span class="s1">memorized_result.args_id == memorized_result_loads.args_id</span>
+    <span class="s3">assert </span><span class="s1">str(memorized_result) == str(memorized_result_loads)</span>
+
+
+<span class="s3">def </span><span class="s1">compare(left</span><span class="s3">, </span><span class="s1">right</span><span class="s3">, </span><span class="s1">ignored_attrs=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s3">if </span><span class="s1">ignored_attrs </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">ignored_attrs = []</span>
+
+    <span class="s1">left_vars = vars(left)</span>
+    <span class="s1">right_vars = vars(right)</span>
+    <span class="s3">assert </span><span class="s1">set(left_vars.keys()) == set(right_vars.keys())</span>
+    <span class="s3">for </span><span class="s1">attr </span><span class="s3">in </span><span class="s1">left_vars.keys():</span>
+        <span class="s3">if </span><span class="s1">attr </span><span class="s3">in </span><span class="s1">ignored_attrs:</span>
+            <span class="s3">continue</span>
+        <span class="s3">assert </span><span class="s1">left_vars[attr] == right_vars[attr]</span>
+
+
+<span class="s1">@pytest.mark.parametrize(</span><span class="s5">'memory_kwargs'</span><span class="s3">,</span>
+                         <span class="s1">[{</span><span class="s5">'compress'</span><span class="s1">: </span><span class="s4">3</span><span class="s3">, </span><span class="s5">'verbose'</span><span class="s1">: </span><span class="s4">2</span><span class="s1">}</span><span class="s3">,</span>
+                          <span class="s1">{</span><span class="s5">'mmap_mode'</span><span class="s1">: </span><span class="s5">'r'</span><span class="s3">, </span><span class="s5">'verbose'</span><span class="s1">: </span><span class="s4">5</span><span class="s3">,</span>
+                           <span class="s5">'backend_options'</span><span class="s1">: {</span><span class="s5">'parameter'</span><span class="s1">: </span><span class="s5">'unused'</span><span class="s1">}}])</span>
+<span class="s3">def </span><span class="s1">test_memory_pickle_dump_load(tmpdir</span><span class="s3">, </span><span class="s1">memory_kwargs):</span>
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">**memory_kwargs)</span>
+
+    <span class="s1">memory_reloaded = pickle.loads(pickle.dumps(memory))</span>
+
+    <span class="s2"># Compare Memory instance before and after pickle roundtrip</span>
+    <span class="s1">compare(memory.store_backend</span><span class="s3">, </span><span class="s1">memory_reloaded.store_backend)</span>
+    <span class="s1">compare(memory</span><span class="s3">, </span><span class="s1">memory_reloaded</span><span class="s3">,</span>
+            <span class="s1">ignored_attrs=set([</span><span class="s5">'store_backend'</span><span class="s3">, </span><span class="s5">'timestamp'</span><span class="s3">, </span><span class="s5">'_func_code_id'</span><span class="s1">]))</span>
+    <span class="s3">assert </span><span class="s1">hash(memory) == hash(memory_reloaded)</span>
+
+    <span class="s1">func_cached = memory.cache(f)</span>
+
+    <span class="s1">func_cached_reloaded = pickle.loads(pickle.dumps(func_cached))</span>
+
+    <span class="s2"># Compare MemorizedFunc instance before/after pickle roundtrip</span>
+    <span class="s1">compare(func_cached.store_backend</span><span class="s3">, </span><span class="s1">func_cached_reloaded.store_backend)</span>
+    <span class="s1">compare(func_cached</span><span class="s3">, </span><span class="s1">func_cached_reloaded</span><span class="s3">,</span>
+            <span class="s1">ignored_attrs=set([</span><span class="s5">'store_backend'</span><span class="s3">, </span><span class="s5">'timestamp'</span><span class="s3">, </span><span class="s5">'_func_code_id'</span><span class="s1">]))</span>
+    <span class="s3">assert </span><span class="s1">hash(func_cached) == hash(func_cached_reloaded)</span>
+
+    <span class="s2"># Compare MemorizedResult instance before/after pickle roundtrip</span>
+    <span class="s1">memorized_result = func_cached.call_and_shelve(</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">memorized_result_reloaded = pickle.loads(pickle.dumps(memorized_result))</span>
+
+    <span class="s1">compare(memorized_result.store_backend</span><span class="s3">,</span>
+            <span class="s1">memorized_result_reloaded.store_backend)</span>
+    <span class="s1">compare(memorized_result</span><span class="s3">, </span><span class="s1">memorized_result_reloaded</span><span class="s3">,</span>
+            <span class="s1">ignored_attrs=set([</span><span class="s5">'store_backend'</span><span class="s3">, </span><span class="s5">'timestamp'</span><span class="s3">, </span><span class="s5">'_func_code_id'</span><span class="s1">]))</span>
+    <span class="s3">assert </span><span class="s1">hash(memorized_result) == hash(memorized_result_reloaded)</span>
+
+
+<span class="s3">def </span><span class="s1">test_info_log(tmpdir</span><span class="s3">, </span><span class="s1">caplog):</span>
+    <span class="s1">caplog.set_level(logging.INFO)</span>
+    <span class="s1">x = </span><span class="s4">3</span>
+
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">20</span><span class="s1">)</span>
+
+    <span class="s1">@memory.cache</span>
+    <span class="s3">def </span><span class="s1">f(x):</span>
+        <span class="s3">return </span><span class="s1">x ** </span><span class="s4">2</span>
+
+    <span class="s1">_ = f(x)</span>
+    <span class="s3">assert </span><span class="s5">&quot;Querying&quot; </span><span class="s3">in </span><span class="s1">caplog.text</span>
+    <span class="s1">caplog.clear()</span>
+
+    <span class="s1">memory = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">verbose=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s1">@memory.cache</span>
+    <span class="s3">def </span><span class="s1">f(x):</span>
+        <span class="s3">return </span><span class="s1">x ** </span><span class="s4">2</span>
+
+    <span class="s1">_ = f(x)</span>
+    <span class="s3">assert </span><span class="s5">&quot;Querying&quot; </span><span class="s3">not in </span><span class="s1">caplog.text</span>
+    <span class="s1">caplog.clear()</span>
+
+
+<span class="s3">def </span><span class="s1">test_deprecated_bytes_limit(tmpdir):</span>
+    <span class="s3">from </span><span class="s1">joblib </span><span class="s3">import </span><span class="s1">__version__</span>
+    <span class="s3">if </span><span class="s1">__version__ &gt;= </span><span class="s5">&quot;1.5&quot;</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">DeprecationWarning(</span>
+            <span class="s5">&quot;Bytes limit is deprecated and should be removed by 1.4&quot;</span>
+        <span class="s1">)</span>
+    <span class="s3">with </span><span class="s1">pytest.warns(DeprecationWarning</span><span class="s3">, </span><span class="s1">match=</span><span class="s5">&quot;bytes_limit&quot;</span><span class="s1">):</span>
+        <span class="s1">_ = Memory(location=tmpdir.strpath</span><span class="s3">, </span><span class="s1">bytes_limit=</span><span class="s5">'1K'</span><span class="s1">)</span>
+
+
+<span class="s3">class </span><span class="s1">TestCacheValidationCallback:</span>
+    <span class="s0">&quot;Tests on parameter `cache_validation_callback`&quot;</span>
+
+    <span class="s1">@pytest.fixture()</span>
+    <span class="s3">def </span><span class="s1">memory(self</span><span class="s3">, </span><span class="s1">tmp_path):</span>
+        <span class="s1">mem = Memory(location=tmp_path)</span>
+        <span class="s3">yield </span><span class="s1">mem</span>
+        <span class="s1">mem.clear()</span>
+
+    <span class="s3">def </span><span class="s1">foo(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">d</span><span class="s3">, </span><span class="s1">delay=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s1">d[</span><span class="s5">&quot;run&quot;</span><span class="s1">] = </span><span class="s3">True</span>
+        <span class="s3">if </span><span class="s1">delay </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">time.sleep(delay)</span>
+        <span class="s3">return </span><span class="s1">x * </span><span class="s4">2</span>
+
+    <span class="s3">def </span><span class="s1">test_invalid_cache_validation_callback(self</span><span class="s3">, </span><span class="s1">memory):</span>
+        <span class="s0">&quot;Test invalid values for `cache_validation_callback&quot;</span>
+        <span class="s1">match = </span><span class="s5">&quot;cache_validation_callback needs to be callable. Got True.&quot;</span>
+        <span class="s3">with </span><span class="s1">pytest.raises(ValueError</span><span class="s3">, </span><span class="s1">match=match):</span>
+            <span class="s1">memory.cache(cache_validation_callback=</span><span class="s3">True</span><span class="s1">)</span>
+
+    <span class="s1">@pytest.mark.parametrize(</span><span class="s5">&quot;consider_cache_valid&quot;</span><span class="s3">, </span><span class="s1">[</span><span class="s3">True, False</span><span class="s1">])</span>
+    <span class="s3">def </span><span class="s1">test_constant_cache_validation_callback(</span>
+            <span class="s1">self</span><span class="s3">, </span><span class="s1">memory</span><span class="s3">, </span><span class="s1">consider_cache_valid</span>
+    <span class="s1">):</span>
+        <span class="s0">&quot;Test expiry of old results&quot;</span>
+        <span class="s1">f = memory.cache(</span>
+            <span class="s1">self.foo</span><span class="s3">, </span><span class="s1">cache_validation_callback=</span><span class="s3">lambda </span><span class="s1">_: consider_cache_valid</span><span class="s3">,</span>
+            <span class="s1">ignore=[</span><span class="s5">&quot;d&quot;</span><span class="s1">]</span>
+        <span class="s1">)</span>
+
+        <span class="s1">d1</span><span class="s3">, </span><span class="s1">d2 = {</span><span class="s5">&quot;run&quot;</span><span class="s1">: </span><span class="s3">False</span><span class="s1">}</span><span class="s3">, </span><span class="s1">{</span><span class="s5">&quot;run&quot;</span><span class="s1">: </span><span class="s3">False</span><span class="s1">}</span>
+        <span class="s3">assert </span><span class="s1">f(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">d1) == </span><span class="s4">4</span>
+        <span class="s3">assert </span><span class="s1">f(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">d2) == </span><span class="s4">4</span>
+
+        <span class="s3">assert </span><span class="s1">d1[</span><span class="s5">&quot;run&quot;</span><span class="s1">]</span>
+        <span class="s3">assert </span><span class="s1">d2[</span><span class="s5">&quot;run&quot;</span><span class="s1">] != consider_cache_valid</span>
+
+    <span class="s3">def </span><span class="s1">test_memory_only_cache_long_run(self</span><span class="s3">, </span><span class="s1">memory):</span>
+        <span class="s0">&quot;Test cache validity based on run duration.&quot;</span>
+
+        <span class="s3">def </span><span class="s1">cache_validation_callback(metadata):</span>
+            <span class="s1">duration = metadata[</span><span class="s5">'duration'</span><span class="s1">]</span>
+            <span class="s3">if </span><span class="s1">duration &gt; </span><span class="s4">0.1</span><span class="s1">:</span>
+                <span class="s3">return True</span>
+
+        <span class="s1">f = memory.cache(</span>
+            <span class="s1">self.foo</span><span class="s3">, </span><span class="s1">cache_validation_callback=cache_validation_callback</span><span class="s3">,</span>
+            <span class="s1">ignore=[</span><span class="s5">&quot;d&quot;</span><span class="s1">]</span>
+        <span class="s1">)</span>
+
+        <span class="s2"># Short run are not cached</span>
+        <span class="s1">d1</span><span class="s3">, </span><span class="s1">d2 = {</span><span class="s5">&quot;run&quot;</span><span class="s1">: </span><span class="s3">False</span><span class="s1">}</span><span class="s3">, </span><span class="s1">{</span><span class="s5">&quot;run&quot;</span><span class="s1">: </span><span class="s3">False</span><span class="s1">}</span>
+        <span class="s3">assert </span><span class="s1">f(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">d1</span><span class="s3">, </span><span class="s1">delay=</span><span class="s4">0</span><span class="s1">) == </span><span class="s4">4</span>
+        <span class="s3">assert </span><span class="s1">f(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">d2</span><span class="s3">, </span><span class="s1">delay=</span><span class="s4">0</span><span class="s1">) == </span><span class="s4">4</span>
+        <span class="s3">assert </span><span class="s1">d1[</span><span class="s5">&quot;run&quot;</span><span class="s1">]</span>
+        <span class="s3">assert </span><span class="s1">d2[</span><span class="s5">&quot;run&quot;</span><span class="s1">]</span>
+
+        <span class="s2"># Longer run are cached</span>
+        <span class="s1">d1</span><span class="s3">, </span><span class="s1">d2 = {</span><span class="s5">&quot;run&quot;</span><span class="s1">: </span><span class="s3">False</span><span class="s1">}</span><span class="s3">, </span><span class="s1">{</span><span class="s5">&quot;run&quot;</span><span class="s1">: </span><span class="s3">False</span><span class="s1">}</span>
+        <span class="s3">assert </span><span class="s1">f(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">d1</span><span class="s3">, </span><span class="s1">delay=</span><span class="s4">0.2</span><span class="s1">) == </span><span class="s4">4</span>
+        <span class="s3">assert </span><span class="s1">f(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">d2</span><span class="s3">, </span><span class="s1">delay=</span><span class="s4">0.2</span><span class="s1">) == </span><span class="s4">4</span>
+        <span class="s3">assert </span><span class="s1">d1[</span><span class="s5">&quot;run&quot;</span><span class="s1">]</span>
+        <span class="s3">assert not </span><span class="s1">d2[</span><span class="s5">&quot;run&quot;</span><span class="s1">]</span>
+
+    <span class="s3">def </span><span class="s1">test_memory_expires_after(self</span><span class="s3">, </span><span class="s1">memory):</span>
+        <span class="s0">&quot;Test expiry of old cached results&quot;</span>
+
+        <span class="s1">f = memory.cache(</span>
+            <span class="s1">self.foo</span><span class="s3">, </span><span class="s1">cache_validation_callback=expires_after(seconds=</span><span class="s4">.3</span><span class="s1">)</span><span class="s3">,</span>
+            <span class="s1">ignore=[</span><span class="s5">&quot;d&quot;</span><span class="s1">]</span>
+        <span class="s1">)</span>
+
+        <span class="s1">d1</span><span class="s3">, </span><span class="s1">d2</span><span class="s3">, </span><span class="s1">d3 = {</span><span class="s5">&quot;run&quot;</span><span class="s1">: </span><span class="s3">False</span><span class="s1">}</span><span class="s3">, </span><span class="s1">{</span><span class="s5">&quot;run&quot;</span><span class="s1">: </span><span class="s3">False</span><span class="s1">}</span><span class="s3">, </span><span class="s1">{</span><span class="s5">&quot;run&quot;</span><span class="s1">: </span><span class="s3">False</span><span class="s1">}</span>
+        <span class="s3">assert </span><span class="s1">f(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">d1) == </span><span class="s4">4</span>
+        <span class="s3">assert </span><span class="s1">f(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">d2) == </span><span class="s4">4</span>
+        <span class="s1">time.sleep(</span><span class="s4">.5</span><span class="s1">)</span>
+        <span class="s3">assert </span><span class="s1">f(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">d3) == </span><span class="s4">4</span>
+
+        <span class="s3">assert </span><span class="s1">d1[</span><span class="s5">&quot;run&quot;</span><span class="s1">]</span>
+        <span class="s3">assert not </span><span class="s1">d2[</span><span class="s5">&quot;run&quot;</span><span class="s1">]</span>
+        <span class="s3">assert </span><span class="s1">d3[</span><span class="s5">&quot;run&quot;</span><span class="s1">]</span>
+</pre>
+</body>
+</html>

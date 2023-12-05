@@ -1,0 +1,661 @@
+<html>
+<head>
+<title>_statistics.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_statistics.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Statistical transformations for visualization. 
+ 
+This module is currently private, but is being written to eventually form part 
+of the public API. 
+ 
+The classes should behave roughly in the style of scikit-learn. 
+ 
+- All data-independent parameters should be passed to the class constructor. 
+- Each class should implement a default transformation that is exposed through 
+  __call__. These are currently written for vector arguments, but I think 
+  consuming a whole `plot_data` DataFrame and return it with transformed 
+  variables would make more sense. 
+- Some class have data-dependent preprocessing that should be cached and used 
+  multiple times (think defining histogram bins off all data and then counting 
+  observations within each bin multiple times per data subsets). These currently 
+  have unique names, but it would be good to have a common name. Not quite 
+  `fit`, but something similar. 
+- Alternatively, the transform interface could take some information about grouping 
+  variables and do a groupby internally. 
+- Some classes should define alternate transforms that might make the most sense 
+  with a different function. For example, KDE usually evaluates the distribution 
+  on a regular grid, but it would be useful for it to transform at the actual 
+  datapoints. Then again, this could be controlled by a parameter at  the time of 
+  class instantiation. 
+ 
+&quot;&quot;&quot;</span>
+<span class="s2">from </span><span class="s1">numbers </span><span class="s2">import </span><span class="s1">Number</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">pandas </span><span class="s2">as </span><span class="s1">pd</span>
+<span class="s2">try</span><span class="s1">:</span>
+    <span class="s2">from </span><span class="s1">scipy.stats </span><span class="s2">import </span><span class="s1">gaussian_kde</span>
+    <span class="s1">_no_scipy = </span><span class="s2">False</span>
+<span class="s2">except </span><span class="s1">ImportError:</span>
+    <span class="s2">from </span><span class="s1">.external.kde </span><span class="s2">import </span><span class="s1">gaussian_kde</span>
+    <span class="s1">_no_scipy = </span><span class="s2">True</span>
+
+<span class="s2">from </span><span class="s1">.algorithms </span><span class="s2">import </span><span class="s1">bootstrap</span>
+<span class="s2">from </span><span class="s1">.utils </span><span class="s2">import </span><span class="s1">_check_argument</span><span class="s2">, </span><span class="s1">_normal_quantile_func</span>
+
+
+<span class="s2">class </span><span class="s1">KDE:</span>
+    <span class="s0">&quot;&quot;&quot;Univariate and bivariate kernel density estimator.&quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">, </span><span class="s1">*</span><span class="s2">,</span>
+        <span class="s1">bw_method=</span><span class="s2">None,</span>
+        <span class="s1">bw_adjust=</span><span class="s3">1</span><span class="s2">,</span>
+        <span class="s1">gridsize=</span><span class="s3">200</span><span class="s2">,</span>
+        <span class="s1">cut=</span><span class="s3">3</span><span class="s2">,</span>
+        <span class="s1">clip=</span><span class="s2">None,</span>
+        <span class="s1">cumulative=</span><span class="s2">False,</span>
+    <span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Initialize the estimator with its parameters. 
+ 
+        Parameters 
+        ---------- 
+        bw_method : string, scalar, or callable, optional 
+            Method for determining the smoothing bandwidth to use; passed to 
+            :class:`scipy.stats.gaussian_kde`. 
+        bw_adjust : number, optional 
+            Factor that multiplicatively scales the value chosen using 
+            ``bw_method``. Increasing will make the curve smoother. See Notes. 
+        gridsize : int, optional 
+            Number of points on each dimension of the evaluation grid. 
+        cut : number, optional 
+            Factor, multiplied by the smoothing bandwidth, that determines how 
+            far the evaluation grid extends past the extreme datapoints. When 
+            set to 0, truncate the curve at the data limits. 
+        clip : pair of numbers or None, or a pair of such pairs 
+            Do not evaluate the density outside of these limits. 
+        cumulative : bool, optional 
+            If True, estimate a cumulative distribution function. Requires scipy. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">clip </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">clip = </span><span class="s2">None, None</span>
+
+        <span class="s1">self.bw_method = bw_method</span>
+        <span class="s1">self.bw_adjust = bw_adjust</span>
+        <span class="s1">self.gridsize = gridsize</span>
+        <span class="s1">self.cut = cut</span>
+        <span class="s1">self.clip = clip</span>
+        <span class="s1">self.cumulative = cumulative</span>
+
+        <span class="s2">if </span><span class="s1">cumulative </span><span class="s2">and </span><span class="s1">_no_scipy:</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s4">&quot;Cumulative KDE evaluation requires scipy&quot;</span><span class="s1">)</span>
+
+        <span class="s1">self.support = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_define_support_grid(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">bw</span><span class="s2">, </span><span class="s1">cut</span><span class="s2">, </span><span class="s1">clip</span><span class="s2">, </span><span class="s1">gridsize):</span>
+        <span class="s0">&quot;&quot;&quot;Create the grid of evaluation points depending for vector x.&quot;&quot;&quot;</span>
+        <span class="s1">clip_lo = -np.inf </span><span class="s2">if </span><span class="s1">clip[</span><span class="s3">0</span><span class="s1">] </span><span class="s2">is None else </span><span class="s1">clip[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">clip_hi = +np.inf </span><span class="s2">if </span><span class="s1">clip[</span><span class="s3">1</span><span class="s1">] </span><span class="s2">is None else </span><span class="s1">clip[</span><span class="s3">1</span><span class="s1">]</span>
+        <span class="s1">gridmin = max(x.min() - bw * cut</span><span class="s2">, </span><span class="s1">clip_lo)</span>
+        <span class="s1">gridmax = min(x.max() + bw * cut</span><span class="s2">, </span><span class="s1">clip_hi)</span>
+        <span class="s2">return </span><span class="s1">np.linspace(gridmin</span><span class="s2">, </span><span class="s1">gridmax</span><span class="s2">, </span><span class="s1">gridsize)</span>
+
+    <span class="s2">def </span><span class="s1">_define_support_univariate(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">weights):</span>
+        <span class="s0">&quot;&quot;&quot;Create a 1D grid of evaluation points.&quot;&quot;&quot;</span>
+        <span class="s1">kde = self._fit(x</span><span class="s2">, </span><span class="s1">weights)</span>
+        <span class="s1">bw = np.sqrt(kde.covariance.squeeze())</span>
+        <span class="s1">grid = self._define_support_grid(</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">bw</span><span class="s2">, </span><span class="s1">self.cut</span><span class="s2">, </span><span class="s1">self.clip</span><span class="s2">, </span><span class="s1">self.gridsize</span>
+        <span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">grid</span>
+
+    <span class="s2">def </span><span class="s1">_define_support_bivariate(self</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">weights):</span>
+        <span class="s0">&quot;&quot;&quot;Create a 2D grid of evaluation points.&quot;&quot;&quot;</span>
+        <span class="s1">clip = self.clip</span>
+        <span class="s2">if </span><span class="s1">clip[</span><span class="s3">0</span><span class="s1">] </span><span class="s2">is None or </span><span class="s1">np.isscalar(clip[</span><span class="s3">0</span><span class="s1">]):</span>
+            <span class="s1">clip = (clip</span><span class="s2">, </span><span class="s1">clip)</span>
+
+        <span class="s1">kde = self._fit([x1</span><span class="s2">, </span><span class="s1">x2]</span><span class="s2">, </span><span class="s1">weights)</span>
+        <span class="s1">bw = np.sqrt(np.diag(kde.covariance).squeeze())</span>
+
+        <span class="s1">grid1 = self._define_support_grid(</span>
+            <span class="s1">x1</span><span class="s2">, </span><span class="s1">bw[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.cut</span><span class="s2">, </span><span class="s1">clip[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.gridsize</span>
+        <span class="s1">)</span>
+        <span class="s1">grid2 = self._define_support_grid(</span>
+            <span class="s1">x2</span><span class="s2">, </span><span class="s1">bw[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.cut</span><span class="s2">, </span><span class="s1">clip[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.gridsize</span>
+        <span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">grid1</span><span class="s2">, </span><span class="s1">grid2</span>
+
+    <span class="s2">def </span><span class="s1">define_support(self</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">x2=</span><span class="s2">None, </span><span class="s1">weights=</span><span class="s2">None, </span><span class="s1">cache=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Create the evaluation grid for a given data set.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">x2 </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">support = self._define_support_univariate(x1</span><span class="s2">, </span><span class="s1">weights)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">support = self._define_support_bivariate(x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">weights)</span>
+
+        <span class="s2">if </span><span class="s1">cache:</span>
+            <span class="s1">self.support = support</span>
+
+        <span class="s2">return </span><span class="s1">support</span>
+
+    <span class="s2">def </span><span class="s1">_fit(self</span><span class="s2">, </span><span class="s1">fit_data</span><span class="s2">, </span><span class="s1">weights=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the scipy kde while adding bw_adjust logic and version check.&quot;&quot;&quot;</span>
+        <span class="s1">fit_kws = {</span><span class="s4">&quot;bw_method&quot;</span><span class="s1">: self.bw_method}</span>
+        <span class="s2">if </span><span class="s1">weights </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">fit_kws[</span><span class="s4">&quot;weights&quot;</span><span class="s1">] = weights</span>
+
+        <span class="s1">kde = gaussian_kde(fit_data</span><span class="s2">, </span><span class="s1">**fit_kws)</span>
+        <span class="s1">kde.set_bandwidth(kde.factor * self.bw_adjust)</span>
+
+        <span class="s2">return </span><span class="s1">kde</span>
+
+    <span class="s2">def </span><span class="s1">_eval_univariate(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">weights=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit and evaluate a univariate on univariate data.&quot;&quot;&quot;</span>
+        <span class="s1">support = self.support</span>
+        <span class="s2">if </span><span class="s1">support </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">support = self.define_support(x</span><span class="s2">, </span><span class="s1">cache=</span><span class="s2">False</span><span class="s1">)</span>
+
+        <span class="s1">kde = self._fit(x</span><span class="s2">, </span><span class="s1">weights)</span>
+
+        <span class="s2">if </span><span class="s1">self.cumulative:</span>
+            <span class="s1">s_0 = support[</span><span class="s3">0</span><span class="s1">]</span>
+            <span class="s1">density = np.array([</span>
+                <span class="s1">kde.integrate_box_1d(s_0</span><span class="s2">, </span><span class="s1">s_i) </span><span class="s2">for </span><span class="s1">s_i </span><span class="s2">in </span><span class="s1">support</span>
+            <span class="s1">])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">density = kde(support)</span>
+
+        <span class="s2">return </span><span class="s1">density</span><span class="s2">, </span><span class="s1">support</span>
+
+    <span class="s2">def </span><span class="s1">_eval_bivariate(self</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">weights=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit and evaluate a univariate on bivariate data.&quot;&quot;&quot;</span>
+        <span class="s1">support = self.support</span>
+        <span class="s2">if </span><span class="s1">support </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">support = self.define_support(x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">cache=</span><span class="s2">False</span><span class="s1">)</span>
+
+        <span class="s1">kde = self._fit([x1</span><span class="s2">, </span><span class="s1">x2]</span><span class="s2">, </span><span class="s1">weights)</span>
+
+        <span class="s2">if </span><span class="s1">self.cumulative:</span>
+
+            <span class="s1">grid1</span><span class="s2">, </span><span class="s1">grid2 = support</span>
+            <span class="s1">density = np.zeros((grid1.size</span><span class="s2">, </span><span class="s1">grid2.size))</span>
+            <span class="s1">p0 = grid1.min()</span><span class="s2">, </span><span class="s1">grid2.min()</span>
+            <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">xi </span><span class="s2">in </span><span class="s1">enumerate(grid1):</span>
+                <span class="s2">for </span><span class="s1">j</span><span class="s2">, </span><span class="s1">xj </span><span class="s2">in </span><span class="s1">enumerate(grid2):</span>
+                    <span class="s1">density[i</span><span class="s2">, </span><span class="s1">j] = kde.integrate_box(p0</span><span class="s2">, </span><span class="s1">(xi</span><span class="s2">, </span><span class="s1">xj))</span>
+
+        <span class="s2">else</span><span class="s1">:</span>
+
+            <span class="s1">xx1</span><span class="s2">, </span><span class="s1">xx2 = np.meshgrid(*support)</span>
+            <span class="s1">density = kde([xx1.ravel()</span><span class="s2">, </span><span class="s1">xx2.ravel()]).reshape(xx1.shape)</span>
+
+        <span class="s2">return </span><span class="s1">density</span><span class="s2">, </span><span class="s1">support</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">x2=</span><span class="s2">None, </span><span class="s1">weights=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit and evaluate on univariate or bivariate data.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">x2 </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._eval_univariate(x1</span><span class="s2">, </span><span class="s1">weights)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._eval_bivariate(x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">weights)</span>
+
+
+<span class="s5"># Note: we no longer use this for univariate histograms in histplot,</span>
+<span class="s5"># preferring _stats.Hist. We'll deprecate this once we have a bivariate Stat class.</span>
+<span class="s2">class </span><span class="s1">Histogram:</span>
+    <span class="s0">&quot;&quot;&quot;Univariate and bivariate histogram estimator.&quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">stat=</span><span class="s4">&quot;count&quot;</span><span class="s2">,</span>
+        <span class="s1">bins=</span><span class="s4">&quot;auto&quot;</span><span class="s2">,</span>
+        <span class="s1">binwidth=</span><span class="s2">None,</span>
+        <span class="s1">binrange=</span><span class="s2">None,</span>
+        <span class="s1">discrete=</span><span class="s2">False,</span>
+        <span class="s1">cumulative=</span><span class="s2">False,</span>
+    <span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Initialize the estimator with its parameters. 
+ 
+        Parameters 
+        ---------- 
+        stat : str 
+            Aggregate statistic to compute in each bin. 
+ 
+            - `count`: show the number of observations in each bin 
+            - `frequency`: show the number of observations divided by the bin width 
+            - `probability` or `proportion`: normalize such that bar heights sum to 1 
+            - `percent`: normalize such that bar heights sum to 100 
+            - `density`: normalize such that the total area of the histogram equals 1 
+ 
+        bins : str, number, vector, or a pair of such values 
+            Generic bin parameter that can be the name of a reference rule, 
+            the number of bins, or the breaks of the bins. 
+            Passed to :func:`numpy.histogram_bin_edges`. 
+        binwidth : number or pair of numbers 
+            Width of each bin, overrides ``bins`` but can be used with 
+            ``binrange``. 
+        binrange : pair of numbers or a pair of pairs 
+            Lowest and highest value for bin edges; can be used either 
+            with ``bins`` or ``binwidth``. Defaults to data extremes. 
+        discrete : bool or pair of bools 
+            If True, set ``binwidth`` and ``binrange`` such that bin 
+            edges cover integer values in the dataset. 
+        cumulative : bool 
+            If True, return the cumulative statistic. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">stat_choices = [</span>
+            <span class="s4">&quot;count&quot;</span><span class="s2">, </span><span class="s4">&quot;frequency&quot;</span><span class="s2">, </span><span class="s4">&quot;density&quot;</span><span class="s2">, </span><span class="s4">&quot;probability&quot;</span><span class="s2">, </span><span class="s4">&quot;proportion&quot;</span><span class="s2">, </span><span class="s4">&quot;percent&quot;</span><span class="s2">,</span>
+        <span class="s1">]</span>
+        <span class="s1">_check_argument(</span><span class="s4">&quot;stat&quot;</span><span class="s2">, </span><span class="s1">stat_choices</span><span class="s2">, </span><span class="s1">stat)</span>
+
+        <span class="s1">self.stat = stat</span>
+        <span class="s1">self.bins = bins</span>
+        <span class="s1">self.binwidth = binwidth</span>
+        <span class="s1">self.binrange = binrange</span>
+        <span class="s1">self.discrete = discrete</span>
+        <span class="s1">self.cumulative = cumulative</span>
+
+        <span class="s1">self.bin_kws = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_define_bin_edges(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">bins</span><span class="s2">, </span><span class="s1">binwidth</span><span class="s2">, </span><span class="s1">binrange</span><span class="s2">, </span><span class="s1">discrete):</span>
+        <span class="s0">&quot;&quot;&quot;Inner function that takes bin parameters as arguments.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">binrange </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">start</span><span class="s2">, </span><span class="s1">stop = x.min()</span><span class="s2">, </span><span class="s1">x.max()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">start</span><span class="s2">, </span><span class="s1">stop = binrange</span>
+
+        <span class="s2">if </span><span class="s1">discrete:</span>
+            <span class="s1">bin_edges = np.arange(start - </span><span class="s3">.5</span><span class="s2">, </span><span class="s1">stop + </span><span class="s3">1.5</span><span class="s1">)</span>
+        <span class="s2">elif </span><span class="s1">binwidth </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">step = binwidth</span>
+            <span class="s1">bin_edges = np.arange(start</span><span class="s2">, </span><span class="s1">stop + step</span><span class="s2">, </span><span class="s1">step)</span>
+            <span class="s5"># Handle roundoff error (maybe there is a less clumsy way?)</span>
+            <span class="s2">if </span><span class="s1">bin_edges.max() &lt; stop </span><span class="s2">or </span><span class="s1">len(bin_edges) &lt; </span><span class="s3">2</span><span class="s1">:</span>
+                <span class="s1">bin_edges = np.append(bin_edges</span><span class="s2">, </span><span class="s1">bin_edges.max() + step)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">bin_edges = np.histogram_bin_edges(</span>
+                <span class="s1">x</span><span class="s2">, </span><span class="s1">bins</span><span class="s2">, </span><span class="s1">binrange</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">,</span>
+            <span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">bin_edges</span>
+
+    <span class="s2">def </span><span class="s1">define_bin_params(self</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">x2=</span><span class="s2">None, </span><span class="s1">weights=</span><span class="s2">None, </span><span class="s1">cache=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Given data, return numpy.histogram parameters to define bins.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">x2 </span><span class="s2">is None</span><span class="s1">:</span>
+
+            <span class="s1">bin_edges = self._define_bin_edges(</span>
+                <span class="s1">x1</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">self.bins</span><span class="s2">, </span><span class="s1">self.binwidth</span><span class="s2">, </span><span class="s1">self.binrange</span><span class="s2">, </span><span class="s1">self.discrete</span><span class="s2">,</span>
+            <span class="s1">)</span>
+
+            <span class="s2">if </span><span class="s1">isinstance(self.bins</span><span class="s2">, </span><span class="s1">(str</span><span class="s2">, </span><span class="s1">Number)):</span>
+                <span class="s1">n_bins = len(bin_edges) - </span><span class="s3">1</span>
+                <span class="s1">bin_range = bin_edges.min()</span><span class="s2">, </span><span class="s1">bin_edges.max()</span>
+                <span class="s1">bin_kws = dict(bins=n_bins</span><span class="s2">, </span><span class="s1">range=bin_range)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">bin_kws = dict(bins=bin_edges)</span>
+
+        <span class="s2">else</span><span class="s1">:</span>
+
+            <span class="s1">bin_edges = []</span>
+            <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">x </span><span class="s2">in </span><span class="s1">enumerate([x1</span><span class="s2">, </span><span class="s1">x2]):</span>
+
+                <span class="s5"># Resolve out whether bin parameters are shared</span>
+                <span class="s5"># or specific to each variable</span>
+
+                <span class="s1">bins = self.bins</span>
+                <span class="s2">if not </span><span class="s1">bins </span><span class="s2">or </span><span class="s1">isinstance(bins</span><span class="s2">, </span><span class="s1">(str</span><span class="s2">, </span><span class="s1">Number)):</span>
+                    <span class="s2">pass</span>
+                <span class="s2">elif </span><span class="s1">isinstance(bins[i]</span><span class="s2">, </span><span class="s1">str):</span>
+                    <span class="s1">bins = bins[i]</span>
+                <span class="s2">elif </span><span class="s1">len(bins) == </span><span class="s3">2</span><span class="s1">:</span>
+                    <span class="s1">bins = bins[i]</span>
+
+                <span class="s1">binwidth = self.binwidth</span>
+                <span class="s2">if </span><span class="s1">binwidth </span><span class="s2">is None</span><span class="s1">:</span>
+                    <span class="s2">pass</span>
+                <span class="s2">elif not </span><span class="s1">isinstance(binwidth</span><span class="s2">, </span><span class="s1">Number):</span>
+                    <span class="s1">binwidth = binwidth[i]</span>
+
+                <span class="s1">binrange = self.binrange</span>
+                <span class="s2">if </span><span class="s1">binrange </span><span class="s2">is None</span><span class="s1">:</span>
+                    <span class="s2">pass</span>
+                <span class="s2">elif not </span><span class="s1">isinstance(binrange[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">Number):</span>
+                    <span class="s1">binrange = binrange[i]</span>
+
+                <span class="s1">discrete = self.discrete</span>
+                <span class="s2">if not </span><span class="s1">isinstance(discrete</span><span class="s2">, </span><span class="s1">bool):</span>
+                    <span class="s1">discrete = discrete[i]</span>
+
+                <span class="s5"># Define the bins for this variable</span>
+
+                <span class="s1">bin_edges.append(self._define_bin_edges(</span>
+                    <span class="s1">x</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">bins</span><span class="s2">, </span><span class="s1">binwidth</span><span class="s2">, </span><span class="s1">binrange</span><span class="s2">, </span><span class="s1">discrete</span><span class="s2">,</span>
+                <span class="s1">))</span>
+
+            <span class="s1">bin_kws = dict(bins=tuple(bin_edges))</span>
+
+        <span class="s2">if </span><span class="s1">cache:</span>
+            <span class="s1">self.bin_kws = bin_kws</span>
+
+        <span class="s2">return </span><span class="s1">bin_kws</span>
+
+    <span class="s2">def </span><span class="s1">_eval_bivariate(self</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">weights):</span>
+        <span class="s0">&quot;&quot;&quot;Inner function for histogram of two variables.&quot;&quot;&quot;</span>
+        <span class="s1">bin_kws = self.bin_kws</span>
+        <span class="s2">if </span><span class="s1">bin_kws </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">bin_kws = self.define_bin_params(x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">cache=</span><span class="s2">False</span><span class="s1">)</span>
+
+        <span class="s1">density = self.stat == </span><span class="s4">&quot;density&quot;</span>
+
+        <span class="s1">hist</span><span class="s2">, </span><span class="s1">*bin_edges = np.histogram2d(</span>
+            <span class="s1">x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">**bin_kws</span><span class="s2">, </span><span class="s1">weights=weights</span><span class="s2">, </span><span class="s1">density=density</span>
+        <span class="s1">)</span>
+
+        <span class="s1">area = np.outer(</span>
+            <span class="s1">np.diff(bin_edges[</span><span class="s3">0</span><span class="s1">])</span><span class="s2">,</span>
+            <span class="s1">np.diff(bin_edges[</span><span class="s3">1</span><span class="s1">])</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">self.stat == </span><span class="s4">&quot;probability&quot; </span><span class="s2">or </span><span class="s1">self.stat == </span><span class="s4">&quot;proportion&quot;</span><span class="s1">:</span>
+            <span class="s1">hist = hist.astype(float) / hist.sum()</span>
+        <span class="s2">elif </span><span class="s1">self.stat == </span><span class="s4">&quot;percent&quot;</span><span class="s1">:</span>
+            <span class="s1">hist = hist.astype(float) / hist.sum() * </span><span class="s3">100</span>
+        <span class="s2">elif </span><span class="s1">self.stat == </span><span class="s4">&quot;frequency&quot;</span><span class="s1">:</span>
+            <span class="s1">hist = hist.astype(float) / area</span>
+
+        <span class="s2">if </span><span class="s1">self.cumulative:</span>
+            <span class="s2">if </span><span class="s1">self.stat </span><span class="s2">in </span><span class="s1">[</span><span class="s4">&quot;density&quot;</span><span class="s2">, </span><span class="s4">&quot;frequency&quot;</span><span class="s1">]:</span>
+                <span class="s1">hist = (hist * area).cumsum(axis=</span><span class="s3">0</span><span class="s1">).cumsum(axis=</span><span class="s3">1</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">hist = hist.cumsum(axis=</span><span class="s3">0</span><span class="s1">).cumsum(axis=</span><span class="s3">1</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">hist</span><span class="s2">, </span><span class="s1">bin_edges</span>
+
+    <span class="s2">def </span><span class="s1">_eval_univariate(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">weights):</span>
+        <span class="s0">&quot;&quot;&quot;Inner function for histogram of one variable.&quot;&quot;&quot;</span>
+        <span class="s1">bin_kws = self.bin_kws</span>
+        <span class="s2">if </span><span class="s1">bin_kws </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">bin_kws = self.define_bin_params(x</span><span class="s2">, </span><span class="s1">weights=weights</span><span class="s2">, </span><span class="s1">cache=</span><span class="s2">False</span><span class="s1">)</span>
+
+        <span class="s1">density = self.stat == </span><span class="s4">&quot;density&quot;</span>
+        <span class="s1">hist</span><span class="s2">, </span><span class="s1">bin_edges = np.histogram(</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">**bin_kws</span><span class="s2">, </span><span class="s1">weights=weights</span><span class="s2">, </span><span class="s1">density=density</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">self.stat == </span><span class="s4">&quot;probability&quot; </span><span class="s2">or </span><span class="s1">self.stat == </span><span class="s4">&quot;proportion&quot;</span><span class="s1">:</span>
+            <span class="s1">hist = hist.astype(float) / hist.sum()</span>
+        <span class="s2">elif </span><span class="s1">self.stat == </span><span class="s4">&quot;percent&quot;</span><span class="s1">:</span>
+            <span class="s1">hist = hist.astype(float) / hist.sum() * </span><span class="s3">100</span>
+        <span class="s2">elif </span><span class="s1">self.stat == </span><span class="s4">&quot;frequency&quot;</span><span class="s1">:</span>
+            <span class="s1">hist = hist.astype(float) / np.diff(bin_edges)</span>
+
+        <span class="s2">if </span><span class="s1">self.cumulative:</span>
+            <span class="s2">if </span><span class="s1">self.stat </span><span class="s2">in </span><span class="s1">[</span><span class="s4">&quot;density&quot;</span><span class="s2">, </span><span class="s4">&quot;frequency&quot;</span><span class="s1">]:</span>
+                <span class="s1">hist = (hist * np.diff(bin_edges)).cumsum()</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">hist = hist.cumsum()</span>
+
+        <span class="s2">return </span><span class="s1">hist</span><span class="s2">, </span><span class="s1">bin_edges</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">x2=</span><span class="s2">None, </span><span class="s1">weights=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Count the occurrences in each bin, maybe normalize.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">x2 </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._eval_univariate(x1</span><span class="s2">, </span><span class="s1">weights)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._eval_bivariate(x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">weights)</span>
+
+
+<span class="s2">class </span><span class="s1">ECDF:</span>
+    <span class="s0">&quot;&quot;&quot;Univariate empirical cumulative distribution estimator.&quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">stat=</span><span class="s4">&quot;proportion&quot;</span><span class="s2">, </span><span class="s1">complementary=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Initialize the class with its parameters 
+ 
+        Parameters 
+        ---------- 
+        stat : {{&quot;proportion&quot;, &quot;percent&quot;, &quot;count&quot;}} 
+            Distribution statistic to compute. 
+        complementary : bool 
+            If True, use the complementary CDF (1 - CDF) 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_check_argument(</span><span class="s4">&quot;stat&quot;</span><span class="s2">, </span><span class="s1">[</span><span class="s4">&quot;count&quot;</span><span class="s2">, </span><span class="s4">&quot;percent&quot;</span><span class="s2">, </span><span class="s4">&quot;proportion&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">stat)</span>
+        <span class="s1">self.stat = stat</span>
+        <span class="s1">self.complementary = complementary</span>
+
+    <span class="s2">def </span><span class="s1">_eval_bivariate(self</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">weights):</span>
+        <span class="s0">&quot;&quot;&quot;Inner function for ECDF of two variables.&quot;&quot;&quot;</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError(</span><span class="s4">&quot;Bivariate ECDF is not implemented&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_eval_univariate(self</span><span class="s2">, </span><span class="s1">x</span><span class="s2">, </span><span class="s1">weights):</span>
+        <span class="s0">&quot;&quot;&quot;Inner function for ECDF of one variable.&quot;&quot;&quot;</span>
+        <span class="s1">sorter = x.argsort()</span>
+        <span class="s1">x = x[sorter]</span>
+        <span class="s1">weights = weights[sorter]</span>
+        <span class="s1">y = weights.cumsum()</span>
+
+        <span class="s2">if </span><span class="s1">self.stat </span><span class="s2">in </span><span class="s1">[</span><span class="s4">&quot;percent&quot;</span><span class="s2">, </span><span class="s4">&quot;proportion&quot;</span><span class="s1">]:</span>
+            <span class="s1">y = y / y.max()</span>
+        <span class="s2">if </span><span class="s1">self.stat == </span><span class="s4">&quot;percent&quot;</span><span class="s1">:</span>
+            <span class="s1">y = y * </span><span class="s3">100</span>
+
+        <span class="s1">x = np.r_[-np.inf</span><span class="s2">, </span><span class="s1">x]</span>
+        <span class="s1">y = np.r_[</span><span class="s3">0</span><span class="s2">, </span><span class="s1">y]</span>
+
+        <span class="s2">if </span><span class="s1">self.complementary:</span>
+            <span class="s1">y = y.max() - y</span>
+
+        <span class="s2">return </span><span class="s1">y</span><span class="s2">, </span><span class="s1">x</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">x1</span><span class="s2">, </span><span class="s1">x2=</span><span class="s2">None, </span><span class="s1">weights=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Return proportion or count of observations below each sorted datapoint.&quot;&quot;&quot;</span>
+        <span class="s1">x1 = np.asarray(x1)</span>
+        <span class="s2">if </span><span class="s1">weights </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">weights = np.ones_like(x1)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">weights = np.asarray(weights)</span>
+
+        <span class="s2">if </span><span class="s1">x2 </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._eval_univariate(x1</span><span class="s2">, </span><span class="s1">weights)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._eval_bivariate(x1</span><span class="s2">, </span><span class="s1">x2</span><span class="s2">, </span><span class="s1">weights)</span>
+
+
+<span class="s2">class </span><span class="s1">EstimateAggregator:</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">estimator</span><span class="s2">, </span><span class="s1">errorbar=</span><span class="s2">None, </span><span class="s1">**boot_kws):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Data aggregator that produces an estimate and error bar interval. 
+ 
+        Parameters 
+        ---------- 
+        estimator : callable or string 
+            Function (or method name) that maps a vector to a scalar. 
+        errorbar : string, (string, number) tuple, or callable 
+            Name of errorbar method (either &quot;ci&quot;, &quot;pi&quot;, &quot;se&quot;, or &quot;sd&quot;), or a tuple 
+            with a method name and a level parameter, or a function that maps from a 
+            vector to a (min, max) interval. 
+        boot_kws 
+            Additional keywords are passed to bootstrap when error_method is &quot;ci&quot;. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.estimator = estimator</span>
+
+        <span class="s1">method</span><span class="s2">, </span><span class="s1">level = _validate_errorbar_arg(errorbar)</span>
+        <span class="s1">self.error_method = method</span>
+        <span class="s1">self.error_level = level</span>
+
+        <span class="s1">self.boot_kws = boot_kws</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">var):</span>
+        <span class="s0">&quot;&quot;&quot;Aggregate over `var` column of `data` with estimate and error interval.&quot;&quot;&quot;</span>
+        <span class="s1">vals = data[var]</span>
+        <span class="s2">if </span><span class="s1">callable(self.estimator):</span>
+            <span class="s5"># You would think we could pass to vals.agg, and yet:</span>
+            <span class="s5"># https://github.com/mwaskom/seaborn/issues/2943</span>
+            <span class="s1">estimate = self.estimator(vals)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">estimate = vals.agg(self.estimator)</span>
+
+        <span class="s5"># Options that produce no error bars</span>
+        <span class="s2">if </span><span class="s1">self.error_method </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">err_min = err_max = np.nan</span>
+        <span class="s2">elif </span><span class="s1">len(data) &lt;= </span><span class="s3">1</span><span class="s1">:</span>
+            <span class="s1">err_min = err_max = np.nan</span>
+
+        <span class="s5"># Generic errorbars from user-supplied function</span>
+        <span class="s2">elif </span><span class="s1">callable(self.error_method):</span>
+            <span class="s1">err_min</span><span class="s2">, </span><span class="s1">err_max = self.error_method(vals)</span>
+
+        <span class="s5"># Parametric options</span>
+        <span class="s2">elif </span><span class="s1">self.error_method == </span><span class="s4">&quot;sd&quot;</span><span class="s1">:</span>
+            <span class="s1">half_interval = vals.std() * self.error_level</span>
+            <span class="s1">err_min</span><span class="s2">, </span><span class="s1">err_max = estimate - half_interval</span><span class="s2">, </span><span class="s1">estimate + half_interval</span>
+        <span class="s2">elif </span><span class="s1">self.error_method == </span><span class="s4">&quot;se&quot;</span><span class="s1">:</span>
+            <span class="s1">half_interval = vals.sem() * self.error_level</span>
+            <span class="s1">err_min</span><span class="s2">, </span><span class="s1">err_max = estimate - half_interval</span><span class="s2">, </span><span class="s1">estimate + half_interval</span>
+
+        <span class="s5"># Nonparametric options</span>
+        <span class="s2">elif </span><span class="s1">self.error_method == </span><span class="s4">&quot;pi&quot;</span><span class="s1">:</span>
+            <span class="s1">err_min</span><span class="s2">, </span><span class="s1">err_max = _percentile_interval(vals</span><span class="s2">, </span><span class="s1">self.error_level)</span>
+        <span class="s2">elif </span><span class="s1">self.error_method == </span><span class="s4">&quot;ci&quot;</span><span class="s1">:</span>
+            <span class="s1">units = data.get(</span><span class="s4">&quot;units&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+            <span class="s1">boots = bootstrap(vals</span><span class="s2">, </span><span class="s1">units=units</span><span class="s2">, </span><span class="s1">func=self.estimator</span><span class="s2">, </span><span class="s1">**self.boot_kws)</span>
+            <span class="s1">err_min</span><span class="s2">, </span><span class="s1">err_max = _percentile_interval(boots</span><span class="s2">, </span><span class="s1">self.error_level)</span>
+
+        <span class="s2">return </span><span class="s1">pd.Series({var: estimate</span><span class="s2">, </span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">var</span><span class="s2">}</span><span class="s4">min&quot;</span><span class="s1">: err_min</span><span class="s2">, </span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">var</span><span class="s2">}</span><span class="s4">max&quot;</span><span class="s1">: err_max})</span>
+
+
+<span class="s2">class </span><span class="s1">LetterValues:</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">k_depth</span><span class="s2">, </span><span class="s1">outlier_prop</span><span class="s2">, </span><span class="s1">trust_alpha):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compute percentiles of a distribution using various tail stopping rules. 
+ 
+        Parameters 
+        ---------- 
+        k_depth: &quot;tukey&quot;, &quot;proportion&quot;, &quot;trustworthy&quot;, or &quot;full&quot; 
+            Stopping rule for choosing tail percentiled to show: 
+ 
+            - tukey: Show a similar number of outliers as in a conventional boxplot. 
+            - proportion: Show approximately `outlier_prop` outliers. 
+            - trust_alpha: Use `trust_alpha` level for most extreme tail percentile. 
+ 
+        outlier_prop: float 
+            Parameter for `k_depth=&quot;proportion&quot;` setting the expected outlier rate. 
+        trust_alpha: float 
+            Parameter for `k_depth=&quot;trustworthy&quot;` setting the confidence threshold. 
+ 
+        Notes 
+        ----- 
+        Based on the proposal in this paper: 
+        https://vita.had.co.nz/papers/letter-value-plot.pdf 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">k_options = [</span><span class="s4">&quot;tukey&quot;</span><span class="s2">, </span><span class="s4">&quot;proportion&quot;</span><span class="s2">, </span><span class="s4">&quot;trustworthy&quot;</span><span class="s2">, </span><span class="s4">&quot;full&quot;</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">isinstance(k_depth</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s1">_check_argument(</span><span class="s4">&quot;k_depth&quot;</span><span class="s2">, </span><span class="s1">k_options</span><span class="s2">, </span><span class="s1">k_depth)</span>
+        <span class="s2">elif not </span><span class="s1">isinstance(k_depth</span><span class="s2">, </span><span class="s1">int):</span>
+            <span class="s1">err = (</span>
+                <span class="s4">&quot;The `k_depth` parameter must be either an integer or string &quot;</span>
+                <span class="s4">f&quot;(one of </span><span class="s2">{</span><span class="s1">k_options</span><span class="s2">}</span><span class="s4">), not </span><span class="s2">{</span><span class="s1">k_depth</span><span class="s2">!r}</span><span class="s4">.&quot;</span>
+            <span class="s1">)</span>
+            <span class="s2">raise </span><span class="s1">TypeError(err)</span>
+
+        <span class="s1">self.k_depth = k_depth</span>
+        <span class="s1">self.outlier_prop = outlier_prop</span>
+        <span class="s1">self.trust_alpha = trust_alpha</span>
+
+    <span class="s2">def </span><span class="s1">_compute_k(self</span><span class="s2">, </span><span class="s1">n):</span>
+
+        <span class="s5"># Select the depth, i.e. number of boxes to draw, based on the method</span>
+        <span class="s2">if </span><span class="s1">self.k_depth == </span><span class="s4">&quot;full&quot;</span><span class="s1">:</span>
+            <span class="s5"># extend boxes to 100% of the data</span>
+            <span class="s1">k = int(np.log2(n)) + </span><span class="s3">1</span>
+        <span class="s2">elif </span><span class="s1">self.k_depth == </span><span class="s4">&quot;tukey&quot;</span><span class="s1">:</span>
+            <span class="s5"># This results with 5-8 points in each tail</span>
+            <span class="s1">k = int(np.log2(n)) - </span><span class="s3">3</span>
+        <span class="s2">elif </span><span class="s1">self.k_depth == </span><span class="s4">&quot;proportion&quot;</span><span class="s1">:</span>
+            <span class="s1">k = int(np.log2(n)) - int(np.log2(n * self.outlier_prop)) + </span><span class="s3">1</span>
+        <span class="s2">elif </span><span class="s1">self.k_depth == </span><span class="s4">&quot;trustworthy&quot;</span><span class="s1">:</span>
+            <span class="s1">point_conf = </span><span class="s3">2 </span><span class="s1">* _normal_quantile_func(</span><span class="s3">1 </span><span class="s1">- self.trust_alpha / </span><span class="s3">2</span><span class="s1">) ** </span><span class="s3">2</span>
+            <span class="s1">k = int(np.log2(n / point_conf)) + </span><span class="s3">1</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s5"># Allow having k directly specified as input</span>
+            <span class="s1">k = int(self.k_depth)</span>
+
+        <span class="s2">return </span><span class="s1">max(k</span><span class="s2">, </span><span class="s3">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">x):</span>
+        <span class="s0">&quot;&quot;&quot;Evaluate the letter values.&quot;&quot;&quot;</span>
+        <span class="s1">k = self._compute_k(len(x))</span>
+        <span class="s1">exp = np.arange(k + </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s1">-</span><span class="s3">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">np.arange(</span><span class="s3">2</span><span class="s2">, </span><span class="s1">k + </span><span class="s3">2</span><span class="s1">)</span>
+        <span class="s1">levels = k + </span><span class="s3">1 </span><span class="s1">- np.concatenate([exp[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">exp[</span><span class="s3">1</span><span class="s1">][</span><span class="s3">1</span><span class="s1">:]])</span>
+        <span class="s1">percentiles = </span><span class="s3">100 </span><span class="s1">* np.concatenate([</span><span class="s3">0.5 </span><span class="s1">** exp[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s3">1 </span><span class="s1">- </span><span class="s3">0.5 </span><span class="s1">** exp[</span><span class="s3">1</span><span class="s1">]])</span>
+        <span class="s2">if </span><span class="s1">self.k_depth == </span><span class="s4">&quot;full&quot;</span><span class="s1">:</span>
+            <span class="s1">percentiles[</span><span class="s3">0</span><span class="s1">] = </span><span class="s3">0</span>
+            <span class="s1">percentiles[-</span><span class="s3">1</span><span class="s1">] = </span><span class="s3">100</span>
+        <span class="s1">values = np.percentile(x</span><span class="s2">, </span><span class="s1">percentiles)</span>
+        <span class="s1">fliers = np.asarray(x[(x &lt; values.min()) | (x &gt; values.max())])</span>
+        <span class="s1">median = np.percentile(x</span><span class="s2">, </span><span class="s3">50</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">{</span>
+            <span class="s4">&quot;k&quot;</span><span class="s1">: k</span><span class="s2">,</span>
+            <span class="s4">&quot;levels&quot;</span><span class="s1">: levels</span><span class="s2">,</span>
+            <span class="s4">&quot;percs&quot;</span><span class="s1">: percentiles</span><span class="s2">,</span>
+            <span class="s4">&quot;values&quot;</span><span class="s1">: values</span><span class="s2">,</span>
+            <span class="s4">&quot;fliers&quot;</span><span class="s1">: fliers</span><span class="s2">,</span>
+            <span class="s4">&quot;median&quot;</span><span class="s1">: median</span><span class="s2">,</span>
+        <span class="s1">}</span>
+
+
+<span class="s2">def </span><span class="s1">_percentile_interval(data</span><span class="s2">, </span><span class="s1">width):</span>
+    <span class="s0">&quot;&quot;&quot;Return a percentile interval from data of a given width.&quot;&quot;&quot;</span>
+    <span class="s1">edge = (</span><span class="s3">100 </span><span class="s1">- width) / </span><span class="s3">2</span>
+    <span class="s1">percentiles = edge</span><span class="s2">, </span><span class="s3">100 </span><span class="s1">- edge</span>
+    <span class="s2">return </span><span class="s1">np.nanpercentile(data</span><span class="s2">, </span><span class="s1">percentiles)</span>
+
+
+<span class="s2">def </span><span class="s1">_validate_errorbar_arg(arg):</span>
+    <span class="s0">&quot;&quot;&quot;Check type and value of errorbar argument and assign default level.&quot;&quot;&quot;</span>
+    <span class="s1">DEFAULT_LEVELS = {</span>
+        <span class="s4">&quot;ci&quot;</span><span class="s1">: </span><span class="s3">95</span><span class="s2">,</span>
+        <span class="s4">&quot;pi&quot;</span><span class="s1">: </span><span class="s3">95</span><span class="s2">,</span>
+        <span class="s4">&quot;se&quot;</span><span class="s1">: </span><span class="s3">1</span><span class="s2">,</span>
+        <span class="s4">&quot;sd&quot;</span><span class="s1">: </span><span class="s3">1</span><span class="s2">,</span>
+    <span class="s1">}</span>
+
+    <span class="s1">usage = </span><span class="s4">&quot;`errorbar` must be a callable, string, or (string, number) tuple&quot;</span>
+
+    <span class="s2">if </span><span class="s1">arg </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">return None, None</span>
+    <span class="s2">elif </span><span class="s1">callable(arg):</span>
+        <span class="s2">return </span><span class="s1">arg</span><span class="s2">, None</span>
+    <span class="s2">elif </span><span class="s1">isinstance(arg</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s1">method = arg</span>
+        <span class="s1">level = DEFAULT_LEVELS.get(method</span><span class="s2">, None</span><span class="s1">)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">method</span><span class="s2">, </span><span class="s1">level = arg</span>
+        <span class="s2">except </span><span class="s1">(ValueError</span><span class="s2">, </span><span class="s1">TypeError) </span><span class="s2">as </span><span class="s1">err:</span>
+            <span class="s2">raise </span><span class="s1">err.__class__(usage) </span><span class="s2">from </span><span class="s1">err</span>
+
+    <span class="s1">_check_argument(</span><span class="s4">&quot;errorbar&quot;</span><span class="s2">, </span><span class="s1">list(DEFAULT_LEVELS)</span><span class="s2">, </span><span class="s1">method)</span>
+    <span class="s2">if </span><span class="s1">level </span><span class="s2">is not None and not </span><span class="s1">isinstance(level</span><span class="s2">, </span><span class="s1">Number):</span>
+        <span class="s2">raise </span><span class="s1">TypeError(usage)</span>
+
+    <span class="s2">return </span><span class="s1">method</span><span class="s2">, </span><span class="s1">level</span>
+</pre>
+</body>
+</html>

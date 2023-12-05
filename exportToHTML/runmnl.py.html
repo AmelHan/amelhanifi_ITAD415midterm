@@ -1,0 +1,393 @@
+<html>
+<head>
+<title>runmnl.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+runmnl.py</font>
+</center></td></tr></table>
+<pre><span class="s0">'''conditional logit and nested conditional logit 
+ 
+nested conditional logit is supposed to be the random utility version 
+(RU2 and maybe RU1) 
+ 
+References: 
+----------- 
+currently based on: 
+Greene, Econometric Analysis, 5th edition and draft (?) 
+Hess, Florian, 2002, Structural Choice analysis with nested logit models, 
+    The Stats Journal 2(3) pp 227-252 
+ 
+not yet used: 
+Silberhorn Nadja, Yasemin Boztug, Lutz Hildebrandt, 2008, Estimation with the 
+    nested logit model: specifications and software particularities, 
+    OR Spectrum 
+Koppelman, Frank S., and Chandra Bhat with technical support from Vaneet Sethi, 
+    Sriram Subramanian, Vincent Bernardin and Jian Zhang, 2006, 
+    A Self Instructing Course in Mode Choice Modeling: Multinomial and 
+    Nested Logit Models 
+ 
+Author: josef-pktd 
+License: BSD (simplified) 
+'''</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">numpy.lib.recfunctions </span><span class="s2">as </span><span class="s1">recf</span>
+<span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">optimize</span>
+
+
+<span class="s2">class </span><span class="s1">TryCLogit:</span>
+    <span class="s0">''' 
+    Conditional Logit, data handling test 
+ 
+    Parameters 
+    ---------- 
+ 
+    endog : array (nobs,nchoices) 
+        dummy encoding of realized choices 
+    exog_bychoices : list of arrays 
+        explanatory variables, one array of exog for each choice. Variables 
+        with common coefficients have to be first in each array 
+    ncommon : int 
+        number of explanatory variables with common coefficients 
+ 
+    Notes 
+    ----- 
+ 
+    Utility for choice j is given by 
+ 
+        $V_j = X_j * beta + Z * gamma_j$ 
+ 
+    where X_j contains generic variables (terminology Hess) that have the same 
+    coefficient across choices, and Z are variables, like individual-specific 
+    variables that have different coefficients across variables. 
+ 
+    If there are choice specific constants, then they should be contained in Z. 
+    For identification, the constant of one choice should be dropped. 
+ 
+ 
+    '''</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog_bychoices</span><span class="s2">, </span><span class="s1">ncommon):</span>
+        <span class="s1">self.endog = endog</span>
+        <span class="s1">self.exog_bychoices = exog_bychoices</span>
+        <span class="s1">self.ncommon = ncommon</span>
+        <span class="s1">self.nobs</span><span class="s2">, </span><span class="s1">self.nchoices = endog.shape</span>
+        <span class="s1">self.nchoices = len(exog_bychoices)</span>
+
+        <span class="s3">#TODO: rename beta to params and include inclusive values for nested CL</span>
+        <span class="s1">betaind = [exog_bychoices[ii].shape[</span><span class="s4">1</span><span class="s1">]-ncommon </span><span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range(</span><span class="s4">4</span><span class="s1">)]</span>
+        <span class="s1">zi = np.r_[[ncommon]</span><span class="s2">, </span><span class="s1">ncommon + np.array(betaind).cumsum()]</span>
+        <span class="s1">beta_indices = [np.r_[np.array([</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">])</span><span class="s2">,</span><span class="s1">z[zi[ii]:zi[ii+</span><span class="s4">1</span><span class="s1">]]]</span>
+                       <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range(len(zi)-</span><span class="s4">1</span><span class="s1">)]</span>
+        <span class="s1">self.beta_indices = beta_indices</span>
+
+        <span class="s3">#for testing only</span>
+        <span class="s1">beta = np.arange(</span><span class="s4">7</span><span class="s1">)</span>
+        <span class="s1">betaidx_bychoices = [beta[idx] </span><span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">beta_indices]</span>
+
+
+    <span class="s2">def </span><span class="s1">xbetas(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">'''these are the V_i 
+        '''</span>
+
+        <span class="s1">res = np.empty((self.nobs</span><span class="s2">, </span><span class="s1">self.nchoices))</span>
+        <span class="s2">for </span><span class="s1">choiceind </span><span class="s2">in </span><span class="s1">range(self.nchoices):</span>
+            <span class="s1">res[:</span><span class="s2">,</span><span class="s1">choiceind] = np.dot(self.exog_bychoices[choiceind]</span><span class="s2">,</span>
+                                      <span class="s1">params[self.beta_indices[choiceind]])</span>
+        <span class="s2">return </span><span class="s1">res</span>
+
+    <span class="s2">def </span><span class="s1">loglike(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s3">#normalization ?</span>
+        <span class="s1">xb = self.xbetas(params)</span>
+        <span class="s1">expxb = np.exp(xb)</span>
+        <span class="s1">sumexpxb = expxb.sum(</span><span class="s4">1</span><span class="s1">)</span><span class="s3">#[:,None]</span>
+        <span class="s1">probs = expxb/expxb.sum(</span><span class="s4">1</span><span class="s1">)[:</span><span class="s2">,None</span><span class="s1">]  </span><span class="s3">#we do not really need this for all</span>
+        <span class="s1">loglike = (self.endog * np.log(probs)).sum(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s3">#is this the same: YES</span>
+        <span class="s3">#self.logliketest = (self.endog * xb).sum(1) - np.log(sumexpxb)</span>
+        <span class="s3">#if self.endog where index then xb[self.endog]</span>
+        <span class="s2">return </span><span class="s1">-loglike.sum()   </span><span class="s3">#return sum for now not for each observation</span>
+
+    <span class="s2">def </span><span class="s1">fit(self</span><span class="s2">, </span><span class="s1">start_params=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">start_params </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">start_params = np.zeros(</span><span class="s4">6</span><span class="s1">)  </span><span class="s3"># need better np.zeros(6)</span>
+        <span class="s2">return </span><span class="s1">optimize.fmin(self.loglike</span><span class="s2">, </span><span class="s1">start_params</span><span class="s2">, </span><span class="s1">maxfun=</span><span class="s4">10000</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TryNCLogit:</span>
+    <span class="s0">''' 
+    Nested Conditional Logit (RUNMNL), data handling test 
+ 
+    unfinished, does not do anything yet 
+ 
+    '''</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog_bychoices</span><span class="s2">, </span><span class="s1">ncommon):</span>
+        <span class="s1">self.endog = endog</span>
+        <span class="s1">self.exog_bychoices = exog_bychoices</span>
+        <span class="s1">self.ncommon = ncommon</span>
+        <span class="s1">self.nobs</span><span class="s2">, </span><span class="s1">self.nchoices = endog.shape</span>
+        <span class="s1">self.nchoices = len(exog_bychoices)</span>
+
+
+        <span class="s3">#TODO rename beta to params and include inclusive values for nested CL</span>
+        <span class="s1">betaind = [exog_bychoices[ii].shape[</span><span class="s4">1</span><span class="s1">]-ncommon </span><span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range(</span><span class="s4">4</span><span class="s1">)]</span>
+        <span class="s1">zi = np.r_[[ncommon]</span><span class="s2">, </span><span class="s1">ncommon + np.array(betaind).cumsum()]</span>
+        <span class="s1">beta_indices = [np.r_[np.array([</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">])</span><span class="s2">,</span><span class="s1">z[zi[ii]:zi[ii+</span><span class="s4">1</span><span class="s1">]]]</span>
+                       <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range(len(zi)-</span><span class="s4">1</span><span class="s1">)]</span>
+        <span class="s1">self.beta_indices = beta_indices</span>
+
+        <span class="s3">#for testing only</span>
+        <span class="s1">beta = np.arange(</span><span class="s4">7</span><span class="s1">)</span>
+        <span class="s1">betaidx_bychoices = [beta[idx] </span><span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">beta_indices]</span>
+
+
+    <span class="s2">def </span><span class="s1">xbetas(self</span><span class="s2">, </span><span class="s1">params):</span>
+        <span class="s0">'''these are the V_i 
+        '''</span>
+
+        <span class="s1">res = np.empty((self.nobs</span><span class="s2">, </span><span class="s1">self.nchoices))</span>
+        <span class="s2">for </span><span class="s1">choiceind </span><span class="s2">in </span><span class="s1">range(self.nchoices):</span>
+            <span class="s1">res[:</span><span class="s2">,</span><span class="s1">choiceind] = np.dot(self.exog_bychoices[choiceind]</span><span class="s2">,</span>
+                                      <span class="s1">params[self.beta_indices[choiceind]])</span>
+        <span class="s2">return </span><span class="s1">res</span>
+
+    <span class="s2">def </span><span class="s1">loglike_leafbranch(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">tau):</span>
+        <span class="s3">#normalization ?</span>
+        <span class="s3">#check/change naming for tau</span>
+        <span class="s1">xb = self.xbetas(params)</span>
+        <span class="s1">expxb = np.exp(xb/tau)</span>
+        <span class="s1">sumexpxb = expxb.sum(</span><span class="s4">1</span><span class="s1">)</span><span class="s3">#[:,None]</span>
+        <span class="s1">logsumexpxb = np.log(sumexpxb)</span>
+        <span class="s3">#loglike = (self.endog * xb).sum(1) - logsumexpxb</span>
+        <span class="s1">probs = expxb/sumexpxb[:</span><span class="s2">,None</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">probs</span><span class="s2">, </span><span class="s1">logsumexpxp  </span><span class="s3"># noqa:F821  See GH#5756</span>
+        <span class="s3">#if self.endog where index then xb[self.endog]</span>
+        <span class="s3">#return -loglike.sum()   #return sum for now not for each observation</span>
+
+    <span class="s2">def </span><span class="s1">loglike_branch(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">tau):</span>
+        <span class="s3">#not yet sure how to keep track of branches during walking of tree</span>
+        <span class="s1">ivs = []</span>
+        <span class="s2">for </span><span class="s1">b </span><span class="s2">in </span><span class="s1">branches:  </span><span class="s3"># noqa:F821  See GH#5756</span>
+            <span class="s1">probs</span><span class="s2">, </span><span class="s1">iv = self.loglike_leafbranch(params</span><span class="s2">, </span><span class="s1">tau)</span>
+            <span class="s1">ivs.append(iv)</span>
+
+        <span class="s3">#ivs = np.array(ivs)   #note ivs is (nobs,nbranchchoices)</span>
+        <span class="s1">ivs = np.column_stack(ivs) </span><span class="s3"># this way ?</span>
+        <span class="s1">exptiv = np.exp(tau*ivs)</span>
+        <span class="s1">sumexptiv = exptiv.sum(</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">logsumexpxb = np.log(sumexpxb)  </span><span class="s3"># noqa:F821  See GH#5756</span>
+        <span class="s1">probs = exptiv/sumexptiv[:</span><span class="s2">,None</span><span class="s1">]</span>
+
+
+<span class="s3">####### obsolete version to try out attaching data,</span>
+<span class="s3">####### new in treewalkerclass.py, copy new version to replace this</span>
+<span class="s3">####### problem with bzr I will disconnect history when copying</span>
+<span class="s1">testxb = </span><span class="s4">0 </span><span class="s3">#global to class</span>
+<span class="s2">class </span><span class="s1">RU2NMNL:</span>
+    <span class="s0">'''Nested Multinomial Logit with Random Utility 2 parameterization 
+ 
+    '''</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">tree</span><span class="s2">, </span><span class="s1">paramsind):</span>
+        <span class="s1">self.endog = endog</span>
+        <span class="s1">self.datadict = exog</span>
+        <span class="s1">self.tree = tree</span>
+        <span class="s1">self.paramsind = paramsind</span>
+
+        <span class="s1">self.branchsum = </span><span class="s5">''</span>
+        <span class="s1">self.probs = {}</span>
+
+
+    <span class="s2">def </span><span class="s1">calc_prob(self</span><span class="s2">, </span><span class="s1">tree</span><span class="s2">, </span><span class="s1">keys=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">'''walking a tree bottom-up based on dictionary 
+        '''</span>
+        <span class="s1">endog = self.endog</span>
+        <span class="s1">datadict = self.datadict</span>
+        <span class="s1">paramsind = self.paramsind</span>
+        <span class="s1">branchsum = self.branchsum</span>
+
+
+        <span class="s2">if </span><span class="s1">isinstance(tree</span><span class="s2">, </span><span class="s1">tuple):   </span><span class="s3">#assumes leaves are int for choice index</span>
+            <span class="s1">name</span><span class="s2">, </span><span class="s1">subtree = tree</span>
+            <span class="s1">print(name</span><span class="s2">, </span><span class="s1">datadict[name])</span>
+            <span class="s1">print(</span><span class="s5">'subtree'</span><span class="s2">, </span><span class="s1">subtree)</span>
+            <span class="s1">keys = []</span>
+            <span class="s2">if </span><span class="s1">testxb:</span>
+                <span class="s1">branchsum = datadict[name]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">branchsum = name  </span><span class="s3">#0</span>
+            <span class="s2">for </span><span class="s1">b </span><span class="s2">in </span><span class="s1">subtree:</span>
+                <span class="s1">print(b)</span>
+                <span class="s3">#branchsum += branch2(b)</span>
+                <span class="s1">branchsum = branchsum + self.calc_prob(b</span><span class="s2">, </span><span class="s1">keys)</span>
+            <span class="s1">print(</span><span class="s5">'branchsum'</span><span class="s2">, </span><span class="s1">branchsum</span><span class="s2">, </span><span class="s1">keys)</span>
+            <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">keys:</span>
+                <span class="s1">self.probs[k] = self.probs[k] + [</span><span class="s5">'*' </span><span class="s1">+ name + </span><span class="s5">'-prob'</span><span class="s1">]</span>
+
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">keys.append(tree)</span>
+            <span class="s1">self.probs[tree] = [tree + </span><span class="s5">'-prob' </span><span class="s1">+</span>
+                                <span class="s5">'(%s)' </span><span class="s1">% </span><span class="s5">', '</span><span class="s1">.join(self.paramsind[tree])]</span>
+            <span class="s2">if </span><span class="s1">testxb:</span>
+                <span class="s1">leavessum = sum((datadict[bi] </span><span class="s2">for </span><span class="s1">bi </span><span class="s2">in </span><span class="s1">tree))</span>
+                <span class="s1">print(</span><span class="s5">'final branch with'</span><span class="s2">, </span><span class="s1">tree</span><span class="s2">, </span><span class="s5">''</span><span class="s1">.join(tree)</span><span class="s2">, </span><span class="s1">leavessum) </span><span class="s3">#sum(tree)</span>
+                <span class="s2">return </span><span class="s1">leavessum  </span><span class="s3">#sum(xb[tree])</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s5">''</span><span class="s1">.join(tree) </span><span class="s3">#sum(tree)</span>
+
+        <span class="s1">print(</span><span class="s5">'working on branch'</span><span class="s2">, </span><span class="s1">tree</span><span class="s2">, </span><span class="s1">branchsum)</span>
+        <span class="s2">return </span><span class="s1">branchsum</span>
+
+
+
+<span class="s3">#Trying out ways to handle data</span>
+<span class="s3">#------------------------------</span>
+
+<span class="s3">#travel data from Greene</span>
+<span class="s1">dta = np.genfromtxt(</span><span class="s5">'TableF23-2.txt'</span><span class="s2">, </span><span class="s1">skip_header=</span><span class="s4">1</span><span class="s2">,</span>
+                    <span class="s1">names=</span><span class="s5">'Mode   Ttme   Invc    Invt      GC     Hinc    PSize'</span><span class="s1">.split())</span>
+
+<span class="s1">endog = dta[</span><span class="s5">'Mode'</span><span class="s1">].reshape(-</span><span class="s4">1</span><span class="s2">,</span><span class="s4">4</span><span class="s1">).copy() </span><span class="s3">#I do not want a view</span>
+<span class="s1">nobs</span><span class="s2">, </span><span class="s1">nchoices = endog.shape</span>
+<span class="s1">datafloat = dta.view(float).reshape(-</span><span class="s4">1</span><span class="s2">,</span><span class="s4">7</span><span class="s1">)</span>
+<span class="s1">exog = datafloat[:</span><span class="s2">,</span><span class="s4">1</span><span class="s1">:].reshape(-</span><span class="s4">1</span><span class="s2">,</span><span class="s4">6</span><span class="s1">*nchoices).copy() </span><span class="s3">#I do not want a view</span>
+
+<span class="s1">print(endog.sum(</span><span class="s4">0</span><span class="s1">))</span>
+<span class="s1">varnames = dta.dtype.names</span>
+<span class="s1">print(varnames[</span><span class="s4">1</span><span class="s1">:])</span>
+<span class="s1">modes = [</span><span class="s5">'Air'</span><span class="s2">, </span><span class="s5">'Train'</span><span class="s2">, </span><span class="s5">'Bus'</span><span class="s2">, </span><span class="s5">'Car'</span><span class="s1">]</span>
+<span class="s1">print(exog.mean(</span><span class="s4">0</span><span class="s1">).reshape(nchoices</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)) </span><span class="s3"># Greene Table 23.23</span>
+
+
+
+
+<span class="s3">#try dummy encoding for individual-specific variables</span>
+<span class="s1">exog_choice_names = [</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s1">]</span>
+<span class="s1">exog_choice = np.column_stack([dta[name] </span><span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">exog_choice_names])</span>
+<span class="s1">exog_choice = exog_choice.reshape(-</span><span class="s4">1</span><span class="s2">,</span><span class="s1">len(exog_choice_names)*nchoices)</span>
+<span class="s1">exog_choice = np.c_[endog</span><span class="s2">, </span><span class="s1">exog_choice] </span><span class="s3"># add constant dummy</span>
+
+<span class="s1">exog_individual = dta[</span><span class="s5">'Hinc'</span><span class="s1">][:</span><span class="s2">,None</span><span class="s1">]</span>
+
+<span class="s3">#exog2 = np.c_[exog_choice, exog_individual*endog]</span>
+
+<span class="s3"># we can also overwrite and select in original datafloat</span>
+<span class="s3"># e.g. Hinc*endog{choice)</span>
+
+<span class="s1">choice_index = np.arange(dta.shape[</span><span class="s4">0</span><span class="s1">]) % nchoices</span>
+<span class="s1">hinca = dta[</span><span class="s5">'Hinc'</span><span class="s1">]*(choice_index==</span><span class="s4">0</span><span class="s1">)</span>
+<span class="s1">dta2=recf.append_fields(dta</span><span class="s2">, </span><span class="s1">[</span><span class="s5">'Hinca'</span><span class="s1">]</span><span class="s2">,</span><span class="s1">[hinca]</span><span class="s2">, </span><span class="s1">usemask=</span><span class="s2">False</span><span class="s1">)</span>
+
+
+<span class="s3">#another version</span>
+
+<span class="s1">xi = []</span>
+<span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range(</span><span class="s4">4</span><span class="s1">):</span>
+    <span class="s1">xi.append(datafloat[choice_index==ii])</span>
+
+<span class="s3">#one more</span>
+<span class="s1">dta1 = recf.append_fields(dta</span><span class="s2">, </span><span class="s1">[</span><span class="s5">'Const'</span><span class="s1">]</span><span class="s2">,</span><span class="s1">[np.ones(dta.shape[</span><span class="s4">0</span><span class="s1">])]</span><span class="s2">, </span><span class="s1">usemask=</span><span class="s2">False</span><span class="s1">)</span>
+
+<span class="s1">xivar = [[</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s2">, </span><span class="s5">'Const'</span><span class="s2">, </span><span class="s5">'Hinc'</span><span class="s1">]</span><span class="s2">,</span>
+         <span class="s1">[</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s2">, </span><span class="s5">'Const'</span><span class="s1">]</span><span class="s2">,</span>
+         <span class="s1">[</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s2">, </span><span class="s5">'Const'</span><span class="s1">]</span><span class="s2">,</span>
+         <span class="s1">[</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s1">]]    </span><span class="s3">#need to drop one constant</span>
+
+<span class="s1">xi = []</span>
+<span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range(</span><span class="s4">4</span><span class="s1">):</span>
+    <span class="s1">xi.append(dta1[xivar[ii]][choice_index==ii])</span>
+    <span class="s3">#this does not change sequence of columns, bug report by Skipper I think</span>
+
+<span class="s1">ncommon = </span><span class="s4">2</span>
+<span class="s1">betaind = [len(xi[ii].dtype.names)-ncommon </span><span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range(</span><span class="s4">4</span><span class="s1">)]</span>
+<span class="s1">zi=np.r_[[ncommon]</span><span class="s2">, </span><span class="s1">ncommon+np.array(betaind).cumsum()]</span>
+<span class="s1">z=np.arange(</span><span class="s4">7</span><span class="s1">)  </span><span class="s3">#what is n?</span>
+<span class="s1">betaindices = [np.r_[np.array([</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">])</span><span class="s2">,</span><span class="s1">z[zi[ii]:zi[ii+</span><span class="s4">1</span><span class="s1">]]]</span>
+               <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range(len(zi)-</span><span class="s4">1</span><span class="s1">)]</span>
+
+<span class="s1">beta = np.arange(</span><span class="s4">7</span><span class="s1">)</span>
+<span class="s1">betai = [beta[idx] </span><span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">betaindices]</span>
+
+
+
+
+<span class="s3">#examples for TryCLogit</span>
+<span class="s3">#----------------------</span>
+
+
+<span class="s3">#get exogs as float</span>
+<span class="s1">xifloat = [xx.view(float).reshape(nobs</span><span class="s2">,</span><span class="s1">-</span><span class="s4">1</span><span class="s1">) </span><span class="s2">for </span><span class="s1">xx </span><span class="s2">in </span><span class="s1">xi]</span>
+<span class="s1">clogit = TryCLogit(endog</span><span class="s2">, </span><span class="s1">xifloat</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span>
+
+<span class="s1">debug = </span><span class="s4">0</span>
+<span class="s2">if </span><span class="s1">debug:</span>
+    <span class="s1">res = optimize.fmin(clogit.loglike</span><span class="s2">, </span><span class="s1">np.ones(</span><span class="s4">6</span><span class="s1">))</span>
+<span class="s3">#estimated parameters from Greene:</span>
+<span class="s1">tab2324 = [-</span><span class="s4">0.15501</span><span class="s2">, </span><span class="s1">-</span><span class="s4">0.09612</span><span class="s2">, </span><span class="s4">0.01329</span><span class="s2">, </span><span class="s4">5.2074</span><span class="s2">, </span><span class="s4">3.8690</span><span class="s2">, </span><span class="s4">3.1632</span><span class="s1">]</span>
+<span class="s2">if </span><span class="s1">debug:</span>
+    <span class="s1">res2 = optimize.fmin(clogit.loglike</span><span class="s2">, </span><span class="s1">tab2324)</span>
+
+<span class="s1">res3 = optimize.fmin(clogit.loglike</span><span class="s2">, </span><span class="s1">np.zeros(</span><span class="s4">6</span><span class="s1">)</span><span class="s2">,</span><span class="s1">maxfun=</span><span class="s4">10000</span><span class="s1">)</span>
+<span class="s3">#this has same numbers as Greene table 23.24, but different sequence</span>
+<span class="s3">#coefficient on GC is exactly 10% of Greene's</span>
+<span class="s3">#TODO: get better starting values</span>
+<span class="s5">''' 
+Optimization terminated successfully. 
+         Current function value: 199.128369 
+         Iterations: 957 
+         Function evaluations: 1456 
+array([-0.0961246 , -0.0155019 ,  0.01328757,  5.20741244,  3.86905293, 
+        3.16319074]) 
+'''</span>
+<span class="s1">res3corr = res3[[</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">2</span><span class="s2">, </span><span class="s4">3</span><span class="s2">, </span><span class="s4">4</span><span class="s2">, </span><span class="s4">5</span><span class="s1">]]</span>
+<span class="s1">res3corr[</span><span class="s4">0</span><span class="s1">] *= </span><span class="s4">10</span>
+<span class="s1">print(res3corr - tab2324)  </span><span class="s3"># diff 1e-5 to 1e-6</span>
+<span class="s3">#199.128369 - 199.1284  #llf same up to print(precision of Greene</span>
+
+<span class="s1">print(clogit.fit())</span>
+
+
+<span class="s1">tree0 = (</span><span class="s5">'top'</span><span class="s2">,</span>
+            <span class="s1">[(</span><span class="s5">'Fly'</span><span class="s2">,</span><span class="s1">[</span><span class="s5">'Air'</span><span class="s1">])</span><span class="s2">,</span>
+             <span class="s1">(</span><span class="s5">'Ground'</span><span class="s2">, </span><span class="s1">[</span><span class="s5">'Train'</span><span class="s2">, </span><span class="s5">'Car'</span><span class="s2">, </span><span class="s5">'Bus'</span><span class="s1">])</span>
+             <span class="s1">])</span>
+
+<span class="s1">datadict = dict(zip([</span><span class="s5">'Air'</span><span class="s2">, </span><span class="s5">'Train'</span><span class="s2">, </span><span class="s5">'Bus'</span><span class="s2">, </span><span class="s5">'Car'</span><span class="s1">]</span><span class="s2">,</span>
+                    <span class="s1">[xifloat[i]</span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s4">4</span><span class="s1">)]))</span>
+
+<span class="s3">#for testing only (mock that returns it's own name</span>
+<span class="s1">datadict = dict(zip([</span><span class="s5">'Air'</span><span class="s2">, </span><span class="s5">'Train'</span><span class="s2">, </span><span class="s5">'Bus'</span><span class="s2">, </span><span class="s5">'Car'</span><span class="s1">]</span><span class="s2">,</span>
+                    <span class="s1">[</span><span class="s5">'Airdata'</span><span class="s2">, </span><span class="s5">'Traindata'</span><span class="s2">, </span><span class="s5">'Busdata'</span><span class="s2">, </span><span class="s5">'Cardata'</span><span class="s1">]))</span>
+
+<span class="s1">datadict.update({</span><span class="s5">'top' </span><span class="s1">:   []</span><span class="s2">,</span>
+                 <span class="s5">'Fly' </span><span class="s1">:   []</span><span class="s2">,</span>
+                 <span class="s5">'Ground'</span><span class="s1">: []})</span>
+
+<span class="s1">paramsind = {</span><span class="s5">'top' </span><span class="s1">:   []</span><span class="s2">,</span>
+             <span class="s5">'Fly' </span><span class="s1">:   []</span><span class="s2">,</span>
+             <span class="s5">'Ground'</span><span class="s1">: []</span><span class="s2">,</span>
+             <span class="s5">'Air' </span><span class="s1">:   [</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s2">, </span><span class="s5">'ConstA'</span><span class="s2">, </span><span class="s5">'Hinc'</span><span class="s1">]</span><span class="s2">,</span>
+             <span class="s5">'Train' </span><span class="s1">: [</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s2">, </span><span class="s5">'ConstT'</span><span class="s1">]</span><span class="s2">,</span>
+             <span class="s5">'Bus' </span><span class="s1">:   [</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s2">, </span><span class="s5">'ConstB'</span><span class="s1">]</span><span class="s2">,</span>
+             <span class="s5">'Car' </span><span class="s1">:   [</span><span class="s5">'GC'</span><span class="s2">, </span><span class="s5">'Ttme'</span><span class="s1">]</span>
+             <span class="s1">}</span>
+
+<span class="s1">modru = RU2NMNL(endog</span><span class="s2">, </span><span class="s1">datadict</span><span class="s2">, </span><span class="s1">tree0</span><span class="s2">, </span><span class="s1">paramsind)</span>
+<span class="s1">print(modru.calc_prob(modru.tree))</span>
+<span class="s1">print(</span><span class="s5">'</span><span class="s2">\n</span><span class="s5">modru.probs'</span><span class="s1">)</span>
+<span class="s1">print(modru.probs)</span>
+</pre>
+</body>
+</html>

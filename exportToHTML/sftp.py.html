@@ -1,0 +1,201 @@
+<html>
+<head>
+<title>sftp.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+sftp.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">datetime</span>
+<span class="s0">import </span><span class="s1">logging</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">types</span>
+<span class="s0">import </span><span class="s1">uuid</span>
+<span class="s0">from </span><span class="s1">stat </span><span class="s0">import </span><span class="s1">S_ISDIR</span><span class="s0">, </span><span class="s1">S_ISLNK</span>
+
+<span class="s0">import </span><span class="s1">paramiko</span>
+
+<span class="s0">from </span><span class="s1">.. </span><span class="s0">import </span><span class="s1">AbstractFileSystem</span>
+<span class="s0">from </span><span class="s1">..utils </span><span class="s0">import </span><span class="s1">infer_storage_options</span>
+
+<span class="s1">logger = logging.getLogger(</span><span class="s2">&quot;fsspec.sftp&quot;</span><span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">SFTPFileSystem(AbstractFileSystem):</span>
+    <span class="s3">&quot;&quot;&quot;Files over SFTP/SSH 
+ 
+    Peer-to-peer filesystem over SSH using paramiko. 
+ 
+    Note: if using this with the ``open`` or ``open_files``, with full URLs, 
+    there is no way to tell if a path is relative, so all paths are assumed 
+    to be absolute. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">protocol = </span><span class="s2">&quot;sftp&quot;</span><span class="s0">, </span><span class="s2">&quot;ssh&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">host</span><span class="s0">, </span><span class="s1">**ssh_kwargs):</span>
+        <span class="s3">&quot;&quot;&quot; 
+ 
+        Parameters 
+        ---------- 
+        host: str 
+            Hostname or IP as a string 
+        temppath: str 
+            Location on the server to put files, when within a transaction 
+        ssh_kwargs: dict 
+            Parameters passed on to connection. See details in 
+            https://docs.paramiko.org/en/3.3/api/client.html#paramiko.client.SSHClient.connect 
+            May include port, username, password... 
+        &quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self._cached:</span>
+            <span class="s0">return</span>
+        <span class="s1">super().__init__(**ssh_kwargs)</span>
+        <span class="s1">self.temppath = ssh_kwargs.pop(</span><span class="s2">&quot;temppath&quot;</span><span class="s0">, </span><span class="s2">&quot;/tmp&quot;</span><span class="s1">)  </span><span class="s4"># remote temp directory</span>
+        <span class="s1">self.host = host</span>
+        <span class="s1">self.ssh_kwargs = ssh_kwargs</span>
+        <span class="s1">self._connect()</span>
+
+    <span class="s0">def </span><span class="s1">_connect(self):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;Connecting to SFTP server %s&quot;</span><span class="s0">, </span><span class="s1">self.host)</span>
+        <span class="s1">self.client = paramiko.SSHClient()</span>
+        <span class="s1">self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())</span>
+        <span class="s1">self.client.connect(self.host</span><span class="s0">, </span><span class="s1">**self.ssh_kwargs)</span>
+        <span class="s1">self.ftp = self.client.open_sftp()</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_strip_protocol(cls</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s0">return </span><span class="s1">infer_storage_options(path)[</span><span class="s2">&quot;path&quot;</span><span class="s1">]</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s0">def </span><span class="s1">_get_kwargs_from_urls(urlpath):</span>
+        <span class="s1">out = infer_storage_options(urlpath)</span>
+        <span class="s1">out.pop(</span><span class="s2">&quot;path&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">out.pop(</span><span class="s2">&quot;protocol&quot;</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">mkdir(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">create_parents=</span><span class="s0">False, </span><span class="s1">mode=</span><span class="s5">511</span><span class="s1">):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;Creating folder %s&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+        <span class="s0">if </span><span class="s1">self.exists(path):</span>
+            <span class="s0">raise </span><span class="s1">FileExistsError(</span><span class="s2">f&quot;File exists: </span><span class="s0">{</span><span class="s1">path</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+
+        <span class="s0">if </span><span class="s1">create_parents:</span>
+            <span class="s1">self.makedirs(path)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.ftp.mkdir(path</span><span class="s0">, </span><span class="s1">mode)</span>
+
+    <span class="s0">def </span><span class="s1">makedirs(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">False, </span><span class="s1">mode=</span><span class="s5">511</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">self.exists(path) </span><span class="s0">and not </span><span class="s1">exist_ok:</span>
+            <span class="s0">raise </span><span class="s1">FileExistsError(</span><span class="s2">f&quot;File exists: </span><span class="s0">{</span><span class="s1">path</span><span class="s0">}</span><span class="s2">&quot;</span><span class="s1">)</span>
+
+        <span class="s1">parts = path.split(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span>
+        <span class="s1">path = </span><span class="s2">&quot;&quot;</span>
+
+        <span class="s0">for </span><span class="s1">part </span><span class="s0">in </span><span class="s1">parts:</span>
+            <span class="s1">path += </span><span class="s2">f&quot;/</span><span class="s0">{</span><span class="s1">part</span><span class="s0">}</span><span class="s2">&quot;</span>
+            <span class="s0">if not </span><span class="s1">self.exists(path):</span>
+                <span class="s1">self.ftp.mkdir(path</span><span class="s0">, </span><span class="s1">mode)</span>
+
+    <span class="s0">def </span><span class="s1">rmdir(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;Removing folder %s&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+        <span class="s1">self.ftp.rmdir(path)</span>
+
+    <span class="s0">def </span><span class="s1">info(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s1">stat = self._decode_stat(self.ftp.stat(path))</span>
+        <span class="s1">stat[</span><span class="s2">&quot;name&quot;</span><span class="s1">] = path</span>
+        <span class="s0">return </span><span class="s1">stat</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s0">def </span><span class="s1">_decode_stat(stat</span><span class="s0">, </span><span class="s1">parent_path=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s0">if </span><span class="s1">S_ISDIR(stat.st_mode):</span>
+            <span class="s1">t = </span><span class="s2">&quot;directory&quot;</span>
+        <span class="s0">elif </span><span class="s1">S_ISLNK(stat.st_mode):</span>
+            <span class="s1">t = </span><span class="s2">&quot;link&quot;</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">t = </span><span class="s2">&quot;file&quot;</span>
+        <span class="s1">out = {</span>
+            <span class="s2">&quot;name&quot;</span><span class="s1">: </span><span class="s2">&quot;&quot;</span><span class="s0">,</span>
+            <span class="s2">&quot;size&quot;</span><span class="s1">: stat.st_size</span><span class="s0">,</span>
+            <span class="s2">&quot;type&quot;</span><span class="s1">: t</span><span class="s0">,</span>
+            <span class="s2">&quot;uid&quot;</span><span class="s1">: stat.st_uid</span><span class="s0">,</span>
+            <span class="s2">&quot;gid&quot;</span><span class="s1">: stat.st_gid</span><span class="s0">,</span>
+            <span class="s2">&quot;time&quot;</span><span class="s1">: datetime.datetime.fromtimestamp(</span>
+                <span class="s1">stat.st_atime</span><span class="s0">, </span><span class="s1">tz=datetime.timezone.utc</span>
+            <span class="s1">)</span><span class="s0">,</span>
+            <span class="s2">&quot;mtime&quot;</span><span class="s1">: datetime.datetime.fromtimestamp(</span>
+                <span class="s1">stat.st_mtime</span><span class="s0">, </span><span class="s1">tz=datetime.timezone.utc</span>
+            <span class="s1">)</span><span class="s0">,</span>
+        <span class="s1">}</span>
+        <span class="s0">if </span><span class="s1">parent_path:</span>
+            <span class="s1">out[</span><span class="s2">&quot;name&quot;</span><span class="s1">] = </span><span class="s2">&quot;/&quot;</span><span class="s1">.join([parent_path.rstrip(</span><span class="s2">&quot;/&quot;</span><span class="s1">)</span><span class="s0">, </span><span class="s1">stat.filename])</span>
+        <span class="s0">return </span><span class="s1">out</span>
+
+    <span class="s0">def </span><span class="s1">ls(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">detail=</span><span class="s0">False</span><span class="s1">):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;Listing folder %s&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+        <span class="s1">stats = [self._decode_stat(stat</span><span class="s0">, </span><span class="s1">path) </span><span class="s0">for </span><span class="s1">stat </span><span class="s0">in </span><span class="s1">self.ftp.listdir_iter(path)]</span>
+        <span class="s0">if </span><span class="s1">detail:</span>
+            <span class="s0">return </span><span class="s1">stats</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">paths = [stat[</span><span class="s2">&quot;name&quot;</span><span class="s1">] </span><span class="s0">for </span><span class="s1">stat </span><span class="s0">in </span><span class="s1">stats]</span>
+            <span class="s0">return </span><span class="s1">sorted(paths)</span>
+
+    <span class="s0">def </span><span class="s1">put(self</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">callback=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;Put file %s into %s&quot;</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">rpath)</span>
+        <span class="s1">self.ftp.put(lpath</span><span class="s0">, </span><span class="s1">rpath)</span>
+
+    <span class="s0">def </span><span class="s1">get_file(self</span><span class="s0">, </span><span class="s1">rpath</span><span class="s0">, </span><span class="s1">lpath</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">if </span><span class="s1">self.isdir(rpath):</span>
+            <span class="s1">os.makedirs(lpath</span><span class="s0">, </span><span class="s1">exist_ok=</span><span class="s0">True</span><span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.ftp.get(self._strip_protocol(rpath)</span><span class="s0">, </span><span class="s1">lpath)</span>
+
+    <span class="s0">def </span><span class="s1">_open(self</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">mode=</span><span class="s2">&quot;rb&quot;</span><span class="s0">, </span><span class="s1">block_size=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot; 
+        block_size: int or None 
+            If 0, no buffering, if 1, line buffering, if &gt;1, buffer that many 
+            bytes, if None use default from paramiko. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;Opening file %s&quot;</span><span class="s0">, </span><span class="s1">path)</span>
+        <span class="s0">if </span><span class="s1">kwargs.get(</span><span class="s2">&quot;autocommit&quot;</span><span class="s0">, True</span><span class="s1">) </span><span class="s0">is False</span><span class="s1">:</span>
+            <span class="s4"># writes to temporary file, move on commit</span>
+            <span class="s1">path2 = </span><span class="s2">&quot;/&quot;</span><span class="s1">.join([self.temppath</span><span class="s0">, </span><span class="s1">str(uuid.uuid4())])</span>
+            <span class="s1">f = self.ftp.open(path2</span><span class="s0">, </span><span class="s1">mode</span><span class="s0">, </span><span class="s1">bufsize=block_size </span><span class="s0">if </span><span class="s1">block_size </span><span class="s0">else </span><span class="s1">-</span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s1">f.temppath = path2</span>
+            <span class="s1">f.targetpath = path</span>
+            <span class="s1">f.fs = self</span>
+            <span class="s1">f.commit = types.MethodType(commit_a_file</span><span class="s0">, </span><span class="s1">f)</span>
+            <span class="s1">f.discard = types.MethodType(discard_a_file</span><span class="s0">, </span><span class="s1">f)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">f = self.ftp.open(path</span><span class="s0">, </span><span class="s1">mode</span><span class="s0">, </span><span class="s1">bufsize=block_size </span><span class="s0">if </span><span class="s1">block_size </span><span class="s0">else </span><span class="s1">-</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s0">return </span><span class="s1">f</span>
+
+    <span class="s0">def </span><span class="s1">_rm(self</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s0">if </span><span class="s1">self.isdir(path):</span>
+            <span class="s1">self.ftp.rmdir(path)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.ftp.remove(path)</span>
+
+    <span class="s0">def </span><span class="s1">mv(self</span><span class="s0">, </span><span class="s1">old</span><span class="s0">, </span><span class="s1">new):</span>
+        <span class="s1">logger.debug(</span><span class="s2">&quot;Renaming %s into %s&quot;</span><span class="s0">, </span><span class="s1">old</span><span class="s0">, </span><span class="s1">new)</span>
+        <span class="s1">self.ftp.posix_rename(old</span><span class="s0">, </span><span class="s1">new)</span>
+
+
+<span class="s0">def </span><span class="s1">commit_a_file(self):</span>
+    <span class="s1">self.fs.mv(self.temppath</span><span class="s0">, </span><span class="s1">self.targetpath)</span>
+
+
+<span class="s0">def </span><span class="s1">discard_a_file(self):</span>
+    <span class="s1">self.fs._rm(self.temppath)</span>
+</pre>
+</body>
+</html>

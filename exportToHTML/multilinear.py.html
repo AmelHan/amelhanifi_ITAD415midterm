@@ -1,0 +1,345 @@
+<html>
+<head>
+<title>multilinear.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+multilinear.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Analyze a set of multiple variables with a linear models 
+ 
+multiOLS: 
+    take a model and test it on a series of variables defined over a 
+    pandas dataset, returning a summary for each variable 
+ 
+multigroup: 
+    take a boolean vector and the definition of several groups of variables 
+    and test if the group has a fraction of true values higher than the 
+    rest. It allows to test if the variables in the group are significantly 
+    more significant than outside the group. 
+&quot;&quot;&quot;</span>
+<span class="s2">from </span><span class="s1">patsy </span><span class="s2">import </span><span class="s1">dmatrix</span>
+<span class="s2">import </span><span class="s1">pandas </span><span class="s2">as </span><span class="s1">pd</span>
+<span class="s2">from </span><span class="s1">statsmodels.api </span><span class="s2">import </span><span class="s1">OLS</span>
+<span class="s2">from </span><span class="s1">statsmodels.api </span><span class="s2">import </span><span class="s1">stats</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">logging</span>
+
+<span class="s2">def </span><span class="s1">_model2dataframe(model_endog</span><span class="s2">, </span><span class="s1">model_exog</span><span class="s2">, </span><span class="s1">model_type=OLS</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+    <span class="s0">&quot;&quot;&quot;return a series containing the summary of a linear model 
+ 
+    All the exceding parameters will be redirected to the linear model 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># create the linear model and perform the fit</span>
+    <span class="s1">model_result = model_type(model_endog</span><span class="s2">, </span><span class="s1">model_exog</span><span class="s2">, </span><span class="s1">**kwargs).fit()</span>
+    <span class="s3"># keeps track of some global statistics</span>
+    <span class="s1">statistics = pd.Series({</span><span class="s4">'r2'</span><span class="s1">: model_result.rsquared</span><span class="s2">,</span>
+                  <span class="s4">'adj_r2'</span><span class="s1">: model_result.rsquared_adj})</span>
+    <span class="s3"># put them togher with the result for each term</span>
+    <span class="s1">result_df = pd.DataFrame({</span><span class="s4">'params'</span><span class="s1">: model_result.params</span><span class="s2">,</span>
+                              <span class="s4">'pvals'</span><span class="s1">: model_result.pvalues</span><span class="s2">,</span>
+                              <span class="s4">'std'</span><span class="s1">: model_result.bse</span><span class="s2">,</span>
+                              <span class="s4">'statistics'</span><span class="s1">: statistics})</span>
+    <span class="s3"># add the complexive results for f-value and the total p-value</span>
+    <span class="s1">fisher_df = pd.DataFrame({</span><span class="s4">'params'</span><span class="s1">: {</span><span class="s4">'_f_test'</span><span class="s1">: model_result.fvalue}</span><span class="s2">,</span>
+                              <span class="s4">'pvals'</span><span class="s1">: {</span><span class="s4">'_f_test'</span><span class="s1">: model_result.f_pvalue}})</span>
+    <span class="s3"># merge them and unstack to obtain a hierarchically indexed series</span>
+    <span class="s1">res_series = pd.concat([result_df</span><span class="s2">, </span><span class="s1">fisher_df]).unstack()</span>
+    <span class="s2">return </span><span class="s1">res_series.dropna()</span>
+
+
+<span class="s2">def </span><span class="s1">multiOLS(model</span><span class="s2">, </span><span class="s1">dataframe</span><span class="s2">, </span><span class="s1">column_list=</span><span class="s2">None, </span><span class="s1">method=</span><span class="s4">'fdr_bh'</span><span class="s2">,</span>
+             <span class="s1">alpha=</span><span class="s5">0.05</span><span class="s2">, </span><span class="s1">subset=</span><span class="s2">None, </span><span class="s1">model_type=OLS</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+    <span class="s0">&quot;&quot;&quot;apply a linear model to several endogenous variables on a dataframe 
+ 
+    Take a linear model definition via formula and a dataframe that will be 
+    the environment of the model, and apply the linear model to a subset 
+    (or all) of the columns of the dataframe. It will return a dataframe 
+    with part of the information from the linear model summary. 
+ 
+    Parameters 
+    ---------- 
+    model : str 
+        formula description of the model 
+    dataframe : pandas.dataframe 
+        dataframe where the model will be evaluated 
+    column_list : list[str], optional 
+        Names of the columns to analyze with the model. 
+        If None (Default) it will perform the function on all the 
+        eligible columns (numerical type and not in the model definition) 
+    model_type : model class, optional 
+        The type of model to be used. The default is the linear model. 
+        Can be any linear model (OLS, WLS, GLS, etc..) 
+    method : str, optional 
+        the method used to perform the pvalue correction for multiple testing. 
+        default is the Benjamini/Hochberg, other available methods are: 
+ 
+            `bonferroni` : one-step correction 
+            `sidak` : on-step correction 
+            `holm-sidak` : 
+            `holm` : 
+            `simes-hochberg` : 
+            `hommel` : 
+            `fdr_bh` : Benjamini/Hochberg 
+            `fdr_by` : Benjamini/Yekutieli 
+ 
+    alpha : float, optional 
+        the significance level used for the pvalue correction (default 0.05) 
+    subset : bool array 
+        the selected rows to be used in the regression 
+ 
+    all the other parameters will be directed to the model creation. 
+ 
+    Returns 
+    ------- 
+    summary : pandas.DataFrame 
+        a dataframe containing an extract from the summary of the model 
+        obtained for each columns. It will give the model complexive f test 
+        result and p-value, and the regression value and standard deviarion 
+        for each of the regressors. The DataFrame has a hierachical column 
+        structure, divided as: 
+ 
+            - params: contains the parameters resulting from the models. Has 
+            an additional column named _f_test containing the result of the 
+            F test. 
+            - pval: the pvalue results of the models. Has the _f_test column 
+            for the significativity of the whole test. 
+            - adj_pval: the corrected pvalues via the multitest function. 
+            - std: uncertainties of the model parameters 
+            - statistics: contains the r squared statistics and the adjusted 
+            r squared. 
+ 
+    Notes 
+    ----- 
+    The main application of this function is on system biology to perform 
+    a linear model testing of a lot of different parameters, like the 
+    different genetic expression of several genes. 
+ 
+    See Also 
+    -------- 
+    statsmodels.stats.multitest 
+        contains several functions to perform the multiple p-value correction 
+ 
+    Examples 
+    -------- 
+    Using the longley data as dataframe example 
+ 
+    &gt;&gt;&gt; import statsmodels.api as sm 
+    &gt;&gt;&gt; data = sm.datasets.longley.load_pandas() 
+    &gt;&gt;&gt; df = data.exog 
+    &gt;&gt;&gt; df['TOTEMP'] = data.endog 
+ 
+    This will perform the specified linear model on all the 
+    other columns of the dataframe 
+    &gt;&gt;&gt; multiOLS('GNP + 1', df) 
+ 
+    This select only a certain subset of the columns 
+    &gt;&gt;&gt; multiOLS('GNP + 0', df, ['GNPDEFL', 'TOTEMP', 'POP']) 
+ 
+    It is possible to specify a trasformation also on the target column, 
+    conforming to the patsy formula specification 
+    &gt;&gt;&gt; multiOLS('GNP + 0', df, ['I(GNPDEFL**2)', 'center(TOTEMP)']) 
+ 
+    It is possible to specify the subset of the dataframe 
+    on which perform the analysis 
+    &gt;&gt; multiOLS('GNP + 1', df, subset=df.GNPDEFL &gt; 90) 
+ 
+    Even a single column name can be given without enclosing it in a list 
+    &gt;&gt;&gt; multiOLS('GNP + 0', df, 'GNPDEFL') 
+    &quot;&quot;&quot;</span>
+    <span class="s3"># data normalization</span>
+    <span class="s3"># if None take all the numerical columns that are not present in the model</span>
+    <span class="s3"># it's not waterproof but is a good enough criterion for everyday use</span>
+    <span class="s2">if </span><span class="s1">column_list </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">column_list = [name </span><span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">dataframe.columns</span>
+                      <span class="s2">if </span><span class="s1">dataframe[name].dtype != object </span><span class="s2">and </span><span class="s1">name </span><span class="s2">not in </span><span class="s1">model]</span>
+    <span class="s3"># if it's a single string transform it in a single element list</span>
+    <span class="s2">if </span><span class="s1">isinstance(column_list</span><span class="s2">, </span><span class="s1">str):</span>
+        <span class="s1">column_list = [column_list]</span>
+    <span class="s2">if </span><span class="s1">subset </span><span class="s2">is not None</span><span class="s1">:</span>
+        <span class="s1">dataframe = dataframe.loc[subset]</span>
+    <span class="s3"># perform each model and retrieve the statistics</span>
+    <span class="s1">col_results = {}</span>
+    <span class="s3"># as the model will use always the same endogenous variables</span>
+    <span class="s3"># we can create them once and reuse</span>
+    <span class="s1">model_exog = dmatrix(model</span><span class="s2">, </span><span class="s1">data=dataframe</span><span class="s2">, </span><span class="s1">return_type=</span><span class="s4">&quot;dataframe&quot;</span><span class="s1">)</span>
+    <span class="s2">for </span><span class="s1">col_name </span><span class="s2">in </span><span class="s1">column_list:</span>
+        <span class="s3"># it will try to interpret the column name as a valid dataframe</span>
+        <span class="s3"># index as it can be several times faster. If it fails it</span>
+        <span class="s3"># interpret it as a patsy formula (for example for centering)</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">model_endog = dataframe[col_name]</span>
+        <span class="s2">except </span><span class="s1">KeyError:</span>
+            <span class="s1">model_endog = dmatrix(col_name + </span><span class="s4">' + 0'</span><span class="s2">, </span><span class="s1">data=dataframe)</span>
+        <span class="s3"># retrieve the result and store them</span>
+        <span class="s1">res = _model2dataframe(model_endog</span><span class="s2">, </span><span class="s1">model_exog</span><span class="s2">, </span><span class="s1">model_type</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">col_results[col_name] = res</span>
+    <span class="s3"># mangle them togheter and sort by complexive p-value</span>
+    <span class="s1">summary = pd.DataFrame(col_results)</span>
+    <span class="s3"># order by the p-value: the most useful model first!</span>
+    <span class="s1">summary = summary.T.sort_values([(</span><span class="s4">'pvals'</span><span class="s2">, </span><span class="s4">'_f_test'</span><span class="s1">)])</span>
+    <span class="s1">summary.index.name = </span><span class="s4">'endogenous vars'</span>
+    <span class="s3"># implementing the pvalue correction method</span>
+    <span class="s1">smt = stats.multipletests</span>
+    <span class="s2">for </span><span class="s1">(key1</span><span class="s2">, </span><span class="s1">key2) </span><span class="s2">in </span><span class="s1">summary:</span>
+        <span class="s2">if </span><span class="s1">key1 != </span><span class="s4">'pvals'</span><span class="s1">:</span>
+            <span class="s2">continue</span>
+        <span class="s1">p_values = summary[key1</span><span class="s2">, </span><span class="s1">key2]</span>
+        <span class="s1">corrected = smt(p_values</span><span class="s2">, </span><span class="s1">method=method</span><span class="s2">, </span><span class="s1">alpha=alpha)[</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s3"># extend the dataframe of results with the column</span>
+        <span class="s3"># of the corrected p_values</span>
+        <span class="s1">summary[</span><span class="s4">'adj_' </span><span class="s1">+ key1</span><span class="s2">, </span><span class="s1">key2] = corrected</span>
+    <span class="s2">return </span><span class="s1">summary</span>
+
+
+<span class="s2">def </span><span class="s1">_test_group(pvalues</span><span class="s2">, </span><span class="s1">group_name</span><span class="s2">, </span><span class="s1">group</span><span class="s2">, </span><span class="s1">exact=</span><span class="s2">True</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;test if the objects in the group are different from the general set. 
+ 
+    The test is performed on the pvalues set (ad a pandas series) over 
+    the group specified via a fisher exact test. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">from </span><span class="s1">scipy.stats </span><span class="s2">import </span><span class="s1">fisher_exact</span><span class="s2">, </span><span class="s1">chi2_contingency</span>
+
+    <span class="s1">totals = </span><span class="s5">1.0 </span><span class="s1">* len(pvalues)</span>
+    <span class="s1">total_significant = </span><span class="s5">1.0 </span><span class="s1">* np.sum(pvalues)</span>
+    <span class="s1">cross_index = [c </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">group </span><span class="s2">if </span><span class="s1">c </span><span class="s2">in </span><span class="s1">pvalues.index]</span>
+    <span class="s1">missing = [c </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">group </span><span class="s2">if </span><span class="s1">c </span><span class="s2">not in </span><span class="s1">pvalues.index]</span>
+    <span class="s2">if </span><span class="s1">missing:</span>
+        <span class="s1">s = (</span><span class="s4">'the test is not well defined if the group '</span>
+             <span class="s4">'has elements not presents in the significativity '</span>
+             <span class="s4">'array. group name: {}, missing elements: {}'</span><span class="s1">)</span>
+        <span class="s1">logging.warning(s.format(group_name</span><span class="s2">, </span><span class="s1">missing))</span>
+    <span class="s3"># how many are significant and not in the group</span>
+    <span class="s1">group_total = </span><span class="s5">1.0 </span><span class="s1">* len(cross_index)</span>
+    <span class="s1">group_sign = </span><span class="s5">1.0 </span><span class="s1">* len([c </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">cross_index </span><span class="s2">if </span><span class="s1">pvalues[c]])</span>
+    <span class="s1">group_nonsign = </span><span class="s5">1.0 </span><span class="s1">* (group_total - group_sign)</span>
+    <span class="s3"># how many are significant and not outside the group</span>
+    <span class="s1">extern_sign = </span><span class="s5">1.0 </span><span class="s1">* (total_significant - group_sign)</span>
+    <span class="s1">extern_nonsign = </span><span class="s5">1.0 </span><span class="s1">* (totals - total_significant - group_nonsign)</span>
+    <span class="s3"># make the fisher test or the chi squared</span>
+    <span class="s1">test = fisher_exact </span><span class="s2">if </span><span class="s1">exact </span><span class="s2">else </span><span class="s1">chi2_contingency</span>
+    <span class="s1">table = [[extern_nonsign</span><span class="s2">, </span><span class="s1">extern_sign]</span><span class="s2">, </span><span class="s1">[group_nonsign</span><span class="s2">, </span><span class="s1">group_sign]]</span>
+    <span class="s1">pvalue = test(np.array(table))[</span><span class="s5">1</span><span class="s1">]</span>
+    <span class="s3"># is the group more represented or less?</span>
+    <span class="s1">part = group_sign</span><span class="s2">, </span><span class="s1">group_nonsign</span><span class="s2">, </span><span class="s1">extern_sign</span><span class="s2">, </span><span class="s1">extern_nonsign</span>
+    <span class="s3">#increase = (group_sign / group_total) &gt; (total_significant / totals)</span>
+    <span class="s1">increase = np.log((totals * group_sign)</span>
+                      <span class="s1">/ (total_significant * group_total))</span>
+    <span class="s2">return </span><span class="s1">pvalue</span><span class="s2">, </span><span class="s1">increase</span><span class="s2">, </span><span class="s1">part</span>
+
+
+<span class="s2">def </span><span class="s1">multigroup(pvals</span><span class="s2">, </span><span class="s1">groups</span><span class="s2">, </span><span class="s1">exact=</span><span class="s2">True, </span><span class="s1">keep_all=</span><span class="s2">True, </span><span class="s1">alpha=</span><span class="s5">0.05</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Test if the given groups are different from the total partition. 
+ 
+    Given a boolean array test if each group has a proportion of positives 
+    different than the complexive proportion. 
+    The test can be done as an exact Fisher test or approximated as a 
+    Chi squared test for more speed. 
+ 
+    Parameters 
+    ---------- 
+    pvals : pandas series of boolean 
+        the significativity of the variables under analysis 
+    groups : dict of list 
+        the name of each category of variables under exam. 
+        each one is a list of the variables included 
+    exact : bool, optional 
+        If True (default) use the fisher exact test, otherwise 
+        use the chi squared test for contingencies tables. 
+        For high number of elements in the array the fisher test can 
+        be significantly slower than the chi squared. 
+    keep_all : bool, optional 
+        if False it will drop those groups where the fraction 
+        of positive is below the expected result. If True (default) 
+         it will keep all the significant results. 
+    alpha : float, optional 
+        the significativity level for the pvalue correction 
+        on the whole set of groups (not inside the groups themselves). 
+ 
+    Returns 
+    ------- 
+    result_df: pandas dataframe 
+        for each group returns: 
+ 
+            pvals - the fisher p value of the test 
+            adj_pvals - the adjusted pvals 
+            increase - the log of the odd ratio between the 
+                internal significant ratio versus the external one 
+            _in_sign - significative elements inside the group 
+            _in_non - non significative elements inside the group 
+            _out_sign - significative elements outside the group 
+            _out_non - non significative elements outside the group 
+ 
+    Notes 
+    ----- 
+    This test allow to see if a category of variables is generally better 
+    suited to be described for the model. For example to see if a predictor 
+    gives more information on demographic or economical parameters, 
+    by creating two groups containing the endogenous variables of each 
+    category. 
+ 
+    This function is conceived for medical dataset with a lot of variables 
+    that can be easily grouped into functional groups. This is because 
+    The significativity of a group require a rather large number of 
+    composing elements. 
+ 
+    Examples 
+    -------- 
+    A toy example on a real dataset, the Guerry dataset from R 
+    &gt;&gt;&gt; url = &quot;https://raw.githubusercontent.com/vincentarelbundock/&quot; 
+    &gt;&gt;&gt; url = url + &quot;Rdatasets/csv/HistData/Guerry.csv&quot; 
+    &gt;&gt;&gt; df = pd.read_csv(url, index_col='dept') 
+ 
+    evaluate the relationship between the various paramenters whith the Wealth 
+    &gt;&gt;&gt; pvals = multiOLS('Wealth', df)['adj_pvals', '_f_test'] 
+ 
+    define the groups 
+    &gt;&gt;&gt; groups = {} 
+    &gt;&gt;&gt; groups['crime'] = ['Crime_prop', 'Infanticide', 
+    ...     'Crime_parents', 'Desertion', 'Crime_pers'] 
+    &gt;&gt;&gt; groups['religion'] = ['Donation_clergy', 'Clergy', 'Donations'] 
+    &gt;&gt;&gt; groups['wealth'] = ['Commerce', 'Lottery', 'Instruction', 'Literacy'] 
+ 
+    do the analysis of the significativity 
+    &gt;&gt;&gt; multigroup(pvals &lt; 0.05, groups) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">pvals = pd.Series(pvals)</span>
+    <span class="s2">if not </span><span class="s1">(set(pvals.unique()) &lt;= set([</span><span class="s2">False, True</span><span class="s1">])):</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;the series should be binary&quot;</span><span class="s1">)</span>
+    <span class="s2">if </span><span class="s1">hasattr(pvals.index</span><span class="s2">, </span><span class="s4">'is_unique'</span><span class="s1">) </span><span class="s2">and not </span><span class="s1">pvals.index.is_unique:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;series with duplicated index is not accepted&quot;</span><span class="s1">)</span>
+    <span class="s1">results = {</span><span class="s4">'pvals'</span><span class="s1">: {}</span><span class="s2">,</span>
+        <span class="s4">'increase'</span><span class="s1">: {}</span><span class="s2">,</span>
+        <span class="s4">'_in_sign'</span><span class="s1">: {}</span><span class="s2">,</span>
+        <span class="s4">'_in_non'</span><span class="s1">: {}</span><span class="s2">,</span>
+        <span class="s4">'_out_sign'</span><span class="s1">: {}</span><span class="s2">,</span>
+        <span class="s4">'_out_non'</span><span class="s1">: {}}</span>
+    <span class="s2">for </span><span class="s1">group_name</span><span class="s2">, </span><span class="s1">group_list </span><span class="s2">in </span><span class="s1">groups.items():</span>
+        <span class="s1">res = _test_group(pvals</span><span class="s2">, </span><span class="s1">group_name</span><span class="s2">, </span><span class="s1">group_list</span><span class="s2">, </span><span class="s1">exact)</span>
+        <span class="s1">results[</span><span class="s4">'pvals'</span><span class="s1">][group_name] = res[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">results[</span><span class="s4">'increase'</span><span class="s1">][group_name] = res[</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">results[</span><span class="s4">'_in_sign'</span><span class="s1">][group_name] = res[</span><span class="s5">2</span><span class="s1">][</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">results[</span><span class="s4">'_in_non'</span><span class="s1">][group_name] = res[</span><span class="s5">2</span><span class="s1">][</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">results[</span><span class="s4">'_out_sign'</span><span class="s1">][group_name] = res[</span><span class="s5">2</span><span class="s1">][</span><span class="s5">2</span><span class="s1">]</span>
+        <span class="s1">results[</span><span class="s4">'_out_non'</span><span class="s1">][group_name] = res[</span><span class="s5">2</span><span class="s1">][</span><span class="s5">3</span><span class="s1">]</span>
+    <span class="s1">result_df = pd.DataFrame(results).sort_values(</span><span class="s4">'pvals'</span><span class="s1">)</span>
+    <span class="s2">if not </span><span class="s1">keep_all:</span>
+        <span class="s1">result_df = result_df[result_df.increase]</span>
+    <span class="s1">smt = stats.multipletests</span>
+    <span class="s1">corrected = smt(result_df[</span><span class="s4">'pvals'</span><span class="s1">]</span><span class="s2">, </span><span class="s1">method=</span><span class="s4">'fdr_bh'</span><span class="s2">, </span><span class="s1">alpha=alpha)[</span><span class="s5">1</span><span class="s1">]</span>
+    <span class="s1">result_df[</span><span class="s4">'adj_pvals'</span><span class="s1">] = corrected</span>
+    <span class="s2">return </span><span class="s1">result_df</span>
+</pre>
+</body>
+</html>

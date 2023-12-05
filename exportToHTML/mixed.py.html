@@ -1,0 +1,681 @@
+<html>
+<head>
+<title>mixed.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+mixed.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Mixed effects models 
+ 
+Author: Jonathan Taylor 
+Author: Josef Perktold 
+License: BSD-3 
+ 
+ 
+Notes 
+----- 
+ 
+It's pretty slow if the model is misspecified, in my first example convergence 
+in loglike is not reached within 2000 iterations. Added stop criteria based 
+on convergence of parameters instead. 
+ 
+With correctly specified model, convergence is fast, in 6 iterations in 
+example. 
+ 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">numpy.linalg </span><span class="s2">as </span><span class="s1">L</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.base.model </span><span class="s2">import </span><span class="s1">LikelihoodModelResults</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.decorators </span><span class="s2">import </span><span class="s1">cache_readonly</span>
+
+<span class="s2">class </span><span class="s1">Unit:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Individual experimental unit for 
+    EM implementation of (repeated measures) 
+    mixed effects model. 
+ 
+    \'Maximum Likelihood Computations with Repeated Measures: 
+    Application of the EM Algorithm\' 
+ 
+    Nan Laird; Nicholas Lange; Daniel Stram 
+ 
+    Journal of the American Statistical Association, 
+    Vol. 82, No. 397. (Mar., 1987), pp. 97-105. 
+ 
+ 
+    Parameters 
+    ---------- 
+    endog : ndarray, (nobs,) 
+        response, endogenous variable 
+    exog_fe : ndarray, (nobs, k_vars_fe) 
+        explanatory variables as regressors or fixed effects, 
+        should include exog_re to correct mean of random 
+        coefficients, see Notes 
+    exog_re : ndarray, (nobs, k_vars_re) 
+        explanatory variables or random effects or coefficients 
+ 
+    Notes 
+    ----- 
+    If the exog_re variables are not included in exog_fe, then the 
+    mean of the random constants or coefficients are not centered. 
+    The covariance matrix of the random parameter estimates are not 
+    centered in this case. (That's how it looks to me. JP) 
+    &quot;&quot;&quot;</span>
+
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog_fe</span><span class="s2">, </span><span class="s1">exog_re):</span>
+
+        <span class="s1">self.Y = endog</span>
+        <span class="s1">self.X = exog_fe</span>
+        <span class="s1">self.Z = exog_re</span>
+        <span class="s1">self.n = endog.shape[</span><span class="s3">0</span><span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">_compute_S(self</span><span class="s2">, </span><span class="s1">D</span><span class="s2">, </span><span class="s1">sigma):</span>
+        <span class="s0">&quot;&quot;&quot;covariance of observations (nobs_i, nobs_i)  (JP check) 
+        Display (3.3) from Laird, Lange, Stram (see help(Unit)) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.S = (np.identity(self.n) * sigma**</span><span class="s3">2 </span><span class="s1">+</span>
+                  <span class="s1">np.dot(self.Z</span><span class="s2">, </span><span class="s1">np.dot(D</span><span class="s2">, </span><span class="s1">self.Z.T)))</span>
+
+    <span class="s2">def </span><span class="s1">_compute_W(self):</span>
+        <span class="s0">&quot;&quot;&quot;inverse covariance of observations (nobs_i, nobs_i)  (JP check) 
+        Display (3.2) from Laird, Lange, Stram (see help(Unit)) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.W = L.inv(self.S)</span>
+
+    <span class="s2">def </span><span class="s1">compute_P(self</span><span class="s2">, </span><span class="s1">Sinv):</span>
+        <span class="s0">&quot;&quot;&quot;projection matrix (nobs_i, nobs_i) (M in regression ?)  (JP check, guessing) 
+        Display (3.10) from Laird, Lange, Stram (see help(Unit)) 
+ 
+        W - W X Sinv X' W' 
+        &quot;&quot;&quot;</span>
+        <span class="s1">t = np.dot(self.W</span><span class="s2">, </span><span class="s1">self.X)</span>
+        <span class="s1">self.P = self.W - np.dot(np.dot(t</span><span class="s2">, </span><span class="s1">Sinv)</span><span class="s2">, </span><span class="s1">t.T)</span>
+
+    <span class="s2">def </span><span class="s1">_compute_r(self</span><span class="s2">, </span><span class="s1">alpha):</span>
+        <span class="s0">&quot;&quot;&quot;residual after removing fixed effects 
+ 
+        Display (3.5) from Laird, Lange, Stram (see help(Unit)) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.r = self.Y - np.dot(self.X</span><span class="s2">, </span><span class="s1">alpha)</span>
+
+    <span class="s2">def </span><span class="s1">_compute_b(self</span><span class="s2">, </span><span class="s1">D):</span>
+        <span class="s0">&quot;&quot;&quot;coefficients for random effects/coefficients 
+        Display (3.4) from Laird, Lange, Stram (see help(Unit)) 
+ 
+        D Z' W r 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self.b = np.dot(D</span><span class="s2">, </span><span class="s1">np.dot(np.dot(self.Z.T</span><span class="s2">, </span><span class="s1">self.W)</span><span class="s2">, </span><span class="s1">self.r))</span>
+
+    <span class="s2">def </span><span class="s1">fit(self</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">D</span><span class="s2">, </span><span class="s1">sigma):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Compute unit specific parameters in 
+        Laird, Lange, Stram (see help(Unit)). 
+ 
+        Displays (3.2)-(3.5). 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">self._compute_S(D</span><span class="s2">, </span><span class="s1">sigma)    </span><span class="s4">#random effect plus error covariance</span>
+        <span class="s1">self._compute_W()            </span><span class="s4">#inv(S)</span>
+        <span class="s1">self._compute_r(a)           </span><span class="s4">#residual after removing fixed effects/exogs</span>
+        <span class="s1">self._compute_b(D)           </span><span class="s4">#?  coefficients on random exog, Z ?</span>
+
+    <span class="s2">def </span><span class="s1">compute_xtwy(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Utility function to compute X^tWY (transposed ?) for Unit instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">np.dot(np.dot(self.W</span><span class="s2">, </span><span class="s1">self.Y)</span><span class="s2">, </span><span class="s1">self.X) </span><span class="s4">#is this transposed ?</span>
+
+    <span class="s2">def </span><span class="s1">compute_xtwx(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Utility function to compute X^tWX for Unit instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">np.dot(np.dot(self.X.T</span><span class="s2">, </span><span class="s1">self.W)</span><span class="s2">, </span><span class="s1">self.X)</span>
+
+    <span class="s2">def </span><span class="s1">cov_random(self</span><span class="s2">, </span><span class="s1">D</span><span class="s2">, </span><span class="s1">Sinv=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Approximate covariance of estimates of random effects. Just after 
+        Display (3.10) in Laird, Lange, Stram (see help(Unit)). 
+ 
+        D - D' Z' P Z D 
+ 
+        Notes 
+        ----- 
+        In example where the mean of the random coefficient is not zero, this 
+        is not a covariance but a non-centered moment. (proof by example) 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">Sinv </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.compute_P(Sinv)</span>
+        <span class="s1">t = np.dot(self.Z</span><span class="s2">, </span><span class="s1">D)</span>
+        <span class="s2">return </span><span class="s1">D - np.dot(np.dot(t.T</span><span class="s2">, </span><span class="s1">self.P)</span><span class="s2">, </span><span class="s1">t)</span>
+
+    <span class="s2">def </span><span class="s1">logL(self</span><span class="s2">, </span><span class="s1">a</span><span class="s2">, </span><span class="s1">ML=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Individual contributions to the log-likelihood, tries to return REML 
+        contribution by default though this requires estimated 
+        fixed effect a to be passed as an argument. 
+ 
+        no constant with pi included 
+ 
+        a is not used if ML=true  (should be a=None in signature) 
+        If ML is false, then the residuals are calculated for the given fixed 
+        effects parameters a. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">if </span><span class="s1">ML:</span>
+            <span class="s2">return </span><span class="s1">(np.log(L.det(self.W)) - (self.r * np.dot(self.W</span><span class="s2">, </span><span class="s1">self.r)).sum()) / </span><span class="s3">2.</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">a </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'need fixed effect a for REML contribution to log-likelihood'</span><span class="s1">)</span>
+            <span class="s1">r = self.Y - np.dot(self.X</span><span class="s2">, </span><span class="s1">a)</span>
+            <span class="s2">return </span><span class="s1">(np.log(L.det(self.W)) - (r * np.dot(self.W</span><span class="s2">, </span><span class="s1">r)).sum()) / </span><span class="s3">2.</span>
+
+    <span class="s2">def </span><span class="s1">deviance(self</span><span class="s2">, </span><span class="s1">ML=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">'''deviance defined as 2 times the negative loglikelihood 
+ 
+        '''</span>
+        <span class="s2">return </span><span class="s1">- </span><span class="s3">2 </span><span class="s1">* self.logL(ML=ML)</span>
+
+
+<span class="s2">class </span><span class="s1">OneWayMixed:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Model for 
+    EM implementation of (repeated measures) 
+    mixed effects model. 
+ 
+    \'Maximum Likelihood Computations with Repeated Measures: 
+    Application of the EM Algorithm\' 
+ 
+    Nan Laird; Nicholas Lange; Daniel Stram 
+ 
+    Journal of the American Statistical Association, 
+    Vol. 82, No. 397. (Mar., 1987), pp. 97-105. 
+ 
+ 
+    Parameters 
+    ---------- 
+    units : list of units 
+       the data for the individual units should be attached to the units 
+    response, fixed and random : formula expression, called as argument to Formula 
+ 
+ 
+    *available results and alias* 
+ 
+    (subject to renaming, and coversion to cached attributes) 
+ 
+    params() -&gt; self.a : coefficient for fixed effects or exog 
+    cov_params() -&gt; self.Sinv : covariance estimate of fixed effects/exog 
+    bse() : standard deviation of params 
+ 
+    cov_random -&gt; self.D : estimate of random effects covariance 
+    params_random_units -&gt; [self.units[...].b] : random coefficient for each unit 
+ 
+ 
+    *attributes* 
+ 
+    (others) 
+ 
+    self.m : number of units 
+    self.p : k_vars_fixed 
+    self.q : k_vars_random 
+    self.N : nobs (total) 
+ 
+ 
+    Notes 
+    ----- 
+    Fit returns a result instance, but not all results that use the inherited 
+    methods have been checked. 
+ 
+    Parameters need to change: drop formula and we require a naming convention for 
+    the units (currently Y,X,Z). - endog, exog_fe, endog_re ? 
+ 
+    logL does not include constant, e.g. sqrt(pi) 
+    llf is for MLE not for REML 
+ 
+ 
+    convergence criteria for iteration 
+    Currently convergence in the iterative solver is reached if either the loglikelihood 
+    *or* the fixed effects parameter do not change above tolerance. 
+ 
+    In some examples, the fixed effects parameters converged to 1e-5 within 150 iterations 
+    while the log likelihood did not converge within 2000 iterations. This might be 
+    the case if the fixed effects parameters are well estimated, but there are still 
+    changes in the random effects. If params_rtol and params_atol are set at a higher 
+    level, then the random effects might not be estimated to a very high precision. 
+ 
+    The above was with a misspecified model, without a constant. With a 
+    correctly specified model convergence is fast, within a few iterations 
+    (6 in example). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">units):</span>
+        <span class="s1">self.units = units</span>
+        <span class="s1">self.m = len(self.units)</span>
+        <span class="s1">self.n_units = self.m</span>
+
+        <span class="s1">self.N = sum(unit.X.shape[</span><span class="s3">0</span><span class="s1">] </span><span class="s2">for </span><span class="s1">unit </span><span class="s2">in </span><span class="s1">self.units)</span>
+        <span class="s1">self.nobs = self.N     </span><span class="s4">#alias for now</span>
+
+        <span class="s4"># Determine size of fixed effects</span>
+        <span class="s1">d = self.units[</span><span class="s3">0</span><span class="s1">].X</span>
+        <span class="s1">self.p = d.shape[</span><span class="s3">1</span><span class="s1">]  </span><span class="s4"># d.shape = p</span>
+        <span class="s1">self.k_exog_fe = self.p   </span><span class="s4">#alias for now</span>
+        <span class="s1">self.a = np.zeros(self.p</span><span class="s2">, </span><span class="s1">np.float64)</span>
+
+        <span class="s4"># Determine size of D, and sensible initial estimates</span>
+        <span class="s4"># of sigma and D</span>
+        <span class="s1">d = self.units[</span><span class="s3">0</span><span class="s1">].Z</span>
+        <span class="s1">self.q = d.shape[</span><span class="s3">1</span><span class="s1">]  </span><span class="s4"># Z.shape = q</span>
+        <span class="s1">self.k_exog_re = self.q   </span><span class="s4">#alias for now</span>
+        <span class="s1">self.D = np.zeros((self.q</span><span class="s2">,</span><span class="s1">)*</span><span class="s3">2</span><span class="s2">, </span><span class="s1">np.float64)</span>
+        <span class="s1">self.sigma = </span><span class="s3">1.</span>
+
+        <span class="s1">self.dev = np.inf   </span><span class="s4">#initialize for iterations, move it?</span>
+
+    <span class="s2">def </span><span class="s1">_compute_a(self):</span>
+        <span class="s0">&quot;&quot;&quot;fixed effects parameters 
+ 
+        Display (3.1) of 
+        Laird, Lange, Stram (see help(Mixed)). 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">for </span><span class="s1">unit </span><span class="s2">in </span><span class="s1">self.units:</span>
+            <span class="s1">unit.fit(self.a</span><span class="s2">, </span><span class="s1">self.D</span><span class="s2">, </span><span class="s1">self.sigma)</span>
+
+        <span class="s1">S = sum([unit.compute_xtwx() </span><span class="s2">for </span><span class="s1">unit </span><span class="s2">in </span><span class="s1">self.units])</span>
+        <span class="s1">Y = sum([unit.compute_xtwy() </span><span class="s2">for </span><span class="s1">unit </span><span class="s2">in </span><span class="s1">self.units])</span>
+
+        <span class="s1">self.Sinv = L.pinv(S)</span>
+        <span class="s1">self.a = np.dot(self.Sinv</span><span class="s2">, </span><span class="s1">Y)</span>
+
+    <span class="s2">def </span><span class="s1">_compute_sigma(self</span><span class="s2">, </span><span class="s1">ML=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimate sigma. If ML is True, return the ML estimate of sigma, 
+        else return the REML estimate. 
+ 
+        If ML, this is (3.6) in Laird, Lange, Stram (see help(Mixed)), 
+        otherwise it corresponds to (3.8). 
+ 
+        sigma is the standard deviation of the noise (residual) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">sigmasq = </span><span class="s3">0.</span>
+        <span class="s2">for </span><span class="s1">unit </span><span class="s2">in </span><span class="s1">self.units:</span>
+            <span class="s2">if </span><span class="s1">ML:</span>
+                <span class="s1">W = unit.W</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">unit.compute_P(self.Sinv)</span>
+                <span class="s1">W = unit.P</span>
+            <span class="s1">t = unit.r - np.dot(unit.Z</span><span class="s2">, </span><span class="s1">unit.b)</span>
+            <span class="s1">sigmasq += np.power(t</span><span class="s2">, </span><span class="s3">2</span><span class="s1">).sum()</span>
+            <span class="s1">sigmasq += self.sigma**</span><span class="s3">2 </span><span class="s1">* np.trace(np.identity(unit.n) -</span>
+                                               <span class="s1">self.sigma**</span><span class="s3">2 </span><span class="s1">* W)</span>
+        <span class="s1">self.sigma = np.sqrt(sigmasq / self.N)</span>
+
+    <span class="s2">def </span><span class="s1">_compute_D(self</span><span class="s2">, </span><span class="s1">ML=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimate random effects covariance D. 
+        If ML is True, return the ML estimate of sigma, 
+        else return the REML estimate. 
+ 
+        If ML, this is (3.7) in Laird, Lange, Stram (see help(Mixed)), 
+        otherwise it corresponds to (3.9). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">D = </span><span class="s3">0.</span>
+        <span class="s2">for </span><span class="s1">unit </span><span class="s2">in </span><span class="s1">self.units:</span>
+            <span class="s2">if </span><span class="s1">ML:</span>
+                <span class="s1">W = unit.W</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">unit.compute_P(self.Sinv)</span>
+                <span class="s1">W = unit.P</span>
+            <span class="s1">D += np.multiply.outer(unit.b</span><span class="s2">, </span><span class="s1">unit.b)</span>
+            <span class="s1">t = np.dot(unit.Z</span><span class="s2">, </span><span class="s1">self.D)</span>
+            <span class="s1">D += self.D - np.dot(np.dot(t.T</span><span class="s2">, </span><span class="s1">W)</span><span class="s2">, </span><span class="s1">t)</span>
+
+        <span class="s1">self.D = D / self.m</span>
+
+    <span class="s2">def </span><span class="s1">cov_fixed(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Approximate covariance of estimates of fixed effects. 
+ 
+        Just after Display (3.10) in Laird, Lange, Stram (see help(Mixed)). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.Sinv</span>
+
+    <span class="s4">#----------- alias (JP)   move to results class ?</span>
+
+    <span class="s2">def </span><span class="s1">cov_random(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimate random effects covariance D. 
+ 
+        If ML is True, return the ML estimate of sigma, else return the REML estimate. 
+ 
+        see _compute_D, alias for self.D 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.D</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">params(self):</span>
+        <span class="s0">''' 
+        estimated coefficients for exogeneous variables or fixed effects 
+ 
+        see _compute_a, alias for self.a 
+        '''</span>
+        <span class="s2">return </span><span class="s1">self.a</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">params_random_units(self):</span>
+        <span class="s0">'''random coefficients for each unit 
+ 
+        '''</span>
+        <span class="s2">return </span><span class="s1">np.array([unit.b </span><span class="s2">for </span><span class="s1">unit </span><span class="s2">in </span><span class="s1">self.units])</span>
+
+    <span class="s2">def </span><span class="s1">cov_params(self):</span>
+        <span class="s0">''' 
+        estimated covariance for coefficients for exogeneous variables or fixed effects 
+ 
+        see cov_fixed, and Sinv in _compute_a 
+        '''</span>
+        <span class="s2">return </span><span class="s1">self.cov_fixed()</span>
+
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">bse(self):</span>
+        <span class="s0">''' 
+        standard errors of estimated coefficients for exogeneous variables (fixed) 
+ 
+        '''</span>
+        <span class="s2">return </span><span class="s1">np.sqrt(np.diag(self.cov_params()))</span>
+
+    <span class="s4">#----------- end alias</span>
+
+    <span class="s2">def </span><span class="s1">deviance(self</span><span class="s2">, </span><span class="s1">ML=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">'''deviance defined as 2 times the negative loglikelihood 
+ 
+        '''</span>
+        <span class="s2">return </span><span class="s1">-</span><span class="s3">2 </span><span class="s1">* self.logL(ML=ML)</span>
+
+
+    <span class="s2">def </span><span class="s1">logL(self</span><span class="s2">, </span><span class="s1">ML=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return log-likelihood, REML by default. 
+        &quot;&quot;&quot;</span>
+        <span class="s4">#I do not know what the difference between REML and ML is here.</span>
+        <span class="s1">logL = </span><span class="s3">0.</span>
+
+        <span class="s2">for </span><span class="s1">unit </span><span class="s2">in </span><span class="s1">self.units:</span>
+            <span class="s1">logL += unit.logL(a=self.a</span><span class="s2">, </span><span class="s1">ML=ML)</span>
+        <span class="s2">if not </span><span class="s1">ML:</span>
+            <span class="s1">logL += np.log(L.det(self.Sinv)) / </span><span class="s3">2</span>
+        <span class="s2">return </span><span class="s1">logL</span>
+
+    <span class="s2">def </span><span class="s1">initialize(self):</span>
+        <span class="s1">S = sum([np.dot(unit.X.T</span><span class="s2">, </span><span class="s1">unit.X) </span><span class="s2">for </span><span class="s1">unit </span><span class="s2">in </span><span class="s1">self.units])</span>
+        <span class="s1">Y = sum([np.dot(unit.X.T</span><span class="s2">, </span><span class="s1">unit.Y) </span><span class="s2">for </span><span class="s1">unit </span><span class="s2">in </span><span class="s1">self.units])</span>
+        <span class="s1">self.a = L.lstsq(S</span><span class="s2">, </span><span class="s1">Y</span><span class="s2">, </span><span class="s1">rcond=-</span><span class="s3">1</span><span class="s1">)[</span><span class="s3">0</span><span class="s1">]</span>
+
+        <span class="s1">D = </span><span class="s3">0</span>
+        <span class="s1">t = </span><span class="s3">0</span>
+        <span class="s1">sigmasq = </span><span class="s3">0</span>
+        <span class="s2">for </span><span class="s1">unit </span><span class="s2">in </span><span class="s1">self.units:</span>
+            <span class="s1">unit.r = unit.Y - np.dot(unit.X</span><span class="s2">, </span><span class="s1">self.a)</span>
+            <span class="s2">if </span><span class="s1">self.q &gt; </span><span class="s3">1</span><span class="s1">:</span>
+                <span class="s1">unit.b = L.lstsq(unit.Z</span><span class="s2">, </span><span class="s1">unit.r</span><span class="s2">, </span><span class="s1">rcond=-</span><span class="s3">1</span><span class="s1">)[</span><span class="s3">0</span><span class="s1">]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">Z = unit.Z.reshape((unit.Z.shape[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s3">1</span><span class="s1">))</span>
+                <span class="s1">unit.b = L.lstsq(Z</span><span class="s2">, </span><span class="s1">unit.r</span><span class="s2">, </span><span class="s1">rcond=-</span><span class="s3">1</span><span class="s1">)[</span><span class="s3">0</span><span class="s1">]</span>
+
+            <span class="s1">sigmasq += (np.power(unit.Y</span><span class="s2">, </span><span class="s3">2</span><span class="s1">).sum() -</span>
+                        <span class="s1">(self.a * np.dot(unit.X.T</span><span class="s2">, </span><span class="s1">unit.Y)).sum() -</span>
+                        <span class="s1">(unit.b * np.dot(unit.Z.T</span><span class="s2">, </span><span class="s1">unit.r)).sum())</span>
+            <span class="s1">D += np.multiply.outer(unit.b</span><span class="s2">, </span><span class="s1">unit.b)</span>
+            <span class="s1">t += L.pinv(np.dot(unit.Z.T</span><span class="s2">, </span><span class="s1">unit.Z))</span>
+
+        <span class="s4">#TODO: JP added df_resid check</span>
+        <span class="s1">self.df_resid = (self.N - (self.m - </span><span class="s3">1</span><span class="s1">) * self.q - self.p)</span>
+        <span class="s1">sigmasq /= (self.N - (self.m - </span><span class="s3">1</span><span class="s1">) * self.q - self.p)</span>
+        <span class="s1">self.sigma = np.sqrt(sigmasq)</span>
+        <span class="s1">self.D = (D - sigmasq * t) / self.m</span>
+
+    <span class="s2">def </span><span class="s1">cont(self</span><span class="s2">, </span><span class="s1">ML=</span><span class="s2">False, </span><span class="s1">rtol=</span><span class="s3">1.0e-05</span><span class="s2">, </span><span class="s1">params_rtol=</span><span class="s3">1e-5</span><span class="s2">, </span><span class="s1">params_atol=</span><span class="s3">1e-4</span><span class="s1">):</span>
+        <span class="s0">'''convergence check for iterative estimation 
+ 
+        '''</span>
+
+        <span class="s1">self.dev</span><span class="s2">, </span><span class="s1">old = self.deviance(ML=ML)</span><span class="s2">, </span><span class="s1">self.dev</span>
+
+        <span class="s4">#self.history.append(np.hstack((self.dev, self.a)))</span>
+        <span class="s1">self.history[</span><span class="s5">'llf'</span><span class="s1">].append(self.dev)</span>
+        <span class="s1">self.history[</span><span class="s5">'params'</span><span class="s1">].append(self.a.copy())</span>
+        <span class="s1">self.history[</span><span class="s5">'D'</span><span class="s1">].append(self.D.copy())</span>
+
+        <span class="s2">if </span><span class="s1">np.fabs((self.dev - old) / self.dev) &lt; rtol:   </span><span class="s4">#why is there times `*`?</span>
+            <span class="s4">#print np.fabs((self.dev - old)), self.dev, old</span>
+            <span class="s1">self.termination = </span><span class="s5">'llf'</span>
+            <span class="s2">return False</span>
+
+        <span class="s4">#break if parameters converged</span>
+        <span class="s4">#TODO: check termination conditions, OR or AND</span>
+        <span class="s2">if </span><span class="s1">np.all(np.abs(self.a - self._a_old) &lt; (params_rtol * self.a + params_atol)):</span>
+            <span class="s1">self.termination = </span><span class="s5">'params'</span>
+            <span class="s2">return False</span>
+
+        <span class="s1">self._a_old =  self.a.copy()</span>
+        <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">fit(self</span><span class="s2">, </span><span class="s1">maxiter=</span><span class="s3">100</span><span class="s2">, </span><span class="s1">ML=</span><span class="s2">False, </span><span class="s1">rtol=</span><span class="s3">1.0e-05</span><span class="s2">, </span><span class="s1">params_rtol=</span><span class="s3">1e-6</span><span class="s2">, </span><span class="s1">params_atol=</span><span class="s3">1e-6</span><span class="s1">):</span>
+
+        <span class="s4">#initialize for convergence criteria</span>
+        <span class="s1">self._a_old = np.inf * self.a</span>
+        <span class="s1">self.history = {</span><span class="s5">'llf'</span><span class="s1">:[]</span><span class="s2">, </span><span class="s5">'params'</span><span class="s1">:[]</span><span class="s2">, </span><span class="s5">'D'</span><span class="s1">:[]}</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(maxiter):</span>
+            <span class="s1">self._compute_a()              </span><span class="s4">#a, Sinv :  params, cov_params of fixed exog</span>
+            <span class="s1">self._compute_sigma(ML=ML)     </span><span class="s4">#sigma   MLE or REML of sigma ?</span>
+            <span class="s1">self._compute_D(ML=ML)         </span><span class="s4">#D :  covariance of random effects, MLE or REML</span>
+            <span class="s2">if not </span><span class="s1">self.cont(ML=ML</span><span class="s2">, </span><span class="s1">rtol=rtol</span><span class="s2">, </span><span class="s1">params_rtol=params_rtol</span><span class="s2">,</span>
+                                             <span class="s1">params_atol=params_atol):</span>
+                <span class="s2">break</span>
+        <span class="s2">else</span><span class="s1">: </span><span class="s4">#if end of loop is reached without break</span>
+            <span class="s1">self.termination = </span><span class="s5">'maxiter'</span>
+            <span class="s1">print(</span><span class="s5">'Warning: maximum number of iterations reached'</span><span class="s1">)</span>
+
+        <span class="s1">self.iterations = i</span>
+
+        <span class="s1">results = OneWayMixedResults(self)</span>
+        <span class="s4">#compatibility functions for fixed effects/exog</span>
+        <span class="s1">results.scale = </span><span class="s3">1</span>
+        <span class="s1">results.normalized_cov_params = self.cov_params()</span>
+
+        <span class="s2">return </span><span class="s1">results</span>
+
+
+<span class="s2">class </span><span class="s1">OneWayMixedResults(LikelihoodModelResults):</span>
+    <span class="s0">'''Results class for OneWayMixed models 
+ 
+    '''</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">model):</span>
+        <span class="s4">#TODO: check, change initialization to more standard pattern</span>
+        <span class="s1">self.model = model</span>
+        <span class="s1">self.params = model.params</span>
+
+
+    <span class="s4">#need to overwrite this because we do not have a standard</span>
+    <span class="s4">#model.loglike yet</span>
+    <span class="s4">#TODO: what todo about REML loglike, logL is not normalized</span>
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">llf(self):</span>
+        <span class="s2">return </span><span class="s1">self.model.logL(ML=</span><span class="s2">True</span><span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">params_random_units(self):</span>
+        <span class="s2">return </span><span class="s1">self.model.params_random_units</span>
+
+    <span class="s2">def </span><span class="s1">cov_random(self):</span>
+        <span class="s2">return </span><span class="s1">self.model.cov_random()</span>
+
+    <span class="s2">def </span><span class="s1">mean_random(self</span><span class="s2">, </span><span class="s1">idx=</span><span class="s5">'lastexog'</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">idx == </span><span class="s5">'lastexog'</span><span class="s1">:</span>
+            <span class="s1">meanr = self.params[-self.model.k_exog_re:]</span>
+        <span class="s2">elif </span><span class="s1">isinstance(idx</span><span class="s2">, </span><span class="s1">list):</span>
+            <span class="s2">if not </span><span class="s1">len(idx) == self.model.k_exog_re:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'length of idx different from k_exog_re'</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">meanr = self.params[idx]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">meanr = np.zeros(self.model.k_exog_re)</span>
+
+        <span class="s2">return </span><span class="s1">meanr</span>
+
+    <span class="s2">def </span><span class="s1">std_random(self):</span>
+        <span class="s2">return </span><span class="s1">np.sqrt(np.diag(self.cov_random()))</span>
+
+    <span class="s2">def </span><span class="s1">plot_random_univariate(self</span><span class="s2">, </span><span class="s1">bins=</span><span class="s2">None, </span><span class="s1">use_loc=</span><span class="s2">True</span><span class="s1">):</span>
+        <span class="s0">'''create plot of marginal distribution of random effects 
+ 
+        Parameters 
+        ---------- 
+        bins : int or bin edges 
+            option for bins in matplotlibs hist method. Current default is not 
+            very sophisticated. All distributions use the same setting for 
+            bins. 
+        use_loc : bool 
+            If True, then the distribution with mean given by the fixed 
+            effect is used. 
+ 
+        Returns 
+        ------- 
+        Figure 
+            figure with subplots 
+ 
+        Notes 
+        ----- 
+        What can make this fancier? 
+ 
+        Bin edges will not make sense if loc or scale differ across random 
+        effect distributions. 
+ 
+        '''</span>
+        <span class="s4">#outsource this</span>
+        <span class="s2">import </span><span class="s1">matplotlib.pyplot </span><span class="s2">as </span><span class="s1">plt</span>
+        <span class="s2">from </span><span class="s1">scipy.stats </span><span class="s2">import </span><span class="s1">norm </span><span class="s2">as </span><span class="s1">normal</span>
+        <span class="s1">fig = plt.figure()</span>
+        <span class="s1">k = self.model.k_exog_re</span>
+        <span class="s2">if </span><span class="s1">k &gt; </span><span class="s3">3</span><span class="s1">:</span>
+            <span class="s1">rows</span><span class="s2">, </span><span class="s1">cols = int(np.ceil(k * </span><span class="s3">0.5</span><span class="s1">))</span><span class="s2">, </span><span class="s3">2</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">rows</span><span class="s2">, </span><span class="s1">cols = k</span><span class="s2">, </span><span class="s3">1</span>
+        <span class="s2">if </span><span class="s1">bins </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s4">#bins = self.model.n_units // 20    #TODO: just roughly, check</span>
+            <span class="s4">#bins = np.sqrt(self.model.n_units)</span>
+            <span class="s1">bins = </span><span class="s3">5 </span><span class="s1">+ </span><span class="s3">2 </span><span class="s1">* self.model.n_units**(</span><span class="s3">1.</span><span class="s1">/</span><span class="s3">3.</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">use_loc:</span>
+            <span class="s1">loc = self.mean_random()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">loc = [</span><span class="s3">0</span><span class="s1">]*k</span>
+
+        <span class="s1">scale = self.std_random()</span>
+
+        <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range(k):</span>
+            <span class="s1">ax = fig.add_subplot(rows</span><span class="s2">, </span><span class="s1">cols</span><span class="s2">, </span><span class="s1">ii)</span>
+
+            <span class="s1">freq</span><span class="s2">, </span><span class="s1">bins_</span><span class="s2">, </span><span class="s1">_ = ax.hist(loc[ii] + self.params_random_units[:</span><span class="s2">,</span><span class="s1">ii]</span><span class="s2">,</span>
+                                    <span class="s1">bins=bins</span><span class="s2">, </span><span class="s1">normed=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">points = np.linspace(bins_[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">bins_[-</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s3">200</span><span class="s1">)</span>
+
+            <span class="s4">#ax.plot(points, normal.pdf(points, loc=loc, scale=scale))</span>
+            <span class="s4">#loc of sample is approx. zero, with Z appended to X</span>
+            <span class="s4">#alternative, add fixed  to mean</span>
+            <span class="s1">ax.set_title(</span><span class="s5">'Random Effect %d Marginal Distribution' </span><span class="s1">% ii)</span>
+            <span class="s1">ax.plot(points</span><span class="s2">,</span>
+                    <span class="s1">normal.pdf(points</span><span class="s2">, </span><span class="s1">loc=loc[ii]</span><span class="s2">, </span><span class="s1">scale=scale[ii])</span><span class="s2">,</span>
+                    <span class="s5">'r'</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">fig</span>
+
+    <span class="s2">def </span><span class="s1">plot_scatter_pairs(self</span><span class="s2">, </span><span class="s1">idx1</span><span class="s2">, </span><span class="s1">idx2</span><span class="s2">, </span><span class="s1">title=</span><span class="s2">None, </span><span class="s1">ax=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">'''create scatter plot of two random effects 
+ 
+        Parameters 
+        ---------- 
+        idx1, idx2 : int 
+            indices of the two random effects to display, corresponding to 
+            columns of exog_re 
+        title : None or string 
+            If None, then a default title is added 
+        ax : None or matplotlib axis instance 
+            If None, then a figure with one axis is created and returned. 
+            If ax is not None, then the scatter plot is created on it, and 
+            this axis instance is returned. 
+ 
+        Returns 
+        ------- 
+        ax_or_fig : axis or figure instance 
+            see ax parameter 
+ 
+        Notes 
+        ----- 
+        Still needs ellipse from estimated parameters 
+ 
+        '''</span>
+        <span class="s2">import </span><span class="s1">matplotlib.pyplot </span><span class="s2">as </span><span class="s1">plt</span>
+        <span class="s2">if </span><span class="s1">ax </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">fig = plt.figure()</span>
+            <span class="s1">ax = fig.add_subplot(</span><span class="s3">1</span><span class="s2">,</span><span class="s3">1</span><span class="s2">,</span><span class="s3">1</span><span class="s1">)</span>
+            <span class="s1">ax_or_fig = fig</span>
+
+        <span class="s1">re1 = self.params_random_units[:</span><span class="s2">,</span><span class="s1">idx1]</span>
+        <span class="s1">re2 = self.params_random_units[:</span><span class="s2">,</span><span class="s1">idx2]</span>
+        <span class="s1">ax.plot(re1</span><span class="s2">, </span><span class="s1">re2</span><span class="s2">, </span><span class="s5">'o'</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s3">0.75</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">title </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">title = </span><span class="s5">'Random Effects %d and %d' </span><span class="s1">% (idx1</span><span class="s2">, </span><span class="s1">idx2)</span>
+        <span class="s1">ax.set_title(title)</span>
+        <span class="s1">ax_or_fig = ax</span>
+
+        <span class="s2">return </span><span class="s1">ax_or_fig</span>
+
+    <span class="s2">def </span><span class="s1">plot_scatter_all_pairs(self</span><span class="s2">, </span><span class="s1">title=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">from </span><span class="s1">statsmodels.graphics.plot_grids </span><span class="s2">import </span><span class="s1">scatter_ellipse</span>
+        <span class="s2">if </span><span class="s1">self.model.k_exog_re &lt; </span><span class="s3">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'less than two variables available'</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">scatter_ellipse(self.params_random_units</span><span class="s2">,</span>
+                               <span class="s4">#ell_kwds not implemented yet</span>
+                               <span class="s1">ell_kwds={</span><span class="s5">'color'</span><span class="s1">:</span><span class="s5">'r'</span><span class="s1">})</span>
+
+<span class="s4">#        #note I have written this already as helper function, get it</span>
+<span class="s4">#        import matplotlib.pyplot as plt</span>
+<span class="s4">#        #from scipy.stats import norm as normal</span>
+<span class="s4">#        fig = plt.figure()</span>
+<span class="s4">#        k = self.model.k_exog_re</span>
+<span class="s4">#        n_plots = k * (k - 1) // 2</span>
+<span class="s4">#        if n_plots &gt; 3:</span>
+<span class="s4">#            rows, cols = int(np.ceil(n_plots * 0.5)), 2</span>
+<span class="s4">#        else:</span>
+<span class="s4">#            rows, cols = n_plots, 1</span>
+<span class="s4">#</span>
+<span class="s4">#        count = 1</span>
+<span class="s4">#        for ii in range(k):</span>
+<span class="s4">#            for jj in range(ii):</span>
+<span class="s4">#                ax = fig.add_subplot(rows, cols, count)</span>
+<span class="s4">#                self.plot_scatter_pairs(ii, jj, title=None, ax=ax)</span>
+<span class="s4">#                count += 1</span>
+<span class="s4">#</span>
+<span class="s4">#        return fig</span>
+</pre>
+</body>
+</html>

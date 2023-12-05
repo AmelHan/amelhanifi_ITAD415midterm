@@ -1,0 +1,436 @@
+<html>
+<head>
+<title>profile.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6a8759;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+profile.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">from </span><span class="s1">collections </span><span class="s0">import </span><span class="s1">namedtuple</span>
+<span class="s0">from </span><span class="s1">itertools </span><span class="s0">import </span><span class="s1">starmap</span>
+<span class="s0">from </span><span class="s1">multiprocessing </span><span class="s0">import </span><span class="s1">Pipe</span><span class="s0">, </span><span class="s1">Process</span><span class="s0">, </span><span class="s1">current_process</span>
+<span class="s0">from </span><span class="s1">time </span><span class="s0">import </span><span class="s1">sleep</span>
+<span class="s0">from </span><span class="s1">timeit </span><span class="s0">import </span><span class="s1">default_timer</span>
+
+<span class="s0">from </span><span class="s1">dask.callbacks </span><span class="s0">import </span><span class="s1">Callback</span>
+<span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">import_required</span>
+
+<span class="s2"># Stores execution data for each task</span>
+<span class="s1">TaskData = namedtuple(</span>
+    <span class="s3">&quot;TaskData&quot;</span><span class="s0">, </span><span class="s1">(</span><span class="s3">&quot;key&quot;</span><span class="s0">, </span><span class="s3">&quot;task&quot;</span><span class="s0">, </span><span class="s3">&quot;start_time&quot;</span><span class="s0">, </span><span class="s3">&quot;end_time&quot;</span><span class="s0">, </span><span class="s3">&quot;worker_id&quot;</span><span class="s1">)</span>
+<span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">Profiler(Callback):</span>
+    <span class="s4">&quot;&quot;&quot;A profiler for dask execution at the task level. 
+ 
+    Records the following information for each task: 
+        1. Key 
+        2. Task 
+        3. Start time in seconds since the epoch 
+        4. Finish time in seconds since the epoch 
+        5. Worker id 
+ 
+    Examples 
+    -------- 
+ 
+    &gt;&gt;&gt; from operator import add, mul 
+    &gt;&gt;&gt; from dask.threaded import get 
+    &gt;&gt;&gt; from dask.diagnostics import Profiler 
+    &gt;&gt;&gt; dsk = {'x': 1, 'y': (add, 'x', 10), 'z': (mul, 'y', 2)} 
+    &gt;&gt;&gt; with Profiler() as prof: 
+    ...     get(dsk, 'z') 
+    22 
+ 
+    &gt;&gt;&gt; prof.results        # doctest: +SKIP 
+    [TaskData(key='y', task=(add, 'x', 10), start_time=..., end_time=..., worker_id=...), 
+     TaskData(key='z', task=(mul, 'y', 2), start_time=..., end_time=..., worker_id=...)] 
+ 
+    These results can be visualized in a bokeh plot using the ``visualize`` 
+    method. Note that this requires bokeh to be installed. 
+ 
+    &gt;&gt;&gt; prof.visualize()    # doctest: +SKIP 
+ 
+    You can activate the profiler globally 
+ 
+    &gt;&gt;&gt; prof.register() 
+ 
+    If you use the profiler globally you will need to clear out old results 
+    manually. 
+ 
+    &gt;&gt;&gt; prof.clear() 
+    &gt;&gt;&gt; prof.unregister() 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">self._results = {}</span>
+        <span class="s1">self.results = []</span>
+        <span class="s1">self._dsk = {}</span>
+        <span class="s1">self.start_time = </span><span class="s0">None</span>
+        <span class="s1">self.end_time = </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">__enter__(self):</span>
+        <span class="s1">self.clear()</span>
+        <span class="s1">self.start_time = default_timer()</span>
+        <span class="s0">return </span><span class="s1">super().__enter__()</span>
+
+    <span class="s0">def </span><span class="s1">__exit__(self</span><span class="s0">, </span><span class="s1">*args):</span>
+        <span class="s1">self.end_time = default_timer()</span>
+        <span class="s0">return </span><span class="s1">super().__exit__(*args)</span>
+
+    <span class="s0">def </span><span class="s1">_start(self</span><span class="s0">, </span><span class="s1">dsk):</span>
+        <span class="s1">self._dsk.update(dsk)</span>
+
+    <span class="s0">def </span><span class="s1">_pretask(self</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">state):</span>
+        <span class="s1">start = default_timer()</span>
+        <span class="s1">self._results[key] = (key</span><span class="s0">, </span><span class="s1">dsk[key]</span><span class="s0">, </span><span class="s1">start)</span>
+
+    <span class="s0">def </span><span class="s1">_posttask(self</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">state</span><span class="s0">, </span><span class="s1">id):</span>
+        <span class="s1">end = default_timer()</span>
+        <span class="s1">self._results[key] += (end</span><span class="s0">, </span><span class="s1">id)</span>
+
+    <span class="s0">def </span><span class="s1">_finish(self</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">state</span><span class="s0">, </span><span class="s1">failed):</span>
+        <span class="s1">results = {k: v </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">self._results.items() </span><span class="s0">if </span><span class="s1">len(v) == </span><span class="s5">5</span><span class="s1">}</span>
+        <span class="s1">self.results += list(starmap(TaskData</span><span class="s0">, </span><span class="s1">results.values()))</span>
+        <span class="s1">self._results.clear()</span>
+
+    <span class="s0">def </span><span class="s1">_plot(self</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">from </span><span class="s1">dask.diagnostics.profile_visualize </span><span class="s0">import </span><span class="s1">plot_tasks</span>
+
+        <span class="s0">return </span><span class="s1">plot_tasks(</span>
+            <span class="s1">self.results</span><span class="s0">, </span><span class="s1">self._dsk</span><span class="s0">, </span><span class="s1">self.start_time</span><span class="s0">, </span><span class="s1">self.end_time</span><span class="s0">, </span><span class="s1">**kwargs</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">visualize(self</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s4">&quot;&quot;&quot;Visualize the profiling run in a bokeh plot. 
+ 
+        See also 
+        -------- 
+        dask.diagnostics.profile_visualize.visualize 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">dask.diagnostics.profile_visualize </span><span class="s0">import </span><span class="s1">visualize</span>
+
+        <span class="s0">return </span><span class="s1">visualize(self</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">clear(self):</span>
+        <span class="s4">&quot;&quot;&quot;Clear out old results from profiler&quot;&quot;&quot;</span>
+        <span class="s1">self._results.clear()</span>
+        <span class="s0">del </span><span class="s1">self.results[:]</span>
+        <span class="s1">self._dsk = {}</span>
+        <span class="s1">self.start_time = </span><span class="s0">None</span>
+        <span class="s1">self.end_time = </span><span class="s0">None</span>
+
+
+<span class="s1">ResourceData = namedtuple(</span><span class="s3">&quot;ResourceData&quot;</span><span class="s0">, </span><span class="s1">(</span><span class="s3">&quot;time&quot;</span><span class="s0">, </span><span class="s3">&quot;mem&quot;</span><span class="s0">, </span><span class="s3">&quot;cpu&quot;</span><span class="s1">))</span>
+
+
+<span class="s0">class </span><span class="s1">ResourceProfiler(Callback):</span>
+    <span class="s4">&quot;&quot;&quot;A profiler for resource use. 
+ 
+    Records the following each timestep 
+        1. Time in seconds since the epoch 
+        2. Memory usage in MB 
+        3. % CPU usage 
+ 
+    Examples 
+    -------- 
+ 
+    &gt;&gt;&gt; from operator import add, mul 
+    &gt;&gt;&gt; from dask.threaded import get 
+    &gt;&gt;&gt; dsk = {'x': 1, 'y': (add, 'x', 10), 'z': (mul, 'y', 2)} 
+    &gt;&gt;&gt; with ResourceProfiler() as prof: 
+    ...     get(dsk, 'z') 
+    22 
+ 
+    These results can be visualized in a bokeh plot using the ``visualize`` 
+    method. Note that this requires bokeh to be installed. 
+ 
+    &gt;&gt;&gt; prof.visualize() # doctest: +SKIP 
+ 
+    You can activate the profiler globally 
+ 
+    &gt;&gt;&gt; prof.register() 
+ 
+    If you use the profiler globally you will need to clear out old results 
+    manually. 
+ 
+    &gt;&gt;&gt; prof.clear() 
+ 
+    Note that when used as a context manager data will be collected throughout 
+    the duration of the enclosed block. In contrast, when registered globally 
+    data will only be collected while a dask scheduler is active. 
+ 
+    &gt;&gt;&gt; prof.unregister() 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">dt=</span><span class="s5">1</span><span class="s1">):</span>
+        <span class="s1">self._dt = dt</span>
+        <span class="s1">self._entered = </span><span class="s0">False</span>
+        <span class="s1">self._tracker = </span><span class="s0">None</span>
+        <span class="s1">self.results = []</span>
+        <span class="s1">self.start_time = </span><span class="s0">None</span>
+        <span class="s1">self.end_time = </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">_is_running(self):</span>
+        <span class="s0">return </span><span class="s1">self._tracker </span><span class="s0">is not None and </span><span class="s1">self._tracker.is_alive()</span>
+
+    <span class="s0">def </span><span class="s1">_start_collect(self):</span>
+        <span class="s0">if not </span><span class="s1">self._is_running():</span>
+            <span class="s1">self._tracker = _Tracker(self._dt)</span>
+            <span class="s1">self._tracker.start()</span>
+        <span class="s1">self._tracker.parent_conn.send(</span><span class="s3">&quot;collect&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_stop_collect(self):</span>
+        <span class="s0">if </span><span class="s1">self._is_running():</span>
+            <span class="s1">self._tracker.parent_conn.send(</span><span class="s3">&quot;send_data&quot;</span><span class="s1">)</span>
+            <span class="s1">self.results.extend(starmap(ResourceData</span><span class="s0">, </span><span class="s1">self._tracker.parent_conn.recv()))</span>
+
+    <span class="s0">def </span><span class="s1">__enter__(self):</span>
+        <span class="s1">self._entered = </span><span class="s0">True</span>
+        <span class="s1">self.clear()</span>
+        <span class="s1">self.start_time = default_timer()</span>
+        <span class="s1">self._start_collect()</span>
+        <span class="s0">return </span><span class="s1">super().__enter__()</span>
+
+    <span class="s0">def </span><span class="s1">__exit__(self</span><span class="s0">, </span><span class="s1">*args):</span>
+        <span class="s1">self._entered = </span><span class="s0">False</span>
+        <span class="s1">self._stop_collect()</span>
+        <span class="s1">self.close()</span>
+        <span class="s1">self.end_time = default_timer()</span>
+        <span class="s1">super().__exit__(*args)</span>
+
+    <span class="s0">def </span><span class="s1">_start(self</span><span class="s0">, </span><span class="s1">dsk):</span>
+        <span class="s1">self._start_collect()</span>
+
+    <span class="s0">def </span><span class="s1">_finish(self</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">state</span><span class="s0">, </span><span class="s1">failed):</span>
+        <span class="s0">if not </span><span class="s1">self._entered:</span>
+            <span class="s1">self._stop_collect()</span>
+
+    <span class="s0">def </span><span class="s1">close(self):</span>
+        <span class="s4">&quot;&quot;&quot;Shutdown the resource tracker process&quot;&quot;&quot;</span>
+        <span class="s0">if </span><span class="s1">self._is_running():</span>
+            <span class="s1">self._tracker.shutdown()</span>
+            <span class="s1">self._tracker = </span><span class="s0">None</span>
+
+    <span class="s1">__del__ = close</span>
+
+    <span class="s0">def </span><span class="s1">clear(self):</span>
+        <span class="s1">self.results = []</span>
+        <span class="s1">self.start_time = </span><span class="s0">None</span>
+        <span class="s1">self.end_time = </span><span class="s0">None</span>
+
+    <span class="s0">def </span><span class="s1">_plot(self</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">from </span><span class="s1">dask.diagnostics.profile_visualize </span><span class="s0">import </span><span class="s1">plot_resources</span>
+
+        <span class="s0">return </span><span class="s1">plot_resources(self.results</span><span class="s0">, </span><span class="s1">self.start_time</span><span class="s0">, </span><span class="s1">self.end_time</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">visualize(self</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s4">&quot;&quot;&quot;Visualize the profiling run in a bokeh plot. 
+ 
+        See also 
+        -------- 
+        dask.diagnostics.profile_visualize.visualize 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">dask.diagnostics.profile_visualize </span><span class="s0">import </span><span class="s1">visualize</span>
+
+        <span class="s0">return </span><span class="s1">visualize(self</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+
+<span class="s0">class </span><span class="s1">_Tracker(Process):</span>
+    <span class="s4">&quot;&quot;&quot;Background process for tracking resource usage&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">dt=</span><span class="s5">1</span><span class="s1">):</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s1">self.daemon = </span><span class="s0">True</span>
+        <span class="s1">self.dt = dt</span>
+        <span class="s1">self.parent_pid = current_process().pid</span>
+        <span class="s1">self.parent_conn</span><span class="s0">, </span><span class="s1">self.child_conn = Pipe()</span>
+
+    <span class="s0">def </span><span class="s1">shutdown(self):</span>
+        <span class="s0">if not </span><span class="s1">self.parent_conn.closed:</span>
+            <span class="s1">self.parent_conn.send(</span><span class="s3">&quot;shutdown&quot;</span><span class="s1">)</span>
+            <span class="s1">self.parent_conn.close()</span>
+        <span class="s1">self.join()</span>
+
+    <span class="s0">def </span><span class="s1">_update_pids(self</span><span class="s0">, </span><span class="s1">pid):</span>
+        <span class="s0">return </span><span class="s1">[self.parent] + [</span>
+            <span class="s1">p </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">self.parent.children() </span><span class="s0">if </span><span class="s1">p.pid != pid </span><span class="s0">and </span><span class="s1">p.status() != </span><span class="s3">&quot;zombie&quot;</span>
+        <span class="s1">]</span>
+
+    <span class="s0">def </span><span class="s1">run(self):</span>
+        <span class="s1">psutil = import_required(</span>
+            <span class="s3">&quot;psutil&quot;</span><span class="s0">, </span><span class="s3">&quot;Tracking resource usage requires `psutil` to be installed&quot;</span>
+        <span class="s1">)</span>
+        <span class="s1">self.parent = psutil.Process(self.parent_pid)</span>
+
+        <span class="s1">pid = current_process()</span>
+        <span class="s1">data = []</span>
+        <span class="s0">while True</span><span class="s1">:</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">msg = self.child_conn.recv()</span>
+            <span class="s0">except </span><span class="s1">KeyboardInterrupt:</span>
+                <span class="s0">continue</span>
+            <span class="s0">if </span><span class="s1">msg == </span><span class="s3">&quot;shutdown&quot;</span><span class="s1">:</span>
+                <span class="s0">break</span>
+            <span class="s0">elif </span><span class="s1">msg == </span><span class="s3">&quot;collect&quot;</span><span class="s1">:</span>
+                <span class="s1">ps = self._update_pids(pid)</span>
+                <span class="s0">while not </span><span class="s1">data </span><span class="s0">or not </span><span class="s1">self.child_conn.poll():</span>
+                    <span class="s1">tic = default_timer()</span>
+                    <span class="s1">mem = cpu = </span><span class="s5">0</span>
+                    <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">ps:</span>
+                        <span class="s0">try</span><span class="s1">:</span>
+                            <span class="s1">mem2 = p.memory_info().rss</span>
+                            <span class="s1">cpu2 = p.cpu_percent()</span>
+                        <span class="s0">except </span><span class="s1">Exception:  </span><span class="s2"># could be a few different exceptions</span>
+                            <span class="s0">pass</span>
+                        <span class="s0">else</span><span class="s1">:</span>
+                            <span class="s2"># Only increment if both were successful</span>
+                            <span class="s1">mem += mem2</span>
+                            <span class="s1">cpu += cpu2</span>
+                    <span class="s1">data.append((tic</span><span class="s0">, </span><span class="s1">mem / </span><span class="s5">1e6</span><span class="s0">, </span><span class="s1">cpu))</span>
+                    <span class="s1">sleep(self.dt)</span>
+            <span class="s0">elif </span><span class="s1">msg == </span><span class="s3">&quot;send_data&quot;</span><span class="s1">:</span>
+                <span class="s1">self.child_conn.send(data)</span>
+                <span class="s1">data = []</span>
+        <span class="s1">self.child_conn.close()</span>
+
+
+<span class="s1">CacheData = namedtuple(</span>
+    <span class="s3">&quot;CacheData&quot;</span><span class="s0">, </span><span class="s1">(</span><span class="s3">&quot;key&quot;</span><span class="s0">, </span><span class="s3">&quot;task&quot;</span><span class="s0">, </span><span class="s3">&quot;metric&quot;</span><span class="s0">, </span><span class="s3">&quot;cache_time&quot;</span><span class="s0">, </span><span class="s3">&quot;free_time&quot;</span><span class="s1">)</span>
+<span class="s1">)</span>
+
+
+<span class="s0">class </span><span class="s1">CacheProfiler(Callback):</span>
+    <span class="s4">&quot;&quot;&quot;A profiler for dask execution at the scheduler cache level. 
+ 
+    Records the following information for each task: 
+        1. Key 
+        2. Task 
+        3. Size metric 
+        4. Cache entry time in seconds since the epoch 
+        5. Cache exit time in seconds since the epoch 
+ 
+    Examples 
+    -------- 
+ 
+    &gt;&gt;&gt; from operator import add, mul 
+    &gt;&gt;&gt; from dask.threaded import get 
+    &gt;&gt;&gt; from dask.diagnostics import CacheProfiler 
+    &gt;&gt;&gt; dsk = {'x': 1, 'y': (add, 'x', 10), 'z': (mul, 'y', 2)} 
+    &gt;&gt;&gt; with CacheProfiler() as prof: 
+    ...     get(dsk, 'z') 
+    22 
+ 
+    &gt;&gt;&gt; prof.results    # doctest: +SKIP 
+    [CacheData(key='y', task=(add, 'x', 10), metric=1, cache_time=..., free_time=...), 
+     CacheData(key='z', task=(mul, 'y', 2), metric=1, cache_time=..., free_time=...)] 
+ 
+    The default is to count each task (``metric`` is 1 for all tasks). Other 
+    functions may used as a metric instead through the ``metric`` keyword. For 
+    example, the ``nbytes`` function found in ``cachey`` can be used to measure 
+    the number of bytes in the cache. 
+ 
+    &gt;&gt;&gt; from cachey import nbytes                   # doctest: +SKIP 
+    &gt;&gt;&gt; with CacheProfiler(metric=nbytes) as prof:  # doctest: +SKIP 
+    ...     get(dsk, 'z') 
+    22 
+ 
+    The profiling results can be visualized in a bokeh plot using the 
+    ``visualize`` method. Note that this requires bokeh to be installed. 
+ 
+    &gt;&gt;&gt; prof.visualize() # doctest: +SKIP 
+ 
+    You can activate the profiler globally 
+ 
+    &gt;&gt;&gt; prof.register() 
+ 
+    If you use the profiler globally you will need to clear out old results 
+    manually. 
+ 
+    &gt;&gt;&gt; prof.clear() 
+    &gt;&gt;&gt; prof.unregister() 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">metric=</span><span class="s0">None, </span><span class="s1">metric_name=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">self.clear()</span>
+        <span class="s1">self._metric = metric </span><span class="s0">if </span><span class="s1">metric </span><span class="s0">else lambda </span><span class="s1">value: </span><span class="s5">1</span>
+        <span class="s0">if </span><span class="s1">metric_name:</span>
+            <span class="s1">self._metric_name = metric_name</span>
+        <span class="s0">elif </span><span class="s1">metric:</span>
+            <span class="s1">self._metric_name = metric.__name__</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self._metric_name = </span><span class="s3">&quot;count&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__enter__(self):</span>
+        <span class="s1">self.clear()</span>
+        <span class="s1">self.start_time = default_timer()</span>
+        <span class="s0">return </span><span class="s1">super().__enter__()</span>
+
+    <span class="s0">def </span><span class="s1">__exit__(self</span><span class="s0">, </span><span class="s1">*args):</span>
+        <span class="s1">self.end_time = default_timer()</span>
+        <span class="s0">return </span><span class="s1">super().__exit__(*args)</span>
+
+    <span class="s0">def </span><span class="s1">_start(self</span><span class="s0">, </span><span class="s1">dsk):</span>
+        <span class="s1">self._dsk.update(dsk)</span>
+
+    <span class="s0">def </span><span class="s1">_posttask(self</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">value</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">state</span><span class="s0">, </span><span class="s1">id):</span>
+        <span class="s1">t = default_timer()</span>
+        <span class="s1">self._cache[key] = (self._metric(value)</span><span class="s0">, </span><span class="s1">t)</span>
+        <span class="s0">for </span><span class="s1">k </span><span class="s0">in </span><span class="s1">state[</span><span class="s3">&quot;released&quot;</span><span class="s1">] &amp; self._cache.keys():</span>
+            <span class="s1">metric</span><span class="s0">, </span><span class="s1">start = self._cache.pop(k)</span>
+            <span class="s1">self.results.append(CacheData(k</span><span class="s0">, </span><span class="s1">dsk[k]</span><span class="s0">, </span><span class="s1">metric</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">t))</span>
+
+    <span class="s0">def </span><span class="s1">_finish(self</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">state</span><span class="s0">, </span><span class="s1">failed):</span>
+        <span class="s1">t = default_timer()</span>
+        <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">(metric</span><span class="s0">, </span><span class="s1">start) </span><span class="s0">in </span><span class="s1">self._cache.items():</span>
+            <span class="s1">self.results.append(CacheData(k</span><span class="s0">, </span><span class="s1">dsk[k]</span><span class="s0">, </span><span class="s1">metric</span><span class="s0">, </span><span class="s1">start</span><span class="s0">, </span><span class="s1">t))</span>
+        <span class="s1">self._cache.clear()</span>
+
+    <span class="s0">def </span><span class="s1">_plot(self</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">from </span><span class="s1">dask.diagnostics.profile_visualize </span><span class="s0">import </span><span class="s1">plot_cache</span>
+
+        <span class="s0">return </span><span class="s1">plot_cache(</span>
+            <span class="s1">self.results</span><span class="s0">,</span>
+            <span class="s1">self._dsk</span><span class="s0">,</span>
+            <span class="s1">self.start_time</span><span class="s0">,</span>
+            <span class="s1">self.end_time</span><span class="s0">,</span>
+            <span class="s1">self._metric_name</span><span class="s0">,</span>
+            <span class="s1">**kwargs</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">visualize(self</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s4">&quot;&quot;&quot;Visualize the profiling run in a bokeh plot. 
+ 
+        See also 
+        -------- 
+        dask.diagnostics.profile_visualize.visualize 
+        &quot;&quot;&quot;</span>
+        <span class="s0">from </span><span class="s1">dask.diagnostics.profile_visualize </span><span class="s0">import </span><span class="s1">visualize</span>
+
+        <span class="s0">return </span><span class="s1">visualize(self</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s0">def </span><span class="s1">clear(self):</span>
+        <span class="s4">&quot;&quot;&quot;Clear out old results from profiler&quot;&quot;&quot;</span>
+        <span class="s1">self.results = []</span>
+        <span class="s1">self._cache = {}</span>
+        <span class="s1">self._dsk = {}</span>
+        <span class="s1">self.start_time = </span><span class="s0">None</span>
+        <span class="s1">self.end_time = </span><span class="s0">None</span>
+</pre>
+</body>
+</html>

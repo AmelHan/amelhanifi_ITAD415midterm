@@ -1,0 +1,236 @@
+<html>
+<head>
+<title>libarchive.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6a8759;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+libarchive.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">contextlib </span><span class="s0">import </span><span class="s1">contextmanager</span>
+<span class="s0">from </span><span class="s1">ctypes </span><span class="s0">import </span><span class="s1">(</span>
+    <span class="s1">CFUNCTYPE</span><span class="s0">,</span>
+    <span class="s1">POINTER</span><span class="s0">,</span>
+    <span class="s1">c_int</span><span class="s0">,</span>
+    <span class="s1">c_longlong</span><span class="s0">,</span>
+    <span class="s1">c_void_p</span><span class="s0">,</span>
+    <span class="s1">cast</span><span class="s0">,</span>
+    <span class="s1">create_string_buffer</span><span class="s0">,</span>
+<span class="s1">)</span>
+
+<span class="s0">import </span><span class="s1">libarchive</span>
+<span class="s0">import </span><span class="s1">libarchive.ffi </span><span class="s0">as </span><span class="s1">ffi</span>
+
+<span class="s0">from </span><span class="s1">fsspec </span><span class="s0">import </span><span class="s1">open_files</span>
+<span class="s0">from </span><span class="s1">fsspec.archive </span><span class="s0">import </span><span class="s1">AbstractArchiveFileSystem</span>
+<span class="s0">from </span><span class="s1">fsspec.implementations.memory </span><span class="s0">import </span><span class="s1">MemoryFile</span>
+<span class="s0">from </span><span class="s1">fsspec.utils </span><span class="s0">import </span><span class="s1">DEFAULT_BLOCK_SIZE</span>
+
+<span class="s2"># Libarchive requires seekable files or memory only for certain archive</span>
+<span class="s2"># types. However, since we read the directory first to cache the contents</span>
+<span class="s2"># and also allow random access to any file, the file-like object needs</span>
+<span class="s2"># to be seekable no matter what.</span>
+
+<span class="s2"># Seek call-backs (not provided in the libarchive python wrapper)</span>
+<span class="s1">SEEK_CALLBACK = CFUNCTYPE(c_longlong</span><span class="s0">, </span><span class="s1">c_int</span><span class="s0">, </span><span class="s1">c_void_p</span><span class="s0">, </span><span class="s1">c_longlong</span><span class="s0">, </span><span class="s1">c_int)</span>
+<span class="s1">read_set_seek_callback = ffi.ffi(</span>
+    <span class="s3">&quot;read_set_seek_callback&quot;</span><span class="s0">, </span><span class="s1">[ffi.c_archive_p</span><span class="s0">, </span><span class="s1">SEEK_CALLBACK]</span><span class="s0">, </span><span class="s1">c_int</span><span class="s0">, </span><span class="s1">ffi.check_int</span>
+<span class="s1">)</span>
+<span class="s1">new_api = hasattr(ffi</span><span class="s0">, </span><span class="s3">&quot;NO_OPEN_CB&quot;</span><span class="s1">)</span>
+
+
+<span class="s1">@contextmanager</span>
+<span class="s0">def </span><span class="s1">custom_reader(file</span><span class="s0">, </span><span class="s1">format_name=</span><span class="s3">&quot;all&quot;</span><span class="s0">, </span><span class="s1">filter_name=</span><span class="s3">&quot;all&quot;</span><span class="s0">, </span><span class="s1">block_size=ffi.page_size):</span>
+    <span class="s4">&quot;&quot;&quot;Read an archive from a seekable file-like object. 
+ 
+    The `file` object must support the standard `readinto` and 'seek' methods. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">buf = create_string_buffer(block_size)</span>
+    <span class="s1">buf_p = cast(buf</span><span class="s0">, </span><span class="s1">c_void_p)</span>
+
+    <span class="s0">def </span><span class="s1">read_func(archive_p</span><span class="s0">, </span><span class="s1">context</span><span class="s0">, </span><span class="s1">ptrptr):</span>
+        <span class="s2"># readinto the buffer, returns number of bytes read</span>
+        <span class="s1">length = file.readinto(buf)</span>
+        <span class="s2"># write the address of the buffer into the pointer</span>
+        <span class="s1">ptrptr = cast(ptrptr</span><span class="s0">, </span><span class="s1">POINTER(c_void_p))</span>
+        <span class="s1">ptrptr[</span><span class="s5">0</span><span class="s1">] = buf_p</span>
+        <span class="s2"># tell libarchive how much data was written into the buffer</span>
+        <span class="s0">return </span><span class="s1">length</span>
+
+    <span class="s0">def </span><span class="s1">seek_func(archive_p</span><span class="s0">, </span><span class="s1">context</span><span class="s0">, </span><span class="s1">offset</span><span class="s0">, </span><span class="s1">whence):</span>
+        <span class="s1">file.seek(offset</span><span class="s0">, </span><span class="s1">whence)</span>
+        <span class="s2"># tell libarchvie the current position</span>
+        <span class="s0">return </span><span class="s1">file.tell()</span>
+
+    <span class="s1">read_cb = ffi.READ_CALLBACK(read_func)</span>
+    <span class="s1">seek_cb = SEEK_CALLBACK(seek_func)</span>
+
+    <span class="s0">if </span><span class="s1">new_api:</span>
+        <span class="s1">open_cb = ffi.NO_OPEN_CB</span>
+        <span class="s1">close_cb = ffi.NO_CLOSE_CB</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">open_cb = libarchive.read.OPEN_CALLBACK(ffi.VOID_CB)</span>
+        <span class="s1">close_cb = libarchive.read.CLOSE_CALLBACK(ffi.VOID_CB)</span>
+
+    <span class="s0">with </span><span class="s1">libarchive.read.new_archive_read(format_name</span><span class="s0">, </span><span class="s1">filter_name) </span><span class="s0">as </span><span class="s1">archive_p:</span>
+        <span class="s1">read_set_seek_callback(archive_p</span><span class="s0">, </span><span class="s1">seek_cb)</span>
+        <span class="s1">ffi.read_open(archive_p</span><span class="s0">, None, </span><span class="s1">open_cb</span><span class="s0">, </span><span class="s1">read_cb</span><span class="s0">, </span><span class="s1">close_cb)</span>
+        <span class="s0">yield </span><span class="s1">libarchive.read.ArchiveRead(archive_p)</span>
+
+
+<span class="s0">class </span><span class="s1">LibArchiveFileSystem(AbstractArchiveFileSystem):</span>
+    <span class="s4">&quot;&quot;&quot;Compressed archives as a file-system (read-only) 
+ 
+    Supports the following formats: 
+    tar, pax , cpio, ISO9660, zip, mtree, shar, ar, raw, xar, lha/lzh, rar 
+    Microsoft CAB, 7-Zip, WARC 
+ 
+    See the libarchive documentation for further restrictions. 
+    https://www.libarchive.org/ 
+ 
+    Keeps file object open while instance lives. It only works in seekable 
+    file-like objects. In case the filesystem does not support this kind of 
+    file object, it is recommended to cache locally. 
+ 
+    This class is pickleable, but not necessarily thread-safe (depends on the 
+    platform). See libarchive documentation for details. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">root_marker = </span><span class="s3">&quot;&quot;</span>
+    <span class="s1">protocol = </span><span class="s3">&quot;libarchive&quot;</span>
+    <span class="s1">cachable = </span><span class="s0">False</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">fo=</span><span class="s3">&quot;&quot;</span><span class="s0">,</span>
+        <span class="s1">mode=</span><span class="s3">&quot;r&quot;</span><span class="s0">,</span>
+        <span class="s1">target_protocol=</span><span class="s0">None,</span>
+        <span class="s1">target_options=</span><span class="s0">None,</span>
+        <span class="s1">block_size=DEFAULT_BLOCK_SIZE</span><span class="s0">,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s4">&quot;&quot;&quot; 
+        Parameters 
+        ---------- 
+        fo: str or file-like 
+            Contains ZIP, and must exist. If a str, will fetch file using 
+            :meth:`~fsspec.open_files`, which must return one file exactly. 
+        mode: str 
+            Currently, only 'r' accepted 
+        target_protocol: str (optional) 
+            If ``fo`` is a string, this value can be used to override the 
+            FS protocol inferred from a URL 
+        target_options: dict (optional) 
+            Kwargs passed when instantiating the target FS, if ``fo`` is 
+            a string. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">super().__init__(self</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+        <span class="s0">if </span><span class="s1">mode != </span><span class="s3">&quot;r&quot;</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Only read from archive files accepted&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">isinstance(fo</span><span class="s0">, </span><span class="s1">str):</span>
+            <span class="s1">files = open_files(fo</span><span class="s0">, </span><span class="s1">protocol=target_protocol</span><span class="s0">, </span><span class="s1">**(target_options </span><span class="s0">or </span><span class="s1">{}))</span>
+            <span class="s0">if </span><span class="s1">len(files) != </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">f'Path &quot;</span><span class="s0">{</span><span class="s1">fo</span><span class="s0">}</span><span class="s3">&quot; did not resolve to exactly one file: &quot;</span><span class="s0">{</span><span class="s1">files</span><span class="s0">}</span><span class="s3">&quot;'</span>
+                <span class="s1">)</span>
+            <span class="s1">fo = files[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">self.of = fo</span>
+        <span class="s1">self.fo = fo.__enter__()  </span><span class="s2"># the whole instance is a context</span>
+        <span class="s1">self.block_size = block_size</span>
+        <span class="s1">self.dir_cache = </span><span class="s0">None</span>
+
+    <span class="s1">@contextmanager</span>
+    <span class="s0">def </span><span class="s1">_open_archive(self):</span>
+        <span class="s1">self.fo.seek(</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s0">with </span><span class="s1">custom_reader(self.fo</span><span class="s0">, </span><span class="s1">block_size=self.block_size) </span><span class="s0">as </span><span class="s1">arc:</span>
+            <span class="s0">yield </span><span class="s1">arc</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s0">def </span><span class="s1">_strip_protocol(cls</span><span class="s0">, </span><span class="s1">path):</span>
+        <span class="s2"># file paths are always relative to the archive root</span>
+        <span class="s0">return </span><span class="s1">super()._strip_protocol(path).lstrip(</span><span class="s3">&quot;/&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_get_dirs(self):</span>
+        <span class="s1">fields = {</span>
+            <span class="s3">&quot;name&quot;</span><span class="s1">: </span><span class="s3">&quot;pathname&quot;</span><span class="s0">,</span>
+            <span class="s3">&quot;size&quot;</span><span class="s1">: </span><span class="s3">&quot;size&quot;</span><span class="s0">,</span>
+            <span class="s3">&quot;created&quot;</span><span class="s1">: </span><span class="s3">&quot;ctime&quot;</span><span class="s0">,</span>
+            <span class="s3">&quot;mode&quot;</span><span class="s1">: </span><span class="s3">&quot;mode&quot;</span><span class="s0">,</span>
+            <span class="s3">&quot;uid&quot;</span><span class="s1">: </span><span class="s3">&quot;uid&quot;</span><span class="s0">,</span>
+            <span class="s3">&quot;gid&quot;</span><span class="s1">: </span><span class="s3">&quot;gid&quot;</span><span class="s0">,</span>
+            <span class="s3">&quot;mtime&quot;</span><span class="s1">: </span><span class="s3">&quot;mtime&quot;</span><span class="s0">,</span>
+        <span class="s1">}</span>
+
+        <span class="s0">if </span><span class="s1">self.dir_cache </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">return</span>
+
+        <span class="s1">self.dir_cache = {}</span>
+        <span class="s1">list_names = []</span>
+        <span class="s0">with </span><span class="s1">self._open_archive() </span><span class="s0">as </span><span class="s1">arc:</span>
+            <span class="s0">for </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">arc:</span>
+                <span class="s0">if not </span><span class="s1">entry.isdir </span><span class="s0">and not </span><span class="s1">entry.isfile:</span>
+                    <span class="s2"># Skip symbolic links, fifo entries, etc.</span>
+                    <span class="s0">continue</span>
+                <span class="s1">self.dir_cache.update(</span>
+                    <span class="s1">{</span>
+                        <span class="s1">dirname</span>
+                        <span class="s1">+ </span><span class="s3">&quot;/&quot;</span><span class="s1">: {</span><span class="s3">&quot;name&quot;</span><span class="s1">: dirname + </span><span class="s3">&quot;/&quot;</span><span class="s0">, </span><span class="s3">&quot;size&quot;</span><span class="s1">: </span><span class="s5">0</span><span class="s0">, </span><span class="s3">&quot;type&quot;</span><span class="s1">: </span><span class="s3">&quot;directory&quot;</span><span class="s1">}</span>
+                        <span class="s0">for </span><span class="s1">dirname </span><span class="s0">in </span><span class="s1">self._all_dirnames(set(entry.name))</span>
+                    <span class="s1">}</span>
+                <span class="s1">)</span>
+                <span class="s1">f = {key: getattr(entry</span><span class="s0">, </span><span class="s1">fields[key]) </span><span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">fields}</span>
+                <span class="s1">f[</span><span class="s3">&quot;type&quot;</span><span class="s1">] = </span><span class="s3">&quot;directory&quot; </span><span class="s0">if </span><span class="s1">entry.isdir </span><span class="s0">else </span><span class="s3">&quot;file&quot;</span>
+                <span class="s1">list_names.append(entry.name)</span>
+
+                <span class="s1">self.dir_cache[f[</span><span class="s3">&quot;name&quot;</span><span class="s1">]] = f</span>
+        <span class="s2"># libarchive does not seem to return an entry for the directories (at least</span>
+        <span class="s2"># not in all formats), so get the directories names from the files names</span>
+        <span class="s1">self.dir_cache.update(</span>
+            <span class="s1">{</span>
+                <span class="s1">dirname + </span><span class="s3">&quot;/&quot;</span><span class="s1">: {</span><span class="s3">&quot;name&quot;</span><span class="s1">: dirname + </span><span class="s3">&quot;/&quot;</span><span class="s0">, </span><span class="s3">&quot;size&quot;</span><span class="s1">: </span><span class="s5">0</span><span class="s0">, </span><span class="s3">&quot;type&quot;</span><span class="s1">: </span><span class="s3">&quot;directory&quot;</span><span class="s1">}</span>
+                <span class="s0">for </span><span class="s1">dirname </span><span class="s0">in </span><span class="s1">self._all_dirnames(list_names)</span>
+            <span class="s1">}</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_open(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">path</span><span class="s0">,</span>
+        <span class="s1">mode=</span><span class="s3">&quot;rb&quot;</span><span class="s0">,</span>
+        <span class="s1">block_size=</span><span class="s0">None,</span>
+        <span class="s1">autocommit=</span><span class="s0">True,</span>
+        <span class="s1">cache_options=</span><span class="s0">None,</span>
+        <span class="s1">**kwargs</span><span class="s0">,</span>
+    <span class="s1">):</span>
+        <span class="s1">path = self._strip_protocol(path)</span>
+        <span class="s0">if </span><span class="s1">mode != </span><span class="s3">&quot;rb&quot;</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+        <span class="s1">data = bytes()</span>
+        <span class="s0">with </span><span class="s1">self._open_archive() </span><span class="s0">as </span><span class="s1">arc:</span>
+            <span class="s0">for </span><span class="s1">entry </span><span class="s0">in </span><span class="s1">arc:</span>
+                <span class="s0">if </span><span class="s1">entry.pathname != path:</span>
+                    <span class="s0">continue</span>
+
+                <span class="s0">if </span><span class="s1">entry.size == </span><span class="s5">0</span><span class="s1">:</span>
+                    <span class="s2"># empty file, so there are no blocks</span>
+                    <span class="s0">break</span>
+
+                <span class="s0">for </span><span class="s1">block </span><span class="s0">in </span><span class="s1">entry.get_blocks(entry.size):</span>
+                    <span class="s1">data = block</span>
+                    <span class="s0">break</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s0">raise </span><span class="s1">ValueError</span>
+        <span class="s0">return </span><span class="s1">MemoryFile(fs=self</span><span class="s0">, </span><span class="s1">path=path</span><span class="s0">, </span><span class="s1">data=data)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,486 @@
+<html>
+<head>
+<title>numdiff.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+numdiff.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;numerical differentiation function, gradient, Jacobian, and Hessian 
+ 
+Author : josef-pkt 
+License : BSD 
+ 
+Notes 
+----- 
+These are simple forward differentiation, so that we have them available 
+without dependencies. 
+ 
+* Jacobian should be faster than numdifftools because it does not use loop over 
+  observations. 
+* numerical precision will vary and depend on the choice of stepsizes 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># TODO:</span>
+<span class="s2"># * some cleanup</span>
+<span class="s2"># * check numerical accuracy (and bugs) with numdifftools and analytical</span>
+<span class="s2">#   derivatives</span>
+<span class="s2">#   - linear least squares case: (hess - 2*X'X) is 1e-8 or so</span>
+<span class="s2">#   - gradient and Hessian agree with numdifftools when evaluated away from</span>
+<span class="s2">#     minimum</span>
+<span class="s2">#   - forward gradient, Jacobian evaluated at minimum is inaccurate, centered</span>
+<span class="s2">#     (+/- epsilon) is ok</span>
+<span class="s2"># * dot product of Jacobian is different from Hessian, either wrong example or</span>
+<span class="s2">#   a bug (unlikely), or a real difference</span>
+<span class="s2">#</span>
+<span class="s2">#</span>
+<span class="s2"># What are the conditions that Jacobian dotproduct and Hessian are the same?</span>
+<span class="s2">#</span>
+<span class="s2"># See also:</span>
+<span class="s2">#</span>
+<span class="s2"># BHHH: Greene p481 17.4.6,  MLE Jacobian = d loglike / d beta , where loglike</span>
+<span class="s2"># is vector for each observation</span>
+<span class="s2">#    see also example 17.4 when J'J is very different from Hessian</span>
+<span class="s2">#    also does it hold only at the minimum, what's relationship to covariance</span>
+<span class="s2">#    of Jacobian matrix</span>
+<span class="s2"># http://projects.scipy.org/scipy/ticket/1157</span>
+<span class="s2"># https://en.wikipedia.org/wiki/Levenberg%E2%80%93Marquardt_algorithm</span>
+<span class="s2">#    objective: sum((y-f(beta,x)**2),   Jacobian = d f/d beta</span>
+<span class="s2">#    and not d objective/d beta as in MLE Greene</span>
+<span class="s2">#    similar: http://crsouza.blogspot.com/2009/11/neural-network-learning-by-levenberg_18.html#hessian</span>
+<span class="s2">#</span>
+<span class="s2"># in example: if J = d x*beta / d beta then J'J == X'X</span>
+<span class="s2">#    similar to https://en.wikipedia.org/wiki/Levenberg%E2%80%93Marquardt_algorithm</span>
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+
+<span class="s3">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s3">import </span><span class="s1">Appender</span><span class="s3">, </span><span class="s1">Substitution</span>
+
+<span class="s2"># NOTE: we only do double precision internally so far</span>
+<span class="s1">EPS = np.finfo(float).eps</span>
+
+<span class="s1">_hessian_docs = </span><span class="s4">&quot;&quot;&quot; 
+    Calculate Hessian with finite difference derivative approximation 
+ 
+    Parameters 
+    ---------- 
+    x : array_like 
+       value at which function derivative is evaluated 
+    f : function 
+       function of one array f(x, `*args`, `**kwargs`) 
+    epsilon : float or array_like, optional 
+       Stepsize used, if None, then stepsize is automatically chosen 
+       according to EPS**(1/%(scale)s)*x. 
+    args : tuple 
+        Arguments for function `f`. 
+    kwargs : dict 
+        Keyword arguments for function `f`. 
+    %(extra_params)s 
+ 
+    Returns 
+    ------- 
+    hess : ndarray 
+       array of partial second derivatives, Hessian 
+    %(extra_returns)s 
+ 
+    Notes 
+    ----- 
+    Equation (%(equation_number)s) in Ridout. Computes the Hessian as:: 
+ 
+      %(equation)s 
+ 
+    where e[j] is a vector with element j == 1 and the rest are zero and 
+    d[i] is epsilon[i]. 
+ 
+    References 
+    ----------: 
+ 
+    Ridout, M.S. (2009) Statistical applications of the complex-step method 
+        of numerical differentiation. The American Statistician, 63, 66-74 
+&quot;&quot;&quot;</span>
+
+
+<span class="s3">def </span><span class="s1">_get_epsilon(x</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">n):</span>
+    <span class="s3">if </span><span class="s1">epsilon </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">h = EPS**(</span><span class="s5">1. </span><span class="s1">/ s) * np.maximum(np.abs(x)</span><span class="s3">, </span><span class="s5">0.1</span><span class="s1">)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s1">np.isscalar(epsilon):</span>
+            <span class="s1">h = np.empty(n)</span>
+            <span class="s1">h.fill(epsilon)</span>
+        <span class="s3">else</span><span class="s1">:  </span><span class="s2"># pragma : no cover</span>
+            <span class="s1">h = np.asarray(epsilon)</span>
+            <span class="s3">if </span><span class="s1">h.shape != x.shape:</span>
+                <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;If h is not a scalar it must have the same&quot;</span>
+                                 <span class="s4">&quot; shape as x.&quot;</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">h</span>
+
+
+<span class="s3">def </span><span class="s1">approx_fprime(x</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">epsilon=</span><span class="s3">None, </span><span class="s1">args=()</span><span class="s3">, </span><span class="s1">kwargs={}</span><span class="s3">, </span><span class="s1">centered=</span><span class="s3">False</span><span class="s1">):</span>
+    <span class="s0">''' 
+    Gradient of function, or Jacobian if function f returns 1d array 
+ 
+    Parameters 
+    ---------- 
+    x : ndarray 
+        parameters at which the derivative is evaluated 
+    f : function 
+        `f(*((x,)+args), **kwargs)` returning either one value or 1d array 
+    epsilon : float, optional 
+        Stepsize, if None, optimal stepsize is used. This is EPS**(1/2)*x for 
+        `centered` == False and EPS**(1/3)*x for `centered` == True. 
+    args : tuple 
+        Tuple of additional arguments for function `f`. 
+    kwargs : dict 
+        Dictionary of additional keyword arguments for function `f`. 
+    centered : bool 
+        Whether central difference should be returned. If not, does forward 
+        differencing. 
+ 
+    Returns 
+    ------- 
+    grad : ndarray 
+        gradient or Jacobian 
+ 
+    Notes 
+    ----- 
+    If f returns a 1d array, it returns a Jacobian. If a 2d array is returned 
+    by f (e.g., with a value for each observation), it returns a 3d array 
+    with the Jacobian of each observation with shape xk x nobs x xk. I.e., 
+    the Jacobian of the first observation would be [:, 0, :] 
+    '''</span>
+    <span class="s1">n = len(x)</span>
+    <span class="s1">f0 = f(*((x</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+    <span class="s1">dim = np.atleast_1d(f0).shape  </span><span class="s2"># it could be a scalar</span>
+    <span class="s1">grad = np.zeros((n</span><span class="s3">,</span><span class="s1">) + dim</span><span class="s3">, </span><span class="s1">np.promote_types(float</span><span class="s3">, </span><span class="s1">x.dtype))</span>
+    <span class="s1">ei = np.zeros((n</span><span class="s3">,</span><span class="s1">)</span><span class="s3">, </span><span class="s1">float)</span>
+    <span class="s3">if not </span><span class="s1">centered:</span>
+        <span class="s1">epsilon = _get_epsilon(x</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">n)</span>
+        <span class="s3">for </span><span class="s1">k </span><span class="s3">in </span><span class="s1">range(n):</span>
+            <span class="s1">ei[k] = epsilon[k]</span>
+            <span class="s1">grad[k</span><span class="s3">, </span><span class="s1">:] = (f(*((x+ei</span><span class="s3">,</span><span class="s1">) + args)</span><span class="s3">, </span><span class="s1">**kwargs) - f0)/epsilon[k]</span>
+            <span class="s1">ei[k] = </span><span class="s5">0.0</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">epsilon = _get_epsilon(x</span><span class="s3">, </span><span class="s5">3</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">n) / </span><span class="s5">2.</span>
+        <span class="s3">for </span><span class="s1">k </span><span class="s3">in </span><span class="s1">range(n):</span>
+            <span class="s1">ei[k] = epsilon[k]</span>
+            <span class="s1">grad[k</span><span class="s3">, </span><span class="s1">:] = (f(*((x+ei</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">, </span><span class="s1">**kwargs) -</span>
+                          <span class="s1">f(*((x-ei</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">, </span><span class="s1">**kwargs))/(</span><span class="s5">2 </span><span class="s1">* epsilon[k])</span>
+            <span class="s1">ei[k] = </span><span class="s5">0.0</span>
+
+    <span class="s3">if </span><span class="s1">n == </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">grad.T</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">grad.squeeze().T</span>
+
+
+<span class="s3">def </span><span class="s1">_approx_fprime_scalar(x</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">epsilon=</span><span class="s3">None, </span><span class="s1">args=()</span><span class="s3">, </span><span class="s1">kwargs={}</span><span class="s3">,</span>
+                          <span class="s1">centered=</span><span class="s3">False</span><span class="s1">):</span>
+    <span class="s0">''' 
+    Gradient of function vectorized for scalar parameter. 
+ 
+    This assumes that the function ``f`` is vectorized for a scalar parameter. 
+    The function value ``f(x)`` has then the same shape as the input ``x``. 
+    The derivative returned by this function also has the same shape as ``x``. 
+ 
+    Parameters 
+    ---------- 
+    x : ndarray 
+        Parameters at which the derivative is evaluated. 
+    f : function 
+        `f(*((x,)+args), **kwargs)` returning either one value or 1d array 
+    epsilon : float, optional 
+        Stepsize, if None, optimal stepsize is used. This is EPS**(1/2)*x for 
+        `centered` == False and EPS**(1/3)*x for `centered` == True. 
+    args : tuple 
+        Tuple of additional arguments for function `f`. 
+    kwargs : dict 
+        Dictionary of additional keyword arguments for function `f`. 
+    centered : bool 
+        Whether central difference should be returned. If not, does forward 
+        differencing. 
+ 
+    Returns 
+    ------- 
+    grad : ndarray 
+        Array of derivatives, gradient evaluated at parameters ``x``. 
+    '''</span>
+    <span class="s1">x = np.asarray(x)</span>
+    <span class="s1">n = </span><span class="s5">1</span>
+
+    <span class="s1">f0 = f(*((x</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+    <span class="s3">if not </span><span class="s1">centered:</span>
+        <span class="s1">eps = _get_epsilon(x</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">n)</span>
+        <span class="s1">grad = (f(*((x+eps</span><span class="s3">,</span><span class="s1">) + args)</span><span class="s3">, </span><span class="s1">**kwargs) - f0) / eps</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">eps = _get_epsilon(x</span><span class="s3">, </span><span class="s5">3</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">n) / </span><span class="s5">2.</span>
+        <span class="s1">grad = (f(*((x+eps</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">, </span><span class="s1">**kwargs) -</span>
+                <span class="s1">f(*((x-eps</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">, </span><span class="s1">**kwargs)) / (</span><span class="s5">2 </span><span class="s1">* eps)</span>
+
+    <span class="s3">return </span><span class="s1">grad</span>
+
+
+<span class="s3">def </span><span class="s1">approx_fprime_cs(x</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">epsilon=</span><span class="s3">None, </span><span class="s1">args=()</span><span class="s3">, </span><span class="s1">kwargs={}):</span>
+    <span class="s0">''' 
+    Calculate gradient or Jacobian with complex step derivative approximation 
+ 
+    Parameters 
+    ---------- 
+    x : ndarray 
+        parameters at which the derivative is evaluated 
+    f : function 
+        `f(*((x,)+args), **kwargs)` returning either one value or 1d array 
+    epsilon : float, optional 
+        Stepsize, if None, optimal stepsize is used. Optimal step-size is 
+        EPS*x. See note. 
+    args : tuple 
+        Tuple of additional arguments for function `f`. 
+    kwargs : dict 
+        Dictionary of additional keyword arguments for function `f`. 
+ 
+    Returns 
+    ------- 
+    partials : ndarray 
+       array of partial derivatives, Gradient or Jacobian 
+ 
+    Notes 
+    ----- 
+    The complex-step derivative has truncation error O(epsilon**2), so 
+    truncation error can be eliminated by choosing epsilon to be very small. 
+    The complex-step derivative avoids the problem of round-off error with 
+    small epsilon because there is no subtraction. 
+    '''</span>
+    <span class="s2"># From Guilherme P. de Freitas, numpy mailing list</span>
+    <span class="s2"># May 04 2010 thread &quot;Improvement of performance&quot;</span>
+    <span class="s2"># http://mail.scipy.org/pipermail/numpy-discussion/2010-May/050250.html</span>
+    <span class="s1">n = len(x)</span>
+
+    <span class="s1">epsilon = _get_epsilon(x</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">n)</span>
+    <span class="s1">increments = np.identity(n) * </span><span class="s5">1j </span><span class="s1">* epsilon</span>
+    <span class="s2"># TODO: see if this can be vectorized, but usually dim is small</span>
+    <span class="s1">partials = [f(x+ih</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs).imag / epsilon[i]</span>
+                <span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">ih </span><span class="s3">in </span><span class="s1">enumerate(increments)]</span>
+
+    <span class="s3">return </span><span class="s1">np.array(partials).T</span>
+
+
+<span class="s3">def </span><span class="s1">_approx_fprime_cs_scalar(x</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">epsilon=</span><span class="s3">None, </span><span class="s1">args=()</span><span class="s3">, </span><span class="s1">kwargs={}):</span>
+    <span class="s0">''' 
+    Calculate gradient for scalar parameter with complex step derivatives. 
+ 
+    This assumes that the function ``f`` is vectorized for a scalar parameter. 
+    The function value ``f(x)`` has then the same shape as the input ``x``. 
+    The derivative returned by this function also has the same shape as ``x``. 
+ 
+    Parameters 
+    ---------- 
+    x : ndarray 
+        Parameters at which the derivative is evaluated. 
+    f : function 
+        `f(*((x,)+args), **kwargs)` returning either one value or 1d array. 
+    epsilon : float, optional 
+        Stepsize, if None, optimal stepsize is used. Optimal step-size is 
+        EPS*x. See note. 
+    args : tuple 
+        Tuple of additional arguments for function `f`. 
+    kwargs : dict 
+        Dictionary of additional keyword arguments for function `f`. 
+ 
+    Returns 
+    ------- 
+    partials : ndarray 
+       Array of derivatives, gradient evaluated for parameters ``x``. 
+ 
+    Notes 
+    ----- 
+    The complex-step derivative has truncation error O(epsilon**2), so 
+    truncation error can be eliminated by choosing epsilon to be very small. 
+    The complex-step derivative avoids the problem of round-off error with 
+    small epsilon because there is no subtraction. 
+    '''</span>
+    <span class="s2"># From Guilherme P. de Freitas, numpy mailing list</span>
+    <span class="s2"># May 04 2010 thread &quot;Improvement of performance&quot;</span>
+    <span class="s2"># http://mail.scipy.org/pipermail/numpy-discussion/2010-May/050250.html</span>
+    <span class="s1">x = np.asarray(x)</span>
+    <span class="s1">n = x.shape[-</span><span class="s5">1</span><span class="s1">]</span>
+
+    <span class="s1">epsilon = _get_epsilon(x</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">n)</span>
+    <span class="s1">eps = </span><span class="s5">1j </span><span class="s1">* epsilon</span>
+    <span class="s1">partials = f(x + eps</span><span class="s3">, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs).imag / epsilon</span>
+
+    <span class="s3">return </span><span class="s1">np.array(partials)</span>
+
+
+<span class="s3">def </span><span class="s1">approx_hess_cs(x</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">epsilon=</span><span class="s3">None, </span><span class="s1">args=()</span><span class="s3">, </span><span class="s1">kwargs={}):</span>
+    <span class="s0">'''Calculate Hessian with complex-step derivative approximation 
+ 
+    Parameters 
+    ---------- 
+    x : array_like 
+       value at which function derivative is evaluated 
+    f : function 
+       function of one array f(x) 
+    epsilon : float 
+       stepsize, if None, then stepsize is automatically chosen 
+ 
+    Returns 
+    ------- 
+    hess : ndarray 
+       array of partial second derivatives, Hessian 
+ 
+    Notes 
+    ----- 
+    based on equation 10 in 
+    M. S. RIDOUT: Statistical Applications of the Complex-step Method 
+    of Numerical Differentiation, University of Kent, Canterbury, Kent, U.K. 
+ 
+    The stepsize is the same for the complex and the finite difference part. 
+    '''</span>
+    <span class="s2"># TODO: might want to consider lowering the step for pure derivatives</span>
+    <span class="s1">n = len(x)</span>
+    <span class="s1">h = _get_epsilon(x</span><span class="s3">, </span><span class="s5">3</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">n)</span>
+    <span class="s1">ee = np.diag(h)</span>
+    <span class="s1">hess = np.outer(h</span><span class="s3">, </span><span class="s1">h)</span>
+
+    <span class="s1">n = len(x)</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(n):</span>
+        <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(i</span><span class="s3">, </span><span class="s1">n):</span>
+            <span class="s1">hess[i</span><span class="s3">, </span><span class="s1">j] = np.squeeze(</span>
+                <span class="s1">(f(*((x + </span><span class="s5">1j</span><span class="s1">*ee[i</span><span class="s3">, </span><span class="s1">:] + ee[j</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">) + args)</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+                          <span class="s1">- f(*((x + </span><span class="s5">1j</span><span class="s1">*ee[i</span><span class="s3">, </span><span class="s1">:] - ee[j</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">,</span>
+                              <span class="s1">**kwargs)).imag/</span><span class="s5">2.</span><span class="s1">/hess[i</span><span class="s3">, </span><span class="s1">j]</span>
+            <span class="s1">)</span>
+            <span class="s1">hess[j</span><span class="s3">, </span><span class="s1">i] = hess[i</span><span class="s3">, </span><span class="s1">j]</span>
+
+    <span class="s3">return </span><span class="s1">hess</span>
+
+
+<span class="s1">@Substitution(</span>
+    <span class="s1">scale=</span><span class="s4">&quot;3&quot;</span><span class="s3">,</span>
+    <span class="s1">extra_params=</span><span class="s4">&quot;&quot;&quot;return_grad : bool 
+        Whether or not to also return the gradient 
+&quot;&quot;&quot;</span><span class="s3">,</span>
+    <span class="s1">extra_returns=</span><span class="s4">&quot;&quot;&quot;grad : nparray 
+        Gradient if return_grad == True 
+&quot;&quot;&quot;</span><span class="s3">,</span>
+    <span class="s1">equation_number=</span><span class="s4">&quot;7&quot;</span><span class="s3">,</span>
+    <span class="s1">equation=</span><span class="s4">&quot;&quot;&quot;1/(d_j*d_k) * ((f(x + d[j]*e[j] + d[k]*e[k]) - f(x + d[j]*e[j]))) 
+&quot;&quot;&quot;</span>
+<span class="s1">)</span>
+<span class="s1">@Appender(_hessian_docs)</span>
+<span class="s3">def </span><span class="s1">approx_hess1(x</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">epsilon=</span><span class="s3">None, </span><span class="s1">args=()</span><span class="s3">, </span><span class="s1">kwargs={}</span><span class="s3">, </span><span class="s1">return_grad=</span><span class="s3">False</span><span class="s1">):</span>
+    <span class="s1">n = len(x)</span>
+    <span class="s1">h = _get_epsilon(x</span><span class="s3">, </span><span class="s5">3</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">n)</span>
+    <span class="s1">ee = np.diag(h)</span>
+
+    <span class="s1">f0 = f(*((x</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+    <span class="s2"># Compute forward step</span>
+    <span class="s1">g = np.zeros(n)</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(n):</span>
+        <span class="s1">g[i] = f(*((x+ee[i</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s1">hess = np.outer(h</span><span class="s3">, </span><span class="s1">h)  </span><span class="s2"># this is now epsilon**2</span>
+    <span class="s2"># Compute &quot;double&quot; forward step</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(n):</span>
+        <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(i</span><span class="s3">, </span><span class="s1">n):</span>
+            <span class="s1">hess[i</span><span class="s3">, </span><span class="s1">j] = (f(*((x + ee[i</span><span class="s3">, </span><span class="s1">:] + ee[j</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">) + args)</span><span class="s3">, </span><span class="s1">**kwargs) -</span>
+                          <span class="s1">g[i] - g[j] + f0)/hess[i</span><span class="s3">, </span><span class="s1">j]</span>
+            <span class="s1">hess[j</span><span class="s3">, </span><span class="s1">i] = hess[i</span><span class="s3">, </span><span class="s1">j]</span>
+    <span class="s3">if </span><span class="s1">return_grad:</span>
+        <span class="s1">grad = (g - f0)/h</span>
+        <span class="s3">return </span><span class="s1">hess</span><span class="s3">, </span><span class="s1">grad</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">hess</span>
+
+
+<span class="s1">@Substitution(</span>
+    <span class="s1">scale=</span><span class="s4">&quot;3&quot;</span><span class="s3">,</span>
+    <span class="s1">extra_params=</span><span class="s4">&quot;&quot;&quot;return_grad : bool 
+        Whether or not to also return the gradient 
+&quot;&quot;&quot;</span><span class="s3">,</span>
+    <span class="s1">extra_returns=</span><span class="s4">&quot;&quot;&quot;grad : ndarray 
+        Gradient if return_grad == True 
+&quot;&quot;&quot;</span><span class="s3">,</span>
+    <span class="s1">equation_number=</span><span class="s4">&quot;8&quot;</span><span class="s3">,</span>
+    <span class="s1">equation=</span><span class="s4">&quot;&quot;&quot;1/(2*d_j*d_k) * ((f(x + d[j]*e[j] + d[k]*e[k]) - f(x + d[j]*e[j])) - 
+                 (f(x + d[k]*e[k]) - f(x)) + 
+                 (f(x - d[j]*e[j] - d[k]*e[k]) - f(x + d[j]*e[j])) - 
+                 (f(x - d[k]*e[k]) - f(x))) 
+&quot;&quot;&quot;</span>
+<span class="s1">)</span>
+<span class="s1">@Appender(_hessian_docs)</span>
+<span class="s3">def </span><span class="s1">approx_hess2(x</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">epsilon=</span><span class="s3">None, </span><span class="s1">args=()</span><span class="s3">, </span><span class="s1">kwargs={}</span><span class="s3">, </span><span class="s1">return_grad=</span><span class="s3">False</span><span class="s1">):</span>
+    <span class="s2">#</span>
+    <span class="s1">n = len(x)</span>
+    <span class="s2"># NOTE: ridout suggesting using eps**(1/4)*theta</span>
+    <span class="s1">h = _get_epsilon(x</span><span class="s3">, </span><span class="s5">3</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">n)</span>
+    <span class="s1">ee = np.diag(h)</span>
+    <span class="s1">f0 = f(*((x</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+    <span class="s2"># Compute forward step</span>
+    <span class="s1">g = np.zeros(n)</span>
+    <span class="s1">gg = np.zeros(n)</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(n):</span>
+        <span class="s1">g[i] = f(*((x+ee[i</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">gg[i] = f(*((x-ee[i</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">)+args)</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s1">hess = np.outer(h</span><span class="s3">, </span><span class="s1">h)  </span><span class="s2"># this is now epsilon**2</span>
+    <span class="s2"># Compute &quot;double&quot; forward step</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(n):</span>
+        <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(i</span><span class="s3">, </span><span class="s1">n):</span>
+            <span class="s1">hess[i</span><span class="s3">, </span><span class="s1">j] = (f(*((x + ee[i</span><span class="s3">, </span><span class="s1">:] + ee[j</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">) + args)</span><span class="s3">, </span><span class="s1">**kwargs) -</span>
+                          <span class="s1">g[i] - g[j] + f0 +</span>
+                          <span class="s1">f(*((x - ee[i</span><span class="s3">, </span><span class="s1">:] - ee[j</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">) + args)</span><span class="s3">, </span><span class="s1">**kwargs) -</span>
+                          <span class="s1">gg[i] - gg[j] + f0)/(</span><span class="s5">2 </span><span class="s1">* hess[i</span><span class="s3">, </span><span class="s1">j])</span>
+            <span class="s1">hess[j</span><span class="s3">, </span><span class="s1">i] = hess[i</span><span class="s3">, </span><span class="s1">j]</span>
+    <span class="s3">if </span><span class="s1">return_grad:</span>
+        <span class="s1">grad = (g - f0)/h</span>
+        <span class="s3">return </span><span class="s1">hess</span><span class="s3">, </span><span class="s1">grad</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">hess</span>
+
+
+<span class="s1">@Substitution(</span>
+    <span class="s1">scale=</span><span class="s4">&quot;4&quot;</span><span class="s3">,</span>
+    <span class="s1">extra_params=</span><span class="s4">&quot;&quot;</span><span class="s3">,</span>
+    <span class="s1">extra_returns=</span><span class="s4">&quot;&quot;</span><span class="s3">,</span>
+    <span class="s1">equation_number=</span><span class="s4">&quot;9&quot;</span><span class="s3">,</span>
+    <span class="s1">equation=</span><span class="s4">&quot;&quot;&quot;1/(4*d_j*d_k) * ((f(x + d[j]*e[j] + d[k]*e[k]) - f(x + d[j]*e[j] 
+                                                     - d[k]*e[k])) - 
+                 (f(x - d[j]*e[j] + d[k]*e[k]) - f(x - d[j]*e[j] 
+                                                     - d[k]*e[k]))&quot;&quot;&quot;</span>
+<span class="s1">)</span>
+<span class="s1">@Appender(_hessian_docs)</span>
+<span class="s3">def </span><span class="s1">approx_hess3(x</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">epsilon=</span><span class="s3">None, </span><span class="s1">args=()</span><span class="s3">, </span><span class="s1">kwargs={}):</span>
+    <span class="s1">n = len(x)</span>
+    <span class="s1">h = _get_epsilon(x</span><span class="s3">, </span><span class="s5">4</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">n)</span>
+    <span class="s1">ee = np.diag(h)</span>
+    <span class="s1">hess = np.outer(h</span><span class="s3">, </span><span class="s1">h)</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(n):</span>
+        <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(i</span><span class="s3">, </span><span class="s1">n):</span>
+            <span class="s1">hess[i</span><span class="s3">, </span><span class="s1">j] = np.squeeze(</span>
+                <span class="s1">(f(*((x + ee[i</span><span class="s3">, </span><span class="s1">:] + ee[j</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">) + args)</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+                 <span class="s1">- f(*((x + ee[i</span><span class="s3">, </span><span class="s1">:] - ee[j</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">) + args)</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+                 <span class="s1">- (f(*((x - ee[i</span><span class="s3">, </span><span class="s1">:] + ee[j</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">) + args)</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+                    <span class="s1">- f(*((x - ee[i</span><span class="s3">, </span><span class="s1">:] - ee[j</span><span class="s3">, </span><span class="s1">:]</span><span class="s3">,</span><span class="s1">) + args)</span><span class="s3">, </span><span class="s1">**kwargs))</span>
+                 <span class="s1">)/(</span><span class="s5">4.</span><span class="s1">*hess[i</span><span class="s3">, </span><span class="s1">j])</span>
+            <span class="s1">)</span>
+            <span class="s1">hess[j</span><span class="s3">, </span><span class="s1">i] = hess[i</span><span class="s3">, </span><span class="s1">j]</span>
+    <span class="s3">return </span><span class="s1">hess</span>
+
+
+<span class="s1">approx_hess = approx_hess3</span>
+<span class="s1">approx_hess.__doc__ += </span><span class="s4">&quot;</span><span class="s3">\n    </span><span class="s4">This is an alias for approx_hess3&quot;</span>
+</pre>
+</body>
+</html>

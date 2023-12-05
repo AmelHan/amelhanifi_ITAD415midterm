@@ -1,0 +1,1106 @@
+<html>
+<head>
+<title>_univariate_selection.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_univariate_selection.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Univariate features selection.&quot;&quot;&quot;</span>
+
+<span class="s2"># Authors: V. Michel, B. Thirion, G. Varoquaux, A. Gramfort, E. Duchesnay.</span>
+<span class="s2">#          L. Buitinck, A. Joly</span>
+<span class="s2"># License: BSD 3 clause</span>
+
+
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">from </span><span class="s1">numbers </span><span class="s3">import </span><span class="s1">Integral</span><span class="s3">, </span><span class="s1">Real</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">special</span><span class="s3">, </span><span class="s1">stats</span>
+<span class="s3">from </span><span class="s1">scipy.sparse </span><span class="s3">import </span><span class="s1">issparse</span>
+
+<span class="s3">from </span><span class="s1">..base </span><span class="s3">import </span><span class="s1">BaseEstimator</span><span class="s3">, </span><span class="s1">_fit_context</span>
+<span class="s3">from </span><span class="s1">..preprocessing </span><span class="s3">import </span><span class="s1">LabelBinarizer</span>
+<span class="s3">from </span><span class="s1">..utils </span><span class="s3">import </span><span class="s1">as_float_array</span><span class="s3">, </span><span class="s1">check_array</span><span class="s3">, </span><span class="s1">check_X_y</span><span class="s3">, </span><span class="s1">safe_mask</span><span class="s3">, </span><span class="s1">safe_sqr</span>
+<span class="s3">from </span><span class="s1">..utils._param_validation </span><span class="s3">import </span><span class="s1">Interval</span><span class="s3">, </span><span class="s1">StrOptions</span><span class="s3">, </span><span class="s1">validate_params</span>
+<span class="s3">from </span><span class="s1">..utils.extmath </span><span class="s3">import </span><span class="s1">row_norms</span><span class="s3">, </span><span class="s1">safe_sparse_dot</span>
+<span class="s3">from </span><span class="s1">..utils.validation </span><span class="s3">import </span><span class="s1">check_is_fitted</span>
+<span class="s3">from </span><span class="s1">._base </span><span class="s3">import </span><span class="s1">SelectorMixin</span>
+
+
+<span class="s3">def </span><span class="s1">_clean_nans(scores):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Fixes Issue #1240: NaNs can't be properly compared, so change them to the 
+    smallest value of scores's dtype. -inf seems to be unreliable. 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># XXX where should this function be called? fit? scoring functions</span>
+    <span class="s2"># themselves?</span>
+    <span class="s1">scores = as_float_array(scores</span><span class="s3">, </span><span class="s1">copy=</span><span class="s3">True</span><span class="s1">)</span>
+    <span class="s1">scores[np.isnan(scores)] = np.finfo(scores.dtype).min</span>
+    <span class="s3">return </span><span class="s1">scores</span>
+
+
+<span class="s2">######################################################################</span>
+<span class="s2"># Scoring functions</span>
+
+
+<span class="s2"># The following function is a rewriting of scipy.stats.f_oneway</span>
+<span class="s2"># Contrary to the scipy.stats.f_oneway implementation it does not</span>
+<span class="s2"># copy the data while keeping the inputs unchanged.</span>
+<span class="s3">def </span><span class="s1">f_oneway(*args):</span>
+    <span class="s0">&quot;&quot;&quot;Perform a 1-way ANOVA. 
+ 
+    The one-way ANOVA tests the null hypothesis that 2 or more groups have 
+    the same population mean. The test is applied to samples from two or 
+    more groups, possibly with differing sizes. 
+ 
+    Read more in the :ref:`User Guide &lt;univariate_feature_selection&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    *args : {array-like, sparse matrix} 
+        Sample1, sample2... The sample measurements should be given as 
+        arguments. 
+ 
+    Returns 
+    ------- 
+    f_statistic : float 
+        The computed F-value of the test. 
+    p_value : float 
+        The associated p-value from the F-distribution. 
+ 
+    Notes 
+    ----- 
+    The ANOVA test has important assumptions that must be satisfied in order 
+    for the associated p-value to be valid. 
+ 
+    1. The samples are independent 
+    2. Each sample is from a normally distributed population 
+    3. The population standard deviations of the groups are all equal. This 
+       property is known as homoscedasticity. 
+ 
+    If these assumptions are not true for a given set of data, it may still be 
+    possible to use the Kruskal-Wallis H-test (`scipy.stats.kruskal`_) although 
+    with some loss of power. 
+ 
+    The algorithm is from Heiman[2], pp.394-7. 
+ 
+    See ``scipy.stats.f_oneway`` that should give the same results while 
+    being less efficient. 
+ 
+    References 
+    ---------- 
+    .. [1] Lowry, Richard.  &quot;Concepts and Applications of Inferential 
+           Statistics&quot;. Chapter 14. 
+           http://vassarstats.net/textbook 
+ 
+    .. [2] Heiman, G.W.  Research Methods in Statistics. 2002. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">n_classes = len(args)</span>
+    <span class="s1">args = [as_float_array(a) </span><span class="s3">for </span><span class="s1">a </span><span class="s3">in </span><span class="s1">args]</span>
+    <span class="s1">n_samples_per_class = np.array([a.shape[</span><span class="s4">0</span><span class="s1">] </span><span class="s3">for </span><span class="s1">a </span><span class="s3">in </span><span class="s1">args])</span>
+    <span class="s1">n_samples = np.sum(n_samples_per_class)</span>
+    <span class="s1">ss_alldata = sum(safe_sqr(a).sum(axis=</span><span class="s4">0</span><span class="s1">) </span><span class="s3">for </span><span class="s1">a </span><span class="s3">in </span><span class="s1">args)</span>
+    <span class="s1">sums_args = [np.asarray(a.sum(axis=</span><span class="s4">0</span><span class="s1">)) </span><span class="s3">for </span><span class="s1">a </span><span class="s3">in </span><span class="s1">args]</span>
+    <span class="s1">square_of_sums_alldata = sum(sums_args) ** </span><span class="s4">2</span>
+    <span class="s1">square_of_sums_args = [s**</span><span class="s4">2 </span><span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">sums_args]</span>
+    <span class="s1">sstot = ss_alldata - square_of_sums_alldata / float(n_samples)</span>
+    <span class="s1">ssbn = </span><span class="s4">0.0</span>
+    <span class="s3">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">enumerate(args):</span>
+        <span class="s1">ssbn += square_of_sums_args[k] / n_samples_per_class[k]</span>
+    <span class="s1">ssbn -= square_of_sums_alldata / float(n_samples)</span>
+    <span class="s1">sswn = sstot - ssbn</span>
+    <span class="s1">dfbn = n_classes - </span><span class="s4">1</span>
+    <span class="s1">dfwn = n_samples - n_classes</span>
+    <span class="s1">msb = ssbn / float(dfbn)</span>
+    <span class="s1">msw = sswn / float(dfwn)</span>
+    <span class="s1">constant_features_idx = np.where(msw == </span><span class="s4">0.0</span><span class="s1">)[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s3">if </span><span class="s1">np.nonzero(msb)[</span><span class="s4">0</span><span class="s1">].size != msb.size </span><span class="s3">and </span><span class="s1">constant_features_idx.size:</span>
+        <span class="s1">warnings.warn(</span><span class="s5">&quot;Features %s are constant.&quot; </span><span class="s1">% constant_features_idx</span><span class="s3">, </span><span class="s1">UserWarning)</span>
+    <span class="s1">f = msb / msw</span>
+    <span class="s2"># flatten matrix to vector in sparse case</span>
+    <span class="s1">f = np.asarray(f).ravel()</span>
+    <span class="s1">prob = special.fdtrc(dfbn</span><span class="s3">, </span><span class="s1">dfwn</span><span class="s3">, </span><span class="s1">f)</span>
+    <span class="s3">return </span><span class="s1">f</span><span class="s3">, </span><span class="s1">prob</span>
+
+
+<span class="s1">@validate_params(</span>
+    <span class="s1">{</span>
+        <span class="s5">&quot;X&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s3">, </span><span class="s5">&quot;sparse matrix&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;y&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s1">]</span><span class="s3">,</span>
+    <span class="s1">}</span><span class="s3">,</span>
+    <span class="s1">prefer_skip_nested_validation=</span><span class="s3">True,</span>
+<span class="s1">)</span>
+<span class="s3">def </span><span class="s1">f_classif(X</span><span class="s3">, </span><span class="s1">y):</span>
+    <span class="s0">&quot;&quot;&quot;Compute the ANOVA F-value for the provided sample. 
+ 
+    Read more in the :ref:`User Guide &lt;univariate_feature_selection&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+        The set of regressors that will be tested sequentially. 
+ 
+    y : array-like of shape (n_samples,) 
+        The target vector. 
+ 
+    Returns 
+    ------- 
+    f_statistic : ndarray of shape (n_features,) 
+        F-statistic for each feature. 
+ 
+    p_values : ndarray of shape (n_features,) 
+        P-values associated with the F-statistic. 
+ 
+    See Also 
+    -------- 
+    chi2 : Chi-squared stats of non-negative features for classification tasks. 
+    f_regression : F-value between label/feature for regression tasks. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">X</span><span class="s3">, </span><span class="s1">y = check_X_y(X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">accept_sparse=[</span><span class="s5">&quot;csr&quot;</span><span class="s3">, </span><span class="s5">&quot;csc&quot;</span><span class="s3">, </span><span class="s5">&quot;coo&quot;</span><span class="s1">])</span>
+    <span class="s1">args = [X[safe_mask(X</span><span class="s3">, </span><span class="s1">y == k)] </span><span class="s3">for </span><span class="s1">k </span><span class="s3">in </span><span class="s1">np.unique(y)]</span>
+    <span class="s3">return </span><span class="s1">f_oneway(*args)</span>
+
+
+<span class="s3">def </span><span class="s1">_chisquare(f_obs</span><span class="s3">, </span><span class="s1">f_exp):</span>
+    <span class="s0">&quot;&quot;&quot;Fast replacement for scipy.stats.chisquare. 
+ 
+    Version from https://github.com/scipy/scipy/pull/2525 with additional 
+    optimizations. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">f_obs = np.asarray(f_obs</span><span class="s3">, </span><span class="s1">dtype=np.float64)</span>
+
+    <span class="s1">k = len(f_obs)</span>
+    <span class="s2"># Reuse f_obs for chi-squared statistics</span>
+    <span class="s1">chisq = f_obs</span>
+    <span class="s1">chisq -= f_exp</span>
+    <span class="s1">chisq **= </span><span class="s4">2</span>
+    <span class="s3">with </span><span class="s1">np.errstate(invalid=</span><span class="s5">&quot;ignore&quot;</span><span class="s1">):</span>
+        <span class="s1">chisq /= f_exp</span>
+    <span class="s1">chisq = chisq.sum(axis=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">chisq</span><span class="s3">, </span><span class="s1">special.chdtrc(k - </span><span class="s4">1</span><span class="s3">, </span><span class="s1">chisq)</span>
+
+
+<span class="s1">@validate_params(</span>
+    <span class="s1">{</span>
+        <span class="s5">&quot;X&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s3">, </span><span class="s5">&quot;sparse matrix&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;y&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s1">]</span><span class="s3">,</span>
+    <span class="s1">}</span><span class="s3">,</span>
+    <span class="s1">prefer_skip_nested_validation=</span><span class="s3">True,</span>
+<span class="s1">)</span>
+<span class="s3">def </span><span class="s1">chi2(X</span><span class="s3">, </span><span class="s1">y):</span>
+    <span class="s0">&quot;&quot;&quot;Compute chi-squared stats between each non-negative feature and class. 
+ 
+    This score can be used to select the `n_features` features with the 
+    highest values for the test chi-squared statistic from X, which must 
+    contain only **non-negative features** such as booleans or frequencies 
+    (e.g., term counts in document classification), relative to the classes. 
+ 
+    Recall that the chi-square test measures dependence between stochastic 
+    variables, so using this function &quot;weeds out&quot; the features that are the 
+    most likely to be independent of class and therefore irrelevant for 
+    classification. 
+ 
+    Read more in the :ref:`User Guide &lt;univariate_feature_selection&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+        Sample vectors. 
+ 
+    y : array-like of shape (n_samples,) 
+        Target vector (class labels). 
+ 
+    Returns 
+    ------- 
+    chi2 : ndarray of shape (n_features,) 
+        Chi2 statistics for each feature. 
+ 
+    p_values : ndarray of shape (n_features,) 
+        P-values for each feature. 
+ 
+    See Also 
+    -------- 
+    f_classif : ANOVA F-value between label/feature for classification tasks. 
+    f_regression : F-value between label/feature for regression tasks. 
+ 
+    Notes 
+    ----- 
+    Complexity of this algorithm is O(n_classes * n_features). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2"># XXX: we might want to do some of the following in logspace instead for</span>
+    <span class="s2"># numerical stability.</span>
+    <span class="s2"># Converting X to float allows getting better performance for the</span>
+    <span class="s2"># safe_sparse_dot call made below.</span>
+    <span class="s1">X = check_array(X</span><span class="s3">, </span><span class="s1">accept_sparse=</span><span class="s5">&quot;csr&quot;</span><span class="s3">, </span><span class="s1">dtype=(np.float64</span><span class="s3">, </span><span class="s1">np.float32))</span>
+    <span class="s3">if </span><span class="s1">np.any((X.data </span><span class="s3">if </span><span class="s1">issparse(X) </span><span class="s3">else </span><span class="s1">X) &lt; </span><span class="s4">0</span><span class="s1">):</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;Input X must be non-negative.&quot;</span><span class="s1">)</span>
+
+    <span class="s2"># Use a sparse representation for Y by default to reduce memory usage when</span>
+    <span class="s2"># y has many unique classes.</span>
+    <span class="s1">Y = LabelBinarizer(sparse_output=</span><span class="s3">True</span><span class="s1">).fit_transform(y)</span>
+    <span class="s3">if </span><span class="s1">Y.shape[</span><span class="s4">1</span><span class="s1">] == </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">Y = Y.toarray()</span>
+        <span class="s1">Y = np.append(</span><span class="s4">1 </span><span class="s1">- Y</span><span class="s3">, </span><span class="s1">Y</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s1">observed = safe_sparse_dot(Y.T</span><span class="s3">, </span><span class="s1">X)  </span><span class="s2"># n_classes * n_features</span>
+
+    <span class="s3">if </span><span class="s1">issparse(observed):</span>
+        <span class="s2"># convert back to a dense array before calling _chisquare</span>
+        <span class="s2"># XXX: could _chisquare be reimplement to accept sparse matrices for</span>
+        <span class="s2"># cases where both n_classes and n_features are large (and X is</span>
+        <span class="s2"># sparse)?</span>
+        <span class="s1">observed = observed.toarray()</span>
+
+    <span class="s1">feature_count = X.sum(axis=</span><span class="s4">0</span><span class="s1">).reshape(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">class_prob = Y.mean(axis=</span><span class="s4">0</span><span class="s1">).reshape(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">expected = np.dot(class_prob.T</span><span class="s3">, </span><span class="s1">feature_count)</span>
+
+    <span class="s3">return </span><span class="s1">_chisquare(observed</span><span class="s3">, </span><span class="s1">expected)</span>
+
+
+<span class="s1">@validate_params(</span>
+    <span class="s1">{</span>
+        <span class="s5">&quot;X&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s3">, </span><span class="s5">&quot;sparse matrix&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;y&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;center&quot;</span><span class="s1">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;force_finite&quot;</span><span class="s1">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s1">]</span><span class="s3">,</span>
+    <span class="s1">}</span><span class="s3">,</span>
+    <span class="s1">prefer_skip_nested_validation=</span><span class="s3">True,</span>
+<span class="s1">)</span>
+<span class="s3">def </span><span class="s1">r_regression(X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">center=</span><span class="s3">True, </span><span class="s1">force_finite=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Compute Pearson's r for each features and the target. 
+ 
+    Pearson's r is also known as the Pearson correlation coefficient. 
+ 
+    Linear model for testing the individual effect of each of many regressors. 
+    This is a scoring function to be used in a feature selection procedure, not 
+    a free standing feature selection procedure. 
+ 
+    The cross correlation between each regressor and the target is computed 
+    as:: 
+ 
+        E[(X[:, i] - mean(X[:, i])) * (y - mean(y))] / (std(X[:, i]) * std(y)) 
+ 
+    For more on usage see the :ref:`User Guide &lt;univariate_feature_selection&gt;`. 
+ 
+    .. versionadded:: 1.0 
+ 
+    Parameters 
+    ---------- 
+    X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+        The data matrix. 
+ 
+    y : array-like of shape (n_samples,) 
+        The target vector. 
+ 
+    center : bool, default=True 
+        Whether or not to center the data matrix `X` and the target vector `y`. 
+        By default, `X` and `y` will be centered. 
+ 
+    force_finite : bool, default=True 
+        Whether or not to force the Pearson's R correlation to be finite. 
+        In the particular case where some features in `X` or the target `y` 
+        are constant, the Pearson's R correlation is not defined. When 
+        `force_finite=False`, a correlation of `np.nan` is returned to 
+        acknowledge this case. When `force_finite=True`, this value will be 
+        forced to a minimal correlation of `0.0`. 
+ 
+        .. versionadded:: 1.1 
+ 
+    Returns 
+    ------- 
+    correlation_coefficient : ndarray of shape (n_features,) 
+        Pearson's R correlation coefficients of features. 
+ 
+    See Also 
+    -------- 
+    f_regression: Univariate linear regression tests returning f-statistic 
+        and p-values. 
+    mutual_info_regression: Mutual information for a continuous target. 
+    f_classif: ANOVA F-value between label/feature for classification tasks. 
+    chi2: Chi-squared stats of non-negative features for classification tasks. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">X</span><span class="s3">, </span><span class="s1">y = check_X_y(X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">accept_sparse=[</span><span class="s5">&quot;csr&quot;</span><span class="s3">, </span><span class="s5">&quot;csc&quot;</span><span class="s3">, </span><span class="s5">&quot;coo&quot;</span><span class="s1">]</span><span class="s3">, </span><span class="s1">dtype=np.float64)</span>
+    <span class="s1">n_samples = X.shape[</span><span class="s4">0</span><span class="s1">]</span>
+
+    <span class="s2"># Compute centered values</span>
+    <span class="s2"># Note that E[(x - mean(x))*(y - mean(y))] = E[x*(y - mean(y))], so we</span>
+    <span class="s2"># need not center X</span>
+    <span class="s3">if </span><span class="s1">center:</span>
+        <span class="s1">y = y - np.mean(y)</span>
+        <span class="s3">if </span><span class="s1">issparse(X):</span>
+            <span class="s1">X_means = X.mean(axis=</span><span class="s4">0</span><span class="s1">).getA1()</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">X_means = X.mean(axis=</span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s2"># Compute the scaled standard deviations via moments</span>
+        <span class="s1">X_norms = np.sqrt(row_norms(X.T</span><span class="s3">, </span><span class="s1">squared=</span><span class="s3">True</span><span class="s1">) - n_samples * X_means**</span><span class="s4">2</span><span class="s1">)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">X_norms = row_norms(X.T)</span>
+
+    <span class="s1">correlation_coefficient = safe_sparse_dot(y</span><span class="s3">, </span><span class="s1">X)</span>
+    <span class="s3">with </span><span class="s1">np.errstate(divide=</span><span class="s5">&quot;ignore&quot;</span><span class="s3">, </span><span class="s1">invalid=</span><span class="s5">&quot;ignore&quot;</span><span class="s1">):</span>
+        <span class="s1">correlation_coefficient /= X_norms</span>
+        <span class="s1">correlation_coefficient /= np.linalg.norm(y)</span>
+
+    <span class="s3">if </span><span class="s1">force_finite </span><span class="s3">and not </span><span class="s1">np.isfinite(correlation_coefficient).all():</span>
+        <span class="s2"># case where the target or some features are constant</span>
+        <span class="s2"># the correlation coefficient(s) is/are set to the minimum (i.e. 0.0)</span>
+        <span class="s1">nan_mask = np.isnan(correlation_coefficient)</span>
+        <span class="s1">correlation_coefficient[nan_mask] = </span><span class="s4">0.0</span>
+    <span class="s3">return </span><span class="s1">correlation_coefficient</span>
+
+
+<span class="s1">@validate_params(</span>
+    <span class="s1">{</span>
+        <span class="s5">&quot;X&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s3">, </span><span class="s5">&quot;sparse matrix&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;y&quot;</span><span class="s1">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;center&quot;</span><span class="s1">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s5">&quot;force_finite&quot;</span><span class="s1">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s1">]</span><span class="s3">,</span>
+    <span class="s1">}</span><span class="s3">,</span>
+    <span class="s1">prefer_skip_nested_validation=</span><span class="s3">True,</span>
+<span class="s1">)</span>
+<span class="s3">def </span><span class="s1">f_regression(X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">center=</span><span class="s3">True, </span><span class="s1">force_finite=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Univariate linear regression tests returning F-statistic and p-values. 
+ 
+    Quick linear model for testing the effect of a single regressor, 
+    sequentially for many regressors. 
+ 
+    This is done in 2 steps: 
+ 
+    1. The cross correlation between each regressor and the target is computed 
+       using :func:`r_regression` as:: 
+ 
+           E[(X[:, i] - mean(X[:, i])) * (y - mean(y))] / (std(X[:, i]) * std(y)) 
+ 
+    2. It is converted to an F score and then to a p-value. 
+ 
+    :func:`f_regression` is derived from :func:`r_regression` and will rank 
+    features in the same order if all the features are positively correlated 
+    with the target. 
+ 
+    Note however that contrary to :func:`f_regression`, :func:`r_regression` 
+    values lie in [-1, 1] and can thus be negative. :func:`f_regression` is 
+    therefore recommended as a feature selection criterion to identify 
+    potentially predictive feature for a downstream classifier, irrespective of 
+    the sign of the association with the target variable. 
+ 
+    Furthermore :func:`f_regression` returns p-values while 
+    :func:`r_regression` does not. 
+ 
+    Read more in the :ref:`User Guide &lt;univariate_feature_selection&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+        The data matrix. 
+ 
+    y : array-like of shape (n_samples,) 
+        The target vector. 
+ 
+    center : bool, default=True 
+        Whether or not to center the data matrix `X` and the target vector `y`. 
+        By default, `X` and `y` will be centered. 
+ 
+    force_finite : bool, default=True 
+        Whether or not to force the F-statistics and associated p-values to 
+        be finite. There are two cases where the F-statistic is expected to not 
+        be finite: 
+ 
+        - when the target `y` or some features in `X` are constant. In this 
+          case, the Pearson's R correlation is not defined leading to obtain 
+          `np.nan` values in the F-statistic and p-value. When 
+          `force_finite=True`, the F-statistic is set to `0.0` and the 
+          associated p-value is set to `1.0`. 
+        - when a feature in `X` is perfectly correlated (or 
+          anti-correlated) with the target `y`. In this case, the F-statistic 
+          is expected to be `np.inf`. When `force_finite=True`, the F-statistic 
+          is set to `np.finfo(dtype).max` and the associated p-value is set to 
+          `0.0`. 
+ 
+        .. versionadded:: 1.1 
+ 
+    Returns 
+    ------- 
+    f_statistic : ndarray of shape (n_features,) 
+        F-statistic for each feature. 
+ 
+    p_values : ndarray of shape (n_features,) 
+        P-values associated with the F-statistic. 
+ 
+    See Also 
+    -------- 
+    r_regression: Pearson's R between label/feature for regression tasks. 
+    f_classif: ANOVA F-value between label/feature for classification tasks. 
+    chi2: Chi-squared stats of non-negative features for classification tasks. 
+    SelectKBest: Select features based on the k highest scores. 
+    SelectFpr: Select features based on a false positive rate test. 
+    SelectFdr: Select features based on an estimated false discovery rate. 
+    SelectFwe: Select features based on family-wise error rate. 
+    SelectPercentile: Select features based on percentile of the highest 
+        scores. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">correlation_coefficient = r_regression(</span>
+        <span class="s1">X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">center=center</span><span class="s3">, </span><span class="s1">force_finite=force_finite</span>
+    <span class="s1">)</span>
+    <span class="s1">deg_of_freedom = y.size - (</span><span class="s4">2 </span><span class="s3">if </span><span class="s1">center </span><span class="s3">else </span><span class="s4">1</span><span class="s1">)</span>
+
+    <span class="s1">corr_coef_squared = correlation_coefficient**</span><span class="s4">2</span>
+
+    <span class="s3">with </span><span class="s1">np.errstate(divide=</span><span class="s5">&quot;ignore&quot;</span><span class="s3">, </span><span class="s1">invalid=</span><span class="s5">&quot;ignore&quot;</span><span class="s1">):</span>
+        <span class="s1">f_statistic = corr_coef_squared / (</span><span class="s4">1 </span><span class="s1">- corr_coef_squared) * deg_of_freedom</span>
+        <span class="s1">p_values = stats.f.sf(f_statistic</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">deg_of_freedom)</span>
+
+    <span class="s3">if </span><span class="s1">force_finite </span><span class="s3">and not </span><span class="s1">np.isfinite(f_statistic).all():</span>
+        <span class="s2"># case where there is a perfect (anti-)correlation</span>
+        <span class="s2"># f-statistics can be set to the maximum and p-values to zero</span>
+        <span class="s1">mask_inf = np.isinf(f_statistic)</span>
+        <span class="s1">f_statistic[mask_inf] = np.finfo(f_statistic.dtype).max</span>
+        <span class="s2"># case where the target or some features are constant</span>
+        <span class="s2"># f-statistics would be minimum and thus p-values large</span>
+        <span class="s1">mask_nan = np.isnan(f_statistic)</span>
+        <span class="s1">f_statistic[mask_nan] = </span><span class="s4">0.0</span>
+        <span class="s1">p_values[mask_nan] = </span><span class="s4">1.0</span>
+    <span class="s3">return </span><span class="s1">f_statistic</span><span class="s3">, </span><span class="s1">p_values</span>
+
+
+<span class="s2">######################################################################</span>
+<span class="s2"># Base classes</span>
+
+
+<span class="s3">class </span><span class="s1">_BaseFilter(SelectorMixin</span><span class="s3">, </span><span class="s1">BaseEstimator):</span>
+    <span class="s0">&quot;&quot;&quot;Initialize the univariate feature selection. 
+ 
+    Parameters 
+    ---------- 
+    score_func : callable 
+        Function taking two arrays X and y, and returning a pair of arrays 
+        (scores, pvalues) or a single array with scores. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span><span class="s5">&quot;score_func&quot;</span><span class="s1">: [callable]}</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">score_func):</span>
+        <span class="s1">self.score_func = score_func</span>
+
+    <span class="s1">@_fit_context(prefer_skip_nested_validation=</span><span class="s3">True</span><span class="s1">)</span>
+    <span class="s3">def </span><span class="s1">fit(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y):</span>
+        <span class="s0">&quot;&quot;&quot;Run score function on (X, y) and get the appropriate features. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            The training input samples. 
+ 
+        y : array-like of shape (n_samples,) 
+            The target values (class labels in classification, real numbers in 
+            regression). 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Returns the instance itself. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">X</span><span class="s3">, </span><span class="s1">y = self._validate_data(</span>
+            <span class="s1">X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">accept_sparse=[</span><span class="s5">&quot;csr&quot;</span><span class="s3">, </span><span class="s5">&quot;csc&quot;</span><span class="s1">]</span><span class="s3">, </span><span class="s1">multi_output=</span><span class="s3">True</span>
+        <span class="s1">)</span>
+
+        <span class="s1">self._check_params(X</span><span class="s3">, </span><span class="s1">y)</span>
+        <span class="s1">score_func_ret = self.score_func(X</span><span class="s3">, </span><span class="s1">y)</span>
+        <span class="s3">if </span><span class="s1">isinstance(score_func_ret</span><span class="s3">, </span><span class="s1">(list</span><span class="s3">, </span><span class="s1">tuple)):</span>
+            <span class="s1">self.scores_</span><span class="s3">, </span><span class="s1">self.pvalues_ = score_func_ret</span>
+            <span class="s1">self.pvalues_ = np.asarray(self.pvalues_)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.scores_ = score_func_ret</span>
+            <span class="s1">self.pvalues_ = </span><span class="s3">None</span>
+
+        <span class="s1">self.scores_ = np.asarray(self.scores_)</span>
+
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">_check_params(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y):</span>
+        <span class="s3">pass</span>
+
+    <span class="s3">def </span><span class="s1">_more_tags(self):</span>
+        <span class="s3">return </span><span class="s1">{</span><span class="s5">&quot;requires_y&quot;</span><span class="s1">: </span><span class="s3">True</span><span class="s1">}</span>
+
+
+<span class="s2">######################################################################</span>
+<span class="s2"># Specific filters</span>
+<span class="s2">######################################################################</span>
+<span class="s3">class </span><span class="s1">SelectPercentile(_BaseFilter):</span>
+    <span class="s0">&quot;&quot;&quot;Select features according to a percentile of the highest scores. 
+ 
+    Read more in the :ref:`User Guide &lt;univariate_feature_selection&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    score_func : callable, default=f_classif 
+        Function taking two arrays X and y, and returning a pair of arrays 
+        (scores, pvalues) or a single array with scores. 
+        Default is f_classif (see below &quot;See Also&quot;). The default function only 
+        works with classification tasks. 
+ 
+        .. versionadded:: 0.18 
+ 
+    percentile : int, default=10 
+        Percent of features to keep. 
+ 
+    Attributes 
+    ---------- 
+    scores_ : array-like of shape (n_features,) 
+        Scores of features. 
+ 
+    pvalues_ : array-like of shape (n_features,) 
+        p-values of feature scores, None if `score_func` returned only scores. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    f_classif : ANOVA F-value between label/feature for classification tasks. 
+    mutual_info_classif : Mutual information for a discrete target. 
+    chi2 : Chi-squared stats of non-negative features for classification tasks. 
+    f_regression : F-value between label/feature for regression tasks. 
+    mutual_info_regression : Mutual information for a continuous target. 
+    SelectKBest : Select features based on the k highest scores. 
+    SelectFpr : Select features based on a false positive rate test. 
+    SelectFdr : Select features based on an estimated false discovery rate. 
+    SelectFwe : Select features based on family-wise error rate. 
+    GenericUnivariateSelect : Univariate feature selector with configurable 
+        mode. 
+ 
+    Notes 
+    ----- 
+    Ties between features with equal scores will be broken in an unspecified 
+    way. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.datasets import load_digits 
+    &gt;&gt;&gt; from sklearn.feature_selection import SelectPercentile, chi2 
+    &gt;&gt;&gt; X, y = load_digits(return_X_y=True) 
+    &gt;&gt;&gt; X.shape 
+    (1797, 64) 
+    &gt;&gt;&gt; X_new = SelectPercentile(chi2, percentile=10).fit_transform(X, y) 
+    &gt;&gt;&gt; X_new.shape 
+    (1797, 7) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span>
+        <span class="s1">**_BaseFilter._parameter_constraints</span><span class="s3">,</span>
+        <span class="s5">&quot;percentile&quot;</span><span class="s1">: [Interval(Real</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s4">100</span><span class="s3">, </span><span class="s1">closed=</span><span class="s5">&quot;both&quot;</span><span class="s1">)]</span><span class="s3">,</span>
+    <span class="s1">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">score_func=f_classif</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">percentile=</span><span class="s4">10</span><span class="s1">):</span>
+        <span class="s1">super().__init__(score_func=score_func)</span>
+        <span class="s1">self.percentile = percentile</span>
+
+    <span class="s3">def </span><span class="s1">_get_support_mask(self):</span>
+        <span class="s1">check_is_fitted(self)</span>
+
+        <span class="s2"># Cater for NaNs</span>
+        <span class="s3">if </span><span class="s1">self.percentile == </span><span class="s4">100</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">np.ones(len(self.scores_)</span><span class="s3">, </span><span class="s1">dtype=bool)</span>
+        <span class="s3">elif </span><span class="s1">self.percentile == </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">np.zeros(len(self.scores_)</span><span class="s3">, </span><span class="s1">dtype=bool)</span>
+
+        <span class="s1">scores = _clean_nans(self.scores_)</span>
+        <span class="s1">threshold = np.percentile(scores</span><span class="s3">, </span><span class="s4">100 </span><span class="s1">- self.percentile)</span>
+        <span class="s1">mask = scores &gt; threshold</span>
+        <span class="s1">ties = np.where(scores == threshold)[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s3">if </span><span class="s1">len(ties):</span>
+            <span class="s1">max_feats = int(len(scores) * self.percentile / </span><span class="s4">100</span><span class="s1">)</span>
+            <span class="s1">kept_ties = ties[: max_feats - mask.sum()]</span>
+            <span class="s1">mask[kept_ties] = </span><span class="s3">True</span>
+        <span class="s3">return </span><span class="s1">mask</span>
+
+
+<span class="s3">class </span><span class="s1">SelectKBest(_BaseFilter):</span>
+    <span class="s0">&quot;&quot;&quot;Select features according to the k highest scores. 
+ 
+    Read more in the :ref:`User Guide &lt;univariate_feature_selection&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    score_func : callable, default=f_classif 
+        Function taking two arrays X and y, and returning a pair of arrays 
+        (scores, pvalues) or a single array with scores. 
+        Default is f_classif (see below &quot;See Also&quot;). The default function only 
+        works with classification tasks. 
+ 
+        .. versionadded:: 0.18 
+ 
+    k : int or &quot;all&quot;, default=10 
+        Number of top features to select. 
+        The &quot;all&quot; option bypasses selection, for use in a parameter search. 
+ 
+    Attributes 
+    ---------- 
+    scores_ : array-like of shape (n_features,) 
+        Scores of features. 
+ 
+    pvalues_ : array-like of shape (n_features,) 
+        p-values of feature scores, None if `score_func` returned only scores. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    f_classif: ANOVA F-value between label/feature for classification tasks. 
+    mutual_info_classif: Mutual information for a discrete target. 
+    chi2: Chi-squared stats of non-negative features for classification tasks. 
+    f_regression: F-value between label/feature for regression tasks. 
+    mutual_info_regression: Mutual information for a continuous target. 
+    SelectPercentile: Select features based on percentile of the highest 
+        scores. 
+    SelectFpr : Select features based on a false positive rate test. 
+    SelectFdr : Select features based on an estimated false discovery rate. 
+    SelectFwe : Select features based on family-wise error rate. 
+    GenericUnivariateSelect : Univariate feature selector with configurable 
+        mode. 
+ 
+    Notes 
+    ----- 
+    Ties between features with equal scores will be broken in an unspecified 
+    way. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.datasets import load_digits 
+    &gt;&gt;&gt; from sklearn.feature_selection import SelectKBest, chi2 
+    &gt;&gt;&gt; X, y = load_digits(return_X_y=True) 
+    &gt;&gt;&gt; X.shape 
+    (1797, 64) 
+    &gt;&gt;&gt; X_new = SelectKBest(chi2, k=20).fit_transform(X, y) 
+    &gt;&gt;&gt; X_new.shape 
+    (1797, 20) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span>
+        <span class="s1">**_BaseFilter._parameter_constraints</span><span class="s3">,</span>
+        <span class="s5">&quot;k&quot;</span><span class="s1">: [StrOptions({</span><span class="s5">&quot;all&quot;</span><span class="s1">})</span><span class="s3">, </span><span class="s1">Interval(Integral</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, None, </span><span class="s1">closed=</span><span class="s5">&quot;left&quot;</span><span class="s1">)]</span><span class="s3">,</span>
+    <span class="s1">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">score_func=f_classif</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">k=</span><span class="s4">10</span><span class="s1">):</span>
+        <span class="s1">super().__init__(score_func=score_func)</span>
+        <span class="s1">self.k = k</span>
+
+    <span class="s3">def </span><span class="s1">_check_params(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y):</span>
+        <span class="s3">if not </span><span class="s1">isinstance(self.k</span><span class="s3">, </span><span class="s1">str) </span><span class="s3">and </span><span class="s1">self.k &gt; X.shape[</span><span class="s4">1</span><span class="s1">]:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">f&quot;k should be &lt;= n_features = </span><span class="s3">{</span><span class="s1">X.shape[</span><span class="s4">1</span><span class="s1">]</span><span class="s3">}</span><span class="s5">; &quot;</span>
+                <span class="s5">f&quot;got </span><span class="s3">{</span><span class="s1">self.k</span><span class="s3">}</span><span class="s5">. Use k='all' to return all features.&quot;</span>
+            <span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">_get_support_mask(self):</span>
+        <span class="s1">check_is_fitted(self)</span>
+
+        <span class="s3">if </span><span class="s1">self.k == </span><span class="s5">&quot;all&quot;</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">np.ones(self.scores_.shape</span><span class="s3">, </span><span class="s1">dtype=bool)</span>
+        <span class="s3">elif </span><span class="s1">self.k == </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">np.zeros(self.scores_.shape</span><span class="s3">, </span><span class="s1">dtype=bool)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">scores = _clean_nans(self.scores_)</span>
+            <span class="s1">mask = np.zeros(scores.shape</span><span class="s3">, </span><span class="s1">dtype=bool)</span>
+
+            <span class="s2"># Request a stable sort. Mergesort takes more memory (~40MB per</span>
+            <span class="s2"># megafeature on x86-64).</span>
+            <span class="s1">mask[np.argsort(scores</span><span class="s3">, </span><span class="s1">kind=</span><span class="s5">&quot;mergesort&quot;</span><span class="s1">)[-self.k :]] = </span><span class="s4">1</span>
+            <span class="s3">return </span><span class="s1">mask</span>
+
+
+<span class="s3">class </span><span class="s1">SelectFpr(_BaseFilter):</span>
+    <span class="s0">&quot;&quot;&quot;Filter: Select the pvalues below alpha based on a FPR test. 
+ 
+    FPR test stands for False Positive Rate test. It controls the total 
+    amount of false detections. 
+ 
+    Read more in the :ref:`User Guide &lt;univariate_feature_selection&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    score_func : callable, default=f_classif 
+        Function taking two arrays X and y, and returning a pair of arrays 
+        (scores, pvalues). 
+        Default is f_classif (see below &quot;See Also&quot;). The default function only 
+        works with classification tasks. 
+ 
+    alpha : float, default=5e-2 
+        Features with p-values less than `alpha` are selected. 
+ 
+    Attributes 
+    ---------- 
+    scores_ : array-like of shape (n_features,) 
+        Scores of features. 
+ 
+    pvalues_ : array-like of shape (n_features,) 
+        p-values of feature scores. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    f_classif : ANOVA F-value between label/feature for classification tasks. 
+    chi2 : Chi-squared stats of non-negative features for classification tasks. 
+    mutual_info_classif: Mutual information for a discrete target. 
+    f_regression : F-value between label/feature for regression tasks. 
+    mutual_info_regression : Mutual information for a continuous target. 
+    SelectPercentile : Select features based on percentile of the highest 
+        scores. 
+    SelectKBest : Select features based on the k highest scores. 
+    SelectFdr : Select features based on an estimated false discovery rate. 
+    SelectFwe : Select features based on family-wise error rate. 
+    GenericUnivariateSelect : Univariate feature selector with configurable 
+        mode. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.datasets import load_breast_cancer 
+    &gt;&gt;&gt; from sklearn.feature_selection import SelectFpr, chi2 
+    &gt;&gt;&gt; X, y = load_breast_cancer(return_X_y=True) 
+    &gt;&gt;&gt; X.shape 
+    (569, 30) 
+    &gt;&gt;&gt; X_new = SelectFpr(chi2, alpha=0.01).fit_transform(X, y) 
+    &gt;&gt;&gt; X_new.shape 
+    (569, 16) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span>
+        <span class="s1">**_BaseFilter._parameter_constraints</span><span class="s3">,</span>
+        <span class="s5">&quot;alpha&quot;</span><span class="s1">: [Interval(Real</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">closed=</span><span class="s5">&quot;both&quot;</span><span class="s1">)]</span><span class="s3">,</span>
+    <span class="s1">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">score_func=f_classif</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">alpha=</span><span class="s4">5e-2</span><span class="s1">):</span>
+        <span class="s1">super().__init__(score_func=score_func)</span>
+        <span class="s1">self.alpha = alpha</span>
+
+    <span class="s3">def </span><span class="s1">_get_support_mask(self):</span>
+        <span class="s1">check_is_fitted(self)</span>
+
+        <span class="s3">return </span><span class="s1">self.pvalues_ &lt; self.alpha</span>
+
+
+<span class="s3">class </span><span class="s1">SelectFdr(_BaseFilter):</span>
+    <span class="s0">&quot;&quot;&quot;Filter: Select the p-values for an estimated false discovery rate. 
+ 
+    This uses the Benjamini-Hochberg procedure. ``alpha`` is an upper bound 
+    on the expected false discovery rate. 
+ 
+    Read more in the :ref:`User Guide &lt;univariate_feature_selection&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    score_func : callable, default=f_classif 
+        Function taking two arrays X and y, and returning a pair of arrays 
+        (scores, pvalues). 
+        Default is f_classif (see below &quot;See Also&quot;). The default function only 
+        works with classification tasks. 
+ 
+    alpha : float, default=5e-2 
+        The highest uncorrected p-value for features to keep. 
+ 
+    Attributes 
+    ---------- 
+    scores_ : array-like of shape (n_features,) 
+        Scores of features. 
+ 
+    pvalues_ : array-like of shape (n_features,) 
+        p-values of feature scores. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    f_classif : ANOVA F-value between label/feature for classification tasks. 
+    mutual_info_classif : Mutual information for a discrete target. 
+    chi2 : Chi-squared stats of non-negative features for classification tasks. 
+    f_regression : F-value between label/feature for regression tasks. 
+    mutual_info_regression : Mutual information for a continuous target. 
+    SelectPercentile : Select features based on percentile of the highest 
+        scores. 
+    SelectKBest : Select features based on the k highest scores. 
+    SelectFpr : Select features based on a false positive rate test. 
+    SelectFwe : Select features based on family-wise error rate. 
+    GenericUnivariateSelect : Univariate feature selector with configurable 
+        mode. 
+ 
+    References 
+    ---------- 
+    https://en.wikipedia.org/wiki/False_discovery_rate 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.datasets import load_breast_cancer 
+    &gt;&gt;&gt; from sklearn.feature_selection import SelectFdr, chi2 
+    &gt;&gt;&gt; X, y = load_breast_cancer(return_X_y=True) 
+    &gt;&gt;&gt; X.shape 
+    (569, 30) 
+    &gt;&gt;&gt; X_new = SelectFdr(chi2, alpha=0.01).fit_transform(X, y) 
+    &gt;&gt;&gt; X_new.shape 
+    (569, 16) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span>
+        <span class="s1">**_BaseFilter._parameter_constraints</span><span class="s3">,</span>
+        <span class="s5">&quot;alpha&quot;</span><span class="s1">: [Interval(Real</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">closed=</span><span class="s5">&quot;both&quot;</span><span class="s1">)]</span><span class="s3">,</span>
+    <span class="s1">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">score_func=f_classif</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">alpha=</span><span class="s4">5e-2</span><span class="s1">):</span>
+        <span class="s1">super().__init__(score_func=score_func)</span>
+        <span class="s1">self.alpha = alpha</span>
+
+    <span class="s3">def </span><span class="s1">_get_support_mask(self):</span>
+        <span class="s1">check_is_fitted(self)</span>
+
+        <span class="s1">n_features = len(self.pvalues_)</span>
+        <span class="s1">sv = np.sort(self.pvalues_)</span>
+        <span class="s1">selected = sv[</span>
+            <span class="s1">sv &lt;= float(self.alpha) / n_features * np.arange(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">n_features + </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">]</span>
+        <span class="s3">if </span><span class="s1">selected.size == </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">np.zeros_like(self.pvalues_</span><span class="s3">, </span><span class="s1">dtype=bool)</span>
+        <span class="s3">return </span><span class="s1">self.pvalues_ &lt;= selected.max()</span>
+
+
+<span class="s3">class </span><span class="s1">SelectFwe(_BaseFilter):</span>
+    <span class="s0">&quot;&quot;&quot;Filter: Select the p-values corresponding to Family-wise error rate. 
+ 
+    Read more in the :ref:`User Guide &lt;univariate_feature_selection&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    score_func : callable, default=f_classif 
+        Function taking two arrays X and y, and returning a pair of arrays 
+        (scores, pvalues). 
+        Default is f_classif (see below &quot;See Also&quot;). The default function only 
+        works with classification tasks. 
+ 
+    alpha : float, default=5e-2 
+        The highest uncorrected p-value for features to keep. 
+ 
+    Attributes 
+    ---------- 
+    scores_ : array-like of shape (n_features,) 
+        Scores of features. 
+ 
+    pvalues_ : array-like of shape (n_features,) 
+        p-values of feature scores. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    f_classif : ANOVA F-value between label/feature for classification tasks. 
+    chi2 : Chi-squared stats of non-negative features for classification tasks. 
+    f_regression : F-value between label/feature for regression tasks. 
+    SelectPercentile : Select features based on percentile of the highest 
+        scores. 
+    SelectKBest : Select features based on the k highest scores. 
+    SelectFpr : Select features based on a false positive rate test. 
+    SelectFdr : Select features based on an estimated false discovery rate. 
+    GenericUnivariateSelect : Univariate feature selector with configurable 
+        mode. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.datasets import load_breast_cancer 
+    &gt;&gt;&gt; from sklearn.feature_selection import SelectFwe, chi2 
+    &gt;&gt;&gt; X, y = load_breast_cancer(return_X_y=True) 
+    &gt;&gt;&gt; X.shape 
+    (569, 30) 
+    &gt;&gt;&gt; X_new = SelectFwe(chi2, alpha=0.01).fit_transform(X, y) 
+    &gt;&gt;&gt; X_new.shape 
+    (569, 15) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span>
+        <span class="s1">**_BaseFilter._parameter_constraints</span><span class="s3">,</span>
+        <span class="s5">&quot;alpha&quot;</span><span class="s1">: [Interval(Real</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">closed=</span><span class="s5">&quot;both&quot;</span><span class="s1">)]</span><span class="s3">,</span>
+    <span class="s1">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">score_func=f_classif</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">alpha=</span><span class="s4">5e-2</span><span class="s1">):</span>
+        <span class="s1">super().__init__(score_func=score_func)</span>
+        <span class="s1">self.alpha = alpha</span>
+
+    <span class="s3">def </span><span class="s1">_get_support_mask(self):</span>
+        <span class="s1">check_is_fitted(self)</span>
+
+        <span class="s3">return </span><span class="s1">self.pvalues_ &lt; self.alpha / len(self.pvalues_)</span>
+
+
+<span class="s2">######################################################################</span>
+<span class="s2"># Generic filter</span>
+<span class="s2">######################################################################</span>
+
+
+<span class="s2"># TODO this class should fit on either p-values or scores,</span>
+<span class="s2"># depending on the mode.</span>
+<span class="s3">class </span><span class="s1">GenericUnivariateSelect(_BaseFilter):</span>
+    <span class="s0">&quot;&quot;&quot;Univariate feature selector with configurable strategy. 
+ 
+    Read more in the :ref:`User Guide &lt;univariate_feature_selection&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    score_func : callable, default=f_classif 
+        Function taking two arrays X and y, and returning a pair of arrays 
+        (scores, pvalues). For modes 'percentile' or 'kbest' it can return 
+        a single array scores. 
+ 
+    mode : {'percentile', 'k_best', 'fpr', 'fdr', 'fwe'}, default='percentile' 
+        Feature selection mode. 
+ 
+    param : &quot;all&quot;, float or int, default=1e-5 
+        Parameter of the corresponding mode. 
+ 
+    Attributes 
+    ---------- 
+    scores_ : array-like of shape (n_features,) 
+        Scores of features. 
+ 
+    pvalues_ : array-like of shape (n_features,) 
+        p-values of feature scores, None if `score_func` returned scores only. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    f_classif : ANOVA F-value between label/feature for classification tasks. 
+    mutual_info_classif : Mutual information for a discrete target. 
+    chi2 : Chi-squared stats of non-negative features for classification tasks. 
+    f_regression : F-value between label/feature for regression tasks. 
+    mutual_info_regression : Mutual information for a continuous target. 
+    SelectPercentile : Select features based on percentile of the highest 
+        scores. 
+    SelectKBest : Select features based on the k highest scores. 
+    SelectFpr : Select features based on a false positive rate test. 
+    SelectFdr : Select features based on an estimated false discovery rate. 
+    SelectFwe : Select features based on family-wise error rate. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.datasets import load_breast_cancer 
+    &gt;&gt;&gt; from sklearn.feature_selection import GenericUnivariateSelect, chi2 
+    &gt;&gt;&gt; X, y = load_breast_cancer(return_X_y=True) 
+    &gt;&gt;&gt; X.shape 
+    (569, 30) 
+    &gt;&gt;&gt; transformer = GenericUnivariateSelect(chi2, mode='k_best', param=20) 
+    &gt;&gt;&gt; X_new = transformer.fit_transform(X, y) 
+    &gt;&gt;&gt; X_new.shape 
+    (569, 20) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_selection_modes: dict = {</span>
+        <span class="s5">&quot;percentile&quot;</span><span class="s1">: SelectPercentile</span><span class="s3">,</span>
+        <span class="s5">&quot;k_best&quot;</span><span class="s1">: SelectKBest</span><span class="s3">,</span>
+        <span class="s5">&quot;fpr&quot;</span><span class="s1">: SelectFpr</span><span class="s3">,</span>
+        <span class="s5">&quot;fdr&quot;</span><span class="s1">: SelectFdr</span><span class="s3">,</span>
+        <span class="s5">&quot;fwe&quot;</span><span class="s1">: SelectFwe</span><span class="s3">,</span>
+    <span class="s1">}</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span>
+        <span class="s1">**_BaseFilter._parameter_constraints</span><span class="s3">,</span>
+        <span class="s5">&quot;mode&quot;</span><span class="s1">: [StrOptions(set(_selection_modes.keys()))]</span><span class="s3">,</span>
+        <span class="s5">&quot;param&quot;</span><span class="s1">: [Interval(Real</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, None, </span><span class="s1">closed=</span><span class="s5">&quot;left&quot;</span><span class="s1">)</span><span class="s3">, </span><span class="s1">StrOptions({</span><span class="s5">&quot;all&quot;</span><span class="s1">})]</span><span class="s3">,</span>
+    <span class="s1">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">score_func=f_classif</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">mode=</span><span class="s5">&quot;percentile&quot;</span><span class="s3">, </span><span class="s1">param=</span><span class="s4">1e-5</span><span class="s1">):</span>
+        <span class="s1">super().__init__(score_func=score_func)</span>
+        <span class="s1">self.mode = mode</span>
+        <span class="s1">self.param = param</span>
+
+    <span class="s3">def </span><span class="s1">_make_selector(self):</span>
+        <span class="s1">selector = self._selection_modes[self.mode](score_func=self.score_func)</span>
+
+        <span class="s2"># Now perform some acrobatics to set the right named parameter in</span>
+        <span class="s2"># the selector</span>
+        <span class="s1">possible_params = selector._get_param_names()</span>
+        <span class="s1">possible_params.remove(</span><span class="s5">&quot;score_func&quot;</span><span class="s1">)</span>
+        <span class="s1">selector.set_params(**{possible_params[</span><span class="s4">0</span><span class="s1">]: self.param})</span>
+
+        <span class="s3">return </span><span class="s1">selector</span>
+
+    <span class="s3">def </span><span class="s1">_more_tags(self):</span>
+        <span class="s3">return </span><span class="s1">{</span><span class="s5">&quot;preserves_dtype&quot;</span><span class="s1">: [np.float64</span><span class="s3">, </span><span class="s1">np.float32]}</span>
+
+    <span class="s3">def </span><span class="s1">_check_params(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y):</span>
+        <span class="s1">self._make_selector()._check_params(X</span><span class="s3">, </span><span class="s1">y)</span>
+
+    <span class="s3">def </span><span class="s1">_get_support_mask(self):</span>
+        <span class="s1">check_is_fitted(self)</span>
+
+        <span class="s1">selector = self._make_selector()</span>
+        <span class="s1">selector.pvalues_ = self.pvalues_</span>
+        <span class="s1">selector.scores_ = self.scores_</span>
+        <span class="s3">return </span><span class="s1">selector._get_support_mask()</span>
+</pre>
+</body>
+</html>

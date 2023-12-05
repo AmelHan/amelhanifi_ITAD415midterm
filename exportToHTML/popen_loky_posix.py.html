@@ -1,0 +1,214 @@
+<html>
+<head>
+<title>popen_loky_posix.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+popen_loky_posix.py</font>
+</center></td></tr></table>
+<pre><span class="s0">###############################################################################</span>
+<span class="s0"># Popen for LokyProcess.</span>
+<span class="s0">#</span>
+<span class="s0"># author: Thomas Moreau and Olivier Grisel</span>
+<span class="s0">#</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">signal</span>
+<span class="s2">import </span><span class="s1">pickle</span>
+<span class="s2">from </span><span class="s1">io </span><span class="s2">import </span><span class="s1">BytesIO</span>
+<span class="s2">from </span><span class="s1">multiprocessing </span><span class="s2">import </span><span class="s1">util</span><span class="s2">, </span><span class="s1">process</span>
+<span class="s2">from </span><span class="s1">multiprocessing.connection </span><span class="s2">import </span><span class="s1">wait</span>
+<span class="s2">from </span><span class="s1">multiprocessing.context </span><span class="s2">import </span><span class="s1">set_spawning_popen</span>
+
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">reduction</span><span class="s2">, </span><span class="s1">resource_tracker</span><span class="s2">, </span><span class="s1">spawn</span>
+
+
+<span class="s1">__all__ = [</span><span class="s3">&quot;Popen&quot;</span><span class="s1">]</span>
+
+
+<span class="s0">#</span>
+<span class="s0"># Wrapper for an fd used while launching a process</span>
+<span class="s0">#</span>
+
+
+<span class="s2">class </span><span class="s1">_DupFd:</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">fd):</span>
+        <span class="s1">self.fd = reduction._mk_inheritable(fd)</span>
+
+    <span class="s2">def </span><span class="s1">detach(self):</span>
+        <span class="s2">return </span><span class="s1">self.fd</span>
+
+
+<span class="s0">#</span>
+<span class="s0"># Start child process using subprocess.Popen</span>
+<span class="s0">#</span>
+
+
+<span class="s2">class </span><span class="s1">Popen:</span>
+    <span class="s1">method = </span><span class="s3">&quot;loky&quot;</span>
+    <span class="s1">DupFd = _DupFd</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">process_obj):</span>
+        <span class="s1">sys.stdout.flush()</span>
+        <span class="s1">sys.stderr.flush()</span>
+        <span class="s1">self.returncode = </span><span class="s2">None</span>
+        <span class="s1">self._fds = []</span>
+        <span class="s1">self._launch(process_obj)</span>
+
+    <span class="s2">def </span><span class="s1">duplicate_for_child(self</span><span class="s2">, </span><span class="s1">fd):</span>
+        <span class="s1">self._fds.append(fd)</span>
+        <span class="s2">return </span><span class="s1">reduction._mk_inheritable(fd)</span>
+
+    <span class="s2">def </span><span class="s1">poll(self</span><span class="s2">, </span><span class="s1">flag=os.WNOHANG):</span>
+        <span class="s2">if </span><span class="s1">self.returncode </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">while True</span><span class="s1">:</span>
+                <span class="s2">try</span><span class="s1">:</span>
+                    <span class="s1">pid</span><span class="s2">, </span><span class="s1">sts = os.waitpid(self.pid</span><span class="s2">, </span><span class="s1">flag)</span>
+                <span class="s2">except </span><span class="s1">OSError:</span>
+                    <span class="s0"># Child process not yet created. See #1731717</span>
+                    <span class="s0"># e.errno == errno.ECHILD == 10</span>
+                    <span class="s2">return None</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">break</span>
+            <span class="s2">if </span><span class="s1">pid == self.pid:</span>
+                <span class="s2">if </span><span class="s1">os.WIFSIGNALED(sts):</span>
+                    <span class="s1">self.returncode = -os.WTERMSIG(sts)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">assert </span><span class="s1">os.WIFEXITED(sts)</span>
+                    <span class="s1">self.returncode = os.WEXITSTATUS(sts)</span>
+        <span class="s2">return </span><span class="s1">self.returncode</span>
+
+    <span class="s2">def </span><span class="s1">wait(self</span><span class="s2">, </span><span class="s1">timeout=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">self.returncode </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">timeout </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s2">if not </span><span class="s1">wait([self.sentinel]</span><span class="s2">, </span><span class="s1">timeout):</span>
+                    <span class="s2">return None</span>
+            <span class="s0"># This shouldn't block if wait() returned successfully.</span>
+            <span class="s2">return </span><span class="s1">self.poll(os.WNOHANG </span><span class="s2">if </span><span class="s1">timeout == </span><span class="s4">0.0 </span><span class="s2">else </span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">self.returncode</span>
+
+    <span class="s2">def </span><span class="s1">terminate(self):</span>
+        <span class="s2">if </span><span class="s1">self.returncode </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">os.kill(self.pid</span><span class="s2">, </span><span class="s1">signal.SIGTERM)</span>
+            <span class="s2">except </span><span class="s1">ProcessLookupError:</span>
+                <span class="s2">pass</span>
+            <span class="s2">except </span><span class="s1">OSError:</span>
+                <span class="s2">if </span><span class="s1">self.wait(timeout=</span><span class="s4">0.1</span><span class="s1">) </span><span class="s2">is None</span><span class="s1">:</span>
+                    <span class="s2">raise</span>
+
+    <span class="s2">def </span><span class="s1">_launch(self</span><span class="s2">, </span><span class="s1">process_obj):</span>
+
+        <span class="s1">tracker_fd = resource_tracker._resource_tracker.getfd()</span>
+
+        <span class="s1">fp = BytesIO()</span>
+        <span class="s1">set_spawning_popen(self)</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">prep_data = spawn.get_preparation_data(</span>
+                <span class="s1">process_obj._name</span><span class="s2">,</span>
+                <span class="s1">getattr(process_obj</span><span class="s2">, </span><span class="s3">&quot;init_main_module&quot;</span><span class="s2">, True</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s1">)</span>
+            <span class="s1">reduction.dump(prep_data</span><span class="s2">, </span><span class="s1">fp)</span>
+            <span class="s1">reduction.dump(process_obj</span><span class="s2">, </span><span class="s1">fp)</span>
+
+        <span class="s2">finally</span><span class="s1">:</span>
+            <span class="s1">set_spawning_popen(</span><span class="s2">None</span><span class="s1">)</span>
+
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">parent_r</span><span class="s2">, </span><span class="s1">child_w = os.pipe()</span>
+            <span class="s1">child_r</span><span class="s2">, </span><span class="s1">parent_w = os.pipe()</span>
+            <span class="s0"># for fd in self._fds:</span>
+            <span class="s0">#     _mk_inheritable(fd)</span>
+
+            <span class="s1">cmd_python = [sys.executable]</span>
+            <span class="s1">cmd_python += [</span><span class="s3">&quot;-m&quot;</span><span class="s2">, </span><span class="s1">self.__module__]</span>
+            <span class="s1">cmd_python += [</span><span class="s3">&quot;--process-name&quot;</span><span class="s2">, </span><span class="s1">str(process_obj.name)]</span>
+            <span class="s1">cmd_python += [</span><span class="s3">&quot;--pipe&quot;</span><span class="s2">, </span><span class="s1">str(reduction._mk_inheritable(child_r))]</span>
+            <span class="s1">reduction._mk_inheritable(child_w)</span>
+            <span class="s1">reduction._mk_inheritable(tracker_fd)</span>
+            <span class="s1">self._fds += [child_r</span><span class="s2">, </span><span class="s1">child_w</span><span class="s2">, </span><span class="s1">tracker_fd]</span>
+            <span class="s2">if </span><span class="s1">sys.version_info &gt;= (</span><span class="s4">3</span><span class="s2">, </span><span class="s4">8</span><span class="s1">) </span><span class="s2">and </span><span class="s1">os.name == </span><span class="s3">&quot;posix&quot;</span><span class="s1">:</span>
+                <span class="s1">mp_tracker_fd = prep_data[</span><span class="s3">&quot;mp_tracker_args&quot;</span><span class="s1">][</span><span class="s3">&quot;fd&quot;</span><span class="s1">]</span>
+                <span class="s1">self.duplicate_for_child(mp_tracker_fd)</span>
+
+            <span class="s2">from </span><span class="s1">.fork_exec </span><span class="s2">import </span><span class="s1">fork_exec</span>
+
+            <span class="s1">pid = fork_exec(cmd_python</span><span class="s2">, </span><span class="s1">self._fds</span><span class="s2">, </span><span class="s1">env=process_obj.env)</span>
+            <span class="s1">util.debug(</span>
+                <span class="s3">f&quot;launched python with pid </span><span class="s2">{</span><span class="s1">pid</span><span class="s2">} </span><span class="s3">and cmd:</span><span class="s2">\n{</span><span class="s1">cmd_python</span><span class="s2">}</span><span class="s3">&quot;</span>
+            <span class="s1">)</span>
+            <span class="s1">self.sentinel = parent_r</span>
+
+            <span class="s1">method = </span><span class="s3">&quot;getbuffer&quot;</span>
+            <span class="s2">if not </span><span class="s1">hasattr(fp</span><span class="s2">, </span><span class="s1">method):</span>
+                <span class="s1">method = </span><span class="s3">&quot;getvalue&quot;</span>
+            <span class="s2">with </span><span class="s1">os.fdopen(parent_w</span><span class="s2">, </span><span class="s3">&quot;wb&quot;</span><span class="s1">) </span><span class="s2">as </span><span class="s1">f:</span>
+                <span class="s1">f.write(getattr(fp</span><span class="s2">, </span><span class="s1">method)())</span>
+            <span class="s1">self.pid = pid</span>
+        <span class="s2">finally</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">parent_r </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">util.Finalize(self</span><span class="s2">, </span><span class="s1">os.close</span><span class="s2">, </span><span class="s1">(parent_r</span><span class="s2">,</span><span class="s1">))</span>
+            <span class="s2">for </span><span class="s1">fd </span><span class="s2">in </span><span class="s1">(child_r</span><span class="s2">, </span><span class="s1">child_w):</span>
+                <span class="s2">if </span><span class="s1">fd </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">os.close(fd)</span>
+
+    <span class="s1">@staticmethod</span>
+    <span class="s2">def </span><span class="s1">thread_is_spawning():</span>
+        <span class="s2">return True</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ == </span><span class="s3">&quot;__main__&quot;</span><span class="s1">:</span>
+    <span class="s2">import </span><span class="s1">argparse</span>
+
+    <span class="s1">parser = argparse.ArgumentParser(</span><span class="s3">&quot;Command line parser&quot;</span><span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span>
+        <span class="s3">&quot;--pipe&quot;</span><span class="s2">, </span><span class="s1">type=int</span><span class="s2">, </span><span class="s1">required=</span><span class="s2">True, </span><span class="s1">help=</span><span class="s3">&quot;File handle for the pipe&quot;</span>
+    <span class="s1">)</span>
+    <span class="s1">parser.add_argument(</span>
+        <span class="s3">&quot;--process-name&quot;</span><span class="s2">,</span>
+        <span class="s1">type=str</span><span class="s2">,</span>
+        <span class="s1">default=</span><span class="s2">None,</span>
+        <span class="s1">help=</span><span class="s3">&quot;Identifier for debugging purpose&quot;</span><span class="s2">,</span>
+    <span class="s1">)</span>
+
+    <span class="s1">args = parser.parse_args()</span>
+
+    <span class="s1">info = {}</span>
+    <span class="s1">exitcode = </span><span class="s4">1</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s2">with </span><span class="s1">os.fdopen(args.pipe</span><span class="s2">, </span><span class="s3">&quot;rb&quot;</span><span class="s1">) </span><span class="s2">as </span><span class="s1">from_parent:</span>
+            <span class="s1">process.current_process()._inheriting = </span><span class="s2">True</span>
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">prep_data = pickle.load(from_parent)</span>
+                <span class="s1">spawn.prepare(prep_data)</span>
+                <span class="s1">process_obj = pickle.load(from_parent)</span>
+            <span class="s2">finally</span><span class="s1">:</span>
+                <span class="s2">del </span><span class="s1">process.current_process()._inheriting</span>
+
+        <span class="s1">exitcode = process_obj._bootstrap()</span>
+    <span class="s2">except </span><span class="s1">Exception:</span>
+        <span class="s1">print(</span><span class="s3">&quot;</span><span class="s2">\n\n</span><span class="s3">&quot; </span><span class="s1">+ </span><span class="s3">&quot;-&quot; </span><span class="s1">* </span><span class="s4">80</span><span class="s1">)</span>
+        <span class="s1">print(</span><span class="s3">f&quot;</span><span class="s2">{</span><span class="s1">args.process_name</span><span class="s2">} </span><span class="s3">failed with traceback: &quot;</span><span class="s1">)</span>
+        <span class="s1">print(</span><span class="s3">&quot;-&quot; </span><span class="s1">* </span><span class="s4">80</span><span class="s1">)</span>
+        <span class="s2">import </span><span class="s1">traceback</span>
+
+        <span class="s1">print(traceback.format_exc())</span>
+        <span class="s1">print(</span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot; </span><span class="s1">+ </span><span class="s3">&quot;-&quot; </span><span class="s1">* </span><span class="s4">80</span><span class="s1">)</span>
+    <span class="s2">finally</span><span class="s1">:</span>
+        <span class="s2">if </span><span class="s1">from_parent </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">from_parent.close()</span>
+
+        <span class="s1">sys.exit(exitcode)</span>
+</pre>
+</body>
+</html>

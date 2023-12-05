@@ -1,0 +1,1050 @@
+<html>
+<head>
+<title>test_exact_diffuse_filtering.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_exact_diffuse_filtering.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Tests for exact diffuse initialization 
+ 
+Notes 
+----- 
+ 
+These tests are against four sources: 
+ 
+- Koopman (1997) 
+- The R package KFAS (v1.3.1): test_exact_diffuse_filtering.R 
+- Stata: test_exact_diffuse_filtering_stata.do 
+- statsmodels state space models using approximate diffuse filtering 
+ 
+Koopman (1997) provides analytic results for a few cases that we can test 
+against. More comprehensive tests are available against the R package KFAS, 
+which also uses the Durbin and Koopman (2012) univariate diffuse filtering 
+method. However, there are apparently some bugs in the KFAS output (see notes 
+below), so some tests are run against Stata. 
+ 
+KFAS v1.3.1 appears to have the following bugs: 
+ 
+- Incorrect filtered covariance matrix (in their syntax, kf$Ptt). These 
+  matrices are not even symmetric, so they are clearly wrong. 
+- Loglikelihood computation appears to be incorrect for the diffuse part of 
+  the state. See the section with &quot;Note: Apparent loglikelihood discrepancy&quot; 
+  in the R file. It appears that KFAS does not include the constant term 
+  (-0.5 * log(2 pi)) for the diffuse observations, whereas the loglikelihood 
+  function as given in e.g. section 7.2.5 of Durbin and Koopman (2012) shows 
+  that it should be included. To confirm this, we also check against the 
+  loglikelihood value computed by Stata. 
+ 
+Stata uses the DeJong diffuse filtering method, which gives almost identical 
+results but does imply some numerical differences for output at the 6th or 7th 
+decimal place. 
+ 
+Finally, we have tests against the same model using approximate (rather than 
+exact) diffuse filtering. These will by definition have some discrepancies in 
+the diffuse observations. 
+ 
+Author: Chad Fulton 
+License: Simplified-BSD 
+&quot;&quot;&quot;</span>
+<span class="s2">from </span><span class="s1">statsmodels.compat.platform </span><span class="s2">import </span><span class="s1">PLATFORM_WIN</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">pandas </span><span class="s2">as </span><span class="s1">pd</span>
+<span class="s2">import </span><span class="s1">pytest</span>
+<span class="s2">import </span><span class="s1">os</span>
+
+<span class="s2">from </span><span class="s1">statsmodels </span><span class="s2">import </span><span class="s1">datasets</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.initialization </span><span class="s2">import </span><span class="s1">Initialization</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.kalman_smoother </span><span class="s2">import </span><span class="s1">KalmanSmoother</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.varmax </span><span class="s2">import </span><span class="s1">VARMAX</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.dynamic_factor </span><span class="s2">import </span><span class="s1">DynamicFactor</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.structural </span><span class="s2">import </span><span class="s1">UnobservedComponents</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.statespace.tests.test_impulse_responses </span><span class="s2">import </span><span class="s1">TVSS</span>
+<span class="s2">from </span><span class="s1">numpy.testing </span><span class="s2">import </span><span class="s1">assert_equal</span><span class="s2">, </span><span class="s1">assert_allclose</span>
+
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">kfas_helpers</span>
+
+<span class="s1">current_path = os.path.dirname(os.path.abspath(__file__))</span>
+<span class="s1">macrodata = datasets.macrodata.load_pandas().data</span>
+<span class="s1">macrodata.index = pd.period_range(start=</span><span class="s3">'1959Q1'</span><span class="s2">, </span><span class="s1">end=</span><span class="s3">'2009Q3'</span><span class="s2">, </span><span class="s1">freq=</span><span class="s3">'Q'</span><span class="s1">)</span>
+
+
+<span class="s4"># - Model definitions --------------------------------------------------------</span>
+
+<span class="s2">def </span><span class="s1">model_local_level(endog=</span><span class="s2">None, </span><span class="s1">params=</span><span class="s2">None, </span><span class="s1">direct=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s2">if </span><span class="s1">endog </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">y1 = </span><span class="s5">10.2394</span>
+        <span class="s1">endog = np.r_[y1</span><span class="s2">, </span><span class="s1">[</span><span class="s5">1</span><span class="s1">] * </span><span class="s5">9</span><span class="s1">]</span>
+    <span class="s2">if </span><span class="s1">params </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">params = [</span><span class="s5">1.993</span><span class="s2">, </span><span class="s5">8.253</span><span class="s1">]</span>
+    <span class="s1">sigma2_y</span><span class="s2">, </span><span class="s1">sigma2_mu = params</span>
+
+    <span class="s2">if </span><span class="s1">direct:</span>
+        <span class="s1">mod = </span><span class="s2">None</span>
+        <span class="s4"># Construct the basic representation</span>
+        <span class="s1">ssm = KalmanSmoother(k_endog=</span><span class="s5">1</span><span class="s2">, </span><span class="s1">k_states=</span><span class="s5">1</span><span class="s2">, </span><span class="s1">k_posdef=</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">ssm.bind(endog)</span>
+        <span class="s1">init = Initialization(ssm.k_states</span><span class="s2">, </span><span class="s1">initialization_type=</span><span class="s3">'diffuse'</span><span class="s1">)</span>
+        <span class="s1">ssm.initialize(init)</span>
+        <span class="s4"># ssm.filter_univariate = True  # should not be required</span>
+
+        <span class="s4"># Fill in the system matrices for a local level model</span>
+        <span class="s1">ssm[</span><span class="s3">'design'</span><span class="s2">, </span><span class="s1">:] = </span><span class="s5">1</span>
+        <span class="s1">ssm[</span><span class="s3">'obs_cov'</span><span class="s2">, </span><span class="s1">:] = sigma2_y</span>
+        <span class="s1">ssm[</span><span class="s3">'transition'</span><span class="s2">, </span><span class="s1">:] = </span><span class="s5">1</span>
+        <span class="s1">ssm[</span><span class="s3">'selection'</span><span class="s2">, </span><span class="s1">:] = </span><span class="s5">1</span>
+        <span class="s1">ssm[</span><span class="s3">'state_cov'</span><span class="s2">, </span><span class="s1">:] = sigma2_mu</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">mod = UnobservedComponents(endog</span><span class="s2">, </span><span class="s3">'llevel'</span><span class="s1">)</span>
+        <span class="s1">mod.update(params)</span>
+        <span class="s1">ssm = mod.ssm</span>
+        <span class="s1">ssm.initialize(Initialization(ssm.k_states</span><span class="s2">, </span><span class="s3">'diffuse'</span><span class="s1">))</span>
+
+    <span class="s2">return </span><span class="s1">mod</span><span class="s2">, </span><span class="s1">ssm</span>
+
+
+<span class="s2">def </span><span class="s1">model_local_linear_trend(endog=</span><span class="s2">None, </span><span class="s1">params=</span><span class="s2">None, </span><span class="s1">direct=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s2">if </span><span class="s1">endog </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">y1 = </span><span class="s5">10.2394</span>
+        <span class="s1">y2 = </span><span class="s5">4.2039</span>
+        <span class="s1">y3 = </span><span class="s5">6.123123</span>
+        <span class="s1">endog = np.r_[y1</span><span class="s2">, </span><span class="s1">y2</span><span class="s2">, </span><span class="s1">y3</span><span class="s2">, </span><span class="s1">[</span><span class="s5">1</span><span class="s1">] * </span><span class="s5">7</span><span class="s1">]</span>
+    <span class="s2">if </span><span class="s1">params </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">params = [</span><span class="s5">1.993</span><span class="s2">, </span><span class="s5">8.253</span><span class="s2">, </span><span class="s5">2.334</span><span class="s1">]</span>
+    <span class="s1">sigma2_y</span><span class="s2">, </span><span class="s1">sigma2_mu</span><span class="s2">, </span><span class="s1">sigma2_beta = params</span>
+
+    <span class="s2">if </span><span class="s1">direct:</span>
+        <span class="s1">mod = </span><span class="s2">None</span>
+        <span class="s4"># Construct the basic representation</span>
+        <span class="s1">ssm = KalmanSmoother(k_endog=</span><span class="s5">1</span><span class="s2">, </span><span class="s1">k_states=</span><span class="s5">2</span><span class="s2">, </span><span class="s1">k_posdef=</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">ssm.bind(endog)</span>
+        <span class="s1">init = Initialization(ssm.k_states</span><span class="s2">, </span><span class="s1">initialization_type=</span><span class="s3">'diffuse'</span><span class="s1">)</span>
+        <span class="s1">ssm.initialize(init)</span>
+        <span class="s4"># ssm.filter_univariate = True  # should not be required</span>
+
+        <span class="s4"># Fill in the system matrices for a local level model</span>
+        <span class="s1">ssm[</span><span class="s3">'design'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1</span>
+        <span class="s1">ssm[</span><span class="s3">'obs_cov'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = sigma2_y</span>
+        <span class="s1">ssm[</span><span class="s3">'transition'</span><span class="s1">] = np.array([[</span><span class="s5">1</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">,</span>
+                                      <span class="s1">[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]])</span>
+        <span class="s1">ssm[</span><span class="s3">'selection'</span><span class="s1">] = np.eye(</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">ssm[</span><span class="s3">'state_cov'</span><span class="s1">] = np.diag([sigma2_mu</span><span class="s2">, </span><span class="s1">sigma2_beta])</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">mod = UnobservedComponents(endog</span><span class="s2">, </span><span class="s3">'lltrend'</span><span class="s1">)</span>
+        <span class="s1">mod.update(params)</span>
+        <span class="s1">ssm = mod.ssm</span>
+        <span class="s1">ssm.initialize(Initialization(ssm.k_states</span><span class="s2">, </span><span class="s3">'diffuse'</span><span class="s1">))</span>
+
+    <span class="s2">return </span><span class="s1">mod</span><span class="s2">, </span><span class="s1">ssm</span>
+
+
+<span class="s2">def </span><span class="s1">model_common_level(endog=</span><span class="s2">None, </span><span class="s1">params=</span><span class="s2">None, </span><span class="s1">restricted=</span><span class="s2">False</span><span class="s1">):</span>
+    <span class="s2">if </span><span class="s1">endog </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">y11 = </span><span class="s5">10.2394</span>
+        <span class="s1">y21 = </span><span class="s5">8.2304</span>
+        <span class="s1">endog = np.column_stack([np.r_[y11</span><span class="s2">, </span><span class="s1">[</span><span class="s5">1</span><span class="s1">] * </span><span class="s5">9</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.r_[y21</span><span class="s2">, </span><span class="s1">[</span><span class="s5">1</span><span class="s1">] * </span><span class="s5">9</span><span class="s1">]])</span>
+    <span class="s2">if </span><span class="s1">params </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">params = [</span><span class="s5">0.1111</span><span class="s2">, </span><span class="s5">3.2324</span><span class="s1">]</span>
+    <span class="s1">theta</span><span class="s2">, </span><span class="s1">sigma2_mu = params</span>
+    <span class="s4"># sigma2_1 = 1</span>
+    <span class="s4"># sigma_12 = 0</span>
+    <span class="s4"># sigma2_2 = 1</span>
+
+    <span class="s2">if not </span><span class="s1">restricted:</span>
+        <span class="s4"># Construct the basic representation</span>
+        <span class="s1">ssm = KalmanSmoother(k_endog=</span><span class="s5">2</span><span class="s2">, </span><span class="s1">k_states=</span><span class="s5">2</span><span class="s2">, </span><span class="s1">k_posdef=</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">ssm.bind(endog.T)</span>
+        <span class="s1">init = Initialization(ssm.k_states</span><span class="s2">, </span><span class="s1">initialization_type=</span><span class="s3">'diffuse'</span><span class="s1">)</span>
+        <span class="s1">ssm.initialize(init)</span>
+        <span class="s4"># ssm.filter_univariate = True  # should not be required</span>
+
+        <span class="s4"># Fill in the system matrices for a common trend model</span>
+        <span class="s1">ssm[</span><span class="s3">'design'</span><span class="s1">] = np.array([[</span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+                                  <span class="s1">[theta</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]])</span>
+        <span class="s1">ssm[</span><span class="s3">'obs_cov'</span><span class="s1">] = np.eye(</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">ssm[</span><span class="s3">'transition'</span><span class="s1">] = np.eye(</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">ssm[</span><span class="s3">'selection'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1</span>
+        <span class="s1">ssm[</span><span class="s3">'state_cov'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = sigma2_mu</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s4"># Construct the basic representation</span>
+        <span class="s1">ssm = KalmanSmoother(k_endog=</span><span class="s5">2</span><span class="s2">, </span><span class="s1">k_states=</span><span class="s5">1</span><span class="s2">, </span><span class="s1">k_posdef=</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">ssm.bind(endog.T)</span>
+        <span class="s1">init = Initialization(ssm.k_states</span><span class="s2">, </span><span class="s1">initialization_type=</span><span class="s3">'diffuse'</span><span class="s1">)</span>
+        <span class="s1">ssm.initialize(init)</span>
+        <span class="s4"># ssm.filter_univariate = True  # should not be required</span>
+
+        <span class="s4"># Fill in the system matrices for a local level model</span>
+        <span class="s1">ssm[</span><span class="s3">'design'</span><span class="s1">] = np.array([[</span><span class="s5">1</span><span class="s2">, </span><span class="s1">theta]]).T</span>
+        <span class="s1">ssm[</span><span class="s3">'obs_cov'</span><span class="s1">] = np.eye(</span><span class="s5">2</span><span class="s1">)</span>
+        <span class="s1">ssm[</span><span class="s3">'transition'</span><span class="s2">, </span><span class="s1">:] = </span><span class="s5">1</span>
+        <span class="s1">ssm[</span><span class="s3">'selection'</span><span class="s2">, </span><span class="s1">:] = </span><span class="s5">1</span>
+        <span class="s1">ssm[</span><span class="s3">'state_cov'</span><span class="s2">, </span><span class="s1">:] = sigma2_mu</span>
+
+    <span class="s2">return </span><span class="s1">ssm</span>
+
+
+<span class="s2">def </span><span class="s1">model_var1(endog=</span><span class="s2">None, </span><span class="s1">params=</span><span class="s2">None, </span><span class="s1">measurement_error=</span><span class="s2">False, </span><span class="s1">init=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s2">if </span><span class="s1">endog </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">levels = macrodata[[</span><span class="s3">'realgdp'</span><span class="s2">, </span><span class="s3">'realcons'</span><span class="s1">]]</span>
+        <span class="s1">endog = np.log(levels).iloc[:</span><span class="s5">21</span><span class="s1">].diff().iloc[</span><span class="s5">1</span><span class="s1">:] * </span><span class="s5">400</span>
+    <span class="s2">if </span><span class="s1">params </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">params = np.r_[</span><span class="s5">0.5</span><span class="s2">, </span><span class="s5">0.3</span><span class="s2">, </span><span class="s5">0.2</span><span class="s2">, </span><span class="s5">0.4</span><span class="s2">, </span><span class="s5">2</span><span class="s1">**</span><span class="s5">0.5</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">3</span><span class="s1">**</span><span class="s5">0.5</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">measurement_error:</span>
+            <span class="s1">params = np.r_[params</span><span class="s2">, </span><span class="s5">4</span><span class="s2">, </span><span class="s5">5</span><span class="s1">]</span>
+
+    <span class="s4"># Model</span>
+    <span class="s1">mod = VARMAX(endog</span><span class="s2">, </span><span class="s1">order=(</span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span><span class="s2">, </span><span class="s1">trend=</span><span class="s3">'n'</span><span class="s2">,</span>
+                 <span class="s1">measurement_error=measurement_error)</span>
+    <span class="s1">mod.update(params)</span>
+    <span class="s1">ssm = mod.ssm</span>
+    <span class="s2">if </span><span class="s1">init </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">init = Initialization(ssm.k_states</span><span class="s2">, </span><span class="s3">'diffuse'</span><span class="s1">)</span>
+    <span class="s1">ssm.initialize(init)</span>
+
+    <span class="s2">return </span><span class="s1">mod</span><span class="s2">, </span><span class="s1">ssm</span>
+
+
+<span class="s2">def </span><span class="s1">model_dfm(endog=</span><span class="s2">None, </span><span class="s1">params=</span><span class="s2">None, </span><span class="s1">factor_order=</span><span class="s5">2</span><span class="s1">):</span>
+    <span class="s2">if </span><span class="s1">endog </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">levels = macrodata[[</span><span class="s3">'realgdp'</span><span class="s2">, </span><span class="s3">'realcons'</span><span class="s1">]]</span>
+        <span class="s1">endog = np.log(levels).iloc[:</span><span class="s5">21</span><span class="s1">].diff().iloc[</span><span class="s5">1</span><span class="s1">:] * </span><span class="s5">400</span>
+    <span class="s2">if </span><span class="s1">params </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">params = np.r_[</span><span class="s5">0.5</span><span class="s2">, </span><span class="s5">1.</span><span class="s2">, </span><span class="s5">1.5</span><span class="s2">, </span><span class="s5">2.</span><span class="s2">, </span><span class="s5">0.9</span><span class="s2">, </span><span class="s5">0.1</span><span class="s1">]</span>
+
+    <span class="s4"># Model</span>
+    <span class="s1">mod = DynamicFactor(endog</span><span class="s2">, </span><span class="s1">k_factors=</span><span class="s5">1</span><span class="s2">, </span><span class="s1">factor_order=factor_order)</span>
+    <span class="s1">mod.update(params)</span>
+    <span class="s1">ssm = mod.ssm</span>
+    <span class="s1">ssm.filter_univariate = </span><span class="s2">True</span>
+    <span class="s1">init = Initialization(ssm.k_states</span><span class="s2">, </span><span class="s3">'diffuse'</span><span class="s1">)</span>
+    <span class="s1">ssm.initialize(init)</span>
+
+    <span class="s2">return </span><span class="s1">mod</span><span class="s2">, </span><span class="s1">ssm</span>
+
+
+<span class="s4"># - Analytic tests (Koopman, 1997) -------------------------------------------</span>
+
+
+<span class="s2">class </span><span class="s1">TestLocalLevelAnalytic:</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">cls.mod</span><span class="s2">, </span><span class="s1">cls.ssm = model_local_level(**kwargs)</span>
+        <span class="s1">cls.res = cls.ssm.smooth()</span>
+
+    <span class="s2">def </span><span class="s1">test_results(self):</span>
+        <span class="s1">ssm = self.ssm</span>
+        <span class="s1">res = self.res</span>
+
+        <span class="s1">y1 = ssm.endog[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">sigma2_y = ssm[</span><span class="s3">'obs_cov'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">sigma2_mu = ssm[</span><span class="s3">'state_cov'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+
+        <span class="s4"># Basic initialization variables</span>
+        <span class="s1">assert_allclose(res.predicted_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_allclose(res.predicted_diffuse_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+
+        <span class="s4"># Output of the exact diffuse initialization, see Koopman (1997)</span>
+        <span class="s1">assert_allclose(res.forecasts_error[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">y1)</span>
+        <span class="s1">assert_allclose(res.forecasts_error_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">sigma2_y)</span>
+        <span class="s1">assert_allclose(res.forecasts_error_diffuse_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">assert_allclose(res.kalman_gain[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">assert_allclose(res.predicted_state[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">y1)</span>
+        <span class="s1">assert_allclose(res.predicted_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">sigma2_y + sigma2_mu)</span>
+        <span class="s1">assert_allclose(res.predicted_diffuse_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+
+        <span class="s4"># Miscellaneous</span>
+        <span class="s1">assert_equal(res.nobs_diffuse</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestLocalLevelAnalyticDirect(TestLocalLevelAnalytic):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls):</span>
+        <span class="s1">super(TestLocalLevelAnalyticDirect</span><span class="s2">, </span><span class="s1">cls).setup_class(direct=</span><span class="s2">True</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestLocalLinearTrendAnalytic:</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">cls.mod</span><span class="s2">, </span><span class="s1">cls.ssm = model_local_linear_trend(**kwargs)</span>
+        <span class="s1">cls.res = cls.ssm.smooth()</span>
+
+    <span class="s2">def </span><span class="s1">test_results(self):</span>
+        <span class="s1">ssm = self.ssm</span>
+        <span class="s1">res = self.res</span>
+
+        <span class="s1">y1</span><span class="s2">, </span><span class="s1">y2</span><span class="s2">, </span><span class="s1">y3 = ssm.endog[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s1">]</span>
+        <span class="s1">sigma2_y = ssm[</span><span class="s3">'obs_cov'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">sigma2_mu</span><span class="s2">, </span><span class="s1">sigma2_beta = np.diagonal(ssm[</span><span class="s3">'state_cov'</span><span class="s1">])</span>
+
+        <span class="s4"># Basic initialization variables</span>
+        <span class="s1">assert_allclose(res.predicted_state_cov[...</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.zeros((</span><span class="s5">2</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)))</span>
+        <span class="s1">assert_allclose(res.predicted_diffuse_state_cov[...</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.eye(</span><span class="s5">2</span><span class="s1">))</span>
+
+        <span class="s4"># Output of the exact diffuse initialization, see Koopman (1997)</span>
+        <span class="s1">q_mu = sigma2_mu / sigma2_y</span>
+        <span class="s1">q_beta = sigma2_beta / sigma2_y</span>
+        <span class="s1">assert_allclose(res.forecasts_error[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">y1)</span>
+        <span class="s1">assert_allclose(res.kalman_gain[:</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">])</span>
+        <span class="s1">assert_allclose(res.predicted_state[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[y1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">])</span>
+        <span class="s1">P2 = sigma2_y * np.array([[</span><span class="s5">1 </span><span class="s1">+ q_mu</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+                                  <span class="s1">[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">q_beta]])</span>
+        <span class="s1">assert_allclose(res.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">P2)</span>
+        <span class="s1">assert_allclose(res.predicted_diffuse_state_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">np.ones((</span><span class="s5">2</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)))</span>
+
+        <span class="s4"># assert_allclose(res.kalman_gain[:, 0, 1], [2, 1])</span>
+        <span class="s1">assert_allclose(res.predicted_state[:</span><span class="s2">, </span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[</span><span class="s5">2 </span><span class="s1">* y2 - y1</span><span class="s2">, </span><span class="s1">y2 - y1])</span>
+        <span class="s1">P3 = sigma2_y * np.array([[</span><span class="s5">5 </span><span class="s1">+ </span><span class="s5">2 </span><span class="s1">* q_mu + q_beta</span><span class="s2">, </span><span class="s5">3 </span><span class="s1">+ q_mu + q_beta]</span><span class="s2">,</span>
+                                  <span class="s1">[</span><span class="s5">3 </span><span class="s1">+ q_mu + q_beta</span><span class="s2">, </span><span class="s5">2 </span><span class="s1">+ q_mu + </span><span class="s5">2 </span><span class="s1">* q_beta]])</span>
+        <span class="s1">assert_allclose(res.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s5">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">P3)</span>
+        <span class="s1">assert_allclose(res.predicted_diffuse_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s5">2</span><span class="s1">]</span><span class="s2">,</span>
+                        <span class="s1">np.zeros((</span><span class="s5">2</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)))</span>
+
+        <span class="s4"># Miscellaneous</span>
+        <span class="s1">assert_equal(res.nobs_diffuse</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestLocalLinearTrendAnalyticDirect(TestLocalLinearTrendAnalytic):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls):</span>
+        <span class="s1">super(TestLocalLinearTrendAnalyticDirect</span><span class="s2">, </span><span class="s1">cls).setup_class(direct=</span><span class="s2">True</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestLocalLinearTrendAnalyticMissing(TestLocalLinearTrendAnalytic):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls):</span>
+        <span class="s1">y1 = </span><span class="s5">10.2394</span>
+        <span class="s1">y2 = np.nan</span>
+        <span class="s1">y3 = </span><span class="s5">6.123123</span>
+        <span class="s1">endog = np.r_[y1</span><span class="s2">, </span><span class="s1">y2</span><span class="s2">, </span><span class="s1">y3</span><span class="s2">, </span><span class="s1">[</span><span class="s5">1</span><span class="s1">] * </span><span class="s5">7</span><span class="s1">]</span>
+        <span class="s1">super(TestLocalLinearTrendAnalyticMissing</span><span class="s2">, </span><span class="s1">cls).setup_class(</span>
+            <span class="s1">endog=endog)</span>
+
+    <span class="s2">def </span><span class="s1">test_results(self):</span>
+        <span class="s1">ssm = self.ssm</span>
+        <span class="s1">res = self.res</span>
+
+        <span class="s1">y1</span><span class="s2">, </span><span class="s1">y2</span><span class="s2">, </span><span class="s1">y3 = ssm.endog[</span><span class="s5">0</span><span class="s2">, </span><span class="s1">:</span><span class="s5">3</span><span class="s1">]</span>
+        <span class="s1">sigma2_y = ssm[</span><span class="s3">'obs_cov'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">sigma2_mu</span><span class="s2">, </span><span class="s1">sigma2_beta = np.diagonal(ssm[</span><span class="s3">'state_cov'</span><span class="s1">])</span>
+
+        <span class="s4"># Test output</span>
+        <span class="s1">q_mu = sigma2_mu / sigma2_y</span>
+        <span class="s1">q_beta = sigma2_beta / sigma2_y</span>
+        <span class="s1">a4 = [</span><span class="s5">1.5 </span><span class="s1">* y3 - </span><span class="s5">0.5 </span><span class="s1">* y1</span><span class="s2">, </span><span class="s5">0.5 </span><span class="s1">* y3 - </span><span class="s5">0.5 </span><span class="s1">* y1]</span>
+        <span class="s1">assert_allclose(res.predicted_state[:</span><span class="s2">, </span><span class="s5">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">a4)</span>
+        <span class="s1">P4 = sigma2_y * np.array([</span>
+            <span class="s1">[</span><span class="s5">2.5 </span><span class="s1">+ </span><span class="s5">1.5 </span><span class="s1">* q_mu + </span><span class="s5">1.25 </span><span class="s1">* q_beta</span><span class="s2">,</span>
+             <span class="s5">1 </span><span class="s1">+ </span><span class="s5">0.5 </span><span class="s1">* q_mu + </span><span class="s5">1.25 </span><span class="s1">* q_beta]</span><span class="s2">,</span>
+            <span class="s1">[</span><span class="s5">1 </span><span class="s1">+ </span><span class="s5">0.5 </span><span class="s1">* q_mu + </span><span class="s5">1.25 </span><span class="s1">* q_beta</span><span class="s2">,</span>
+             <span class="s5">0.5 </span><span class="s1">+ </span><span class="s5">0.5 </span><span class="s1">* q_mu + </span><span class="s5">2.25 </span><span class="s1">* q_beta]])</span>
+        <span class="s1">assert_allclose(res.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s5">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">P4)</span>
+
+        <span class="s4"># Miscellaneous</span>
+        <span class="s1">assert_equal(res.nobs_diffuse</span><span class="s2">, </span><span class="s5">3</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">test_common_level_analytic():</span>
+    <span class="s4"># Analytic test using results from Koopman (1997), section 5.3</span>
+    <span class="s1">mod = model_common_level()</span>
+    <span class="s1">y11</span><span class="s2">, </span><span class="s1">y21 = mod.endog[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">theta = mod[</span><span class="s3">'design'</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">sigma2_mu = mod[</span><span class="s3">'state_cov'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s4"># Perform filtering</span>
+    <span class="s1">res = mod.smooth()</span>
+
+    <span class="s4"># Basic initialization variables</span>
+    <span class="s1">assert_allclose(res.predicted_state_cov[...</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.zeros((</span><span class="s5">2</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)))</span>
+    <span class="s1">assert_allclose(res.predicted_diffuse_state_cov[...</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.eye(</span><span class="s5">2</span><span class="s1">))</span>
+
+    <span class="s4"># Output of the exact diffuse initialization, see Koopman (1997)</span>
+
+    <span class="s4"># Note: since Koopman (1997) did not apply the univariate method,</span>
+    <span class="s4"># forecast errors and covariances, and the Kalman gain will not match</span>
+    <span class="s4"># assert_allclose(res.forecasts_error[:, 0], [y11, y21])</span>
+    <span class="s4"># assert_allclose(res.forecasts_error_cov[:, :, 0], np.eye(2))</span>
+    <span class="s4"># F_inf1 = np.array([[1, theta],</span>
+    <span class="s4">#                    [theta, 1 + theta**2]])</span>
+    <span class="s4"># assert_allclose(res.forecasts_error_diffuse_cov[:, :, 0], F_inf1)</span>
+    <span class="s4"># K0 = np.array([[1, 0],</span>
+    <span class="s4">#                [-theta, 1]])</span>
+    <span class="s4"># assert_allclose(res.kalman_gain[..., 0], K0)</span>
+    <span class="s1">assert_allclose(res.predicted_state[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">[y11</span><span class="s2">, </span><span class="s1">y21 - theta * y11])</span>
+    <span class="s1">P2 = np.array([[</span><span class="s5">1 </span><span class="s1">+ sigma2_mu</span><span class="s2">, </span><span class="s1">-theta]</span><span class="s2">,</span>
+                   <span class="s1">[-theta</span><span class="s2">, </span><span class="s5">1 </span><span class="s1">+ theta**</span><span class="s5">2</span><span class="s1">]])</span>
+    <span class="s1">assert_allclose(res.predicted_state_cov[...</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">P2)</span>
+    <span class="s1">assert_allclose(res.predicted_diffuse_state_cov[...</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">np.zeros((</span><span class="s5">2</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)))</span>
+
+    <span class="s4"># Miscellaneous</span>
+    <span class="s1">assert_equal(res.nobs_diffuse</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">test_common_level_restricted_analytic():</span>
+    <span class="s4"># Analytic test using results from Koopman (1997), section 5.3,</span>
+    <span class="s4"># with the restriction mu_bar = 0</span>
+    <span class="s1">mod = model_common_level(restricted=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s1">y11</span><span class="s2">, </span><span class="s1">y21 = mod.endog[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">theta = mod[</span><span class="s3">'design'</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">sigma2_mu = mod[</span><span class="s3">'state_cov'</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s4"># Perform filtering</span>
+    <span class="s1">res = mod.smooth()</span>
+
+    <span class="s4"># Basic initialization variables</span>
+    <span class="s1">assert_allclose(res.predicted_state_cov[...</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">assert_allclose(res.predicted_diffuse_state_cov[...</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s4"># Output of the exact diffuse initialization, see Koopman (1997)</span>
+    <span class="s1">phi = </span><span class="s5">1 </span><span class="s1">/ (</span><span class="s5">1 </span><span class="s1">+ theta**</span><span class="s5">2</span><span class="s1">)</span>
+    <span class="s4"># Note: since Koopman (1997) did not apply the univariate method,</span>
+    <span class="s4"># forecast errors and covariances, and the Kalman gain will not match</span>
+    <span class="s4"># assert_allclose(res.forecasts_error[:, 0], [y11, y21])</span>
+    <span class="s4"># assert_allclose(res.forecasts_error_cov[0, 0, 0], np.eye(2))</span>
+    <span class="s4"># F_inf1 = np.array([[1, theta],</span>
+    <span class="s4">#                    [theta, theta**2]])</span>
+    <span class="s4"># assert_allclose(res.forecasts_error_diffuse_cov[0, 0, 0], F_inf1)</span>
+    <span class="s4"># assert_allclose(res.kalman_gain[..., 0], phi * np.array([1, theta]))</span>
+    <span class="s1">assert_allclose(res.predicted_state[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">phi * (y11 + theta * y21))</span>
+    <span class="s4"># Note: Koopman (1997) actually has phi + sigma2_mu**0.5, but that appears</span>
+    <span class="s4"># to be a typo</span>
+    <span class="s1">assert_allclose(res.predicted_state_cov[...</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">phi + sigma2_mu)</span>
+    <span class="s1">assert_allclose(res.predicted_diffuse_state_cov[...</span><span class="s2">, </span><span class="s5">1</span><span class="s1">]</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+
+    <span class="s4"># Miscellaneous</span>
+    <span class="s1">assert_equal(res.nobs_diffuse</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">CheckSSMResults:</span>
+    <span class="s1">atol = </span><span class="s5">1e-14</span>
+    <span class="s1">rtol = </span><span class="s5">1e-07</span>
+    <span class="s1">atol_diffuse = </span><span class="s5">1e-7</span>
+    <span class="s1">rtol_diffuse = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">check_object(self</span><span class="s2">, </span><span class="s1">actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse):</span>
+        <span class="s4"># Short-circuit the test if desired is set to None (which allows us to</span>
+        <span class="s4"># skip testing some objects where appropriate)</span>
+        <span class="s2">if </span><span class="s1">actual </span><span class="s2">is None or </span><span class="s1">desired </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return</span>
+        <span class="s4"># Optionally apply a different relative tolerance to the periods in the</span>
+        <span class="s4"># diffuse observations.</span>
+        <span class="s4"># This is especially useful when testing against approximate diffuse</span>
+        <span class="s4"># initialization. By definition, the first few observations will be</span>
+        <span class="s4"># quite different between the exact and approximate approach for many</span>
+        <span class="s4"># quantities.</span>
+        <span class="s4"># Note that the absolute tolerance is also pretty low (1e-7), mostly</span>
+        <span class="s4"># for comparison against zero values in the approximate case</span>
+        <span class="s1">d = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">rtol_diffuse </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">rtol_diffuse = self.rtol_diffuse</span>
+        <span class="s2">if </span><span class="s1">rtol_diffuse </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">d = self.d</span>
+            <span class="s2">if </span><span class="s1">rtol_diffuse != np.inf:</span>
+                <span class="s1">assert_allclose(actual.T[:d]</span><span class="s2">, </span><span class="s1">desired.T[:d]</span><span class="s2">, </span><span class="s1">rtol=rtol_diffuse</span><span class="s2">,</span>
+                                <span class="s1">atol=self.atol_diffuse)</span>
+        <span class="s1">assert_allclose(actual.T[d:]</span><span class="s2">, </span><span class="s1">desired.T[d:]</span><span class="s2">, </span><span class="s1">rtol=self.rtol</span><span class="s2">,</span>
+                        <span class="s1">atol=self.atol)</span>
+
+    <span class="s4"># - Filtered results tests -----------------------------------------------</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.forecasts</span>
+        <span class="s1">desired = self.results_a.forecasts</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts_error(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.forecasts_error</span>
+        <span class="s1">desired = self.results_a.forecasts_error</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts_error_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.forecasts_error_cov</span>
+        <span class="s1">desired = self.results_b.forecasts_error_cov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_filtered_state(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s5">1e-5</span><span class="s1">):</span>
+        <span class="s4"># Note: we do want to check the diffuse values here, with a reduced</span>
+        <span class="s4"># tolerance. See the note before the smoothed values for additional</span>
+        <span class="s4"># details.</span>
+        <span class="s1">actual = self.results_a.filtered_state</span>
+        <span class="s1">desired = self.results_b.filtered_state</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_filtered_state_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.filtered_state_cov</span>
+        <span class="s1">desired = self.results_b.filtered_state_cov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_state(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.predicted_state</span>
+        <span class="s1">desired = self.results_b.predicted_state</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_state_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.predicted_state_cov</span>
+        <span class="s1">desired = self.results_b.predicted_state_cov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_kalman_gain(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.kalman_gain</span>
+        <span class="s1">desired = self.results_b.kalman_gain</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_loglike(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">np.isscalar(self.results_b.llf_obs):</span>
+            <span class="s1">actual = np.sum(self.results_a.llf_obs)</span>
+            <span class="s1">desired = self.results_b.llf_obs</span>
+            <span class="s1">assert_allclose(actual</span><span class="s2">, </span><span class="s1">desired)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">actual = self.results_a.llf_obs</span>
+            <span class="s1">desired = self.results_b.llf_obs</span>
+            <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s4"># - Smoothed output tests ------------------------------------------------</span>
+    <span class="s4"># Note: for smoothed states, we do want to check some of the diffuse values</span>
+    <span class="s4"># even in the approximate case, but with reduced precision. Note also that</span>
+    <span class="s4"># there are cases that demonstrate the numerical error associated with the</span>
+    <span class="s4"># approximate method, and so some specific tests are overridden in certain</span>
+    <span class="s4"># cases, since they would not pass.</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s5">1e-5</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.smoothed_state</span>
+        <span class="s1">desired = self.results_b.smoothed_state</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s5">1e-5</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.smoothed_state_cov</span>
+        <span class="s1">desired = self.results_b.smoothed_state_cov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_autocov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.smoothed_state_autocov</span>
+        <span class="s1">desired = self.results_b.smoothed_state_autocov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s5">1e-5</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.smoothed_measurement_disturbance</span>
+        <span class="s1">desired = self.results_b.smoothed_measurement_disturbance</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s5">1e-5</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.smoothed_measurement_disturbance_cov</span>
+        <span class="s1">desired = self.results_b.smoothed_measurement_disturbance_cov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s5">1e-5</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.smoothed_state_disturbance</span>
+        <span class="s1">desired = self.results_b.smoothed_state_disturbance</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_disturbance_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s5">1e-5</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.smoothed_state_disturbance_cov</span>
+        <span class="s1">desired = self.results_b.smoothed_state_disturbance_cov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s4"># - Smoothed intermediate tests ------------------------------------------</span>
+
+    <span class="s1">@pytest.mark.skip(</span><span class="s3">&quot;This is not computed in the univariate method or &quot;</span>
+                      <span class="s3">&quot;by KFAS.&quot;</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">test_smoothing_error(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.smoothing_error</span>
+        <span class="s1">desired = self.results_b.smoothing_error</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_scaled_smoothed_estimator(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s5">1e-5</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.scaled_smoothed_estimator</span>
+        <span class="s1">desired = self.results_b.scaled_smoothed_estimator</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_scaled_smoothed_estimator_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s5">1e-5</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.scaled_smoothed_estimator_cov</span>
+        <span class="s1">desired = self.results_b.scaled_smoothed_estimator_cov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s4"># - Diffuse objects tests ------------------------------------------------</span>
+    <span class="s4"># Note: these cannot be checked against the approximate diffuse method.</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts_error_diffuse_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.forecasts_error_diffuse_cov</span>
+        <span class="s1">desired = self.results_b.forecasts_error_diffuse_cov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_predicted_diffuse_state_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.predicted_diffuse_state_cov</span>
+        <span class="s1">desired = self.results_b.predicted_diffuse_state_cov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s4"># TODO: do something with this other than commenting it out?</span>
+    <span class="s4"># We do not currently store this array</span>
+    <span class="s4"># def test_kalman_gain_diffuse(self, rtol_diffuse=None):</span>
+    <span class="s4">#     actual = self.results_a.</span>
+    <span class="s4">#     desired = self.results_b.</span>
+    <span class="s4">#     self.check_object(actual, desired, rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_scaled_smoothed_diffuse_estimator(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.scaled_smoothed_diffuse_estimator</span>
+        <span class="s1">desired = self.results_b.scaled_smoothed_diffuse_estimator</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_scaled_smoothed_diffuse1_estimator_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.scaled_smoothed_diffuse1_estimator_cov</span>
+        <span class="s1">desired = self.results_b.scaled_smoothed_diffuse1_estimator_cov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s2">def </span><span class="s1">test_scaled_smoothed_diffuse2_estimator_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">actual = self.results_a.scaled_smoothed_diffuse2_estimator_cov</span>
+        <span class="s1">desired = self.results_b.scaled_smoothed_diffuse2_estimator_cov</span>
+        <span class="s1">self.check_object(actual</span><span class="s2">, </span><span class="s1">desired</span><span class="s2">, </span><span class="s1">rtol_diffuse)</span>
+
+    <span class="s4"># - Simulation smoother results tests ------------------------------------</span>
+
+    <span class="s1">@pytest.mark.xfail(reason=</span><span class="s3">&quot;No sim_a attribute&quot;</span><span class="s2">,</span>
+                       <span class="s1">raises=AttributeError</span><span class="s2">, </span><span class="s1">strict=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">test_simulation_smoothed_state(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.sim_a.simulated_state</span><span class="s2">,</span>
+            <span class="s1">self.sim_a.simulated_state)</span>
+
+    <span class="s1">@pytest.mark.xfail(reason=</span><span class="s3">&quot;No sim_a attribute&quot;</span><span class="s2">,</span>
+                       <span class="s1">raises=AttributeError</span><span class="s2">, </span><span class="s1">strict=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">test_simulation_smoothed_measurement_disturbance(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.sim_a.simulated_measurement_disturbance</span><span class="s2">,</span>
+            <span class="s1">self.sim_a.simulated_measurement_disturbance)</span>
+
+    <span class="s1">@pytest.mark.xfail(reason=</span><span class="s3">&quot;No sim_a attribute&quot;</span><span class="s2">,</span>
+                       <span class="s1">raises=AttributeError</span><span class="s2">, </span><span class="s1">strict=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s2">def </span><span class="s1">test_simulation_smoothed_state_disturbance(self):</span>
+        <span class="s1">assert_allclose(</span>
+            <span class="s1">self.sim_a.simulated_state_disturbance</span><span class="s2">,</span>
+            <span class="s1">self.sim_a.simulated_state_disturbance)</span>
+
+
+<span class="s2">class </span><span class="s1">CheckApproximateDiffuseMixin:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Test the exact diffuse initialization against the approximate diffuse 
+    initialization. By definition, the first few observations will be quite 
+    different between the exact and approximate approach for many quantities, 
+    so we do not test them here. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">approximate_diffuse_variance = </span><span class="s5">1e6</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">init_approx = kwargs.pop(</span><span class="s3">'init_approx'</span><span class="s2">, None</span><span class="s1">)</span>
+
+        <span class="s1">super(CheckApproximateDiffuseMixin</span><span class="s2">, </span><span class="s1">cls).setup_class(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s4"># Get the approximate diffuse results</span>
+        <span class="s1">kappa = cls.approximate_diffuse_variance</span>
+        <span class="s2">if </span><span class="s1">init_approx </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">init_approx = Initialization(</span>
+                <span class="s1">cls.ssm.k_states</span><span class="s2">,</span>
+                <span class="s3">'approximate_diffuse'</span><span class="s2">,</span>
+                <span class="s1">approximate_diffuse_variance=kappa)</span>
+        <span class="s1">cls.ssm.initialize(init_approx)</span>
+        <span class="s1">cls.results_b = cls.ssm.smooth()</span>
+
+        <span class="s4"># Instruct the tests not to test against the first d values</span>
+        <span class="s1">cls.rtol_diffuse = np.inf</span>
+
+    <span class="s2">def </span><span class="s1">test_initialization_approx(self):</span>
+        <span class="s1">kappa = self.approximate_diffuse_variance</span>
+        <span class="s1">assert_allclose(self.results_b.initial_state_cov</span><span class="s2">,</span>
+                        <span class="s1">np.eye(self.ssm.k_states) * kappa)</span>
+        <span class="s1">assert_equal(self.results_b.initial_diffuse_state_cov</span><span class="s2">, None</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">CheckKFASMixin:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Test against values from KFAS 
+    &quot;&quot;&quot;</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s3">'filter_univariate'</span><span class="s2">, True</span><span class="s1">)</span>
+        <span class="s1">super(CheckKFASMixin</span><span class="s2">, </span><span class="s1">cls).setup_class(*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s4"># Get the KFAS results objects</span>
+        <span class="s1">cls.results_b = kfas_helpers.parse(cls.results_path</span><span class="s2">, </span><span class="s1">cls.ssm)</span>
+
+        <span class="s4"># Set some attributes that KFAS does not compute</span>
+        <span class="s1">cls.results_b.smoothed_state_autocov = </span><span class="s2">None</span>
+
+        <span class="s4"># Remove the Kalman gain matrix since KFAS computes it using the</span>
+        <span class="s4"># non-univariate method</span>
+        <span class="s1">cls.results_b.kalman_gain = </span><span class="s2">None</span>
+
+        <span class="s4"># Remove the filtered_state_cov since KFAS v1.3.1 has a bug for these</span>
+        <span class="s4"># matrices (they are not even symmetric)</span>
+        <span class="s1">cls.results_b.filtered_state_cov = </span><span class="s2">None</span>
+
+        <span class="s4"># KFAS v1.3.1 seems to compute the loglikelihood incorrectly, so we</span>
+        <span class="s4"># correct for it here</span>
+        <span class="s4"># (we need to add back in the constant term for all of the non-missing</span>
+        <span class="s4"># diffuse observations for which Finf is nonsingular)</span>
+        <span class="s1">Finf = cls.results_b.forecasts_error_diffuse_cov.T</span>
+        <span class="s1">Finf_nonsingular_obs = np.c_[[np.diag(Finf_t) </span><span class="s2">for </span><span class="s1">Finf_t </span><span class="s2">in </span><span class="s1">Finf]] &gt; </span><span class="s5">0</span>
+        <span class="s1">nonmissing = ~np.isnan(cls.ssm.endog).T</span>
+        <span class="s1">constant = (-</span><span class="s5">0.5 </span><span class="s1">* np.log(</span><span class="s5">2 </span><span class="s1">* np.pi) *</span>
+                    <span class="s1">(Finf_nonsingular_obs * nonmissing).sum(axis=</span><span class="s5">1</span><span class="s1">))</span>
+        <span class="s1">cls.results_b.llf_obs += constant[:cls.results_a.nobs_diffuse].sum()</span>
+
+
+<span class="s4"># - VAR(1) -------------------------------------------------------------------</span>
+
+<span class="s2">class </span><span class="s1">CheckVAR1(CheckSSMResults):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">filter_univariate = kwargs.pop(</span><span class="s3">'filter_univariate'</span><span class="s2">, False</span><span class="s1">)</span>
+        <span class="s1">cls.mod</span><span class="s2">, </span><span class="s1">cls.ssm = model_var1(**kwargs)</span>
+        <span class="s2">if </span><span class="s1">filter_univariate:</span>
+            <span class="s1">cls.ssm.filter_univariate = </span><span class="s2">True</span>
+        <span class="s1">cls.results_a = cls.ssm.smooth()</span>
+        <span class="s1">cls.d = cls.results_a.nobs_diffuse</span>
+
+    <span class="s2">def </span><span class="s1">test_nobs_diffuse(self):</span>
+        <span class="s1">assert_allclose(self.d</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_initialization(self):</span>
+        <span class="s1">assert_allclose(self.results_a.initial_state_cov</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_allclose(self.results_a.initial_diffuse_state_cov</span><span class="s2">, </span><span class="s1">np.eye(</span><span class="s5">2</span><span class="s1">))</span>
+
+
+<span class="s2">class </span><span class="s1">TestVAR1_Approx(CheckApproximateDiffuseMixin</span><span class="s2">, </span><span class="s1">CheckVAR1):</span>
+    <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">TestVAR1_KFAS(CheckKFASMixin</span><span class="s2">, </span><span class="s1">CheckVAR1):</span>
+    <span class="s1">results_path = os.path.join(</span>
+        <span class="s1">current_path</span><span class="s2">, </span><span class="s3">'results'</span><span class="s2">, </span><span class="s3">'results_exact_initial_var1_R.csv'</span><span class="s1">)</span>
+
+
+<span class="s4"># - VAR(1) + Measurement error -----------------------------------------------</span>
+
+
+<span class="s2">class </span><span class="s1">CheckVAR1MeasurementError(CheckVAR1):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">kwargs[</span><span class="s3">'measurement_error'</span><span class="s1">] = </span><span class="s2">True</span>
+        <span class="s1">super(CheckVAR1MeasurementError</span><span class="s2">, </span><span class="s1">cls).setup_class(**kwargs)</span>
+
+
+<span class="s2">class </span><span class="s1">TestVAR1MeasurementError_Approx(CheckApproximateDiffuseMixin</span><span class="s2">,</span>
+                                      <span class="s1">CheckVAR1MeasurementError):</span>
+    <span class="s4"># Note: somewhat fragile, we need to increase the approximate variance to</span>
+    <span class="s4"># 1e9 for the tests to pass at the appropriate level of precision, but</span>
+    <span class="s4"># we cannot increase too much more than this because then we start get</span>
+    <span class="s4"># numerical errors (e.g. 1e10 is fine but 1e11 does not pass)</span>
+    <span class="s1">approximate_diffuse_variance = </span><span class="s5">1e9</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_measurement_disturbance_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># Note: this test would fail here with most rtol, because</span>
+        <span class="s4"># this is an example where the numerical errors associated with the</span>
+        <span class="s4"># approximate method result in noticeable errors</span>
+        <span class="s4"># term: (x is the exact method, y is the approximate method)</span>
+        <span class="s4"># x: array([[[3.355072, 0.      ],</span>
+        <span class="s4">#            [0.      , 4.221227]]])</span>
+        <span class="s4"># y: array([[[ 3.355072, -0.600856],</span>
+        <span class="s4">#            [-0.600856,  4.221227]]])</span>
+        <span class="s1">super(TestVAR1MeasurementError_Approx</span><span class="s2">,</span>
+              <span class="s1">self).test_smoothed_measurement_disturbance_cov(</span>
+                <span class="s1">rtol_diffuse=rtol_diffuse)</span>
+
+
+<span class="s2">class </span><span class="s1">TestVAR1MeasurementError_KFAS(CheckKFASMixin</span><span class="s2">, </span><span class="s1">CheckVAR1MeasurementError):</span>
+    <span class="s1">results_path = os.path.join(</span>
+        <span class="s1">current_path</span><span class="s2">, </span><span class="s3">'results'</span><span class="s2">,</span>
+        <span class="s3">'results_exact_initial_var1_measurement_error_R.csv'</span><span class="s1">)</span>
+
+
+<span class="s4"># - VAR(1) + Missing data ----------------------------------------------------</span>
+
+
+<span class="s2">class </span><span class="s1">CheckVAR1Missing(CheckVAR1):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">levels = macrodata[[</span><span class="s3">'realgdp'</span><span class="s2">, </span><span class="s3">'realcons'</span><span class="s1">]]</span>
+        <span class="s1">endog = np.log(levels).iloc[:</span><span class="s5">21</span><span class="s1">].diff().iloc[</span><span class="s5">1</span><span class="s1">:] * </span><span class="s5">400</span>
+        <span class="s1">endog.iloc[</span><span class="s5">0</span><span class="s1">:</span><span class="s5">5</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = np.nan</span>
+        <span class="s1">endog.iloc[</span><span class="s5">8</span><span class="s1">:</span><span class="s5">12</span><span class="s2">, </span><span class="s1">:] = np.nan</span>
+        <span class="s1">kwargs[</span><span class="s3">'endog'</span><span class="s1">] = endog</span>
+
+        <span class="s1">super(CheckVAR1Missing</span><span class="s2">, </span><span class="s1">cls).setup_class(**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_nobs_diffuse(self):</span>
+        <span class="s1">assert_allclose(self.d</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestVAR1Missing_Approx(CheckApproximateDiffuseMixin</span><span class="s2">, </span><span class="s1">CheckVAR1Missing):</span>
+    <span class="s4"># Note: somewhat fragile, we need to increase the approximate variance to</span>
+    <span class="s4"># 1e10 for the tests to pass at the appropriate level of precision, but</span>
+    <span class="s4"># we cannot increase it any more than this because then we start get</span>
+    <span class="s4"># numerical errors (e.g. 1e11 does not pass)</span>
+    <span class="s1">approximate_diffuse_variance = </span><span class="s5">1e10</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state_cov(self</span><span class="s2">, </span><span class="s1">rtol_diffuse=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s4"># Note: this test would fail here with essentially any rtol, because</span>
+        <span class="s4"># this is an example where the numerical errors associated with the</span>
+        <span class="s4"># approximate method result in extreme errors: here a negative variance</span>
+        <span class="s4"># term: (x is the exact method, y is the approximate method)</span>
+        <span class="s4"># x: array([[[ 5.601218e+01,  0.000000e+00],</span>
+        <span class="s4">#            [ 0.000000e+00,  0.000000e+00]],</span>
+        <span class="s4"># ...</span>
+        <span class="s4"># y: array([[[-12.083676,   0.      ],</span>
+        <span class="s4">#            [  0.      ,   0.      ]],</span>
+        <span class="s1">super(TestVAR1Missing_Approx</span><span class="s2">, </span><span class="s1">self).test_smoothed_state_cov(</span>
+            <span class="s1">rtol_diffuse=rtol_diffuse)</span>
+
+
+<span class="s2">class </span><span class="s1">TestVAR1Missing_KFAS(CheckKFASMixin</span><span class="s2">, </span><span class="s1">CheckVAR1Missing):</span>
+    <span class="s1">results_path = os.path.join(</span>
+        <span class="s1">current_path</span><span class="s2">, </span><span class="s3">'results'</span><span class="s2">, </span><span class="s3">'results_exact_initial_var1_missing_R.csv'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_forecasts_error_cov(self):</span>
+        <span class="s4"># TODO: fails for the general version of forecasts_error_cov because</span>
+        <span class="s4"># (1) the routines in kalman_filter.py fill in values for all variables</span>
+        <span class="s4"># regardless of missing status and also it uses the multivariate</span>
+        <span class="s4"># approach rather than the univariate approach, and (2) KFAS fills in</span>
+        <span class="s4"># values for all variables regardless of missing status (but does use</span>
+        <span class="s4"># the univariate method).</span>
+        <span class="s4"># Here we remove the off-diagonal elements so that the test passes (but</span>
+        <span class="s4"># note that this is **not** a general solution since it depends on</span>
+        <span class="s4"># which variables are missing).</span>
+        <span class="s1">bak = self.results_a.forecasts_error_cov[:]</span>
+        <span class="s1">self.results_a.forecasts_error_cov[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s1">:] = </span><span class="s5">0</span>
+        <span class="s1">self.results_a.forecasts_error_cov[</span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s2">, </span><span class="s1">:] = </span><span class="s5">0</span>
+        <span class="s1">super(TestVAR1Missing_KFAS</span><span class="s2">, </span><span class="s1">self).test_forecasts_error_cov()</span>
+        <span class="s1">self.results_a.forecasts_error_cov = bak</span>
+
+
+<span class="s4"># - VAR(1) + Mixed stationary / diffuse initialization -----------------------</span>
+
+
+<span class="s2">class </span><span class="s1">CheckVAR1Mixed(CheckVAR1):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">k_states = </span><span class="s5">2</span>
+
+        <span class="s1">init = Initialization(k_states)</span>
+        <span class="s1">init.set(</span><span class="s5">0</span><span class="s2">, </span><span class="s3">'diffuse'</span><span class="s1">)</span>
+        <span class="s1">init.set(</span><span class="s5">1</span><span class="s2">, </span><span class="s3">'stationary'</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">kwargs.pop(</span><span class="s3">'approx'</span><span class="s2">, False</span><span class="s1">):</span>
+            <span class="s1">init_approx = Initialization(k_states)</span>
+            <span class="s1">init_approx.set(</span><span class="s5">0</span><span class="s2">, </span><span class="s3">'approximate_diffuse'</span><span class="s1">)</span>
+            <span class="s1">init_approx.set(</span><span class="s5">1</span><span class="s2">, </span><span class="s3">'stationary'</span><span class="s1">)</span>
+            <span class="s1">kwargs[</span><span class="s3">'init_approx'</span><span class="s1">] = init_approx</span>
+
+        <span class="s1">super(CheckVAR1Mixed</span><span class="s2">, </span><span class="s1">cls).setup_class(init=init</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_nobs_diffuse(self):</span>
+        <span class="s1">assert_allclose(self.d</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_initialization(self):</span>
+        <span class="s1">stationary_init = </span><span class="s5">3.5714285714285716</span>
+        <span class="s1">assert_allclose(self.results_a.initial_state_cov</span><span class="s2">,</span>
+                        <span class="s1">np.diag([</span><span class="s5">0</span><span class="s2">, </span><span class="s1">stationary_init]))</span>
+        <span class="s1">assert_allclose(self.results_a.initial_diffuse_state_cov</span><span class="s2">,</span>
+                        <span class="s1">np.diag([</span><span class="s5">1</span><span class="s2">, </span><span class="s5">0</span><span class="s1">]))</span>
+
+
+<span class="s2">class </span><span class="s1">TestVAR1Mixed_Approx(CheckVAR1Mixed</span><span class="s2">, </span><span class="s1">CheckApproximateDiffuseMixin</span><span class="s2">,</span>
+                           <span class="s1">CheckVAR1):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">kwargs[</span><span class="s3">'approx'</span><span class="s1">] = </span><span class="s2">True</span>
+        <span class="s1">super(TestVAR1Mixed_Approx</span><span class="s2">, </span><span class="s1">cls).setup_class(**kwargs)</span>
+
+    <span class="s2">def </span><span class="s1">test_initialization_approx(self):</span>
+        <span class="s1">stationary_init = </span><span class="s5">3.5714285714285716</span>
+        <span class="s1">kappa = self.approximate_diffuse_variance</span>
+        <span class="s1">assert_allclose(self.results_b.initial_state_cov</span><span class="s2">,</span>
+                        <span class="s1">np.diag([kappa</span><span class="s2">, </span><span class="s1">stationary_init]))</span>
+        <span class="s1">assert_equal(self.results_b.initial_diffuse_state_cov</span><span class="s2">, None</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">TestVAR1Mixed_KFAS(CheckVAR1Mixed</span><span class="s2">, </span><span class="s1">CheckKFASMixin</span><span class="s2">, </span><span class="s1">CheckVAR1):</span>
+    <span class="s4"># TODO: fails</span>
+    <span class="s1">results_path = os.path.join(</span>
+        <span class="s1">current_path</span><span class="s2">, </span><span class="s3">'results'</span><span class="s2">, </span><span class="s3">'results_exact_initial_var1_mixed_R.csv'</span><span class="s1">)</span>
+
+    <span class="s4"># TODO: KFAS disagrees for the diffuse observations for all of these</span>
+    <span class="s4"># states, but it appears that they have a bug (e.g. since the approximate</span>
+    <span class="s4"># diffuse case agrees with us), so we should double-check against a third</span>
+    <span class="s4"># package (RATS?)</span>
+    <span class="s2">def </span><span class="s1">test_predicted_state(self):</span>
+        <span class="s1">super(TestVAR1Mixed_KFAS</span><span class="s2">, </span><span class="s1">self).test_predicted_state(</span>
+            <span class="s1">rtol_diffuse=np.inf)</span>
+
+    <span class="s2">def </span><span class="s1">test_filtered_state(self):</span>
+        <span class="s1">super(TestVAR1Mixed_KFAS</span><span class="s2">, </span><span class="s1">self).test_filtered_state(</span>
+            <span class="s1">rtol_diffuse=np.inf)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state(self):</span>
+        <span class="s1">super(TestVAR1Mixed_KFAS</span><span class="s2">, </span><span class="s1">self).test_smoothed_state(</span>
+            <span class="s1">rtol_diffuse=np.inf)</span>
+
+
+<span class="s4"># - DFM ----------------------------------------------------------------------</span>
+
+<span class="s2">class </span><span class="s1">CheckDFM(CheckSSMResults):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">filter_univariate = kwargs.pop(</span><span class="s3">'filter_univariate'</span><span class="s2">, False</span><span class="s1">)</span>
+        <span class="s1">cls.mod</span><span class="s2">, </span><span class="s1">cls.ssm = model_dfm(**kwargs)</span>
+        <span class="s2">if </span><span class="s1">filter_univariate:</span>
+            <span class="s1">cls.ssm.filter_univariate = </span><span class="s2">True</span>
+        <span class="s1">cls.results_a = cls.ssm.smooth()</span>
+        <span class="s1">cls.d = cls.results_a.nobs_diffuse</span>
+
+    <span class="s2">def </span><span class="s1">test_nobs_diffuse(self):</span>
+        <span class="s1">assert_allclose(self.d</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_initialization(self):</span>
+        <span class="s1">assert_allclose(self.results_a.initial_state_cov</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_allclose(self.results_a.initial_diffuse_state_cov</span><span class="s2">, </span><span class="s1">np.eye(</span><span class="s5">2</span><span class="s1">))</span>
+
+
+<span class="s2">class </span><span class="s1">TestDFM_Approx(CheckApproximateDiffuseMixin</span><span class="s2">, </span><span class="s1">CheckDFM):</span>
+    <span class="s4"># Note: somewhat fragile, we need to increase the approximate variance to</span>
+    <span class="s4"># 5e10 for the tests to pass at the appropriate level of precision, but</span>
+    <span class="s4"># we cannot increase it too much more than this because then we start get</span>
+    <span class="s4"># numerical errors (e.g. 1e11 works but 1e12 does not pass)</span>
+    <span class="s1">approximate_diffuse_variance = </span><span class="s5">5e10</span>
+
+
+<span class="s2">class </span><span class="s1">TestDFM_KFAS(CheckKFASMixin</span><span class="s2">, </span><span class="s1">CheckDFM):</span>
+    <span class="s1">results_path = os.path.join(</span>
+        <span class="s1">current_path</span><span class="s2">, </span><span class="s3">'results'</span><span class="s2">, </span><span class="s3">'results_exact_initial_dfm_R.csv'</span><span class="s1">)</span>
+
+    <span class="s4"># TODO: KFAS disagrees for the diffuse observations for all of these</span>
+    <span class="s4"># states, but it appears that they have a bug (e.g. since the approximate</span>
+    <span class="s4"># diffuse case agrees with us), so we should double-check against a third</span>
+    <span class="s4"># package (RATS?)</span>
+    <span class="s2">def </span><span class="s1">test_predicted_state(self):</span>
+        <span class="s1">super(TestDFM_KFAS</span><span class="s2">, </span><span class="s1">self).test_predicted_state(rtol_diffuse=np.inf)</span>
+
+    <span class="s2">def </span><span class="s1">test_filtered_state(self):</span>
+        <span class="s1">super(TestDFM_KFAS</span><span class="s2">, </span><span class="s1">self).test_filtered_state(rtol_diffuse=np.inf)</span>
+
+    <span class="s2">def </span><span class="s1">test_smoothed_state(self):</span>
+        <span class="s1">super(TestDFM_KFAS</span><span class="s2">, </span><span class="s1">self).test_smoothed_state(rtol_diffuse=np.inf)</span>
+
+
+<span class="s4"># - DFM + Collapsed ----------------------------------------------------------</span>
+
+<span class="s2">class </span><span class="s1">CheckDFMCollapsed(CheckSSMResults):</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">setup_class(cls</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">filter_univariate = kwargs.pop(</span><span class="s3">'filter_univariate'</span><span class="s2">, True</span><span class="s1">)</span>
+        <span class="s1">cls.mod</span><span class="s2">, </span><span class="s1">cls.ssm = model_dfm(factor_order=</span><span class="s5">1</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s2">if </span><span class="s1">filter_univariate:</span>
+            <span class="s1">cls.ssm.filter_univariate = </span><span class="s2">True</span>
+        <span class="s1">cls.ssm.filter_collapsed = </span><span class="s2">True</span>
+        <span class="s1">cls.results_a = cls.ssm.smooth()</span>
+        <span class="s1">cls.d = cls.results_a.nobs_diffuse</span>
+
+    <span class="s2">def </span><span class="s1">test_nobs_diffuse(self):</span>
+        <span class="s1">assert_allclose(self.d</span><span class="s2">, </span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">test_initialization(self):</span>
+        <span class="s1">assert_allclose(self.results_a.initial_state_cov</span><span class="s2">, </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s1">assert_allclose(self.results_a.initial_diffuse_state_cov</span><span class="s2">, </span><span class="s1">np.eye(</span><span class="s5">1</span><span class="s1">))</span>
+
+
+<span class="s2">class </span><span class="s1">TestDFMCollapsed_Approx(CheckApproximateDiffuseMixin</span><span class="s2">, </span><span class="s1">CheckDFMCollapsed):</span>
+    <span class="s4"># Note: somewhat fragile, we need to increase the approximate variance to</span>
+    <span class="s4"># 1e9 for the tests to pass at the appropriate level of precision, but</span>
+    <span class="s4"># we cannot increase it too much more than this because then we start get</span>
+    <span class="s4"># numerical errors (e.g. 1e10 does not pass)</span>
+    <span class="s1">approximate_diffuse_variance = </span><span class="s5">1e9</span>
+
+
+<span class="s4"># FIXME: do not leave this commented-out</span>
+<span class="s4"># Note: we cannot test against KFAS, since it does not support collapsed</span>
+<span class="s4"># filtering</span>
+<span class="s4"># class TestDFMCollapsed_KFAS(CheckKFASMixin, TestDFMCollapsed):</span>
+<span class="s4">#     results_path = os.path.join(</span>
+<span class="s4">#         current_path, 'results', '')</span>
+
+<span class="s4"># - TODO: additional tests ---------------------------------------------------</span>
+<span class="s4"># - Local level model, above</span>
+<span class="s4"># - Local linear trend model, above</span>
+<span class="s4"># - Common level model, above</span>
+<span class="s4"># - multivariate test with non-diagonal observation covariance matrix</span>
+<span class="s4"># - simulation smoother</span>
+
+
+<span class="s1">@pytest.mark.xfail</span>
+<span class="s2">def </span><span class="s1">test_irrelevant_state():</span>
+    <span class="s4"># This test records a case in which exact diffuse initialization leads to</span>
+    <span class="s4"># numerical problems, because the existence of an irrelevant state</span>
+    <span class="s4"># initialized as diffuse means that there is never a transition to the</span>
+    <span class="s4"># usual Kalman filter.</span>
+    <span class="s1">endog = macrodata.infl</span>
+
+    <span class="s1">spec = {</span>
+        <span class="s3">'freq_seasonal'</span><span class="s1">: [{</span><span class="s3">'period'</span><span class="s1">: </span><span class="s5">8</span><span class="s2">, </span><span class="s3">'harmonics'</span><span class="s1">: </span><span class="s5">6</span><span class="s1">}</span><span class="s2">,</span>
+                          <span class="s1">{</span><span class="s3">'period'</span><span class="s1">: </span><span class="s5">36</span><span class="s2">, </span><span class="s3">'harmonics'</span><span class="s1">: </span><span class="s5">6</span><span class="s1">}]</span>
+    <span class="s1">}</span>
+
+    <span class="s4"># Approximate diffuse version</span>
+    <span class="s1">mod = UnobservedComponents(endog</span><span class="s2">, </span><span class="s3">'llevel'</span><span class="s2">, </span><span class="s1">**spec)</span>
+    <span class="s1">mod.ssm.initialization = Initialization(mod.k_states</span><span class="s2">,</span>
+                                            <span class="s3">'approximate_diffuse'</span><span class="s1">)</span>
+    <span class="s1">res = mod.smooth([</span><span class="s5">3.4</span><span class="s2">, </span><span class="s5">7.2</span><span class="s2">, </span><span class="s5">0.01</span><span class="s2">, </span><span class="s5">0.01</span><span class="s1">])</span>
+
+    <span class="s4"># Exact diffuse version</span>
+    <span class="s1">mod2 = UnobservedComponents(endog</span><span class="s2">, </span><span class="s3">'llevel'</span><span class="s2">, </span><span class="s1">**spec)</span>
+    <span class="s1">mod2.ssm.filter_univariate = </span><span class="s2">True</span>
+    <span class="s1">mod2.ssm.initialization = Initialization(mod2.k_states</span><span class="s2">, </span><span class="s3">'diffuse'</span><span class="s1">)</span>
+    <span class="s1">res2 = mod2.smooth([</span><span class="s5">3.4</span><span class="s2">, </span><span class="s5">7.2</span><span class="s2">, </span><span class="s5">0.01</span><span class="s2">, </span><span class="s5">0.01</span><span class="s1">])</span>
+
+    <span class="s4"># Check that e.g. the filtered state for the level is equal</span>
+    <span class="s1">assert_allclose(res.filtered_state[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">25</span><span class="s1">:]</span><span class="s2">,</span>
+                    <span class="s1">res2.filtered_state[</span><span class="s5">0</span><span class="s2">, </span><span class="s5">25</span><span class="s1">:]</span><span class="s2">, </span><span class="s1">atol=</span><span class="s5">1e-5</span><span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">test_nondiagonal_obs_cov(reset_randomstate):</span>
+    <span class="s4"># All diffuse handling is done using the univariate filtering approach,</span>
+    <span class="s4"># even if the usual multivariate filtering method is being used for the</span>
+    <span class="s4"># other periods. This means that if the observation covariance matrix is</span>
+    <span class="s4"># not a diagonal matrix during the diffuse periods, we need to transform</span>
+    <span class="s4"># the observation equation as we would if we were using the univariate</span>
+    <span class="s4"># filter.</span>
+
+    <span class="s1">mod = TVSS(np.zeros((</span><span class="s5">10</span><span class="s2">, </span><span class="s5">2</span><span class="s1">)))</span>
+    <span class="s1">res1 = mod.smooth([])</span>
+    <span class="s1">mod.ssm.filter_univariate = </span><span class="s2">True</span>
+    <span class="s1">res2 = mod.smooth([])</span>
+
+    <span class="s1">atol = </span><span class="s5">0.002 </span><span class="s2">if </span><span class="s1">PLATFORM_WIN </span><span class="s2">else </span><span class="s5">1e-5</span>
+    <span class="s1">rtol = </span><span class="s5">0.002 </span><span class="s2">if </span><span class="s1">PLATFORM_WIN </span><span class="s2">else </span><span class="s5">1e-4</span>
+    <span class="s4"># Here we'll just test a few values</span>
+    <span class="s1">assert_allclose(res1.llf</span><span class="s2">, </span><span class="s1">res2.llf</span><span class="s2">, </span><span class="s1">rtol=rtol</span><span class="s2">, </span><span class="s1">atol=atol)</span>
+    <span class="s1">assert_allclose(res1.forecasts[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">res2.forecasts[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">,</span>
+                    <span class="s1">rtol=rtol</span><span class="s2">, </span><span class="s1">atol=atol)</span>
+    <span class="s1">assert_allclose(res1.filtered_state</span><span class="s2">, </span><span class="s1">res2.filtered_state</span><span class="s2">,</span>
+                    <span class="s1">rtol=rtol</span><span class="s2">, </span><span class="s1">atol=atol)</span>
+    <span class="s1">assert_allclose(res1.filtered_state_cov</span><span class="s2">, </span><span class="s1">res2.filtered_state_cov</span><span class="s2">,</span>
+                    <span class="s1">rtol=rtol</span><span class="s2">, </span><span class="s1">atol=atol)</span>
+    <span class="s1">assert_allclose(res1.smoothed_state</span><span class="s2">, </span><span class="s1">res2.smoothed_state</span><span class="s2">,</span>
+                    <span class="s1">rtol=rtol</span><span class="s2">, </span><span class="s1">atol=atol)</span>
+    <span class="s1">assert_allclose(res1.smoothed_state_cov</span><span class="s2">, </span><span class="s1">res2.smoothed_state_cov</span><span class="s2">,</span>
+                    <span class="s1">rtol=rtol</span><span class="s2">, </span><span class="s1">atol=atol)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,321 @@
+<html>
+<head>
+<title>fft.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+fft.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">inspect</span>
+<span class="s0">from </span><span class="s1">collections.abc </span><span class="s0">import </span><span class="s1">Sequence</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">try</span><span class="s1">:</span>
+    <span class="s0">import </span><span class="s1">scipy</span>
+    <span class="s0">import </span><span class="s1">scipy.fftpack</span>
+<span class="s0">except </span><span class="s1">ImportError:</span>
+    <span class="s1">scipy = </span><span class="s0">None</span>
+
+<span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">asarray</span>
+<span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">concatenate </span><span class="s0">as </span><span class="s1">_concatenate</span>
+<span class="s0">from </span><span class="s1">dask.array.creation </span><span class="s0">import </span><span class="s1">arange </span><span class="s0">as </span><span class="s1">_arange</span>
+<span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">derived_from</span><span class="s0">, </span><span class="s1">skip_doctest</span>
+
+<span class="s1">chunk_error = (</span>
+    <span class="s2">&quot;Dask array only supports taking an FFT along an axis that </span><span class="s0">\n</span><span class="s2">&quot;</span>
+    <span class="s2">&quot;has a single chunk. An FFT operation was tried on axis %s </span><span class="s0">\n</span><span class="s2">&quot;</span>
+    <span class="s2">&quot;which has chunks %s. To change the array's chunks use &quot;</span>
+    <span class="s2">&quot;dask.Array.rechunk.&quot;</span>
+<span class="s1">)</span>
+
+<span class="s1">fft_preamble = </span><span class="s2">&quot;&quot;&quot; 
+    Wrapping of %s 
+ 
+    The axis along which the FFT is applied must have only one chunk. To change 
+    the array's chunking use dask.Array.rechunk. 
+ 
+    The %s docstring follows below: 
+ 
+    &quot;&quot;&quot;</span>
+
+
+<span class="s0">def </span><span class="s1">_fft_out_chunks(a</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">axes):</span>
+    <span class="s3">&quot;&quot;&quot;For computing the output chunks of [i]fft*&quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">s </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">a.chunks</span>
+    <span class="s1">chunks = list(a.chunks)</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">enumerate(axes):</span>
+        <span class="s1">chunks[axis] = (s[i]</span><span class="s0">,</span><span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">chunks</span>
+
+
+<span class="s0">def </span><span class="s1">_rfft_out_chunks(a</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">axes):</span>
+    <span class="s3">&quot;&quot;&quot;For computing the output chunks of rfft*&quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">s </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">s = [a.chunks[axis][</span><span class="s4">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">axes]</span>
+    <span class="s1">s = list(s)</span>
+    <span class="s1">s[-</span><span class="s4">1</span><span class="s1">] = s[-</span><span class="s4">1</span><span class="s1">] // </span><span class="s4">2 </span><span class="s1">+ </span><span class="s4">1</span>
+    <span class="s1">chunks = list(a.chunks)</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">enumerate(axes):</span>
+        <span class="s1">chunks[axis] = (s[i]</span><span class="s0">,</span><span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">chunks</span>
+
+
+<span class="s0">def </span><span class="s1">_irfft_out_chunks(a</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">axes):</span>
+    <span class="s3">&quot;&quot;&quot;For computing the output chunks of irfft*&quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">s </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">s = [a.chunks[axis][</span><span class="s4">0</span><span class="s1">] </span><span class="s0">for </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">axes]</span>
+        <span class="s1">s[-</span><span class="s4">1</span><span class="s1">] = </span><span class="s4">2 </span><span class="s1">* (s[-</span><span class="s4">1</span><span class="s1">] - </span><span class="s4">1</span><span class="s1">)</span>
+    <span class="s1">chunks = list(a.chunks)</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">axis </span><span class="s0">in </span><span class="s1">enumerate(axes):</span>
+        <span class="s1">chunks[axis] = (s[i]</span><span class="s0">,</span><span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">chunks</span>
+
+
+<span class="s0">def </span><span class="s1">_hfft_out_chunks(a</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">axes):</span>
+    <span class="s0">assert </span><span class="s1">len(axes) == </span><span class="s4">1</span>
+
+    <span class="s1">axis = axes[</span><span class="s4">0</span><span class="s1">]</span>
+
+    <span class="s0">if </span><span class="s1">s </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">s = [</span><span class="s4">2 </span><span class="s1">* (a.chunks[axis][</span><span class="s4">0</span><span class="s1">] - </span><span class="s4">1</span><span class="s1">)]</span>
+
+    <span class="s1">n = s[</span><span class="s4">0</span><span class="s1">]</span>
+
+    <span class="s1">chunks = list(a.chunks)</span>
+    <span class="s1">chunks[axis] = (n</span><span class="s0">,</span><span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">chunks</span>
+
+
+<span class="s0">def </span><span class="s1">_ihfft_out_chunks(a</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">axes):</span>
+    <span class="s0">assert </span><span class="s1">len(axes) == </span><span class="s4">1</span>
+
+    <span class="s1">axis = axes[</span><span class="s4">0</span><span class="s1">]</span>
+
+    <span class="s0">if </span><span class="s1">s </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">s = [a.chunks[axis][</span><span class="s4">0</span><span class="s1">]]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">assert </span><span class="s1">len(s) == </span><span class="s4">1</span>
+
+    <span class="s1">n = s[</span><span class="s4">0</span><span class="s1">]</span>
+
+    <span class="s1">chunks = list(a.chunks)</span>
+    <span class="s0">if </span><span class="s1">n % </span><span class="s4">2 </span><span class="s1">== </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s1">m = (n // </span><span class="s4">2</span><span class="s1">) + </span><span class="s4">1</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">m = (n + </span><span class="s4">1</span><span class="s1">) // </span><span class="s4">2</span>
+    <span class="s1">chunks[axis] = (m</span><span class="s0">,</span><span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">chunks</span>
+
+
+<span class="s1">_out_chunk_fns = {</span>
+    <span class="s2">&quot;fft&quot;</span><span class="s1">: _fft_out_chunks</span><span class="s0">,</span>
+    <span class="s2">&quot;ifft&quot;</span><span class="s1">: _fft_out_chunks</span><span class="s0">,</span>
+    <span class="s2">&quot;rfft&quot;</span><span class="s1">: _rfft_out_chunks</span><span class="s0">,</span>
+    <span class="s2">&quot;irfft&quot;</span><span class="s1">: _irfft_out_chunks</span><span class="s0">,</span>
+    <span class="s2">&quot;hfft&quot;</span><span class="s1">: _hfft_out_chunks</span><span class="s0">,</span>
+    <span class="s2">&quot;ihfft&quot;</span><span class="s1">: _ihfft_out_chunks</span><span class="s0">,</span>
+<span class="s1">}</span>
+
+
+<span class="s0">def </span><span class="s1">fft_wrap(fft_func</span><span class="s0">, </span><span class="s1">kind=</span><span class="s0">None, </span><span class="s1">dtype=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Wrap 1D, 2D, and ND real and complex FFT functions 
+ 
+    Takes a function that behaves like ``numpy.fft`` functions and 
+    a specified kind to match it to that are named after the functions 
+    in the ``numpy.fft`` API. 
+ 
+    Supported kinds include: 
+ 
+        * fft 
+        * fft2 
+        * fftn 
+        * ifft 
+        * ifft2 
+        * ifftn 
+        * rfft 
+        * rfft2 
+        * rfftn 
+        * irfft 
+        * irfft2 
+        * irfftn 
+        * hfft 
+        * ihfft 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import dask.array.fft as dff 
+    &gt;&gt;&gt; parallel_fft = dff.fft_wrap(np.fft.fft) 
+    &gt;&gt;&gt; parallel_ifft = dff.fft_wrap(np.fft.ifft) 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">scipy </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">fft_func </span><span class="s0">is </span><span class="s1">scipy.fftpack.rfft:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;SciPy's `rfft` doesn't match the NumPy API.&quot;</span><span class="s1">)</span>
+        <span class="s0">elif </span><span class="s1">fft_func </span><span class="s0">is </span><span class="s1">scipy.fftpack.irfft:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;SciPy's `irfft` doesn't match the NumPy API.&quot;</span><span class="s1">)</span>
+
+    <span class="s0">if </span><span class="s1">kind </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">kind = fft_func.__name__</span>
+    <span class="s0">try</span><span class="s1">:</span>
+        <span class="s1">out_chunk_fn = _out_chunk_fns[kind.rstrip(</span><span class="s2">&quot;2n&quot;</span><span class="s1">)]</span>
+    <span class="s0">except </span><span class="s1">KeyError:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Given unknown `kind` %s.&quot; </span><span class="s1">% kind)</span>
+
+    <span class="s0">def </span><span class="s1">func(a</span><span class="s0">, </span><span class="s1">s=</span><span class="s0">None, </span><span class="s1">axes=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s1">a = asarray(a)</span>
+        <span class="s0">if </span><span class="s1">axes </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">kind.endswith(</span><span class="s2">&quot;2&quot;</span><span class="s1">):</span>
+                <span class="s1">axes = (-</span><span class="s4">2</span><span class="s0">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s0">elif </span><span class="s1">kind.endswith(</span><span class="s2">&quot;n&quot;</span><span class="s1">):</span>
+                <span class="s0">if </span><span class="s1">s </span><span class="s0">is None</span><span class="s1">:</span>
+                    <span class="s1">axes = tuple(range(a.ndim))</span>
+                <span class="s0">else</span><span class="s1">:</span>
+                    <span class="s1">axes = tuple(range(len(s)))</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">axes = (-</span><span class="s4">1</span><span class="s0">,</span><span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">len(set(axes)) &lt; len(axes):</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Duplicate axes not allowed.&quot;</span><span class="s1">)</span>
+
+        <span class="s1">_dtype = dtype</span>
+        <span class="s0">if </span><span class="s1">_dtype </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">sample = np.ones(a.ndim * (</span><span class="s4">8</span><span class="s0">,</span><span class="s1">)</span><span class="s0">, </span><span class="s1">dtype=a.dtype)</span>
+            <span class="s0">try</span><span class="s1">:</span>
+                <span class="s1">_dtype = fft_func(sample</span><span class="s0">, </span><span class="s1">axes=axes).dtype</span>
+            <span class="s0">except </span><span class="s1">TypeError:</span>
+                <span class="s1">_dtype = fft_func(sample).dtype</span>
+
+        <span class="s0">for </span><span class="s1">each_axis </span><span class="s0">in </span><span class="s1">axes:</span>
+            <span class="s0">if </span><span class="s1">len(a.chunks[each_axis]) != </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(chunk_error % (each_axis</span><span class="s0">, </span><span class="s1">a.chunks[each_axis]))</span>
+
+        <span class="s1">chunks = out_chunk_fn(a</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">axes)</span>
+
+        <span class="s1">args = (s</span><span class="s0">, </span><span class="s1">axes)</span>
+        <span class="s0">if </span><span class="s1">kind.endswith(</span><span class="s2">&quot;fft&quot;</span><span class="s1">):</span>
+            <span class="s1">axis = </span><span class="s0">None if </span><span class="s1">axes </span><span class="s0">is None else </span><span class="s1">axes[</span><span class="s4">0</span><span class="s1">]</span>
+            <span class="s1">n = </span><span class="s0">None if </span><span class="s1">s </span><span class="s0">is None else </span><span class="s1">s[</span><span class="s4">0</span><span class="s1">]</span>
+            <span class="s1">args = (n</span><span class="s0">, </span><span class="s1">axis)</span>
+
+        <span class="s0">return </span><span class="s1">a.map_blocks(fft_func</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">dtype=_dtype</span><span class="s0">, </span><span class="s1">chunks=chunks)</span>
+
+    <span class="s0">if </span><span class="s1">kind.endswith(</span><span class="s2">&quot;fft&quot;</span><span class="s1">):</span>
+        <span class="s1">_func = func</span>
+
+        <span class="s0">def </span><span class="s1">func(a</span><span class="s0">, </span><span class="s1">n=</span><span class="s0">None, </span><span class="s1">axis=</span><span class="s0">None</span><span class="s1">):</span>
+            <span class="s1">s = </span><span class="s0">None</span>
+            <span class="s0">if </span><span class="s1">n </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">s = (n</span><span class="s0">,</span><span class="s1">)</span>
+
+            <span class="s1">axes = </span><span class="s0">None</span>
+            <span class="s0">if </span><span class="s1">axis </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">axes = (axis</span><span class="s0">,</span><span class="s1">)</span>
+
+            <span class="s0">return </span><span class="s1">_func(a</span><span class="s0">, </span><span class="s1">s</span><span class="s0">, </span><span class="s1">axes)</span>
+
+    <span class="s1">func_mod = inspect.getmodule(fft_func)</span>
+    <span class="s1">func_name = fft_func.__name__</span>
+    <span class="s1">func_fullname = func_mod.__name__ + </span><span class="s2">&quot;.&quot; </span><span class="s1">+ func_name</span>
+    <span class="s0">if </span><span class="s1">fft_func.__doc__ </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s1">func.__doc__ = fft_preamble % (</span><span class="s4">2 </span><span class="s1">* (func_fullname</span><span class="s0">,</span><span class="s1">))</span>
+        <span class="s1">func.__doc__ += fft_func.__doc__</span>
+        <span class="s1">func.__doc__ = skip_doctest(func.__doc__)</span>
+    <span class="s1">func.__name__ = func_name</span>
+    <span class="s0">return </span><span class="s1">func</span>
+
+
+<span class="s1">fft = fft_wrap(np.fft.fft)</span>
+<span class="s1">fft2 = fft_wrap(np.fft.fft2)</span>
+<span class="s1">fftn = fft_wrap(np.fft.fftn)</span>
+<span class="s1">ifft = fft_wrap(np.fft.ifft)</span>
+<span class="s1">ifft2 = fft_wrap(np.fft.ifft2)</span>
+<span class="s1">ifftn = fft_wrap(np.fft.ifftn)</span>
+<span class="s1">rfft = fft_wrap(np.fft.rfft)</span>
+<span class="s1">rfft2 = fft_wrap(np.fft.rfft2)</span>
+<span class="s1">rfftn = fft_wrap(np.fft.rfftn)</span>
+<span class="s1">irfft = fft_wrap(np.fft.irfft)</span>
+<span class="s1">irfft2 = fft_wrap(np.fft.irfft2)</span>
+<span class="s1">irfftn = fft_wrap(np.fft.irfftn)</span>
+<span class="s1">hfft = fft_wrap(np.fft.hfft)</span>
+<span class="s1">ihfft = fft_wrap(np.fft.ihfft)</span>
+
+
+<span class="s0">def </span><span class="s1">_fftfreq_block(i</span><span class="s0">, </span><span class="s1">n</span><span class="s0">, </span><span class="s1">d):</span>
+    <span class="s1">r = i.copy()</span>
+    <span class="s1">r[i &gt;= (n + </span><span class="s4">1</span><span class="s1">) // </span><span class="s4">2</span><span class="s1">] -= n</span>
+    <span class="s1">r /= n * d</span>
+    <span class="s0">return </span><span class="s1">r</span>
+
+
+<span class="s1">@derived_from(np.fft)</span>
+<span class="s0">def </span><span class="s1">fftfreq(n</span><span class="s0">, </span><span class="s1">d=</span><span class="s4">1.0</span><span class="s0">, </span><span class="s1">chunks=</span><span class="s2">&quot;auto&quot;</span><span class="s1">):</span>
+    <span class="s1">n = int(n)</span>
+    <span class="s1">d = float(d)</span>
+
+    <span class="s1">r = _arange(n</span><span class="s0">, </span><span class="s1">dtype=float</span><span class="s0">, </span><span class="s1">chunks=chunks)</span>
+
+    <span class="s0">return </span><span class="s1">r.map_blocks(_fftfreq_block</span><span class="s0">, </span><span class="s1">dtype=float</span><span class="s0">, </span><span class="s1">n=n</span><span class="s0">, </span><span class="s1">d=d)</span>
+
+
+<span class="s1">@derived_from(np.fft)</span>
+<span class="s0">def </span><span class="s1">rfftfreq(n</span><span class="s0">, </span><span class="s1">d=</span><span class="s4">1.0</span><span class="s0">, </span><span class="s1">chunks=</span><span class="s2">&quot;auto&quot;</span><span class="s1">):</span>
+    <span class="s1">n = int(n)</span>
+    <span class="s1">d = float(d)</span>
+
+    <span class="s1">r = _arange(n // </span><span class="s4">2 </span><span class="s1">+ </span><span class="s4">1</span><span class="s0">, </span><span class="s1">dtype=float</span><span class="s0">, </span><span class="s1">chunks=chunks)</span>
+    <span class="s1">r /= n * d</span>
+
+    <span class="s0">return </span><span class="s1">r</span>
+
+
+<span class="s0">def </span><span class="s1">_fftshift_helper(x</span><span class="s0">, </span><span class="s1">axes=</span><span class="s0">None, </span><span class="s1">inverse=</span><span class="s0">False</span><span class="s1">):</span>
+    <span class="s0">if </span><span class="s1">axes </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">axes = list(range(x.ndim))</span>
+    <span class="s0">elif not </span><span class="s1">isinstance(axes</span><span class="s0">, </span><span class="s1">Sequence):</span>
+        <span class="s1">axes = (axes</span><span class="s0">,</span><span class="s1">)</span>
+
+    <span class="s1">y = x</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">axes:</span>
+        <span class="s1">n = y.shape[i]</span>
+        <span class="s1">n_2 = (n + int(inverse </span><span class="s0">is False</span><span class="s1">)) // </span><span class="s4">2</span>
+
+        <span class="s1">l = y.ndim * [slice(</span><span class="s0">None</span><span class="s1">)]</span>
+        <span class="s1">l[i] = slice(</span><span class="s0">None, </span><span class="s1">n_2)</span>
+        <span class="s1">l = tuple(l)</span>
+
+        <span class="s1">r = y.ndim * [slice(</span><span class="s0">None</span><span class="s1">)]</span>
+        <span class="s1">r[i] = slice(n_2</span><span class="s0">, None</span><span class="s1">)</span>
+        <span class="s1">r = tuple(r)</span>
+
+        <span class="s1">y = _concatenate([y[r]</span><span class="s0">, </span><span class="s1">y[l]]</span><span class="s0">, </span><span class="s1">axis=i)</span>
+
+        <span class="s0">if </span><span class="s1">len(x.chunks[i]) == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">y = y.rechunk({i: x.chunks[i]})</span>
+
+    <span class="s0">return </span><span class="s1">y</span>
+
+
+<span class="s1">@derived_from(np.fft)</span>
+<span class="s0">def </span><span class="s1">fftshift(x</span><span class="s0">, </span><span class="s1">axes=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s0">return </span><span class="s1">_fftshift_helper(x</span><span class="s0">, </span><span class="s1">axes=axes</span><span class="s0">, </span><span class="s1">inverse=</span><span class="s0">False</span><span class="s1">)</span>
+
+
+<span class="s1">@derived_from(np.fft)</span>
+<span class="s0">def </span><span class="s1">ifftshift(x</span><span class="s0">, </span><span class="s1">axes=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s0">return </span><span class="s1">_fftshift_helper(x</span><span class="s0">, </span><span class="s1">axes=axes</span><span class="s0">, </span><span class="s1">inverse=</span><span class="s0">True</span><span class="s1">)</span>
+</pre>
+</body>
+</html>

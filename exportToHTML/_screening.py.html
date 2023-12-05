@@ -1,0 +1,454 @@
+<html>
+<head>
+<title>_screening.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_screening.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+<span class="s2">&quot;&quot;&quot; 
+Created on Sat May 19 15:53:21 2018 
+ 
+Author: Josef Perktold 
+License: BSD-3 
+&quot;&quot;&quot;</span>
+
+<span class="s3">from </span><span class="s1">collections </span><span class="s3">import </span><span class="s1">defaultdict</span>
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+
+<span class="s3">from </span><span class="s1">statsmodels.base._penalties </span><span class="s3">import </span><span class="s1">SCADSmoothed</span>
+
+
+<span class="s3">class </span><span class="s1">ScreeningResults:</span>
+    <span class="s2">&quot;&quot;&quot;Results for Variable Screening 
+ 
+    Note: Indices except for exog_idx and in the iterated case also 
+    idx_nonzero_batches are based on the combined [exog_keep, exog] array. 
+ 
+    Attributes 
+    ---------- 
+    results_final : instance 
+        Results instance returned by the final fit of the penalized model, i.e. 
+        after trimming exog with params below trimming threshold. 
+    results_pen : results instance 
+        Results instance of the penalized model before trimming. This includes 
+        variables from the last forward selection 
+    idx_nonzero 
+        index of exog columns in the final selection including exog_keep 
+    idx_exog 
+        index of exog columns in the final selection for exog candidates, i.e. 
+        without exog_keep 
+    idx_excl 
+        idx of excluded exog based on combined [exog_keep, exog] array. This is 
+        the complement of idx_nonzero 
+    converged : bool 
+        True if the iteration has converged and stopped before maxiter has been 
+        reached. False if maxiter has been reached. 
+    iterations : int 
+        number of iterations in the screening process. Each iteration consists 
+        of a forward selection step and a trimming step. 
+    history : dict of lists 
+        results collected for each iteration during the screening process 
+        'idx_nonzero' 'params_keep'].append(start_params) 
+            history['idx_added'].append(idx) 
+ 
+    The ScreeningResults returned by `screen_exog_iterator` has additional 
+    attributes: 
+ 
+    idx_nonzero_batches : ndarray 2-D 
+        Two-dimensional array with batch index in the first column and variable 
+        index withing batch in the second column. They can be used jointly as 
+        index for the data in the exog_iterator. 
+    exog_final_names : list[str] 
+        'var&lt;bidx&gt;_&lt;idx&gt;' where `bidx` is the batch index and `idx` is the 
+        index of the selected column withing batch `bidx`. 
+    history_batches : dict of lists 
+        This provides information about the selected variables within each 
+        batch during the first round screening 
+        'idx_nonzero' is based ond the array that includes exog_keep, while 
+        'idx_exog' is the index based on the exog of the batch. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">screener</span><span class="s3">, </span><span class="s1">**kwds):</span>
+        <span class="s1">self.screener = screener</span>
+        <span class="s1">self.__dict__.update(**kwds)</span>
+
+
+<span class="s3">class </span><span class="s1">VariableScreening:</span>
+    <span class="s2">&quot;&quot;&quot;Ultra-high, conditional sure independence screening 
+ 
+    This is an adjusted version of Fan's sure independence screening. 
+ 
+    Parameters 
+    ---------- 
+    model : instance of penalizing model 
+        examples: GLMPenalized, PoissonPenalized and LogitPenalized. 
+        The attributes of the model instance `pen_weight` and `penal` will be 
+        ignored. 
+    pen_weight : None or float 
+        penalization weight use in SCAD penalized MLE 
+    k_add : int 
+        number of exog to add during expansion or forward selection 
+        see Notes section for tie handling 
+    k_max_add : int 
+        maximum number of variables to include during variable addition, i.e. 
+        forward selection. default is 30 
+    threshold_trim : float 
+        threshold for trimming parameters to zero, default is 1e-4 
+    k_max_included : int 
+        maximum total number of variables to include in model. 
+    ranking_attr : str 
+        This determines the result attribute or model method that is used for 
+        the ranking of exog to include. The availability of attributes depends 
+        on the model. 
+        Default is 'resid_pearson', 'model.score_factor' can be used in GLM. 
+    ranking_project : bool 
+        If ranking_project is True, then the exog candidates for inclusion are 
+        first projected on the already included exog before the computation 
+        of the ranking measure. This brings the ranking measure closer to 
+        the statistic of a score test for variable addition. 
+ 
+    Notes 
+    ----- 
+    Status: experimental, tested only on a limited set of models and 
+    with a limited set of model options. 
+ 
+    Tie handling: If there are ties at the decision threshold, then all those 
+    tied exog columns are treated in the same way. During forward selection 
+    all exog columns with the same boundary value are included. During 
+    elimination, the tied columns are not dropped. Consequently, if ties are 
+    present, then the number of included exog can be larger than specified 
+    by k_add, k_max_add and k_max_included. 
+ 
+    The screening algorithm works similar to step wise regression. Each 
+    iteration of the screening algorithm includes a forward selection step 
+    where variables are added to the model, and a backwards selection step 
+    where variables are removed. In contrast to step wise regression, we add 
+    a fixed number of variables at each forward selection step. The 
+    backwards selection step is based on SCAD penalized estimation and 
+    trimming of variables with estimated coefficients below a threshold. 
+    The tuning parameters can be used to adjust the number of variables to add 
+    and to include depending on the size of the dataset. 
+ 
+    There is currently no automatic tuning parameter selection. Candidate 
+    explanatory variables should be standardized or should be on a similar 
+    scale because penalization and trimming are based on the absolute values 
+    of the parameters. 
+ 
+ 
+    TODOs and current limitations: 
+ 
+    freq_weights are not supported in this. Candidate ranking uses 
+    moment condition with resid_pearson or others without freq_weights. 
+    pearson_resid: GLM resid_pearson does not include freq_weights. 
+ 
+    variable names: do we keep track of those? currently made-up names 
+ 
+    currently only supports numpy arrays, no exog type check or conversion 
+ 
+    currently only single columns are selected, no terms (multi column exog) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">model</span><span class="s3">, </span><span class="s1">pen_weight=</span><span class="s3">None, </span><span class="s1">use_weights=</span><span class="s3">True, </span><span class="s1">k_add=</span><span class="s4">30</span><span class="s3">,</span>
+                 <span class="s1">k_max_add=</span><span class="s4">30</span><span class="s3">, </span><span class="s1">threshold_trim=</span><span class="s4">1e-4</span><span class="s3">, </span><span class="s1">k_max_included=</span><span class="s4">20</span><span class="s3">,</span>
+                 <span class="s1">ranking_attr=</span><span class="s5">'resid_pearson'</span><span class="s3">, </span><span class="s1">ranking_project=</span><span class="s3">True</span><span class="s1">):</span>
+
+        <span class="s1">self.model = model</span>
+        <span class="s1">self.model_class = model.__class__</span>
+        <span class="s1">self.init_kwds = model._get_init_kwds()</span>
+        <span class="s0"># pen_weight and penal are explicitly included</span>
+        <span class="s0"># TODO: check what we want to do here</span>
+        <span class="s1">self.init_kwds.pop(</span><span class="s5">'pen_weight'</span><span class="s3">, None</span><span class="s1">)</span>
+        <span class="s1">self.init_kwds.pop(</span><span class="s5">'penal'</span><span class="s3">, None</span><span class="s1">)</span>
+
+        <span class="s1">self.endog = model.endog</span>
+        <span class="s1">self.exog_keep = model.exog</span>
+        <span class="s1">self.k_keep = model.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">self.nobs = len(self.endog)</span>
+        <span class="s1">self.penal = self._get_penal()</span>
+
+        <span class="s3">if </span><span class="s1">pen_weight </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self.pen_weight = pen_weight</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.pen_weight = self.nobs * </span><span class="s4">10</span>
+
+        <span class="s0"># option for screening algorithm</span>
+        <span class="s1">self.use_weights = use_weights</span>
+        <span class="s1">self.k_add = k_add</span>
+        <span class="s1">self.k_max_add = k_max_add</span>
+        <span class="s1">self.threshold_trim = threshold_trim</span>
+        <span class="s1">self.k_max_included = k_max_included</span>
+        <span class="s1">self.ranking_attr = ranking_attr</span>
+        <span class="s1">self.ranking_project = ranking_project</span>
+
+    <span class="s3">def </span><span class="s1">_get_penal(self</span><span class="s3">, </span><span class="s1">weights=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;create new Penalty instance 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">SCADSmoothed(</span><span class="s4">0.1</span><span class="s3">, </span><span class="s1">c0=</span><span class="s4">0.0001</span><span class="s3">, </span><span class="s1">weights=weights)</span>
+
+    <span class="s3">def </span><span class="s1">ranking_measure(self</span><span class="s3">, </span><span class="s1">res_pen</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">keep=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;compute measure for ranking exog candidates for inclusion 
+        &quot;&quot;&quot;</span>
+        <span class="s1">endog = self.endog</span>
+
+        <span class="s3">if </span><span class="s1">self.ranking_project:</span>
+            <span class="s3">assert </span><span class="s1">res_pen.model.exog.shape[</span><span class="s4">1</span><span class="s1">] == len(keep)</span>
+            <span class="s1">ex_incl = res_pen.model.exog[:</span><span class="s3">, </span><span class="s1">keep]</span>
+            <span class="s1">exog = exog - ex_incl.dot(np.linalg.pinv(ex_incl).dot(exog))</span>
+
+        <span class="s3">if </span><span class="s1">self.ranking_attr == </span><span class="s5">'predicted_poisson'</span><span class="s1">:</span>
+            <span class="s0"># I keep this for more experiments</span>
+
+            <span class="s0"># TODO: does it really help to change/trim params</span>
+            <span class="s0"># we are not reestimating with trimmed model</span>
+            <span class="s1">p = res_pen.params.copy()</span>
+            <span class="s3">if </span><span class="s1">keep </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">p[~keep] = </span><span class="s4">0</span>
+            <span class="s1">predicted = res_pen.model.predict(p)</span>
+            <span class="s0"># this is currently hardcoded for Poisson</span>
+            <span class="s1">resid_factor = (endog - predicted) / np.sqrt(predicted)</span>
+        <span class="s3">elif </span><span class="s1">self.ranking_attr[:</span><span class="s4">6</span><span class="s1">] == </span><span class="s5">'model.'</span><span class="s1">:</span>
+            <span class="s0"># use model method, this is intended for score_factor</span>
+            <span class="s1">attr = self.ranking_attr.split(</span><span class="s5">'.'</span><span class="s1">)[</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">resid_factor = getattr(res_pen.model</span><span class="s3">, </span><span class="s1">attr)(res_pen.params)</span>
+            <span class="s3">if </span><span class="s1">resid_factor.ndim == </span><span class="s4">2</span><span class="s1">:</span>
+                <span class="s0"># for score_factor when extra params are in model</span>
+                <span class="s1">resid_factor = resid_factor[:</span><span class="s3">, </span><span class="s4">0</span><span class="s1">]</span>
+            <span class="s1">mom_cond = np.abs(resid_factor.dot(exog))**</span><span class="s4">2</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s0"># use results attribute</span>
+            <span class="s1">resid_factor = getattr(res_pen</span><span class="s3">, </span><span class="s1">self.ranking_attr)</span>
+            <span class="s1">mom_cond = np.abs(resid_factor.dot(exog))**</span><span class="s4">2</span>
+        <span class="s3">return </span><span class="s1">mom_cond</span>
+
+    <span class="s3">def </span><span class="s1">screen_exog(self</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">endog=</span><span class="s3">None, </span><span class="s1">maxiter=</span><span class="s4">100</span><span class="s3">, </span><span class="s1">method=</span><span class="s5">'bfgs'</span><span class="s3">,</span>
+                    <span class="s1">disp=</span><span class="s3">False, </span><span class="s1">fit_kwds=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;screen and select variables (columns) in exog 
+ 
+        Parameters 
+        ---------- 
+        exog : ndarray 
+            candidate explanatory variables that are screened for inclusion in 
+            the model 
+        endog : ndarray (optional) 
+            use a new endog in the screening model. 
+            This is not tested yet, and might not work correctly 
+        maxiter : int 
+            number of screening iterations 
+        method : str 
+            optimization method to use in fit, needs to be only of the gradient 
+            optimizers 
+        disp : bool 
+            display option for fit during optimization 
+ 
+        Returns 
+        ------- 
+        res_screen : instance of ScreeningResults 
+            The attribute `results_final` contains is the results instance 
+            with the final model selection. 
+            `idx_nonzero` contains the index of the selected exog in the full 
+            exog, combined exog that are always kept plust exog_candidates. 
+            see ScreeningResults for a full description 
+        &quot;&quot;&quot;</span>
+        <span class="s1">model_class = self.model_class</span>
+        <span class="s3">if </span><span class="s1">endog </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s0"># allow a different endog than used in model</span>
+            <span class="s1">endog = self.endog</span>
+        <span class="s1">x0 = self.exog_keep</span>
+        <span class="s1">k_keep = self.k_keep</span>
+        <span class="s1">x1 = exog</span>
+        <span class="s1">k_current = x0.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s0"># TODO: remove the need for x, use x1 separately from x0</span>
+        <span class="s0"># needs change to idx to be based on x1 (candidate variables)</span>
+        <span class="s1">x = np.column_stack((x0</span><span class="s3">, </span><span class="s1">x1))</span>
+        <span class="s1">nobs</span><span class="s3">, </span><span class="s1">k_vars = x.shape</span>
+        <span class="s1">fkwds = fit_kwds </span><span class="s3">if </span><span class="s1">fit_kwds </span><span class="s3">is not None else </span><span class="s1">{}</span>
+        <span class="s1">fit_kwds = {</span><span class="s5">'maxiter'</span><span class="s1">: </span><span class="s4">200</span><span class="s3">, </span><span class="s5">'disp'</span><span class="s1">: </span><span class="s3">False</span><span class="s1">}</span>
+        <span class="s1">fit_kwds.update(fkwds)</span>
+
+        <span class="s1">history = defaultdict(list)</span>
+        <span class="s1">idx_nonzero = np.arange(k_keep</span><span class="s3">, </span><span class="s1">dtype=int)</span>
+        <span class="s1">keep = np.ones(k_keep</span><span class="s3">, </span><span class="s1">np.bool_)</span>
+        <span class="s1">idx_excl = np.arange(k_keep</span><span class="s3">, </span><span class="s1">k_vars)</span>
+        <span class="s1">mod_pen = model_class(endog</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">**self.init_kwds)</span>
+        <span class="s0"># do not penalize initial estimate</span>
+        <span class="s1">mod_pen.pen_weight = </span><span class="s4">0</span>
+        <span class="s1">res_pen = mod_pen.fit(**fit_kwds)</span>
+        <span class="s1">start_params = res_pen.params</span>
+        <span class="s1">converged = </span><span class="s3">False</span>
+        <span class="s1">idx_old = []</span>
+        <span class="s3">for </span><span class="s1">it </span><span class="s3">in </span><span class="s1">range(maxiter):</span>
+            <span class="s0"># candidates for inclusion in next iteration</span>
+            <span class="s1">x1 = x[:</span><span class="s3">, </span><span class="s1">idx_excl]</span>
+            <span class="s1">mom_cond = self.ranking_measure(res_pen</span><span class="s3">, </span><span class="s1">x1</span><span class="s3">, </span><span class="s1">keep=keep)</span>
+            <span class="s3">assert </span><span class="s1">len(mom_cond) == len(idx_excl)</span>
+            <span class="s1">mcs = np.sort(mom_cond)[::-</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">idx_thr = min((self.k_max_add</span><span class="s3">, </span><span class="s1">k_current + self.k_add</span><span class="s3">, </span><span class="s1">len(mcs)))</span>
+            <span class="s1">threshold = mcs[idx_thr]</span>
+            <span class="s0"># indices of exog in current expansion model</span>
+            <span class="s1">idx = np.concatenate((idx_nonzero</span><span class="s3">, </span><span class="s1">idx_excl[mom_cond &gt; threshold]))</span>
+            <span class="s1">start_params2 = np.zeros(len(idx))</span>
+            <span class="s1">start_params2[:len(start_params)] = start_params</span>
+
+            <span class="s3">if </span><span class="s1">self.use_weights:</span>
+                <span class="s1">weights = np.ones(len(idx))</span>
+                <span class="s1">weights[:k_keep] = </span><span class="s4">0</span>
+                <span class="s0"># modify Penalty instance attached to self</span>
+                <span class="s0"># damgerous if res_pen is reused</span>
+                <span class="s1">self.penal.weights = weights</span>
+            <span class="s1">mod_pen = model_class(endog</span><span class="s3">, </span><span class="s1">x[:</span><span class="s3">, </span><span class="s1">idx]</span><span class="s3">, </span><span class="s1">penal=self.penal</span><span class="s3">,</span>
+                                  <span class="s1">pen_weight=self.pen_weight</span><span class="s3">,</span>
+                                  <span class="s1">**self.init_kwds)</span>
+
+            <span class="s1">res_pen = mod_pen.fit(method=method</span><span class="s3">,</span>
+                                  <span class="s1">start_params=start_params2</span><span class="s3">,</span>
+                                  <span class="s1">warn_convergence=</span><span class="s3">False, </span><span class="s1">skip_hessian=</span><span class="s3">True,</span>
+                                  <span class="s1">**fit_kwds)</span>
+
+            <span class="s1">keep = np.abs(res_pen.params) &gt; self.threshold_trim</span>
+            <span class="s0"># use largest params to keep</span>
+            <span class="s3">if </span><span class="s1">keep.sum() &gt; self.k_max_included:</span>
+                <span class="s0"># TODO we can use now np.partition with partial sort</span>
+                <span class="s1">thresh_params = np.sort(np.abs(res_pen.params))[</span>
+                                                        <span class="s1">-self.k_max_included]</span>
+                <span class="s1">keep2 = np.abs(res_pen.params) &gt; thresh_params</span>
+                <span class="s1">keep = np.logical_and(keep</span><span class="s3">, </span><span class="s1">keep2)</span>
+
+            <span class="s0"># Note: idx and keep are for current expansion model</span>
+            <span class="s0"># idx_nonzero has indices of selected variables in full exog</span>
+            <span class="s1">keep[:k_keep] = </span><span class="s3">True  </span><span class="s0"># always keep exog_keep</span>
+            <span class="s1">idx_nonzero = idx[keep]</span>
+
+            <span class="s3">if </span><span class="s1">disp:</span>
+                <span class="s1">print(keep)</span>
+                <span class="s1">print(idx_nonzero)</span>
+            <span class="s0"># x0 is exog of currently selected model, not used in iteration</span>
+            <span class="s0"># x0 = x[:, idx_nonzero]</span>
+            <span class="s1">k_current = len(idx_nonzero)</span>
+            <span class="s1">start_params = res_pen.params[keep]</span>
+
+            <span class="s0"># use mask to get excluded indices</span>
+            <span class="s1">mask_excl = np.ones(k_vars</span><span class="s3">, </span><span class="s1">dtype=bool)</span>
+            <span class="s1">mask_excl[idx_nonzero] = </span><span class="s3">False</span>
+            <span class="s1">idx_excl = np.nonzero(mask_excl)[</span><span class="s4">0</span><span class="s1">]</span>
+            <span class="s1">history[</span><span class="s5">'idx_nonzero'</span><span class="s1">].append(idx_nonzero)</span>
+            <span class="s1">history[</span><span class="s5">'keep'</span><span class="s1">].append(keep)</span>
+            <span class="s1">history[</span><span class="s5">'params_keep'</span><span class="s1">].append(start_params)</span>
+            <span class="s1">history[</span><span class="s5">'idx_added'</span><span class="s1">].append(idx)</span>
+
+            <span class="s3">if </span><span class="s1">(len(idx_nonzero) == len(idx_old) </span><span class="s3">and</span>
+                    <span class="s1">(idx_nonzero == idx_old).all()):</span>
+                <span class="s1">converged = </span><span class="s3">True</span>
+                <span class="s3">break</span>
+            <span class="s1">idx_old = idx_nonzero</span>
+
+        <span class="s0"># final esimate</span>
+        <span class="s0"># check that we still have exog_keep</span>
+        <span class="s3">assert </span><span class="s1">np.all(idx_nonzero[:k_keep] == np.arange(k_keep))</span>
+        <span class="s3">if </span><span class="s1">self.use_weights:</span>
+            <span class="s1">weights = np.ones(len(idx_nonzero))</span>
+            <span class="s1">weights[:k_keep] = </span><span class="s4">0</span>
+            <span class="s0"># create new Penalty instance to avoide sharing attached penal</span>
+            <span class="s1">penal = self._get_penal(weights=weights)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">penal = self.penal</span>
+        <span class="s1">mod_final = model_class(endog</span><span class="s3">, </span><span class="s1">x[:</span><span class="s3">, </span><span class="s1">idx_nonzero]</span><span class="s3">,</span>
+                                <span class="s1">penal=penal</span><span class="s3">,</span>
+                                <span class="s1">pen_weight=self.pen_weight</span><span class="s3">,</span>
+                                <span class="s1">**self.init_kwds)</span>
+
+        <span class="s1">res_final = mod_final.fit(method=method</span><span class="s3">,</span>
+                                  <span class="s1">start_params=start_params</span><span class="s3">,</span>
+                                  <span class="s1">warn_convergence=</span><span class="s3">False,</span>
+                                  <span class="s1">**fit_kwds)</span>
+        <span class="s0"># set exog_names for final model</span>
+        <span class="s1">xnames = [</span><span class="s5">'var%4d' </span><span class="s1">% ii </span><span class="s3">for </span><span class="s1">ii </span><span class="s3">in </span><span class="s1">idx_nonzero]</span>
+        <span class="s1">res_final.model.exog_names[k_keep:] = xnames[k_keep:]</span>
+
+        <span class="s1">res = ScreeningResults(self</span><span class="s3">,</span>
+                               <span class="s1">results_pen = res_pen</span><span class="s3">,</span>
+                               <span class="s1">results_final = res_final</span><span class="s3">,</span>
+                               <span class="s1">idx_nonzero = idx_nonzero</span><span class="s3">,</span>
+                               <span class="s1">idx_exog = idx_nonzero[k_keep:] - k_keep</span><span class="s3">,</span>
+                               <span class="s1">idx_excl = idx_excl</span><span class="s3">,</span>
+                               <span class="s1">history = history</span><span class="s3">,</span>
+                               <span class="s1">converged = converged</span><span class="s3">,</span>
+                               <span class="s1">iterations = it + </span><span class="s4">1  </span><span class="s0"># it is 0-based</span>
+                               <span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s3">def </span><span class="s1">screen_exog_iterator(self</span><span class="s3">, </span><span class="s1">exog_iterator):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        batched version of screen exog 
+ 
+        This screens variables in a two step process: 
+ 
+        In the first step screen_exog is used on each element of the 
+        exog_iterator, and the batch winners are collected. 
+ 
+        In the second step all batch winners are combined into a new array 
+        of exog candidates and `screen_exog` is used to select a final 
+        model. 
+ 
+        Parameters 
+        ---------- 
+        exog_iterator : iterator over ndarrays 
+ 
+        Returns 
+        ------- 
+        res_screen_final : instance of ScreeningResults 
+            This is the instance returned by the second round call to 
+            `screen_exog`. Additional attributes are added to provide 
+            more information about the batched selection process. 
+            The index of final nonzero variables is 
+            `idx_nonzero_batches` which is a 2-dimensional array with batch 
+            index in the first column and variable index within batch in the 
+            second column. They can be used jointly as index for the data 
+            in the exog_iterator. 
+            see ScreeningResults for a full description 
+        &quot;&quot;&quot;</span>
+        <span class="s1">k_keep = self.k_keep</span>
+        <span class="s0"># res_batches = []</span>
+        <span class="s1">res_idx = []</span>
+        <span class="s1">exog_winner = []</span>
+        <span class="s1">exog_idx = []</span>
+        <span class="s3">for </span><span class="s1">ex </span><span class="s3">in </span><span class="s1">exog_iterator:</span>
+            <span class="s1">res_screen = self.screen_exog(ex</span><span class="s3">, </span><span class="s1">maxiter=</span><span class="s4">20</span><span class="s1">)</span>
+            <span class="s0"># avoid storing res_screen, only for debugging</span>
+            <span class="s0"># res_batches.append(res_screen)</span>
+            <span class="s1">res_idx.append(res_screen.idx_nonzero)</span>
+            <span class="s1">exog_winner.append(ex[:</span><span class="s3">, </span><span class="s1">res_screen.idx_nonzero[k_keep:] - k_keep])</span>
+            <span class="s1">exog_idx.append(res_screen.idx_nonzero[k_keep:] - k_keep)</span>
+
+        <span class="s1">exog_winner = np.column_stack(exog_winner)</span>
+        <span class="s1">res_screen_final = self.screen_exog(exog_winner</span><span class="s3">, </span><span class="s1">maxiter=</span><span class="s4">20</span><span class="s1">)</span>
+
+        <span class="s1">exog_winner_names = [</span><span class="s5">'var%d_%d' </span><span class="s1">% (bidx</span><span class="s3">, </span><span class="s1">idx)</span>
+                             <span class="s3">for </span><span class="s1">bidx</span><span class="s3">, </span><span class="s1">batch </span><span class="s3">in </span><span class="s1">enumerate(exog_idx)</span>
+                             <span class="s3">for </span><span class="s1">idx </span><span class="s3">in </span><span class="s1">batch]</span>
+
+        <span class="s1">idx_full = [(bidx</span><span class="s3">, </span><span class="s1">idx)</span>
+                    <span class="s3">for </span><span class="s1">bidx</span><span class="s3">, </span><span class="s1">batch </span><span class="s3">in </span><span class="s1">enumerate(exog_idx)</span>
+                    <span class="s3">for </span><span class="s1">idx </span><span class="s3">in </span><span class="s1">batch]</span>
+        <span class="s1">ex_final_idx = res_screen_final.idx_nonzero[k_keep:] - k_keep</span>
+        <span class="s1">final_names = np.array(exog_winner_names)[ex_final_idx]</span>
+        <span class="s1">res_screen_final.idx_nonzero_batches = np.array(idx_full)[ex_final_idx]</span>
+        <span class="s1">res_screen_final.exog_final_names = final_names</span>
+        <span class="s1">history = {</span><span class="s5">'idx_nonzero'</span><span class="s1">: res_idx</span><span class="s3">,</span>
+                   <span class="s5">'idx_exog'</span><span class="s1">: exog_idx}</span>
+        <span class="s1">res_screen_final.history_batches = history</span>
+        <span class="s3">return </span><span class="s1">res_screen_final</span>
+</pre>
+</body>
+</html>

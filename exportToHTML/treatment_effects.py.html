@@ -1,0 +1,1018 @@
+<html>
+<head>
+<title>treatment_effects.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+treatment_effects.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+<span class="s2">&quot;&quot;&quot;Treatment effect estimators 
+ 
+follows largely Stata's teffects in Stata 13 manual 
+ 
+Created on Tue Jun  9 22:45:23 2015 
+ 
+Author: Josef Perktold 
+License: BSD-3 
+ 
+currently available 
+ 
+                     ATE        POM_0        POM_1 
+res_ipw       230.688598  3172.774059  3403.462658 
+res_aipw     -230.989201  3403.355253  3172.366052 
+res_aipw_wls -227.195618  3403.250651  3176.055033 
+res_ra       -239.639211  3403.242272  3163.603060 
+res_ipwra    -229.967078  3403.335639  3173.368561 
+ 
+ 
+Lots of todos, just the beginning, but most effects are available but not 
+standard errors, and no code structure that has a useful pattern 
+ 
+see https://github.com/statsmodels/statsmodels/issues/2443 
+ 
+Note: script requires cattaneo2 data file from Stata 14, hardcoded file path 
+could be loaded with webuse 
+ 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s3">import </span><span class="s1">Substitution</span>
+<span class="s3">from </span><span class="s1">scipy.linalg </span><span class="s3">import </span><span class="s1">block_diag</span>
+<span class="s3">from </span><span class="s1">statsmodels.regression.linear_model </span><span class="s3">import </span><span class="s1">WLS</span>
+<span class="s3">from </span><span class="s1">statsmodels.sandbox.regression.gmm </span><span class="s3">import </span><span class="s1">GMM</span>
+<span class="s3">from </span><span class="s1">statsmodels.stats.contrast </span><span class="s3">import </span><span class="s1">ContrastResults</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.docstring </span><span class="s3">import </span><span class="s1">indent</span>
+
+
+<span class="s3">def </span><span class="s1">_mom_ate(params</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">tind</span><span class="s3">, </span><span class="s1">prob</span><span class="s3">, </span><span class="s1">weighted=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;moment condition for average treatment effect 
+ 
+    This does not include a moment condition for potential outcome mean (POM). 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">w1 = (tind / prob)</span>
+    <span class="s1">w0 = (</span><span class="s4">1. </span><span class="s1">- tind) / (</span><span class="s4">1. </span><span class="s1">- prob)</span>
+    <span class="s3">if </span><span class="s1">weighted:</span>
+        <span class="s1">w0 /= w0.mean()</span>
+        <span class="s1">w1 /= w1.mean()</span>
+
+    <span class="s1">wdiff = w1 - w0</span>
+
+    <span class="s3">return </span><span class="s1">endog * wdiff - params</span>
+
+
+<span class="s3">def </span><span class="s1">_mom_atm(params</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">tind</span><span class="s3">, </span><span class="s1">prob</span><span class="s3">, </span><span class="s1">weighted=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;moment conditions for average treatment means (POM) 
+ 
+    moment conditions are POM0 and POM1 
+    &quot;&quot;&quot;</span>
+    <span class="s1">w1 = (tind / prob)</span>
+    <span class="s1">w0 = (</span><span class="s4">1. </span><span class="s1">- tind) / (</span><span class="s4">1. </span><span class="s1">- prob)</span>
+    <span class="s3">if </span><span class="s1">weighted:</span>
+        <span class="s1">w1 /= w1.mean()</span>
+        <span class="s1">w0 /= w0.mean()</span>
+
+    <span class="s3">return </span><span class="s1">np.column_stack((endog * w0 - params[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">endog * w1 - params[</span><span class="s4">1</span><span class="s1">]))</span>
+
+
+<span class="s3">def </span><span class="s1">_mom_ols(params</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">tind</span><span class="s3">, </span><span class="s1">prob</span><span class="s3">, </span><span class="s1">weighted=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    moment condition for average treatment mean based on OLS dummy regression 
+ 
+    moment conditions are POM0 and POM1 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">w = tind / prob + (</span><span class="s4">1</span><span class="s1">-tind) / (</span><span class="s4">1 </span><span class="s1">- prob)</span>
+
+    <span class="s1">treat_ind = np.column_stack((</span><span class="s4">1 </span><span class="s1">- tind</span><span class="s3">, </span><span class="s1">tind))</span>
+    <span class="s1">mom = (w * (endog - treat_ind.dot(params)))[:</span><span class="s3">, None</span><span class="s1">] * treat_ind</span>
+
+    <span class="s3">return </span><span class="s1">mom</span>
+
+
+<span class="s3">def </span><span class="s1">_mom_ols_te(tm</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">tind</span><span class="s3">, </span><span class="s1">prob</span><span class="s3">, </span><span class="s1">weighted=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    moment condition for average treatment mean based on OLS dummy regression 
+ 
+    first moment is ATE 
+    second moment is POM0  (control) 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">w = tind / prob + (</span><span class="s4">1</span><span class="s1">-tind) / (</span><span class="s4">1 </span><span class="s1">- prob)</span>
+
+    <span class="s1">treat_ind = np.column_stack((tind</span><span class="s3">, </span><span class="s1">np.ones(len(tind))))</span>
+    <span class="s1">mom = (w * (endog - treat_ind.dot(tm)))[:</span><span class="s3">, None</span><span class="s1">] * treat_ind</span>
+
+    <span class="s3">return </span><span class="s1">mom</span>
+
+
+<span class="s3">def </span><span class="s1">_mom_olsex(params</span><span class="s3">, </span><span class="s1">model=</span><span class="s3">None, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">scale=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s1">exog = exog </span><span class="s3">if </span><span class="s1">exog </span><span class="s3">is not None else </span><span class="s1">model.exog</span>
+    <span class="s1">fitted = model.predict(params</span><span class="s3">, </span><span class="s1">exog)</span>
+    <span class="s1">resid = model.endog - fitted</span>
+    <span class="s3">if </span><span class="s1">scale </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s1">resid /= scale</span>
+    <span class="s1">mom = resid[:</span><span class="s3">, None</span><span class="s1">] * exog</span>
+    <span class="s3">return </span><span class="s1">mom</span>
+
+
+<span class="s3">def </span><span class="s1">ate_ipw(endog</span><span class="s3">, </span><span class="s1">tind</span><span class="s3">, </span><span class="s1">prob</span><span class="s3">, </span><span class="s1">weighted=</span><span class="s3">True, </span><span class="s1">probt=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;average treatment effect based on basic inverse propensity weighting. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">w1 = (tind / prob)</span>
+    <span class="s1">w0 = (</span><span class="s4">1. </span><span class="s1">- tind) / (</span><span class="s4">1. </span><span class="s1">- prob)</span>
+
+    <span class="s3">if </span><span class="s1">probt </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s1">w1 *= probt</span>
+        <span class="s1">w0 *= probt</span>
+
+    <span class="s3">if </span><span class="s1">weighted:</span>
+        <span class="s1">w0 /= w0.mean()</span>
+        <span class="s1">w1 /= w1.mean()</span>
+
+    <span class="s1">wdiff = w1 - w0</span>
+
+    <span class="s3">return </span><span class="s1">(endog * wdiff).mean()</span><span class="s3">, </span><span class="s1">(endog * w0).mean()</span><span class="s3">, </span><span class="s1">(endog * w1).mean()</span>
+
+
+<span class="s3">class </span><span class="s1">_TEGMMGeneric1(GMM):</span>
+    <span class="s2">&quot;&quot;&quot;GMM class to get cov_params for treatment effects 
+ 
+    This combines moment conditions for the selection/treatment model and the 
+    outcome model to get the standard errors for the treatment effect that 
+    takes the first step estimation of the treatment model into account. 
+ 
+    this also matches standard errors of ATE and POM in Stata 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">res_select</span><span class="s3">, </span><span class="s1">mom_outcome</span><span class="s3">, </span><span class="s1">exclude_tmoms=</span><span class="s3">False,</span>
+                 <span class="s1">**kwargs):</span>
+        <span class="s1">super(_TEGMMGeneric1</span><span class="s3">, </span><span class="s1">self).__init__(endog</span><span class="s3">, None, None</span><span class="s1">)</span>
+        <span class="s1">self.results_select = res_select</span>
+        <span class="s1">self.mom_outcome = mom_outcome</span>
+        <span class="s1">self.exclude_tmoms = exclude_tmoms</span>
+        <span class="s1">self.__dict__.update(kwargs)</span>
+
+        <span class="s0"># add xnames so it's not None</span>
+        <span class="s0"># we don't have exog in init in this version</span>
+        <span class="s3">if </span><span class="s1">self.data.xnames </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">self.data.xnames = []</span>
+
+        <span class="s0"># need information about decomposition of parameters</span>
+        <span class="s3">if </span><span class="s1">exclude_tmoms:</span>
+            <span class="s1">self.k_select = </span><span class="s4">0</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.k_select = len(res_select.model.data.param_names)</span>
+
+        <span class="s3">if </span><span class="s1">exclude_tmoms:</span>
+            <span class="s0"># fittedvalues is still linpred</span>
+            <span class="s1">self.prob = self.results_select.predict()</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.prob = </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s1">momcond(self</span><span class="s3">, </span><span class="s1">params):</span>
+        <span class="s1">k_outcome = len(params) - self.k_select</span>
+        <span class="s1">tm = params[:k_outcome]</span>
+        <span class="s1">p_tm = params[k_outcome:]</span>
+
+        <span class="s1">tind = self.results_select.model.endog</span>
+
+        <span class="s3">if </span><span class="s1">self.exclude_tmoms:</span>
+            <span class="s1">prob = self.prob</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">prob = self.results_select.model.predict(p_tm)</span>
+
+        <span class="s1">moms_list = []</span>
+        <span class="s1">mom_o = self.mom_outcome(tm</span><span class="s3">, </span><span class="s1">self.endog</span><span class="s3">, </span><span class="s1">tind</span><span class="s3">, </span><span class="s1">prob</span><span class="s3">, </span><span class="s1">weighted=</span><span class="s3">True</span><span class="s1">)</span>
+        <span class="s1">moms_list.append(mom_o)</span>
+
+        <span class="s3">if not </span><span class="s1">self.exclude_tmoms:</span>
+            <span class="s1">mom_t = self.results_select.model.score_obs(p_tm)</span>
+            <span class="s1">moms_list.append(mom_t)</span>
+
+        <span class="s1">moms = np.column_stack(moms_list)</span>
+        <span class="s3">return </span><span class="s1">moms</span>
+
+
+<span class="s3">class </span><span class="s1">_TEGMM(GMM):</span>
+    <span class="s2">&quot;&quot;&quot;GMM class to get cov_params for treatment effects 
+ 
+    This combines moment conditions for the selection/treatment model and the 
+    outcome model to get the standard errors for the treatment effect that 
+    takes the first step estimation of the treatment model into account. 
+ 
+    this also matches standard errors of ATE and POM in Stata 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">res_select</span><span class="s3">, </span><span class="s1">mom_outcome):</span>
+        <span class="s1">super(_TEGMM</span><span class="s3">, </span><span class="s1">self).__init__(endog</span><span class="s3">, None, None</span><span class="s1">)</span>
+        <span class="s1">self.results_select = res_select</span>
+        <span class="s1">self.mom_outcome = mom_outcome</span>
+
+        <span class="s0"># add xnames so it's not None</span>
+        <span class="s0"># we don't have exog in init in this version</span>
+        <span class="s3">if </span><span class="s1">self.data.xnames </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">self.data.xnames = []</span>
+
+    <span class="s3">def </span><span class="s1">momcond(self</span><span class="s3">, </span><span class="s1">params):</span>
+        <span class="s1">tm = params[:</span><span class="s4">2</span><span class="s1">]</span>
+        <span class="s1">p_tm = params[</span><span class="s4">2</span><span class="s1">:]</span>
+
+        <span class="s1">tind = self.results_select.model.endog</span>
+        <span class="s1">prob = self.results_select.model.predict(p_tm)</span>
+        <span class="s1">momt = self.mom_outcome(tm</span><span class="s3">, </span><span class="s1">self.endog</span><span class="s3">, </span><span class="s1">tind</span><span class="s3">, </span><span class="s1">prob)  </span><span class="s0"># weighted=True)</span>
+        <span class="s1">moms = np.column_stack((momt</span><span class="s3">,</span>
+                                <span class="s1">self.results_select.model.score_obs(p_tm)))</span>
+        <span class="s3">return </span><span class="s1">moms</span>
+
+
+<span class="s3">class </span><span class="s1">_IPWGMM(_TEGMMGeneric1):</span>
+    <span class="s2">&quot;&quot;&quot; GMM for aipw treatment effect and potential outcome 
+ 
+    uses unweighted outcome regression 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">momcond(self</span><span class="s3">, </span><span class="s1">params):</span>
+        <span class="s0"># Note: momcond in original order of observations</span>
+        <span class="s1">ra = self.teff</span>
+        <span class="s1">res_select = ra.results_select</span>
+        <span class="s1">tind = ra.treatment</span>
+        <span class="s1">endog = ra.model_pool.endog</span>
+        <span class="s1">effect_group = self.effect_group</span>
+
+        <span class="s1">tm = params[:</span><span class="s4">2</span><span class="s1">]</span>
+        <span class="s1">ps = params[</span><span class="s4">2</span><span class="s1">:]</span>
+
+        <span class="s1">prob_sel = np.asarray(res_select.model.predict(ps))</span>
+        <span class="s1">prob_sel = np.clip(prob_sel</span><span class="s3">, </span><span class="s4">0.01</span><span class="s3">, </span><span class="s4">0.99</span><span class="s1">)</span>
+        <span class="s1">prob = prob_sel</span>
+
+        <span class="s3">if </span><span class="s1">effect_group == </span><span class="s5">&quot;all&quot;</span><span class="s1">:</span>
+            <span class="s1">probt = </span><span class="s3">None</span>
+        <span class="s3">elif </span><span class="s1">effect_group </span><span class="s3">in </span><span class="s1">[</span><span class="s4">1</span><span class="s3">, </span><span class="s5">&quot;treated&quot;</span><span class="s1">]:</span>
+            <span class="s1">probt = prob</span>
+        <span class="s3">elif </span><span class="s1">effect_group </span><span class="s3">in </span><span class="s1">[</span><span class="s4">0</span><span class="s3">, </span><span class="s5">&quot;untreated&quot;</span><span class="s3">, </span><span class="s5">&quot;control&quot;</span><span class="s1">]:</span>
+            <span class="s1">probt = </span><span class="s4">1 </span><span class="s1">- prob</span>
+        <span class="s3">elif </span><span class="s1">isinstance(effect_group</span><span class="s3">, </span><span class="s1">np.ndarray):</span>
+            <span class="s1">probt = probt</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;incorrect option for effect_group&quot;</span><span class="s1">)</span>
+
+        <span class="s1">w = tind / prob + (</span><span class="s4">1 </span><span class="s1">- tind) / (</span><span class="s4">1 </span><span class="s1">- prob)</span>
+        <span class="s0"># Are we supposed to use scaled weights? doesn't cloesely match Stata</span>
+        <span class="s0"># w1 = tind / prob</span>
+        <span class="s0"># w2 = (1 - tind) / (1 - prob)</span>
+        <span class="s0"># w = w1 / w1.sum() * tind.sum() + w2 / w2.sum() * (1 - tind).sum()</span>
+        <span class="s3">if </span><span class="s1">probt </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">w *= probt</span>
+
+        <span class="s1">treat_ind = np.column_stack((tind</span><span class="s3">, </span><span class="s1">np.ones(len(tind))))</span>
+        <span class="s1">mm = (w * (endog - treat_ind.dot(tm)))[:</span><span class="s3">, None</span><span class="s1">] * treat_ind</span>
+
+        <span class="s1">mom_select = res_select.model.score_obs(ps)</span>
+        <span class="s1">moms = np.column_stack((mm</span><span class="s3">, </span><span class="s1">mom_select))</span>
+        <span class="s3">return </span><span class="s1">moms</span>
+
+
+<span class="s3">class </span><span class="s1">_AIPWGMM(_TEGMMGeneric1):</span>
+    <span class="s2">&quot;&quot;&quot; GMM for aipw treatment effect and potential outcome 
+ 
+    uses unweighted outcome regression 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">momcond(self</span><span class="s3">, </span><span class="s1">params):</span>
+        <span class="s1">ra = self.teff</span>
+        <span class="s1">treat_mask = ra.treat_mask</span>
+        <span class="s1">res_select = ra.results_select</span>
+
+        <span class="s1">ppom = params[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">mask = np.arange(len(params)) != </span><span class="s4">1</span>
+        <span class="s1">params = params[mask]</span>
+
+        <span class="s1">k = ra.results0.model.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">pm = params[</span><span class="s4">0</span><span class="s1">]  </span><span class="s0"># ATE parameter</span>
+        <span class="s1">p0 = params[</span><span class="s4">1</span><span class="s1">:k+</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">p1 = params[k+</span><span class="s4">1</span><span class="s1">:</span><span class="s4">2</span><span class="s1">*k+</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">ps = params[</span><span class="s4">2</span><span class="s1">*k+</span><span class="s4">1</span><span class="s1">:]</span>
+        <span class="s1">mod0 = ra.results0.model</span>
+        <span class="s1">mod1 = ra.results1.model</span>
+        <span class="s0"># use reordered exog, endog so it matches sub models by group</span>
+        <span class="s1">exog = ra.exog_grouped</span>
+        <span class="s1">endog = ra.endog_grouped</span>
+
+        <span class="s1">prob_sel = np.asarray(res_select.model.predict(ps))</span>
+        <span class="s1">prob_sel = np.clip(prob_sel</span><span class="s3">, </span><span class="s4">0.01</span><span class="s3">, </span><span class="s4">0.99</span><span class="s1">)</span>
+
+        <span class="s1">prob0 = prob_sel[~treat_mask]</span>
+        <span class="s1">prob1 = prob_sel[treat_mask]</span>
+        <span class="s1">prob = np.concatenate((prob0</span><span class="s3">, </span><span class="s1">prob1))</span>
+
+        <span class="s0"># outcome models by treatment unweighted</span>
+        <span class="s1">fitted0 = mod0.predict(p0</span><span class="s3">, </span><span class="s1">exog)</span>
+        <span class="s1">mom0 = _mom_olsex(p0</span><span class="s3">, </span><span class="s1">model=mod0)</span>
+
+        <span class="s1">fitted1 = mod1.predict(p1</span><span class="s3">, </span><span class="s1">exog)</span>
+        <span class="s1">mom1 = _mom_olsex(p1</span><span class="s3">, </span><span class="s1">model=mod1)</span>
+
+        <span class="s1">mom_outcome = block_diag(mom0</span><span class="s3">, </span><span class="s1">mom1)</span>
+
+        <span class="s0"># moments for target statistics, ATE and POM</span>
+        <span class="s1">tind = ra.treatment</span>
+        <span class="s1">tind = np.concatenate((tind[~treat_mask]</span><span class="s3">, </span><span class="s1">tind[treat_mask]))</span>
+        <span class="s1">correct0 = (endog - fitted0) / (</span><span class="s4">1 </span><span class="s1">- prob) * (</span><span class="s4">1 </span><span class="s1">- tind)</span>
+        <span class="s1">correct1 = (endog - fitted1) / prob * tind</span>
+
+        <span class="s1">tmean0 = fitted0 + correct0</span>
+        <span class="s1">tmean1 = fitted1 + correct1</span>
+        <span class="s1">ate = tmean1 - tmean0</span>
+
+        <span class="s1">mm = ate - pm</span>
+        <span class="s1">mpom = tmean0 - ppom</span>
+        <span class="s1">mm = np.column_stack((mm</span><span class="s3">, </span><span class="s1">mpom))</span>
+
+        <span class="s0"># Note: res_select has original data order,</span>
+        <span class="s0"># mom_outcome and mm use grouped observations</span>
+        <span class="s1">mom_select = res_select.model.score_obs(ps)</span>
+        <span class="s1">mom_select = np.concatenate((mom_select[~treat_mask]</span><span class="s3">,</span>
+                                     <span class="s1">mom_select[treat_mask])</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+
+        <span class="s1">moms = np.column_stack((mm</span><span class="s3">, </span><span class="s1">mom_outcome</span><span class="s3">, </span><span class="s1">mom_select))</span>
+        <span class="s3">return </span><span class="s1">moms</span>
+
+
+<span class="s3">class </span><span class="s1">_AIPWWLSGMM(_TEGMMGeneric1):</span>
+    <span class="s2">&quot;&quot;&quot; GMM for aipw-wls treatment effect and potential outcome 
+ 
+    uses weighted outcome regression 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">momcond(self</span><span class="s3">, </span><span class="s1">params):</span>
+        <span class="s1">ra = self.teff</span>
+        <span class="s1">treat_mask = ra.treat_mask</span>
+        <span class="s1">res_select = ra.results_select</span>
+
+        <span class="s1">ppom = params[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">mask = np.arange(len(params)) != </span><span class="s4">1</span>
+        <span class="s1">params = params[mask]</span>
+
+        <span class="s1">k = ra.results0.model.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">pm = params[</span><span class="s4">0</span><span class="s1">]  </span><span class="s0"># ATE parameter</span>
+        <span class="s1">p0 = params[</span><span class="s4">1</span><span class="s1">:k+</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">p1 = params[k+</span><span class="s4">1</span><span class="s1">:</span><span class="s4">2</span><span class="s1">*k+</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">ps = params[-</span><span class="s4">6</span><span class="s1">:]</span>
+        <span class="s1">mod0 = ra.results0.model</span>
+        <span class="s1">mod1 = ra.results1.model</span>
+        <span class="s0"># use reordered exog, endog so it matches sub models by group</span>
+        <span class="s1">exog = ra.exog_grouped</span>
+        <span class="s1">endog = ra.endog_grouped</span>
+
+        <span class="s0"># todo: need weights in outcome models</span>
+        <span class="s1">prob_sel = np.asarray(res_select.model.predict(ps))</span>
+
+        <span class="s1">prob_sel = np.clip(prob_sel</span><span class="s3">, </span><span class="s4">0.001</span><span class="s3">, </span><span class="s4">0.999</span><span class="s1">)</span>
+
+        <span class="s1">prob0 = prob_sel[~treat_mask]</span>
+        <span class="s1">prob1 = prob_sel[treat_mask]</span>
+        <span class="s1">prob = np.concatenate((prob0</span><span class="s3">, </span><span class="s1">prob1))</span>
+
+        <span class="s1">tind = </span><span class="s4">0</span>
+        <span class="s1">ww0 = (</span><span class="s4">1 </span><span class="s1">- tind) / (</span><span class="s4">1 </span><span class="s1">- prob0) * ((</span><span class="s4">1 </span><span class="s1">- tind) / (</span><span class="s4">1 </span><span class="s1">- prob0) - </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">tind = </span><span class="s4">1</span>
+        <span class="s1">ww1 = tind / prob1 * (tind / prob1 - </span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s0"># outcome models by treatment using IPW weights</span>
+        <span class="s1">fitted0 = mod0.predict(p0</span><span class="s3">, </span><span class="s1">exog)</span>
+        <span class="s1">mom0 = _mom_olsex(p0</span><span class="s3">, </span><span class="s1">model=mod0) * ww0[:</span><span class="s3">, None</span><span class="s1">]</span>
+
+        <span class="s1">fitted1 = mod1.predict(p1</span><span class="s3">, </span><span class="s1">exog)</span>
+        <span class="s1">mom1 = _mom_olsex(p1</span><span class="s3">, </span><span class="s1">model=mod1) * ww1[:</span><span class="s3">, None</span><span class="s1">]</span>
+
+        <span class="s1">mom_outcome = block_diag(mom0</span><span class="s3">, </span><span class="s1">mom1)</span>
+
+        <span class="s0"># moments for target statistics, ATE and POM</span>
+        <span class="s1">tind = ra.treatment</span>
+        <span class="s1">tind = np.concatenate((tind[~treat_mask]</span><span class="s3">, </span><span class="s1">tind[treat_mask]))</span>
+
+        <span class="s1">correct0 = (endog - fitted0) / (</span><span class="s4">1 </span><span class="s1">- prob) * (</span><span class="s4">1 </span><span class="s1">- tind)</span>
+        <span class="s1">correct1 = (endog - fitted1) / prob * tind</span>
+
+        <span class="s1">tmean0 = fitted0 + correct0</span>
+        <span class="s1">tmean1 = fitted1 + correct1</span>
+        <span class="s1">ate = tmean1 - tmean0</span>
+
+        <span class="s1">mm = ate - pm</span>
+        <span class="s1">mpom = tmean0 - ppom</span>
+        <span class="s1">mm = np.column_stack((mm</span><span class="s3">, </span><span class="s1">mpom))</span>
+
+        <span class="s0"># Note: res_select has original data order,</span>
+        <span class="s0"># mom_outcome and mm use grouped observations</span>
+        <span class="s1">mom_select = res_select.model.score_obs(ps)</span>
+        <span class="s1">mom_select = np.concatenate((mom_select[~treat_mask]</span><span class="s3">,</span>
+                                     <span class="s1">mom_select[treat_mask])</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+
+        <span class="s1">moms = np.column_stack((mm</span><span class="s3">, </span><span class="s1">mom_outcome</span><span class="s3">, </span><span class="s1">mom_select))</span>
+        <span class="s3">return </span><span class="s1">moms</span>
+
+
+<span class="s3">class </span><span class="s1">_RAGMM(_TEGMMGeneric1):</span>
+    <span class="s2">&quot;&quot;&quot;GMM for regression adjustment treatment effect and potential outcome 
+ 
+    uses unweighted outcome regression 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">momcond(self</span><span class="s3">, </span><span class="s1">params):</span>
+        <span class="s1">ra = self.teff</span>
+
+        <span class="s1">ppom = params[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">mask = np.arange(len(params)) != </span><span class="s4">1</span>
+        <span class="s1">params = params[mask]</span>
+
+        <span class="s1">k = ra.results0.model.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">pm = params[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">p0 = params[</span><span class="s4">1</span><span class="s1">:k+</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">p1 = params[-k:]</span>
+        <span class="s1">mod0 = ra.results0.model</span>
+        <span class="s1">mod1 = ra.results1.model</span>
+        <span class="s0"># use reordered exog, endog so it matches sub models by group</span>
+        <span class="s1">exog = ra.exog_grouped</span>
+
+        <span class="s1">fitted0 = mod0.predict(p0</span><span class="s3">, </span><span class="s1">exog)</span>
+        <span class="s1">mom0 = _mom_olsex(p0</span><span class="s3">, </span><span class="s1">model=mod0)</span>
+
+        <span class="s1">fitted1 = mod1.predict(p1</span><span class="s3">, </span><span class="s1">exog)</span>
+        <span class="s1">mom1 = _mom_olsex(p1</span><span class="s3">, </span><span class="s1">model=mod1)</span>
+
+        <span class="s1">momout = block_diag(mom0</span><span class="s3">, </span><span class="s1">mom1)</span>
+
+        <span class="s1">mm = fitted1 - fitted0 - pm</span>
+        <span class="s1">mpom = fitted0 - ppom</span>
+        <span class="s1">mm = np.column_stack((mm</span><span class="s3">, </span><span class="s1">mpom))</span>
+        <span class="s3">if </span><span class="s1">self.probt </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">mm *= (self.probt / self.probt.mean())[:</span><span class="s3">, None</span><span class="s1">]</span>
+
+        <span class="s1">moms = np.column_stack((mm</span><span class="s3">, </span><span class="s1">momout))</span>
+        <span class="s3">return </span><span class="s1">moms</span>
+
+
+<span class="s3">class </span><span class="s1">_IPWRAGMM(_TEGMMGeneric1):</span>
+    <span class="s2">&quot;&quot;&quot; GMM for ipwra treatment effect and potential outcome 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">momcond(self</span><span class="s3">, </span><span class="s1">params):</span>
+        <span class="s1">ra = self.teff</span>
+        <span class="s1">treat_mask = ra.treat_mask</span>
+        <span class="s1">res_select = ra.results_select</span>
+
+        <span class="s1">ppom = params[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">mask = np.arange(len(params)) != </span><span class="s4">1</span>
+        <span class="s1">params = params[mask]</span>
+
+        <span class="s1">k = ra.results0.model.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">pm = params[</span><span class="s4">0</span><span class="s1">]  </span><span class="s0"># ATE parameter</span>
+        <span class="s1">p0 = params[</span><span class="s4">1</span><span class="s1">:k+</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">p1 = params[k+</span><span class="s4">1</span><span class="s1">:</span><span class="s4">2</span><span class="s1">*k+</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">ps = params[-</span><span class="s4">6</span><span class="s1">:]</span>
+        <span class="s1">mod0 = ra.results0.model</span>
+        <span class="s1">mod1 = ra.results1.model</span>
+
+        <span class="s0"># use reordered exog so it matches sub models by group</span>
+        <span class="s1">exog = ra.exog_grouped</span>
+        <span class="s1">tind = np.zeros(len(treat_mask))</span>
+        <span class="s1">tind[-treat_mask.sum():] = </span><span class="s4">1</span>
+
+        <span class="s0"># selection probability by group, propensity score</span>
+        <span class="s1">prob_sel = np.asarray(res_select.model.predict(ps))</span>
+        <span class="s1">prob_sel = np.clip(prob_sel</span><span class="s3">, </span><span class="s4">0.001</span><span class="s3">, </span><span class="s4">0.999</span><span class="s1">)</span>
+        <span class="s1">prob0 = prob_sel[~treat_mask]</span>
+        <span class="s1">prob1 = prob_sel[treat_mask]</span>
+
+        <span class="s1">effect_group = self.effect_group</span>
+        <span class="s3">if </span><span class="s1">effect_group == </span><span class="s5">&quot;all&quot;</span><span class="s1">:</span>
+            <span class="s1">w0 = </span><span class="s4">1 </span><span class="s1">/ (</span><span class="s4">1 </span><span class="s1">- prob0)</span>
+            <span class="s1">w1 = </span><span class="s4">1 </span><span class="s1">/ prob1</span>
+            <span class="s1">sind = </span><span class="s4">1</span>
+        <span class="s3">elif </span><span class="s1">effect_group </span><span class="s3">in </span><span class="s1">[</span><span class="s4">1</span><span class="s3">, </span><span class="s5">&quot;treated&quot;</span><span class="s1">]:</span>
+            <span class="s1">w0 = prob0 / (</span><span class="s4">1 </span><span class="s1">- prob0)</span>
+            <span class="s1">w1 = prob1 / prob1</span>
+            <span class="s0"># for averaging effect on treated</span>
+            <span class="s1">sind = tind / tind.mean()</span>
+        <span class="s3">elif </span><span class="s1">effect_group </span><span class="s3">in </span><span class="s1">[</span><span class="s4">0</span><span class="s3">, </span><span class="s5">&quot;untreated&quot;</span><span class="s3">, </span><span class="s5">&quot;control&quot;</span><span class="s1">]:</span>
+            <span class="s1">w0 = (</span><span class="s4">1 </span><span class="s1">- prob0) / (</span><span class="s4">1 </span><span class="s1">- prob0)</span>
+            <span class="s1">w1 = (</span><span class="s4">1 </span><span class="s1">- prob1) / prob1</span>
+
+            <span class="s1">sind = (</span><span class="s4">1 </span><span class="s1">- tind)</span>
+            <span class="s1">sind /= sind.mean()</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;incorrect option for effect_group&quot;</span><span class="s1">)</span>
+
+        <span class="s0"># outcome models by treatment using IPW weights</span>
+        <span class="s1">fitted0 = mod0.predict(p0</span><span class="s3">, </span><span class="s1">exog)</span>
+        <span class="s1">mom0 = _mom_olsex(p0</span><span class="s3">, </span><span class="s1">model=mod0) * w0[:</span><span class="s3">, None</span><span class="s1">]</span>
+
+        <span class="s1">fitted1 = mod1.predict(p1</span><span class="s3">, </span><span class="s1">exog)</span>
+        <span class="s1">mom1 = _mom_olsex(p1</span><span class="s3">, </span><span class="s1">model=mod1) * w1[:</span><span class="s3">, None</span><span class="s1">]</span>
+
+        <span class="s1">mom_outcome = block_diag(mom0</span><span class="s3">, </span><span class="s1">mom1)</span>
+
+        <span class="s0"># moments for target statistics, ATE and POM</span>
+        <span class="s1">mm = (fitted1 - fitted0 - pm) * sind</span>
+        <span class="s1">mpom = (fitted0 - ppom) * sind</span>
+        <span class="s1">mm = np.column_stack((mm</span><span class="s3">, </span><span class="s1">mpom))</span>
+
+        <span class="s0"># Note: res_select has original data order,</span>
+        <span class="s0"># mom_outcome and mm use grouped observations</span>
+        <span class="s1">mom_select = res_select.model.score_obs(ps)</span>
+        <span class="s1">mom_select = np.concatenate((mom_select[~treat_mask]</span><span class="s3">,</span>
+                                     <span class="s1">mom_select[treat_mask])</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+
+        <span class="s1">moms = np.column_stack((mm</span><span class="s3">, </span><span class="s1">mom_outcome</span><span class="s3">, </span><span class="s1">mom_select))</span>
+        <span class="s3">return </span><span class="s1">moms</span>
+
+
+<span class="s3">class </span><span class="s1">TreatmentEffectResults(ContrastResults):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Results class for treatment effect estimation 
+ 
+    Parameters 
+    ---------- 
+    teff : instance of TreatmentEffect class 
+    results_gmm : instance of GMMResults class 
+    method : string 
+        Method and estimator of treatment effect. 
+    kwds: dict 
+        Other keywords with additional information. 
+ 
+    Notes 
+    ----- 
+    This class is a subclass of ContrastResults and inherits methods like 
+    summary, summary_frame and conf_int. Attributes correspond to a z-test 
+    given by ``GMMResults.t_test``. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">teff</span><span class="s3">, </span><span class="s1">results_gmm</span><span class="s3">, </span><span class="s1">method</span><span class="s3">, </span><span class="s1">**kwds):</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s1">k_params = len(results_gmm.params)</span>
+        <span class="s1">constraints = np.zeros((</span><span class="s4">3</span><span class="s3">, </span><span class="s1">k_params))</span>
+        <span class="s1">constraints[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s1">] = </span><span class="s4">1</span>
+        <span class="s1">constraints[</span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s1">] = </span><span class="s4">1</span>
+        <span class="s1">constraints[</span><span class="s4">2</span><span class="s3">, </span><span class="s1">:</span><span class="s4">2</span><span class="s1">] = [</span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">tt = results_gmm.t_test(constraints)</span>
+        <span class="s1">self.__dict__.update(tt.__dict__)</span>
+        <span class="s1">self.teff = teff</span>
+        <span class="s1">self.results_gmm = results_gmm</span>
+        <span class="s1">self.method = method</span>
+        <span class="s0"># TODO: make those explicit?</span>
+        <span class="s1">self.__dict__.update(kwds)</span>
+
+        <span class="s1">self.c_names = [</span><span class="s5">&quot;ATE&quot;</span><span class="s3">, </span><span class="s5">&quot;POM0&quot;</span><span class="s3">, </span><span class="s5">&quot;POM1&quot;</span><span class="s1">]</span>
+
+
+<span class="s1">doc_params_returns = </span><span class="s5">&quot;&quot;&quot;</span><span class="s3">\ 
+</span><span class="s5">Parameters 
+---------- 
+return_results : bool 
+    If True, then a results instance is returned. 
+    If False, just ATE, POM0 and POM1 are returned. 
+effect_group : {&quot;all&quot;, 0, 1} 
+    ``effectgroup`` determines for which population the effects are 
+    estimated. 
+    If effect_group is &quot;all&quot;, then sample average treatment effect and 
+    potential outcomes are returned 
+    If effect_group is 1 or &quot;treated&quot;, then effects on treated are 
+    returned. 
+    If effect_group is 0, &quot;treated&quot; or &quot;control&quot;, then effects on 
+    untreated, i.e. control group, are returned. 
+disp : bool 
+    Indicates whether the scipy optimizer should display the 
+    optimization results 
+ 
+Returns 
+------- 
+TreatmentEffectsResults instance or tuple (ATE, POM0, POM1) 
+&quot;&quot;&quot;</span>
+
+<span class="s1">doc_params_returns2 = </span><span class="s5">&quot;&quot;&quot;</span><span class="s3">\ 
+</span><span class="s5">Parameters 
+---------- 
+return_results : bool 
+    If True, then a results instance is returned. 
+    If False, just ATE, POM0 and POM1 are returned. 
+disp : bool 
+    Indicates whether the scipy optimizer should display the 
+    optimization results 
+ 
+Returns 
+------- 
+TreatmentEffectsResults instance or tuple (ATE, POM0, POM1) 
+&quot;&quot;&quot;</span>
+
+
+<span class="s3">class </span><span class="s1">TreatmentEffect(object):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Estimate average treatment effect under conditional independence 
+ 
+    .. versionadded:: 0.14.0 
+ 
+    This class estimates treatment effect and potential outcome using 5 
+    different methods, ipw, ra, aipw, aipw-wls, ipw-ra. 
+    Standard errors and inference are based on the joint GMM representation of 
+    selection or treatment model, outcome model and effect functions. 
+ 
+    Parameters 
+    ---------- 
+    model : instance of a model class 
+        The model class should contain endog and exog for the outcome model. 
+    treatment : ndarray 
+        indicator array for observations with treatment (1) or without (0) 
+    results_select : results instance 
+        The results instance for the treatment or selection model. 
+    _cov_type : &quot;HC0&quot; 
+        Internal keyword. The keyword oes not affect GMMResults which always 
+        corresponds to HC0 standard errors. 
+    kwds : keyword arguments 
+        currently not used 
+ 
+    Notes 
+    ----- 
+    The outcome model is currently limited to a linear model based on OLS. 
+    Other outcome models, like Logit and Poisson, will become available in 
+    future. 
+ 
+    See `Treatment Effect notebook 
+    &lt;../examples/notebooks/generated/treatment_effect.html&gt;`__ 
+    for an overview. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">model</span><span class="s3">, </span><span class="s1">treatment</span><span class="s3">, </span><span class="s1">results_select=</span><span class="s3">None, </span><span class="s1">_cov_type=</span><span class="s5">&quot;HC0&quot;</span><span class="s3">,</span>
+                 <span class="s1">**kwds):</span>
+        <span class="s0"># Note _cov_type is only for preliminary estimators,</span>
+        <span class="s0"># cov in GMM alwasy corresponds to HC0</span>
+        <span class="s1">self.__dict__.update(kwds)  </span><span class="s0"># currently not used</span>
+        <span class="s1">self.treatment = np.asarray(treatment)</span>
+        <span class="s1">self.treat_mask = treat_mask = (treatment == </span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s1">results_select </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self.results_select = results_select</span>
+            <span class="s1">self.prob_select = results_select.predict()</span>
+
+        <span class="s1">self.model_pool = model</span>
+        <span class="s1">endog = model.endog</span>
+        <span class="s1">exog = model.exog</span>
+        <span class="s1">self.nobs = endog.shape[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">self._cov_type = _cov_type</span>
+
+        <span class="s0"># no init keys are supported</span>
+        <span class="s1">mod0 = model.__class__(endog[~treat_mask]</span><span class="s3">, </span><span class="s1">exog[~treat_mask])</span>
+        <span class="s1">self.results0 = mod0.fit(cov_type=_cov_type)</span>
+        <span class="s1">mod1 = model.__class__(endog[treat_mask]</span><span class="s3">, </span><span class="s1">exog[treat_mask])</span>
+        <span class="s1">self.results1 = mod1.fit(cov_type=_cov_type)</span>
+        <span class="s0"># self.predict_mean0 = self.model_pool.predict(self.results0.params</span>
+        <span class="s0">#                                             ).mean()</span>
+        <span class="s0"># self.predict_mean1 = self.model_pool.predict(self.results1.params</span>
+        <span class="s0">#                                             ).mean()</span>
+
+        <span class="s1">self.exog_grouped = np.concatenate((mod0.exog</span><span class="s3">, </span><span class="s1">mod1.exog)</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s1">self.endog_grouped = np.concatenate((mod0.endog</span><span class="s3">, </span><span class="s1">mod1.endog)</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s3">def </span><span class="s1">from_data(cls</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">treatment</span><span class="s3">, </span><span class="s1">model=</span><span class="s5">'ols'</span><span class="s3">, </span><span class="s1">**kwds):</span>
+        <span class="s2">&quot;&quot;&quot;create models from data 
+ 
+        not yet implemented 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s3">def </span><span class="s1">ipw(self</span><span class="s3">, </span><span class="s1">return_results=</span><span class="s3">True, </span><span class="s1">effect_group=</span><span class="s5">&quot;all&quot;</span><span class="s3">, </span><span class="s1">disp=</span><span class="s3">False</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Inverse Probability Weighted treatment effect estimation. 
+ 
+        Parameters 
+        ---------- 
+        return_results : bool 
+            If True, then a results instance is returned. 
+            If False, just ATE, POM0 and POM1 are returned. 
+        effect_group : {&quot;all&quot;, 0, 1} 
+            ``effectgroup`` determines for which population the effects are 
+            estimated. 
+            If effect_group is &quot;all&quot;, then sample average treatment effect and 
+            potential outcomes are returned. 
+            If effect_group is 1 or &quot;treated&quot;, then effects on treated are 
+            returned. 
+            If effect_group is 0, &quot;treated&quot; or &quot;control&quot;, then effects on 
+            untreated, i.e. control group, are returned. 
+        disp : bool 
+            Indicates whether the scipy optimizer should display the 
+            optimization results 
+ 
+        Returns 
+        ------- 
+        TreatmentEffectsResults instance or tuple (ATE, POM0, POM1) 
+ 
+        See Also 
+        -------- 
+        TreatmentEffectsResults 
+        &quot;&quot;&quot;</span>
+        <span class="s1">endog = self.model_pool.endog</span>
+        <span class="s1">tind = self.treatment</span>
+        <span class="s1">prob = self.prob_select</span>
+        <span class="s3">if </span><span class="s1">effect_group == </span><span class="s5">&quot;all&quot;</span><span class="s1">:</span>
+            <span class="s1">probt = </span><span class="s3">None</span>
+        <span class="s3">elif </span><span class="s1">effect_group </span><span class="s3">in </span><span class="s1">[</span><span class="s4">1</span><span class="s3">, </span><span class="s5">&quot;treated&quot;</span><span class="s1">]:</span>
+            <span class="s1">probt = prob</span>
+            <span class="s1">effect_group = </span><span class="s4">1  </span><span class="s0"># standardize effect_group name</span>
+        <span class="s3">elif </span><span class="s1">effect_group </span><span class="s3">in </span><span class="s1">[</span><span class="s4">0</span><span class="s3">, </span><span class="s5">&quot;untreated&quot;</span><span class="s3">, </span><span class="s5">&quot;control&quot;</span><span class="s1">]:</span>
+            <span class="s1">probt = </span><span class="s4">1 </span><span class="s1">- prob</span>
+            <span class="s1">effect_group = </span><span class="s4">0  </span><span class="s0"># standardize effect_group name</span>
+        <span class="s3">elif </span><span class="s1">isinstance(effect_group</span><span class="s3">, </span><span class="s1">np.ndarray):</span>
+            <span class="s1">probt = effect_group</span>
+            <span class="s1">effect_group = </span><span class="s5">&quot;user&quot;  </span><span class="s0"># standardize effect_group name</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;incorrect option for effect_group&quot;</span><span class="s1">)</span>
+
+        <span class="s1">res_ipw = ate_ipw(endog</span><span class="s3">, </span><span class="s1">tind</span><span class="s3">, </span><span class="s1">prob</span><span class="s3">, </span><span class="s1">weighted=</span><span class="s3">True, </span><span class="s1">probt=probt)</span>
+
+        <span class="s3">if not </span><span class="s1">return_results:</span>
+            <span class="s3">return </span><span class="s1">res_ipw</span>
+
+        <span class="s0"># gmm = _TEGMMGeneric1(endog, self.results_select, _mom_ols_te,</span>
+        <span class="s0">#                     probt=probt)</span>
+        <span class="s1">gmm = _IPWGMM(endog</span><span class="s3">, </span><span class="s1">self.results_select</span><span class="s3">, None, </span><span class="s1">teff=self</span><span class="s3">,</span>
+                      <span class="s1">effect_group=effect_group)</span>
+        <span class="s1">start_params = np.concatenate((res_ipw[:</span><span class="s4">2</span><span class="s1">]</span><span class="s3">,</span>
+                                       <span class="s1">self.results_select.params))</span>
+        <span class="s1">res_gmm = gmm.fit(start_params=start_params</span><span class="s3">,</span>
+                          <span class="s1">inv_weights=np.eye(len(start_params))</span><span class="s3">,</span>
+                          <span class="s1">optim_method=</span><span class="s5">'nm'</span><span class="s3">,</span>
+                          <span class="s1">optim_args={</span><span class="s5">&quot;maxiter&quot;</span><span class="s1">: </span><span class="s4">5000</span><span class="s3">, </span><span class="s5">&quot;disp&quot;</span><span class="s1">: disp}</span><span class="s3">,</span>
+                          <span class="s1">maxiter=</span><span class="s4">1</span><span class="s3">,</span>
+                          <span class="s1">)</span>
+
+        <span class="s1">res = TreatmentEffectResults(self</span><span class="s3">, </span><span class="s1">res_gmm</span><span class="s3">, </span><span class="s5">&quot;IPW&quot;</span><span class="s3">,</span>
+                                     <span class="s1">start_params=start_params</span><span class="s3">,</span>
+                                     <span class="s1">effect_group=effect_group</span><span class="s3">,</span>
+                                     <span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s1">@Substitution(params_returns=indent(doc_params_returns</span><span class="s3">, </span><span class="s5">&quot; &quot; </span><span class="s1">* </span><span class="s4">8</span><span class="s1">))</span>
+    <span class="s3">def </span><span class="s1">ra(self</span><span class="s3">, </span><span class="s1">return_results=</span><span class="s3">True, </span><span class="s1">effect_group=</span><span class="s5">&quot;all&quot;</span><span class="s3">, </span><span class="s1">disp=</span><span class="s3">False</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Regression Adjustment treatment effect estimation. 
+        \n%(params_returns)s 
+        See Also 
+        -------- 
+        TreatmentEffectsResults 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># need indicator for reordered observations</span>
+        <span class="s1">tind = np.zeros(len(self.treatment))</span>
+        <span class="s1">tind[-self.treatment.sum():] = </span><span class="s4">1</span>
+        <span class="s3">if </span><span class="s1">effect_group == </span><span class="s5">&quot;all&quot;</span><span class="s1">:</span>
+            <span class="s1">probt = </span><span class="s3">None</span>
+        <span class="s3">elif </span><span class="s1">effect_group </span><span class="s3">in </span><span class="s1">[</span><span class="s4">1</span><span class="s3">, </span><span class="s5">&quot;treated&quot;</span><span class="s1">]:</span>
+            <span class="s1">probt = tind</span>
+            <span class="s1">effect_group = </span><span class="s4">1  </span><span class="s0"># standardize effect_group name</span>
+        <span class="s3">elif </span><span class="s1">effect_group </span><span class="s3">in </span><span class="s1">[</span><span class="s4">0</span><span class="s3">, </span><span class="s5">&quot;untreated&quot;</span><span class="s3">, </span><span class="s5">&quot;control&quot;</span><span class="s1">]:</span>
+            <span class="s1">probt = </span><span class="s4">1 </span><span class="s1">- tind</span>
+            <span class="s1">effect_group = </span><span class="s4">0  </span><span class="s0"># standardize effect_group name</span>
+        <span class="s3">elif </span><span class="s1">isinstance(effect_group</span><span class="s3">, </span><span class="s1">np.ndarray):</span>
+            <span class="s0"># TODO: do we keep this?</span>
+            <span class="s1">probt = effect_group</span>
+            <span class="s1">effect_group = </span><span class="s5">&quot;user&quot;  </span><span class="s0"># standardize effect_group name</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;incorrect option for effect_group&quot;</span><span class="s1">)</span>
+
+        <span class="s1">exog = self.exog_grouped</span>
+
+        <span class="s0"># weight or indicator for effect_group</span>
+        <span class="s3">if </span><span class="s1">probt </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">cw = (probt / probt.mean())</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">cw = </span><span class="s4">1</span>
+
+        <span class="s1">pom0 = (self.results0.predict(exog) * cw).mean()</span>
+        <span class="s1">pom1 = (self.results1.predict(exog) * cw).mean()</span>
+        <span class="s3">if not </span><span class="s1">return_results:</span>
+            <span class="s3">return </span><span class="s1">pom1 - pom0</span><span class="s3">, </span><span class="s1">pom0</span><span class="s3">, </span><span class="s1">pom1</span>
+
+        <span class="s1">endog = self.model_pool.endog</span>
+        <span class="s1">mod_gmm = _RAGMM(endog</span><span class="s3">, </span><span class="s1">self.results_select</span><span class="s3">, None, </span><span class="s1">teff=self</span><span class="s3">,</span>
+                         <span class="s1">probt=probt)</span>
+        <span class="s1">start_params = np.concatenate((</span>
+            <span class="s0"># ate, tt0.effect,</span>
+            <span class="s1">[pom1 - pom0</span><span class="s3">, </span><span class="s1">pom0]</span><span class="s3">,</span>
+            <span class="s1">self.results0.params</span><span class="s3">,</span>
+            <span class="s1">self.results1.params))</span>
+        <span class="s1">res_gmm = mod_gmm.fit(start_params=start_params</span><span class="s3">,</span>
+                              <span class="s1">inv_weights=np.eye(len(start_params))</span><span class="s3">,</span>
+                              <span class="s1">optim_method=</span><span class="s5">'nm'</span><span class="s3">,</span>
+                              <span class="s1">optim_args={</span><span class="s5">&quot;maxiter&quot;</span><span class="s1">: </span><span class="s4">5000</span><span class="s3">, </span><span class="s5">&quot;disp&quot;</span><span class="s1">: disp}</span><span class="s3">,</span>
+                              <span class="s1">maxiter=</span><span class="s4">1</span><span class="s3">,</span>
+                              <span class="s1">)</span>
+        <span class="s1">res = TreatmentEffectResults(self</span><span class="s3">, </span><span class="s1">res_gmm</span><span class="s3">, </span><span class="s5">&quot;IPW&quot;</span><span class="s3">,</span>
+                                     <span class="s1">start_params=start_params</span><span class="s3">,</span>
+                                     <span class="s1">effect_group=effect_group</span><span class="s3">,</span>
+                                     <span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s1">@Substitution(params_returns=indent(doc_params_returns2</span><span class="s3">, </span><span class="s5">&quot; &quot; </span><span class="s1">* </span><span class="s4">8</span><span class="s1">))</span>
+    <span class="s3">def </span><span class="s1">aipw(self</span><span class="s3">, </span><span class="s1">return_results=</span><span class="s3">True, </span><span class="s1">disp=</span><span class="s3">False</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        ATE and POM from double robust augmented inverse probability weighting 
+        \n%(params_returns)s 
+        See Also 
+        -------- 
+        TreatmentEffectsResults 
+ 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">nobs = self.nobs</span>
+        <span class="s1">prob = self.prob_select</span>
+        <span class="s1">tind = self.treatment</span>
+        <span class="s1">exog = self.model_pool.exog  </span><span class="s0"># in original order</span>
+        <span class="s1">correct0 = (self.results0.resid / (</span><span class="s4">1 </span><span class="s1">- prob[tind == </span><span class="s4">0</span><span class="s1">])).sum() / nobs</span>
+        <span class="s1">correct1 = (self.results1.resid / (prob[tind == </span><span class="s4">1</span><span class="s1">])).sum() / nobs</span>
+        <span class="s1">tmean0 = self.results0.predict(exog).mean() + correct0</span>
+        <span class="s1">tmean1 = self.results1.predict(exog).mean() + correct1</span>
+        <span class="s1">ate = tmean1 - tmean0</span>
+        <span class="s3">if not </span><span class="s1">return_results:</span>
+            <span class="s3">return </span><span class="s1">ate</span><span class="s3">, </span><span class="s1">tmean0</span><span class="s3">, </span><span class="s1">tmean1</span>
+
+        <span class="s1">endog = self.model_pool.endog</span>
+        <span class="s1">p2_aipw = np.asarray([ate</span><span class="s3">, </span><span class="s1">tmean0])</span>
+
+        <span class="s1">mag_aipw1 = _AIPWGMM(endog</span><span class="s3">, </span><span class="s1">self.results_select</span><span class="s3">, None, </span><span class="s1">teff=self)</span>
+        <span class="s1">start_params = np.concatenate((</span>
+            <span class="s1">p2_aipw</span><span class="s3">,</span>
+            <span class="s1">self.results0.params</span><span class="s3">, </span><span class="s1">self.results1.params</span><span class="s3">,</span>
+            <span class="s1">self.results_select.params))</span>
+        <span class="s1">res_gmm = mag_aipw1.fit(</span>
+            <span class="s1">start_params=start_params</span><span class="s3">,</span>
+            <span class="s1">inv_weights=np.eye(len(start_params))</span><span class="s3">,</span>
+            <span class="s1">optim_method=</span><span class="s5">'nm'</span><span class="s3">,</span>
+            <span class="s1">optim_args={</span><span class="s5">&quot;maxiter&quot;</span><span class="s1">: </span><span class="s4">5000</span><span class="s3">, </span><span class="s5">&quot;disp&quot;</span><span class="s1">: disp}</span><span class="s3">,</span>
+            <span class="s1">maxiter=</span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s1">res = TreatmentEffectResults(self</span><span class="s3">, </span><span class="s1">res_gmm</span><span class="s3">, </span><span class="s5">&quot;IPW&quot;</span><span class="s3">,</span>
+                                     <span class="s1">start_params=start_params</span><span class="s3">,</span>
+                                     <span class="s1">effect_group=</span><span class="s5">&quot;all&quot;</span><span class="s3">,</span>
+                                     <span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s1">@Substitution(params_returns=indent(doc_params_returns2</span><span class="s3">, </span><span class="s5">&quot; &quot; </span><span class="s1">* </span><span class="s4">8</span><span class="s1">))</span>
+    <span class="s3">def </span><span class="s1">aipw_wls(self</span><span class="s3">, </span><span class="s1">return_results=</span><span class="s3">True, </span><span class="s1">disp=</span><span class="s3">False</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        ATE and POM from double robust augmented inverse probability weighting. 
+ 
+        This uses weighted outcome regression, while `aipw` uses unweighted 
+        outcome regression. 
+        Option for effect on treated or on untreated is not available. 
+        \n%(params_returns)s 
+        See Also 
+        -------- 
+        TreatmentEffectsResults 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">nobs = self.nobs</span>
+        <span class="s1">prob = self.prob_select</span>
+
+        <span class="s1">endog = self.model_pool.endog</span>
+        <span class="s1">exog = self.model_pool.exog</span>
+        <span class="s1">tind = self.treatment</span>
+        <span class="s1">treat_mask = self.treat_mask</span>
+
+        <span class="s1">ww1 = tind / prob * (tind / prob - </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">mod1 = WLS(endog[treat_mask]</span><span class="s3">, </span><span class="s1">exog[treat_mask]</span><span class="s3">,</span>
+                   <span class="s1">weights=ww1[treat_mask])</span>
+        <span class="s1">result1 = mod1.fit(cov_type=</span><span class="s5">'HC1'</span><span class="s1">)</span>
+        <span class="s1">mean1_ipw2 = result1.predict(exog).mean()</span>
+
+        <span class="s1">ww0 = (</span><span class="s4">1 </span><span class="s1">- tind) / (</span><span class="s4">1 </span><span class="s1">- prob) * ((</span><span class="s4">1 </span><span class="s1">- tind) / (</span><span class="s4">1 </span><span class="s1">- prob) - </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">mod0 = WLS(endog[~treat_mask]</span><span class="s3">, </span><span class="s1">exog[~treat_mask]</span><span class="s3">,</span>
+                   <span class="s1">weights=ww0[~treat_mask])</span>
+        <span class="s1">result0 = mod0.fit(cov_type=</span><span class="s5">'HC1'</span><span class="s1">)</span>
+        <span class="s1">mean0_ipw2 = result0.predict(exog).mean()</span>
+
+        <span class="s1">self.results_ipwwls0 = result0</span>
+        <span class="s1">self.results_ipwwls1 = result1</span>
+
+        <span class="s1">correct0 = (result0.resid / (</span><span class="s4">1 </span><span class="s1">- prob[tind == </span><span class="s4">0</span><span class="s1">])).sum() / nobs</span>
+        <span class="s1">correct1 = (result1.resid / (prob[tind == </span><span class="s4">1</span><span class="s1">])).sum() / nobs</span>
+        <span class="s1">tmean0 = mean0_ipw2 + correct0</span>
+        <span class="s1">tmean1 = mean1_ipw2 + correct1</span>
+        <span class="s1">ate = tmean1 - tmean0</span>
+
+        <span class="s3">if not </span><span class="s1">return_results:</span>
+            <span class="s3">return </span><span class="s1">ate</span><span class="s3">, </span><span class="s1">tmean0</span><span class="s3">, </span><span class="s1">tmean1</span>
+
+        <span class="s1">p2_aipw_wls = np.asarray([ate</span><span class="s3">, </span><span class="s1">tmean0]).squeeze()</span>
+
+        <span class="s0"># GMM</span>
+        <span class="s1">mod_gmm = _AIPWWLSGMM(endog</span><span class="s3">, </span><span class="s1">self.results_select</span><span class="s3">, None,</span>
+                              <span class="s1">teff=self)</span>
+        <span class="s1">start_params = np.concatenate((</span>
+            <span class="s1">p2_aipw_wls</span><span class="s3">,</span>
+            <span class="s1">result0.params</span><span class="s3">,</span>
+            <span class="s1">result1.params</span><span class="s3">,</span>
+            <span class="s1">self.results_select.params))</span>
+        <span class="s1">res_gmm = mod_gmm.fit(</span>
+            <span class="s1">start_params=start_params</span><span class="s3">,</span>
+            <span class="s1">inv_weights=np.eye(len(start_params))</span><span class="s3">,</span>
+            <span class="s1">optim_method=</span><span class="s5">'nm'</span><span class="s3">,</span>
+            <span class="s1">optim_args={</span><span class="s5">&quot;maxiter&quot;</span><span class="s1">: </span><span class="s4">5000</span><span class="s3">, </span><span class="s5">&quot;disp&quot;</span><span class="s1">: disp}</span><span class="s3">,</span>
+            <span class="s1">maxiter=</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">res = TreatmentEffectResults(self</span><span class="s3">, </span><span class="s1">res_gmm</span><span class="s3">, </span><span class="s5">&quot;IPW&quot;</span><span class="s3">,</span>
+                                     <span class="s1">start_params=start_params</span><span class="s3">,</span>
+                                     <span class="s1">effect_group=</span><span class="s5">&quot;all&quot;</span><span class="s3">,</span>
+                                     <span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s1">@Substitution(params_returns=indent(doc_params_returns</span><span class="s3">, </span><span class="s5">&quot; &quot; </span><span class="s1">* </span><span class="s4">8</span><span class="s1">))</span>
+    <span class="s3">def </span><span class="s1">ipw_ra(self</span><span class="s3">, </span><span class="s1">return_results=</span><span class="s3">True, </span><span class="s1">effect_group=</span><span class="s5">&quot;all&quot;</span><span class="s3">, </span><span class="s1">disp=</span><span class="s3">False</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        ATE and POM from inverse probability weighted regression adjustment. 
+ 
+        \n%(params_returns)s 
+        See Also 
+        -------- 
+        TreatmentEffectsResults 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">treat_mask = self.treat_mask</span>
+        <span class="s1">endog = self.model_pool.endog</span>
+        <span class="s1">exog = self.model_pool.exog</span>
+        <span class="s1">prob = self.prob_select</span>
+
+        <span class="s1">prob0 = prob[~treat_mask]</span>
+        <span class="s1">prob1 = prob[treat_mask]</span>
+        <span class="s3">if </span><span class="s1">effect_group == </span><span class="s5">&quot;all&quot;</span><span class="s1">:</span>
+            <span class="s1">w0 = </span><span class="s4">1 </span><span class="s1">/ (</span><span class="s4">1 </span><span class="s1">- prob0)</span>
+            <span class="s1">w1 = </span><span class="s4">1 </span><span class="s1">/ prob1</span>
+            <span class="s1">exogt = exog</span>
+        <span class="s3">elif </span><span class="s1">effect_group </span><span class="s3">in </span><span class="s1">[</span><span class="s4">1</span><span class="s3">, </span><span class="s5">&quot;treated&quot;</span><span class="s1">]:</span>
+            <span class="s1">w0 = prob0 / (</span><span class="s4">1 </span><span class="s1">- prob0)</span>
+            <span class="s1">w1 = prob1 / prob1</span>
+            <span class="s1">exogt = exog[treat_mask]</span>
+            <span class="s1">effect_group = </span><span class="s4">1  </span><span class="s0"># standardize effect_group name</span>
+        <span class="s3">elif </span><span class="s1">effect_group </span><span class="s3">in </span><span class="s1">[</span><span class="s4">0</span><span class="s3">, </span><span class="s5">&quot;untreated&quot;</span><span class="s3">, </span><span class="s5">&quot;control&quot;</span><span class="s1">]:</span>
+            <span class="s1">w0 = (</span><span class="s4">1 </span><span class="s1">- prob0) / (</span><span class="s4">1 </span><span class="s1">- prob0)</span>
+            <span class="s1">w1 = (</span><span class="s4">1 </span><span class="s1">- prob1) / prob1</span>
+            <span class="s1">exogt = exog[~treat_mask]</span>
+            <span class="s1">effect_group = </span><span class="s4">0  </span><span class="s0"># standardize effect_group name</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;incorrect option for effect_group&quot;</span><span class="s1">)</span>
+
+        <span class="s1">mod0 = WLS(endog[~treat_mask]</span><span class="s3">, </span><span class="s1">exog[~treat_mask]</span><span class="s3">,</span>
+                   <span class="s1">weights=w0)</span>
+        <span class="s1">result0 = mod0.fit(cov_type=</span><span class="s5">'HC1'</span><span class="s1">)</span>
+        <span class="s0"># mean0_ipwra = (result0.predict(exog) * (prob / prob.mean())).mean()</span>
+        <span class="s1">mean0_ipwra = result0.predict(exogt).mean()</span>
+
+        <span class="s1">mod1 = WLS(endog[treat_mask]</span><span class="s3">, </span><span class="s1">exog[treat_mask]</span><span class="s3">,</span>
+                   <span class="s1">weights=w1)</span>
+        <span class="s1">result1 = mod1.fit(cov_type=</span><span class="s5">'HC1'</span><span class="s1">)</span>
+        <span class="s0"># mean1_ipwra = (result1.predict(exog) * (prob / prob.mean())).mean()</span>
+        <span class="s1">mean1_ipwra = result1.predict(exogt).mean()</span>
+
+        <span class="s3">if not </span><span class="s1">return_results:</span>
+            <span class="s3">return </span><span class="s1">mean1_ipwra - mean0_ipwra</span><span class="s3">, </span><span class="s1">mean0_ipwra</span><span class="s3">, </span><span class="s1">mean1_ipwra</span>
+
+        <span class="s0"># GMM</span>
+        <span class="s1">mod_gmm = _IPWRAGMM(endog</span><span class="s3">, </span><span class="s1">self.results_select</span><span class="s3">, None, </span><span class="s1">teff=self</span><span class="s3">,</span>
+                            <span class="s1">effect_group=effect_group)</span>
+        <span class="s1">start_params = np.concatenate((</span>
+            <span class="s1">[mean1_ipwra - mean0_ipwra</span><span class="s3">, </span><span class="s1">mean0_ipwra]</span><span class="s3">,</span>
+            <span class="s1">result0.params</span><span class="s3">,</span>
+            <span class="s1">result1.params</span><span class="s3">,</span>
+            <span class="s1">np.asarray(self.results_select.params)</span>
+            <span class="s1">))</span>
+        <span class="s1">res_gmm = mod_gmm.fit(</span>
+            <span class="s1">start_params=start_params</span><span class="s3">,</span>
+            <span class="s1">inv_weights=np.eye(len(start_params))</span><span class="s3">,</span>
+            <span class="s1">optim_method=</span><span class="s5">'nm'</span><span class="s3">,</span>
+            <span class="s1">optim_args={</span><span class="s5">&quot;maxiter&quot;</span><span class="s1">: </span><span class="s4">2000</span><span class="s3">, </span><span class="s5">&quot;disp&quot;</span><span class="s1">: disp}</span><span class="s3">,</span>
+            <span class="s1">maxiter=</span><span class="s4">1</span>
+            <span class="s1">)</span>
+
+        <span class="s1">res = TreatmentEffectResults(self</span><span class="s3">, </span><span class="s1">res_gmm</span><span class="s3">, </span><span class="s5">&quot;IPW&quot;</span><span class="s3">,</span>
+                                     <span class="s1">start_params=start_params</span><span class="s3">,</span>
+                                     <span class="s1">effect_group=effect_group</span><span class="s3">,</span>
+                                     <span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+</pre>
+</body>
+</html>

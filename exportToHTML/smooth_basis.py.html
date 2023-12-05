@@ -1,0 +1,1085 @@
+<html>
+<head>
+<title>smooth_basis.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+smooth_basis.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+<span class="s2">&quot;&quot;&quot; 
+Spline and other smoother classes for Generalized Additive Models 
+ 
+Author: Luca Puggini 
+Author: Josef Perktold 
+ 
+Created on Fri Jun  5 16:32:00 2015 
+&quot;&quot;&quot;</span>
+
+<span class="s0"># import useful only for development</span>
+<span class="s3">from </span><span class="s1">abc </span><span class="s3">import </span><span class="s1">ABCMeta</span><span class="s3">, </span><span class="s1">abstractmethod</span>
+<span class="s3">from </span><span class="s1">statsmodels.compat.python </span><span class="s3">import </span><span class="s1">with_metaclass</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">import </span><span class="s1">pandas </span><span class="s3">as </span><span class="s1">pd</span>
+<span class="s3">from </span><span class="s1">patsy </span><span class="s3">import </span><span class="s1">dmatrix</span>
+<span class="s3">from </span><span class="s1">patsy.mgcv_cubic_splines </span><span class="s3">import </span><span class="s1">_get_all_sorted_knots</span>
+
+<span class="s3">from </span><span class="s1">statsmodels.tools.linalg </span><span class="s3">import </span><span class="s1">transf_constraints</span>
+
+
+<span class="s0"># Obtain b splines from patsy</span>
+
+<span class="s3">def </span><span class="s1">_equally_spaced_knots(x</span><span class="s3">, </span><span class="s1">df):</span>
+    <span class="s1">n_knots = df - </span><span class="s4">2</span>
+    <span class="s1">x_min = x.min()</span>
+    <span class="s1">x_max = x.max()</span>
+    <span class="s1">knots = np.linspace(x_min</span><span class="s3">, </span><span class="s1">x_max</span><span class="s3">, </span><span class="s1">n_knots)</span>
+    <span class="s3">return </span><span class="s1">knots</span>
+
+
+<span class="s3">def </span><span class="s1">_R_compat_quantile(x</span><span class="s3">, </span><span class="s1">probs):</span>
+    <span class="s0"># return np.percentile(x, 100 * np.asarray(probs))</span>
+    <span class="s1">probs = np.asarray(probs)</span>
+    <span class="s1">quantiles = np.asarray([np.percentile(x</span><span class="s3">, </span><span class="s4">100 </span><span class="s1">* prob)</span>
+                            <span class="s3">for </span><span class="s1">prob </span><span class="s3">in </span><span class="s1">probs.ravel(order=</span><span class="s5">&quot;C&quot;</span><span class="s1">)])</span>
+    <span class="s3">return </span><span class="s1">quantiles.reshape(probs.shape</span><span class="s3">, </span><span class="s1">order=</span><span class="s5">&quot;C&quot;</span><span class="s1">)</span>
+
+
+<span class="s0"># FIXME: is this copy/pasted?  If so, why do we need it?  If not, get</span>
+<span class="s0">#  rid of the try/except for scipy import</span>
+<span class="s0"># from patsy splines.py</span>
+<span class="s3">def </span><span class="s1">_eval_bspline_basis(x</span><span class="s3">, </span><span class="s1">knots</span><span class="s3">, </span><span class="s1">degree</span><span class="s3">, </span><span class="s1">deriv=</span><span class="s5">'all'</span><span class="s3">, </span><span class="s1">include_intercept=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s3">try</span><span class="s1">:</span>
+        <span class="s3">from </span><span class="s1">scipy.interpolate </span><span class="s3">import </span><span class="s1">splev</span>
+    <span class="s3">except </span><span class="s1">ImportError:</span>
+        <span class="s3">raise </span><span class="s1">ImportError(</span><span class="s5">&quot;spline functionality requires scipy&quot;</span><span class="s1">)</span>
+    <span class="s0"># 'knots' are assumed to be already pre-processed. E.g. usually you</span>
+    <span class="s0"># want to include duplicate copies of boundary knots; you should do</span>
+    <span class="s0"># that *before* calling this constructor.</span>
+    <span class="s1">knots = np.atleast_1d(np.asarray(knots</span><span class="s3">, </span><span class="s1">dtype=float))</span>
+    <span class="s3">assert </span><span class="s1">knots.ndim == </span><span class="s4">1</span>
+    <span class="s1">knots.sort()</span>
+    <span class="s1">degree = int(degree)</span>
+    <span class="s1">x = np.atleast_1d(x)</span>
+    <span class="s3">if </span><span class="s1">x.ndim == </span><span class="s4">2 </span><span class="s3">and </span><span class="s1">x.shape[</span><span class="s4">1</span><span class="s1">] == </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">x = x[:</span><span class="s3">, </span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s3">assert </span><span class="s1">x.ndim == </span><span class="s4">1</span>
+    <span class="s0"># XX FIXME: when points fall outside of the boundaries, splev and R seem</span>
+    <span class="s0"># to handle them differently. I do not know why yet. So until we understand</span>
+    <span class="s0"># this and decide what to do with it, I'm going to play it safe and</span>
+    <span class="s0"># disallow such points.</span>
+    <span class="s3">if </span><span class="s1">np.min(x) &lt; np.min(knots) </span><span class="s3">or </span><span class="s1">np.max(x) &gt; np.max(knots):</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError(</span><span class="s5">&quot;some data points fall outside the &quot;</span>
+                                  <span class="s5">&quot;outermost knots, and I'm not sure how &quot;</span>
+                                  <span class="s5">&quot;to handle them. (Patches accepted!)&quot;</span><span class="s1">)</span>
+    <span class="s0"># Thanks to Charles Harris for explaining splev. It's not well</span>
+    <span class="s0"># documented, but basically it computes an arbitrary b-spline basis</span>
+    <span class="s0"># given knots and degree on some specificed points (or derivatives</span>
+    <span class="s0"># thereof, but we do not use that functionality), and then returns some</span>
+    <span class="s0"># linear combination of these basis functions. To get out the basis</span>
+    <span class="s0"># functions themselves, we use linear combinations like [1, 0, 0], [0,</span>
+    <span class="s0"># 1, 0], [0, 0, 1].</span>
+    <span class="s0"># NB: This probably makes it rather inefficient (though I have not checked</span>
+    <span class="s0"># to be sure -- maybe the fortran code actually skips computing the basis</span>
+    <span class="s0"># function for coefficients that are zero).</span>
+    <span class="s0"># Note: the order of a spline is the same as its degree + 1.</span>
+    <span class="s0"># Note: there are (len(knots) - order) basis functions.</span>
+
+    <span class="s1">k_const = </span><span class="s4">1 </span><span class="s1">- int(include_intercept)</span>
+    <span class="s1">n_bases = len(knots) - (degree + </span><span class="s4">1</span><span class="s1">) - k_const</span>
+    <span class="s3">if </span><span class="s1">deriv </span><span class="s3">in </span><span class="s1">[</span><span class="s5">'all'</span><span class="s3">, </span><span class="s4">0</span><span class="s1">]:</span>
+        <span class="s1">basis = np.empty((x.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">n_bases)</span><span class="s3">, </span><span class="s1">dtype=float)</span>
+        <span class="s1">ret = basis</span>
+    <span class="s3">if </span><span class="s1">deriv </span><span class="s3">in </span><span class="s1">[</span><span class="s5">'all'</span><span class="s3">, </span><span class="s4">1</span><span class="s1">]:</span>
+        <span class="s1">der1_basis = np.empty((x.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">n_bases)</span><span class="s3">, </span><span class="s1">dtype=float)</span>
+        <span class="s1">ret = der1_basis</span>
+    <span class="s3">if </span><span class="s1">deriv </span><span class="s3">in </span><span class="s1">[</span><span class="s5">'all'</span><span class="s3">, </span><span class="s4">2</span><span class="s1">]:</span>
+        <span class="s1">der2_basis = np.empty((x.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">n_bases)</span><span class="s3">, </span><span class="s1">dtype=float)</span>
+        <span class="s1">ret = der2_basis</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(n_bases):</span>
+        <span class="s1">coefs = np.zeros((n_bases + k_const</span><span class="s3">,</span><span class="s1">))</span>
+        <span class="s0"># we are skipping the first column of the basis to drop constant</span>
+        <span class="s1">coefs[i + k_const] = </span><span class="s4">1</span>
+        <span class="s1">ii = i</span>
+        <span class="s3">if </span><span class="s1">deriv </span><span class="s3">in </span><span class="s1">[</span><span class="s5">'all'</span><span class="s3">, </span><span class="s4">0</span><span class="s1">]:</span>
+            <span class="s1">basis[:</span><span class="s3">, </span><span class="s1">ii] = splev(x</span><span class="s3">, </span><span class="s1">(knots</span><span class="s3">, </span><span class="s1">coefs</span><span class="s3">, </span><span class="s1">degree))</span>
+        <span class="s3">if </span><span class="s1">deriv </span><span class="s3">in </span><span class="s1">[</span><span class="s5">'all'</span><span class="s3">, </span><span class="s4">1</span><span class="s1">]:</span>
+            <span class="s1">der1_basis[:</span><span class="s3">, </span><span class="s1">ii] = splev(x</span><span class="s3">, </span><span class="s1">(knots</span><span class="s3">, </span><span class="s1">coefs</span><span class="s3">, </span><span class="s1">degree)</span><span class="s3">, </span><span class="s1">der=</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">deriv </span><span class="s3">in </span><span class="s1">[</span><span class="s5">'all'</span><span class="s3">, </span><span class="s4">2</span><span class="s1">]:</span>
+            <span class="s1">der2_basis[:</span><span class="s3">, </span><span class="s1">ii] = splev(x</span><span class="s3">, </span><span class="s1">(knots</span><span class="s3">, </span><span class="s1">coefs</span><span class="s3">, </span><span class="s1">degree)</span><span class="s3">, </span><span class="s1">der=</span><span class="s4">2</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s1">deriv == </span><span class="s5">'all'</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">basis</span><span class="s3">, </span><span class="s1">der1_basis</span><span class="s3">, </span><span class="s1">der2_basis</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">ret</span>
+
+
+<span class="s3">def </span><span class="s1">compute_all_knots(x</span><span class="s3">, </span><span class="s1">df</span><span class="s3">, </span><span class="s1">degree):</span>
+    <span class="s1">order = degree + </span><span class="s4">1</span>
+    <span class="s1">n_inner_knots = df - order</span>
+    <span class="s1">lower_bound = np.min(x)</span>
+    <span class="s1">upper_bound = np.max(x)</span>
+    <span class="s1">knot_quantiles = np.linspace(</span><span class="s4">0</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">n_inner_knots + </span><span class="s4">2</span><span class="s1">)[</span><span class="s4">1</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+    <span class="s1">inner_knots = _R_compat_quantile(x</span><span class="s3">, </span><span class="s1">knot_quantiles)</span>
+    <span class="s1">all_knots = np.concatenate(([lower_bound</span><span class="s3">, </span><span class="s1">upper_bound] * order</span><span class="s3">,</span>
+                                <span class="s1">inner_knots))</span>
+    <span class="s3">return </span><span class="s1">all_knots</span><span class="s3">, </span><span class="s1">lower_bound</span><span class="s3">, </span><span class="s1">upper_bound</span><span class="s3">, </span><span class="s1">inner_knots</span>
+
+
+<span class="s3">def </span><span class="s1">make_bsplines_basis(x</span><span class="s3">, </span><span class="s1">df</span><span class="s3">, </span><span class="s1">degree):</span>
+    <span class="s2">''' make a spline basis for x '''</span>
+
+    <span class="s1">all_knots</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_ = compute_all_knots(x</span><span class="s3">, </span><span class="s1">df</span><span class="s3">, </span><span class="s1">degree)</span>
+    <span class="s1">basis</span><span class="s3">, </span><span class="s1">der_basis</span><span class="s3">, </span><span class="s1">der2_basis = _eval_bspline_basis(x</span><span class="s3">, </span><span class="s1">all_knots</span><span class="s3">, </span><span class="s1">degree)</span>
+    <span class="s3">return </span><span class="s1">basis</span><span class="s3">, </span><span class="s1">der_basis</span><span class="s3">, </span><span class="s1">der2_basis</span>
+
+
+<span class="s3">def </span><span class="s1">get_knots_bsplines(x=</span><span class="s3">None, </span><span class="s1">df=</span><span class="s3">None, </span><span class="s1">knots=</span><span class="s3">None, </span><span class="s1">degree=</span><span class="s4">3</span><span class="s3">,</span>
+                       <span class="s1">spacing=</span><span class="s5">'quantile'</span><span class="s3">, </span><span class="s1">lower_bound=</span><span class="s3">None,</span>
+                       <span class="s1">upper_bound=</span><span class="s3">None, </span><span class="s1">all_knots=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;knots for use in B-splines 
+ 
+    There are two main options for the knot placement 
+ 
+    - quantile spacing with multiplicity of boundary knots 
+    - equal spacing extended to boundary or exterior knots 
+ 
+    The first corresponds to splines as used by patsy. the second is the 
+    knot spacing for P-Splines. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># based on patsy memorize_finish</span>
+    <span class="s3">if </span><span class="s1">all_knots </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">all_knots</span>
+
+    <span class="s1">x_min = x.min()</span>
+    <span class="s1">x_max = x.max()</span>
+
+    <span class="s3">if </span><span class="s1">degree &lt; </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;degree must be greater than 0 (not %r)&quot;</span>
+                         <span class="s1">% (degree</span><span class="s3">,</span><span class="s1">))</span>
+    <span class="s3">if </span><span class="s1">int(degree) != degree:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;degree must be an integer (not %r)&quot;</span>
+                         <span class="s1">% (degree</span><span class="s3">,</span><span class="s1">))</span>
+
+    <span class="s0"># These are guaranteed to all be 1d vectors by the code above</span>
+    <span class="s0"># x = np.concatenate(tmp[&quot;xs&quot;])</span>
+    <span class="s3">if </span><span class="s1">df </span><span class="s3">is None and </span><span class="s1">knots </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;must specify either df or knots&quot;</span><span class="s1">)</span>
+    <span class="s1">order = degree + </span><span class="s4">1</span>
+    <span class="s3">if </span><span class="s1">df </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s1">n_inner_knots = df - order</span>
+        <span class="s3">if </span><span class="s1">n_inner_knots &lt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;df=%r is too small for degree=%r; must be &gt;= %s&quot;</span>
+                             <span class="s1">% (df</span><span class="s3">, </span><span class="s1">degree</span><span class="s3">,</span>
+                                <span class="s0"># We know that n_inner_knots is negative;</span>
+                                <span class="s0"># if df were that much larger, it would</span>
+                                <span class="s0"># have been zero, and things would work.</span>
+                                <span class="s1">df - n_inner_knots))</span>
+        <span class="s3">if </span><span class="s1">knots </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">len(knots) != n_inner_knots:</span>
+                <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;df=%s with degree=%r implies %s knots, &quot;</span>
+                                 <span class="s5">&quot;but %s knots were provided&quot;</span>
+                                 <span class="s1">% (df</span><span class="s3">, </span><span class="s1">degree</span><span class="s3">,</span>
+                                    <span class="s1">n_inner_knots</span><span class="s3">, </span><span class="s1">len(knots)))</span>
+        <span class="s3">elif </span><span class="s1">spacing == </span><span class="s5">'quantile'</span><span class="s1">:</span>
+            <span class="s0"># Need to compute inner knots</span>
+            <span class="s1">knot_quantiles = np.linspace(</span><span class="s4">0</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">n_inner_knots + </span><span class="s4">2</span><span class="s1">)[</span><span class="s4">1</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">inner_knots = _R_compat_quantile(x</span><span class="s3">, </span><span class="s1">knot_quantiles)</span>
+        <span class="s3">elif </span><span class="s1">spacing == </span><span class="s5">'equal'</span><span class="s1">:</span>
+            <span class="s0"># Need to compute inner knots</span>
+            <span class="s1">grid = np.linspace(</span><span class="s4">0</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">n_inner_knots + </span><span class="s4">2</span><span class="s1">)[</span><span class="s4">1</span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">inner_knots = x_min + grid * (x_max - x_min)</span>
+            <span class="s1">diff_knots = inner_knots[</span><span class="s4">1</span><span class="s1">] - inner_knots[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;incorrect option for spacing&quot;</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">knots </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s1">inner_knots = knots</span>
+    <span class="s3">if </span><span class="s1">lower_bound </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">lower_bound = np.min(x)</span>
+    <span class="s3">if </span><span class="s1">upper_bound </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">upper_bound = np.max(x)</span>
+
+    <span class="s3">if </span><span class="s1">lower_bound &gt; upper_bound:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;lower_bound &gt; upper_bound (%r &gt; %r)&quot;</span>
+                         <span class="s1">% (lower_bound</span><span class="s3">, </span><span class="s1">upper_bound))</span>
+    <span class="s1">inner_knots = np.asarray(inner_knots)</span>
+    <span class="s3">if </span><span class="s1">inner_knots.ndim &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;knots must be 1 dimensional&quot;</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">np.any(inner_knots &lt; lower_bound):</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;some knot values (%s) fall below lower bound &quot;</span>
+                         <span class="s5">&quot;(%r)&quot;</span>
+                         <span class="s1">% (inner_knots[inner_knots &lt; lower_bound]</span><span class="s3">,</span>
+                            <span class="s1">lower_bound))</span>
+    <span class="s3">if </span><span class="s1">np.any(inner_knots &gt; upper_bound):</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;some knot values (%s) fall above upper bound &quot;</span>
+                         <span class="s5">&quot;(%r)&quot;</span>
+                         <span class="s1">% (inner_knots[inner_knots &gt; upper_bound]</span><span class="s3">,</span>
+                            <span class="s1">upper_bound))</span>
+
+    <span class="s3">if </span><span class="s1">spacing == </span><span class="s5">&quot;equal&quot;</span><span class="s1">:</span>
+        <span class="s1">diffs = np.arange(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">order + </span><span class="s4">1</span><span class="s1">) * diff_knots</span>
+        <span class="s1">lower_knots = inner_knots[</span><span class="s4">0</span><span class="s1">] - diffs[::-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">upper_knots = inner_knots[-</span><span class="s4">1</span><span class="s1">] + diffs</span>
+        <span class="s1">all_knots = np.concatenate((lower_knots</span><span class="s3">, </span><span class="s1">inner_knots</span><span class="s3">, </span><span class="s1">upper_knots))</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">all_knots = np.concatenate(([lower_bound</span><span class="s3">, </span><span class="s1">upper_bound] * order</span><span class="s3">,</span>
+                                    <span class="s1">inner_knots))</span>
+    <span class="s1">all_knots.sort()</span>
+
+    <span class="s3">return </span><span class="s1">all_knots</span>
+
+
+<span class="s3">def </span><span class="s1">_get_integration_points(knots</span><span class="s3">, </span><span class="s1">k_points=</span><span class="s4">3</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;add points to each subinterval defined by knots 
+ 
+    inserts k_points between each two consecutive knots 
+    &quot;&quot;&quot;</span>
+    <span class="s1">k_points = k_points + </span><span class="s4">1</span>
+    <span class="s1">knots = np.unique(knots)</span>
+    <span class="s1">dxi = np.arange(k_points) / k_points</span>
+    <span class="s1">dxk = np.diff(knots)</span>
+    <span class="s1">dx = dxk[:</span><span class="s3">, None</span><span class="s1">] * dxi</span>
+    <span class="s1">x = np.concatenate(((knots[:-</span><span class="s4">1</span><span class="s3">, None</span><span class="s1">] + dx).ravel()</span><span class="s3">, </span><span class="s1">[knots[-</span><span class="s4">1</span><span class="s1">]]))</span>
+    <span class="s3">return </span><span class="s1">x</span>
+
+
+<span class="s3">def </span><span class="s1">get_covder2(smoother</span><span class="s3">, </span><span class="s1">k_points=</span><span class="s4">4</span><span class="s3">, </span><span class="s1">integration_points=</span><span class="s3">None,</span>
+                <span class="s1">skip_ctransf=</span><span class="s3">False, </span><span class="s1">deriv=</span><span class="s4">2</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Approximate integral of cross product of second derivative of smoother 
+ 
+    This uses scipy.integrate simps to compute an approximation to the 
+    integral of the smoother derivative cross-product at knots plus k_points 
+    in between knots. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">from </span><span class="s1">scipy.integrate </span><span class="s3">import </span><span class="s1">simps</span>
+    <span class="s1">knots = smoother.knots</span>
+    <span class="s1">x = _get_integration_points(knots</span><span class="s3">, </span><span class="s1">k_points=</span><span class="s4">3</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">integration_points </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">d2 = smoother.transform(x</span><span class="s3">, </span><span class="s1">deriv=deriv</span><span class="s3">, </span><span class="s1">skip_ctransf=skip_ctransf)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">x = integration_points</span>
+    <span class="s1">covd2 = simps(d2[:</span><span class="s3">, </span><span class="s1">:</span><span class="s3">, None</span><span class="s1">] * d2[:</span><span class="s3">, None, </span><span class="s1">:]</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">covd2</span>
+
+
+<span class="s0"># TODO: this function should be deleted</span>
+<span class="s3">def </span><span class="s1">make_poly_basis(x</span><span class="s3">, </span><span class="s1">degree</span><span class="s3">, </span><span class="s1">intercept=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s2">''' 
+    given a vector x returns poly=(1, x, x^2, ..., x^degree) 
+    and its first and second derivative 
+    '''</span>
+
+    <span class="s3">if </span><span class="s1">intercept:</span>
+        <span class="s1">start = </span><span class="s4">0</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">start = </span><span class="s4">1</span>
+
+    <span class="s1">nobs = len(x)</span>
+    <span class="s1">basis = np.zeros(shape=(nobs</span><span class="s3">, </span><span class="s1">degree + </span><span class="s4">1 </span><span class="s1">- start))</span>
+    <span class="s1">der_basis = np.zeros(shape=(nobs</span><span class="s3">, </span><span class="s1">degree + </span><span class="s4">1 </span><span class="s1">- start))</span>
+    <span class="s1">der2_basis = np.zeros(shape=(nobs</span><span class="s3">, </span><span class="s1">degree + </span><span class="s4">1 </span><span class="s1">- start))</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(start</span><span class="s3">, </span><span class="s1">degree + </span><span class="s4">1</span><span class="s1">):</span>
+        <span class="s1">basis[:</span><span class="s3">, </span><span class="s1">i - start] = x ** i</span>
+        <span class="s1">der_basis[:</span><span class="s3">, </span><span class="s1">i - start] = i * x ** (i - </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">der2_basis[:</span><span class="s3">, </span><span class="s1">i - start] = i * (i - </span><span class="s4">1</span><span class="s1">) * x ** (i - </span><span class="s4">2</span><span class="s1">)</span>
+
+    <span class="s3">return </span><span class="s1">basis</span><span class="s3">, </span><span class="s1">der_basis</span><span class="s3">, </span><span class="s1">der2_basis</span>
+
+
+<span class="s0"># TODO: try to include other kinds of splines from patsy</span>
+<span class="s0"># x = np.linspace(0, 1, 30)</span>
+<span class="s0"># df = 10</span>
+<span class="s0"># degree = 3</span>
+<span class="s0"># from patsy.mgcv_cubic_splines import cc, cr, te</span>
+<span class="s0"># all_knots, lower, upper, inner  = compute_all_knots(x, df, degree)</span>
+<span class="s0"># result = cc(x, df=df, knots=all_knots, lower_bound=lower, upper_bound=upper,</span>
+<span class="s0">#             constraints=None)</span>
+<span class="s0">#</span>
+<span class="s0"># import matplotlib.pyplot as plt</span>
+<span class="s0">#</span>
+<span class="s0"># result = np.array(result)</span>
+<span class="s0"># print(result.shape)</span>
+<span class="s0"># plt.plot(result.T)</span>
+<span class="s0"># plt.show()</span>
+
+<span class="s3">class </span><span class="s1">UnivariateGamSmoother(with_metaclass(ABCMeta)):</span>
+    <span class="s2">&quot;&quot;&quot;Base Class for single smooth component 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">constraints=</span><span class="s3">None, </span><span class="s1">variable_name=</span><span class="s5">'x'</span><span class="s1">):</span>
+        <span class="s1">self.x = x</span>
+        <span class="s1">self.constraints = constraints</span>
+        <span class="s1">self.variable_name = variable_name</span>
+        <span class="s1">self.nobs</span><span class="s3">, </span><span class="s1">self.k_variables = len(x)</span><span class="s3">, </span><span class="s4">1</span>
+
+        <span class="s1">base4 = self._smooth_basis_for_single_variable()</span>
+        <span class="s3">if </span><span class="s1">constraints == </span><span class="s5">'center'</span><span class="s1">:</span>
+            <span class="s1">constraints = base4[</span><span class="s4">0</span><span class="s1">].mean(</span><span class="s4">0</span><span class="s1">)[</span><span class="s3">None, </span><span class="s1">:]</span>
+
+        <span class="s3">if </span><span class="s1">constraints </span><span class="s3">is not None and not </span><span class="s1">isinstance(constraints</span><span class="s3">, </span><span class="s1">str):</span>
+            <span class="s1">ctransf = transf_constraints(constraints)</span>
+            <span class="s1">self.ctransf = ctransf</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s0"># subclasses might set ctransf directly</span>
+            <span class="s0"># only used if constraints is None</span>
+            <span class="s3">if not </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s5">'ctransf'</span><span class="s1">):</span>
+                <span class="s1">self.ctransf = </span><span class="s3">None</span>
+
+        <span class="s1">self.basis</span><span class="s3">, </span><span class="s1">self.der_basis</span><span class="s3">, </span><span class="s1">self.der2_basis</span><span class="s3">, </span><span class="s1">self.cov_der2 = base4</span>
+        <span class="s3">if </span><span class="s1">self.ctransf </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">ctransf = self.ctransf</span>
+            <span class="s0"># transform attributes that are not None</span>
+            <span class="s3">if </span><span class="s1">base4[</span><span class="s4">0</span><span class="s1">] </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">self.basis = base4[</span><span class="s4">0</span><span class="s1">].dot(ctransf)</span>
+            <span class="s3">if </span><span class="s1">base4[</span><span class="s4">1</span><span class="s1">] </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">self.der_basis = base4[</span><span class="s4">1</span><span class="s1">].dot(ctransf)</span>
+            <span class="s3">if </span><span class="s1">base4[</span><span class="s4">2</span><span class="s1">] </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">self.der2_basis = base4[</span><span class="s4">2</span><span class="s1">].dot(ctransf)</span>
+            <span class="s3">if </span><span class="s1">base4[</span><span class="s4">3</span><span class="s1">] </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">self.cov_der2 = ctransf.T.dot(base4[</span><span class="s4">3</span><span class="s1">]).dot(ctransf)</span>
+
+        <span class="s1">self.dim_basis = self.basis.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">self.col_names = [self.variable_name + </span><span class="s5">&quot;_s&quot; </span><span class="s1">+ str(i)</span>
+                          <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(self.dim_basis)]</span>
+
+    <span class="s1">@abstractmethod</span>
+    <span class="s3">def </span><span class="s1">_smooth_basis_for_single_variable(self):</span>
+        <span class="s3">return</span>
+
+
+<span class="s3">class </span><span class="s1">UnivariateGenericSmoother(UnivariateGamSmoother):</span>
+    <span class="s2">&quot;&quot;&quot;Generic single smooth component 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">basis</span><span class="s3">, </span><span class="s1">der_basis</span><span class="s3">, </span><span class="s1">der2_basis</span><span class="s3">, </span><span class="s1">cov_der2</span><span class="s3">,</span>
+                 <span class="s1">variable_name=</span><span class="s5">'x'</span><span class="s1">):</span>
+        <span class="s1">self.basis = basis</span>
+        <span class="s1">self.der_basis = der_basis</span>
+        <span class="s1">self.der2_basis = der2_basis</span>
+        <span class="s1">self.cov_der2 = cov_der2</span>
+
+        <span class="s1">super(UnivariateGenericSmoother</span><span class="s3">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">x</span><span class="s3">, </span><span class="s1">variable_name=variable_name)</span>
+
+    <span class="s3">def </span><span class="s1">_smooth_basis_for_single_variable(self):</span>
+        <span class="s3">return </span><span class="s1">self.basis</span><span class="s3">, </span><span class="s1">self.der_basis</span><span class="s3">, </span><span class="s1">self.der2_basis</span><span class="s3">, </span><span class="s1">self.cov_der2</span>
+
+
+<span class="s3">class </span><span class="s1">UnivariatePolynomialSmoother(UnivariateGamSmoother):</span>
+    <span class="s2">&quot;&quot;&quot;polynomial single smooth component 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">degree</span><span class="s3">, </span><span class="s1">variable_name=</span><span class="s5">'x'</span><span class="s1">):</span>
+        <span class="s1">self.degree = degree</span>
+        <span class="s1">super(UnivariatePolynomialSmoother</span><span class="s3">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">x</span><span class="s3">, </span><span class="s1">variable_name=variable_name)</span>
+
+    <span class="s3">def </span><span class="s1">_smooth_basis_for_single_variable(self):</span>
+        <span class="s0"># TODO: unclear description</span>
+        <span class="s2">&quot;&quot;&quot; 
+        given a vector x returns poly=(1, x, x^2, ..., x^degree) 
+        and its first and second derivative 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">basis = np.zeros(shape=(self.nobs</span><span class="s3">, </span><span class="s1">self.degree))</span>
+        <span class="s1">der_basis = np.zeros(shape=(self.nobs</span><span class="s3">, </span><span class="s1">self.degree))</span>
+        <span class="s1">der2_basis = np.zeros(shape=(self.nobs</span><span class="s3">, </span><span class="s1">self.degree))</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(self.degree):</span>
+            <span class="s1">dg = i + </span><span class="s4">1</span>
+            <span class="s1">basis[:</span><span class="s3">, </span><span class="s1">i] = self.x ** dg</span>
+            <span class="s1">der_basis[:</span><span class="s3">, </span><span class="s1">i] = dg * self.x ** (dg - </span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s3">if </span><span class="s1">dg &gt; </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">der2_basis[:</span><span class="s3">, </span><span class="s1">i] = dg * (dg - </span><span class="s4">1</span><span class="s1">) * self.x ** (dg - </span><span class="s4">2</span><span class="s1">)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">der2_basis[:</span><span class="s3">, </span><span class="s1">i] = </span><span class="s4">0</span>
+
+        <span class="s1">cov_der2 = np.dot(der2_basis.T</span><span class="s3">, </span><span class="s1">der2_basis)</span>
+
+        <span class="s3">return </span><span class="s1">basis</span><span class="s3">, </span><span class="s1">der_basis</span><span class="s3">, </span><span class="s1">der2_basis</span><span class="s3">, </span><span class="s1">cov_der2</span>
+
+
+<span class="s3">class </span><span class="s1">UnivariateBSplines(UnivariateGamSmoother):</span>
+    <span class="s2">&quot;&quot;&quot;B-Spline single smooth component 
+ 
+    This creates and holds the B-Spline basis function for one 
+    component. 
+ 
+    Parameters 
+    ---------- 
+    x : ndarray, 1-D 
+        underlying explanatory variable for smooth terms. 
+    df : int 
+        number of basis functions or degrees of freedom 
+    degree : int 
+        degree of the spline 
+    include_intercept : bool 
+        If False, then the basis functions are transformed so that they 
+        do not include a constant. This avoids perfect collinearity if 
+        a constant or several components are included in the model. 
+    constraints : {None, str, array} 
+        Constraints are used to transform the basis functions to satisfy 
+        those constraints. 
+        `constraints = 'center'` applies a linear transform to remove the 
+        constant and center the basis functions. 
+    variable_name : {None, str} 
+        The name for the underlying explanatory variable, x, used in for 
+        creating the column and parameter names for the basis functions. 
+    covder2_kwds : {None, dict} 
+        options for computing the penalty matrix from the second derivative 
+        of the spline. 
+    knot_kwds : {None, list[dict]} 
+        option for the knot selection. 
+        By default knots are selected in the same way as in patsy, however the 
+        number of knots is independent of keeping or removing the constant. 
+        Interior knot selection is based on quantiles of the data and is the 
+        same in patsy and mgcv. Boundary points are at the limits of the data 
+        range. 
+        The available options use with `get_knots_bsplines` are 
+ 
+        - knots : None or array 
+          interior knots 
+        - spacing : 'quantile' or 'equal' 
+        - lower_bound : None or float 
+          location of lower boundary knots, all boundary knots are at the same 
+          point 
+        - upper_bound : None or float 
+          location of upper boundary knots, all boundary knots are at the same 
+          point 
+        - all_knots : None or array 
+          If all knots are provided, then those will be taken as given and 
+          all other options will be ignored. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">df</span><span class="s3">, </span><span class="s1">degree=</span><span class="s4">3</span><span class="s3">, </span><span class="s1">include_intercept=</span><span class="s3">False,</span>
+                 <span class="s1">constraints=</span><span class="s3">None, </span><span class="s1">variable_name=</span><span class="s5">'x'</span><span class="s3">,</span>
+                 <span class="s1">covder2_kwds=</span><span class="s3">None, </span><span class="s1">**knot_kwds):</span>
+        <span class="s1">self.degree = degree</span>
+        <span class="s1">self.df = df</span>
+        <span class="s1">self.include_intercept = include_intercept</span>
+        <span class="s1">self.knots = get_knots_bsplines(x</span><span class="s3">, </span><span class="s1">degree=degree</span><span class="s3">, </span><span class="s1">df=df</span><span class="s3">, </span><span class="s1">**knot_kwds)</span>
+        <span class="s1">self.covder2_kwds = (covder2_kwds </span><span class="s3">if </span><span class="s1">covder2_kwds </span><span class="s3">is not None</span>
+                             <span class="s3">else </span><span class="s1">{})</span>
+        <span class="s1">super(UnivariateBSplines</span><span class="s3">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">x</span><span class="s3">, </span><span class="s1">constraints=constraints</span><span class="s3">, </span><span class="s1">variable_name=variable_name)</span>
+
+    <span class="s3">def </span><span class="s1">_smooth_basis_for_single_variable(self):</span>
+        <span class="s1">basis</span><span class="s3">, </span><span class="s1">der_basis</span><span class="s3">, </span><span class="s1">der2_basis = _eval_bspline_basis(</span>
+            <span class="s1">self.x</span><span class="s3">, </span><span class="s1">self.knots</span><span class="s3">, </span><span class="s1">self.degree</span><span class="s3">,</span>
+            <span class="s1">include_intercept=self.include_intercept)</span>
+        <span class="s0"># cov_der2 = np.dot(der2_basis.T, der2_basis)</span>
+
+        <span class="s1">cov_der2 = get_covder2(self</span><span class="s3">, </span><span class="s1">skip_ctransf=</span><span class="s3">True,</span>
+                               <span class="s1">**self.covder2_kwds)</span>
+
+        <span class="s3">return </span><span class="s1">basis</span><span class="s3">, </span><span class="s1">der_basis</span><span class="s3">, </span><span class="s1">der2_basis</span><span class="s3">, </span><span class="s1">cov_der2</span>
+
+    <span class="s3">def </span><span class="s1">transform(self</span><span class="s3">, </span><span class="s1">x_new</span><span class="s3">, </span><span class="s1">deriv=</span><span class="s4">0</span><span class="s3">, </span><span class="s1">skip_ctransf=</span><span class="s3">False</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;create the spline basis for new observations 
+ 
+        The main use of this stateful transformation is for prediction 
+        using the same specification of the spline basis. 
+ 
+        Parameters 
+        ---------- 
+        x_new : ndarray 
+            observations of the underlying explanatory variable 
+        deriv : int 
+            which derivative of the spline basis to compute 
+            This is an options for internal computation. 
+        skip_ctransf : bool 
+            whether to skip the constraint transform 
+            This is an options for internal computation. 
+ 
+        Returns 
+        ------- 
+        basis : ndarray 
+            design matrix for the spline basis for given ``x_new`` 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">if </span><span class="s1">x_new </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">x_new = self.x</span>
+        <span class="s1">exog = _eval_bspline_basis(x_new</span><span class="s3">, </span><span class="s1">self.knots</span><span class="s3">, </span><span class="s1">self.degree</span><span class="s3">,</span>
+                                   <span class="s1">deriv=deriv</span><span class="s3">,</span>
+                                   <span class="s1">include_intercept=self.include_intercept)</span>
+
+        <span class="s0"># ctransf does not exist yet when cov_der2 is computed</span>
+        <span class="s1">ctransf = getattr(self</span><span class="s3">, </span><span class="s5">'ctransf'</span><span class="s3">, None</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">ctransf </span><span class="s3">is not None and not </span><span class="s1">skip_ctransf:</span>
+            <span class="s1">exog = exog.dot(self.ctransf)</span>
+        <span class="s3">return </span><span class="s1">exog</span>
+
+
+<span class="s3">class </span><span class="s1">UnivariateCubicSplines(UnivariateGamSmoother):</span>
+    <span class="s2">&quot;&quot;&quot;Cubic Spline single smooth component 
+ 
+    Cubic splines as described in the wood's book in chapter 3 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">df</span><span class="s3">, </span><span class="s1">constraints=</span><span class="s3">None, </span><span class="s1">transform=</span><span class="s5">'domain'</span><span class="s3">,</span>
+                 <span class="s1">variable_name=</span><span class="s5">'x'</span><span class="s1">):</span>
+
+        <span class="s1">self.degree = </span><span class="s4">3</span>
+        <span class="s1">self.df = df</span>
+        <span class="s1">self.transform_data_method = transform</span>
+
+        <span class="s1">self.x = x = self.transform_data(x</span><span class="s3">, </span><span class="s1">initialize=</span><span class="s3">True</span><span class="s1">)</span>
+        <span class="s1">self.knots = _equally_spaced_knots(x</span><span class="s3">, </span><span class="s1">df)</span>
+        <span class="s1">super(UnivariateCubicSplines</span><span class="s3">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">x</span><span class="s3">, </span><span class="s1">constraints=constraints</span><span class="s3">, </span><span class="s1">variable_name=variable_name)</span>
+
+    <span class="s3">def </span><span class="s1">transform_data(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">initialize=</span><span class="s3">False</span><span class="s1">):</span>
+        <span class="s1">tm = self.transform_data_method</span>
+        <span class="s3">if </span><span class="s1">tm </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">x</span>
+
+        <span class="s3">if </span><span class="s1">initialize </span><span class="s3">is True</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">tm == </span><span class="s5">'domain'</span><span class="s1">:</span>
+                <span class="s1">self.domain_low = x.min(</span><span class="s4">0</span><span class="s1">)</span>
+                <span class="s1">self.domain_upp = x.max(</span><span class="s4">0</span><span class="s1">)</span>
+            <span class="s3">elif </span><span class="s1">isinstance(tm</span><span class="s3">, </span><span class="s1">tuple):</span>
+                <span class="s1">self.domain_low = tm[</span><span class="s4">0</span><span class="s1">]</span>
+                <span class="s1">self.domain_upp = tm[</span><span class="s4">1</span><span class="s1">]</span>
+                <span class="s1">self.transform_data_method = </span><span class="s5">'domain'</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;transform should be None, 'domain' &quot;</span>
+                                 <span class="s5">&quot;or a tuple&quot;</span><span class="s1">)</span>
+            <span class="s1">self.domain_diff = self.domain_upp - self.domain_low</span>
+
+        <span class="s3">if </span><span class="s1">self.transform_data_method == </span><span class="s5">'domain'</span><span class="s1">:</span>
+            <span class="s1">x = (x - self.domain_low) / self.domain_diff</span>
+            <span class="s3">return </span><span class="s1">x</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;incorrect transform_data_method&quot;</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">_smooth_basis_for_single_variable(self):</span>
+
+        <span class="s1">basis = self._splines_x()[:</span><span class="s3">, </span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s0"># demean except for constant, does not affect derivatives</span>
+        <span class="s3">if not </span><span class="s1">self.constraints == </span><span class="s5">'none'</span><span class="s1">:</span>
+            <span class="s1">self.transf_mean = basis[:</span><span class="s3">, </span><span class="s4">1</span><span class="s1">:].mean(</span><span class="s4">0</span><span class="s1">)</span>
+            <span class="s1">basis[:</span><span class="s3">, </span><span class="s4">1</span><span class="s1">:] -= self.transf_mean</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.transf_mean = np.zeros(basis.shape[</span><span class="s4">1</span><span class="s1">])</span>
+        <span class="s1">s = self._splines_s()[:-</span><span class="s4">1</span><span class="s3">, </span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s3">if not </span><span class="s1">self.constraints == </span><span class="s5">'none'</span><span class="s1">:</span>
+            <span class="s1">ctransf = np.diag(</span><span class="s4">1</span><span class="s1">/np.max(np.abs(basis)</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">))</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">ctransf = np.eye(basis.shape[</span><span class="s4">1</span><span class="s1">])</span>
+        <span class="s0"># use np.eye to avoid rescaling</span>
+        <span class="s0"># ctransf = np.eye(basis.shape[1])</span>
+
+        <span class="s3">if </span><span class="s1">self.constraints == </span><span class="s5">'no-const'</span><span class="s1">:</span>
+            <span class="s1">ctransf = ctransf[</span><span class="s4">1</span><span class="s1">:]</span>
+
+        <span class="s1">self.ctransf = ctransf</span>
+
+        <span class="s3">return </span><span class="s1">basis</span><span class="s3">, None, None, </span><span class="s1">s</span>
+
+    <span class="s3">def </span><span class="s1">_rk(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">z):</span>
+        <span class="s1">p1 = ((z - </span><span class="s4">1 </span><span class="s1">/ </span><span class="s4">2</span><span class="s1">) ** </span><span class="s4">2 </span><span class="s1">- </span><span class="s4">1 </span><span class="s1">/ </span><span class="s4">12</span><span class="s1">) * ((x - </span><span class="s4">1 </span><span class="s1">/ </span><span class="s4">2</span><span class="s1">) ** </span><span class="s4">2 </span><span class="s1">- </span><span class="s4">1 </span><span class="s1">/ </span><span class="s4">12</span><span class="s1">) / </span><span class="s4">4</span>
+        <span class="s1">p2 = ((np.abs(z - x) - </span><span class="s4">1 </span><span class="s1">/ </span><span class="s4">2</span><span class="s1">) ** </span><span class="s4">4 </span><span class="s1">-</span>
+              <span class="s4">1 </span><span class="s1">/ </span><span class="s4">2 </span><span class="s1">* (np.abs(z - x) - </span><span class="s4">1 </span><span class="s1">/ </span><span class="s4">2</span><span class="s1">) ** </span><span class="s4">2 </span><span class="s1">+</span>
+              <span class="s4">7 </span><span class="s1">/ </span><span class="s4">240</span><span class="s1">) / </span><span class="s4">24.</span>
+        <span class="s3">return </span><span class="s1">p1 - p2</span>
+
+    <span class="s3">def </span><span class="s1">_splines_x(self</span><span class="s3">, </span><span class="s1">x=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s3">if </span><span class="s1">x </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">x = self.x</span>
+        <span class="s1">n_columns = len(self.knots) + </span><span class="s4">2</span>
+        <span class="s1">nobs = x.shape[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">basis = np.ones(shape=(nobs</span><span class="s3">, </span><span class="s1">n_columns))</span>
+        <span class="s1">basis[:</span><span class="s3">, </span><span class="s4">1</span><span class="s1">] = x</span>
+        <span class="s0"># for loop equivalent to outer(x, xk, fun=rk)</span>
+        <span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">xi </span><span class="s3">in </span><span class="s1">enumerate(x):</span>
+            <span class="s3">for </span><span class="s1">j</span><span class="s3">, </span><span class="s1">xkj </span><span class="s3">in </span><span class="s1">enumerate(self.knots):</span>
+                <span class="s1">s_ij = self._rk(xi</span><span class="s3">, </span><span class="s1">xkj)</span>
+                <span class="s1">basis[i</span><span class="s3">, </span><span class="s1">j + </span><span class="s4">2</span><span class="s1">] = s_ij</span>
+        <span class="s3">return </span><span class="s1">basis</span>
+
+    <span class="s3">def </span><span class="s1">_splines_s(self):</span>
+        <span class="s1">q = len(self.knots) + </span><span class="s4">2</span>
+        <span class="s1">s = np.zeros(shape=(q</span><span class="s3">, </span><span class="s1">q))</span>
+        <span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">x1 </span><span class="s3">in </span><span class="s1">enumerate(self.knots):</span>
+            <span class="s3">for </span><span class="s1">j</span><span class="s3">, </span><span class="s1">x2 </span><span class="s3">in </span><span class="s1">enumerate(self.knots):</span>
+                <span class="s1">s[i + </span><span class="s4">2</span><span class="s3">, </span><span class="s1">j + </span><span class="s4">2</span><span class="s1">] = self._rk(x1</span><span class="s3">, </span><span class="s1">x2)</span>
+        <span class="s3">return </span><span class="s1">s</span>
+
+    <span class="s3">def </span><span class="s1">transform(self</span><span class="s3">, </span><span class="s1">x_new):</span>
+        <span class="s1">x_new = self.transform_data(x_new</span><span class="s3">, </span><span class="s1">initialize=</span><span class="s3">False</span><span class="s1">)</span>
+        <span class="s1">exog = self._splines_x(x_new)</span>
+        <span class="s1">exog[:</span><span class="s3">, </span><span class="s4">1</span><span class="s1">:] -= self.transf_mean</span>
+        <span class="s3">if </span><span class="s1">self.ctransf </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">exog = exog.dot(self.ctransf)</span>
+        <span class="s3">return </span><span class="s1">exog</span>
+
+
+<span class="s3">class </span><span class="s1">UnivariateCubicCyclicSplines(UnivariateGamSmoother):</span>
+    <span class="s2">&quot;&quot;&quot;cyclic cubic regression spline single smooth component 
+ 
+    This creates and holds the Cyclic CubicSpline basis function for one 
+    component. 
+ 
+    Parameters 
+    ---------- 
+    x : ndarray, 1-D 
+        underlying explanatory variable for smooth terms. 
+    df : int 
+        number of basis functions or degrees of freedom 
+    degree : int 
+        degree of the spline 
+    include_intercept : bool 
+        If False, then the basis functions are transformed so that they 
+        do not include a constant. This avoids perfect collinearity if 
+        a constant or several components are included in the model. 
+    constraints : {None, str, array} 
+        Constraints are used to transform the basis functions to satisfy 
+        those constraints. 
+        `constraints = 'center'` applies a linear transform to remove the 
+        constant and center the basis functions. 
+    variable_name : None or str 
+        The name for the underlying explanatory variable, x, used in for 
+        creating the column and parameter names for the basis functions. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">df</span><span class="s3">, </span><span class="s1">constraints=</span><span class="s3">None, </span><span class="s1">variable_name=</span><span class="s5">'x'</span><span class="s1">):</span>
+        <span class="s1">self.degree = </span><span class="s4">3</span>
+        <span class="s1">self.df = df</span>
+        <span class="s1">self.x = x</span>
+        <span class="s1">self.knots = _equally_spaced_knots(x</span><span class="s3">, </span><span class="s1">df)</span>
+        <span class="s1">super(UnivariateCubicCyclicSplines</span><span class="s3">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">x</span><span class="s3">, </span><span class="s1">constraints=constraints</span><span class="s3">, </span><span class="s1">variable_name=variable_name)</span>
+
+    <span class="s3">def </span><span class="s1">_smooth_basis_for_single_variable(self):</span>
+        <span class="s1">basis = dmatrix(</span><span class="s5">&quot;cc(x, df=&quot; </span><span class="s1">+ str(self.df) + </span><span class="s5">&quot;) - 1&quot;</span><span class="s3">, </span><span class="s1">{</span><span class="s5">&quot;x&quot;</span><span class="s1">: self.x})</span>
+        <span class="s1">self.design_info = basis.design_info</span>
+        <span class="s1">n_inner_knots = self.df - </span><span class="s4">2 </span><span class="s1">+ </span><span class="s4">1  </span><span class="s0"># +n_constraints</span>
+        <span class="s0"># TODO: from CubicRegressionSplines class</span>
+        <span class="s1">all_knots = _get_all_sorted_knots(self.x</span><span class="s3">, </span><span class="s1">n_inner_knots=n_inner_knots</span><span class="s3">,</span>
+                                          <span class="s1">inner_knots=</span><span class="s3">None,</span>
+                                          <span class="s1">lower_bound=</span><span class="s3">None, </span><span class="s1">upper_bound=</span><span class="s3">None</span><span class="s1">)</span>
+
+        <span class="s1">b</span><span class="s3">, </span><span class="s1">d = self._get_b_and_d(all_knots)</span>
+        <span class="s1">s = self._get_s(b</span><span class="s3">, </span><span class="s1">d)</span>
+
+        <span class="s3">return </span><span class="s1">basis</span><span class="s3">, None, None, </span><span class="s1">s</span>
+
+    <span class="s3">def </span><span class="s1">_get_b_and_d(self</span><span class="s3">, </span><span class="s1">knots):</span>
+        <span class="s2">&quot;&quot;&quot;Returns mapping of cyclic cubic spline values to 2nd derivatives. 
+ 
+        .. note:: See 'Generalized Additive Models', Simon N. Wood, 2006, 
+           pp 146-147 
+ 
+        Parameters 
+        ---------- 
+        knots : ndarray 
+            The 1-d array knots used for cubic spline parametrization, 
+            must be sorted in ascending order. 
+ 
+        Returns 
+        ------- 
+        b : ndarray 
+            Array for mapping cyclic cubic spline values at knots to 
+            second derivatives. 
+        d : ndarray 
+            Array for mapping cyclic cubic spline values at knots to 
+            second derivatives. 
+ 
+        Notes 
+        ----- 
+        The penalty matrix is equal to ``s = d.T.dot(b^-1).dot(d)`` 
+        &quot;&quot;&quot;</span>
+        <span class="s1">h = knots[</span><span class="s4">1</span><span class="s1">:] - knots[:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">n = knots.size - </span><span class="s4">1</span>
+
+        <span class="s0"># b and d are defined such that the penalty matrix is equivalent to:</span>
+        <span class="s0"># s = d.T.dot(b^-1).dot(d)</span>
+        <span class="s0"># reference in particular to pag 146 of Wood's book</span>
+        <span class="s1">b = np.zeros((n</span><span class="s3">, </span><span class="s1">n))  </span><span class="s0"># the b matrix on page 146 of Wood's book</span>
+        <span class="s1">d = np.zeros((n</span><span class="s3">, </span><span class="s1">n))  </span><span class="s0"># the d matrix on page 146 of Wood's book</span>
+
+        <span class="s1">b[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s1">] = (h[n - </span><span class="s4">1</span><span class="s1">] + h[</span><span class="s4">0</span><span class="s1">]) / </span><span class="s4">3.</span>
+        <span class="s1">b[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">n - </span><span class="s4">1</span><span class="s1">] = h[n - </span><span class="s4">1</span><span class="s1">] / </span><span class="s4">6.</span>
+        <span class="s1">b[n - </span><span class="s4">1</span><span class="s3">, </span><span class="s4">0</span><span class="s1">] = h[n - </span><span class="s4">1</span><span class="s1">] / </span><span class="s4">6.</span>
+
+        <span class="s1">d[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s1">] = -</span><span class="s4">1. </span><span class="s1">/ h[</span><span class="s4">0</span><span class="s1">] - </span><span class="s4">1. </span><span class="s1">/ h[n - </span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">d[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">n - </span><span class="s4">1</span><span class="s1">] = </span><span class="s4">1. </span><span class="s1">/ h[n - </span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">d[n - </span><span class="s4">1</span><span class="s3">, </span><span class="s4">0</span><span class="s1">] = </span><span class="s4">1. </span><span class="s1">/ h[n - </span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">n):</span>
+            <span class="s1">b[i</span><span class="s3">, </span><span class="s1">i] = (h[i - </span><span class="s4">1</span><span class="s1">] + h[i]) / </span><span class="s4">3.</span>
+            <span class="s1">b[i</span><span class="s3">, </span><span class="s1">i - </span><span class="s4">1</span><span class="s1">] = h[i - </span><span class="s4">1</span><span class="s1">] / </span><span class="s4">6.</span>
+            <span class="s1">b[i - </span><span class="s4">1</span><span class="s3">, </span><span class="s1">i] = h[i - </span><span class="s4">1</span><span class="s1">] / </span><span class="s4">6.</span>
+
+            <span class="s1">d[i</span><span class="s3">, </span><span class="s1">i] = -</span><span class="s4">1. </span><span class="s1">/ h[i - </span><span class="s4">1</span><span class="s1">] - </span><span class="s4">1. </span><span class="s1">/ h[i]</span>
+            <span class="s1">d[i</span><span class="s3">, </span><span class="s1">i - </span><span class="s4">1</span><span class="s1">] = </span><span class="s4">1. </span><span class="s1">/ h[i - </span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">d[i - </span><span class="s4">1</span><span class="s3">, </span><span class="s1">i] = </span><span class="s4">1. </span><span class="s1">/ h[i - </span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s3">return </span><span class="s1">b</span><span class="s3">, </span><span class="s1">d</span>
+
+    <span class="s3">def </span><span class="s1">_get_s(self</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">d):</span>
+        <span class="s3">return </span><span class="s1">d.T.dot(np.linalg.inv(b)).dot(d)</span>
+
+    <span class="s3">def </span><span class="s1">transform(self</span><span class="s3">, </span><span class="s1">x_new):</span>
+        <span class="s1">exog = dmatrix(self.design_info</span><span class="s3">, </span><span class="s1">{</span><span class="s5">&quot;x&quot;</span><span class="s1">: x_new})</span>
+        <span class="s3">if </span><span class="s1">self.ctransf </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">exog = exog.dot(self.ctransf)</span>
+        <span class="s3">return </span><span class="s1">exog</span>
+
+
+<span class="s3">class </span><span class="s1">AdditiveGamSmoother(with_metaclass(ABCMeta)):</span>
+    <span class="s2">&quot;&quot;&quot;Base class for additive smooth components 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">variable_names=</span><span class="s3">None, </span><span class="s1">include_intercept=</span><span class="s3">False,</span>
+                 <span class="s1">**kwargs):</span>
+
+        <span class="s0"># get pandas names before using asarray</span>
+        <span class="s3">if </span><span class="s1">isinstance(x</span><span class="s3">, </span><span class="s1">pd.DataFrame):</span>
+            <span class="s1">data_names = x.columns.tolist()</span>
+        <span class="s3">elif </span><span class="s1">isinstance(x</span><span class="s3">, </span><span class="s1">pd.Series):</span>
+            <span class="s1">data_names = [x.name]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">data_names = </span><span class="s3">None</span>
+
+        <span class="s1">x = np.asarray(x)</span>
+
+        <span class="s3">if </span><span class="s1">x.ndim == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">self.x = x.copy()</span>
+            <span class="s1">self.x.shape = (len(x)</span><span class="s3">, </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.x = x</span>
+
+        <span class="s1">self.nobs</span><span class="s3">, </span><span class="s1">self.k_variables = self.x.shape</span>
+        <span class="s3">if </span><span class="s1">isinstance(include_intercept</span><span class="s3">, </span><span class="s1">bool):</span>
+            <span class="s1">self.include_intercept = [include_intercept] * self.k_variables</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.include_intercept = include_intercept</span>
+
+        <span class="s3">if </span><span class="s1">variable_names </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">data_names </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">self.variable_names = data_names</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">self.variable_names = [</span><span class="s5">'x' </span><span class="s1">+ str(i)</span>
+                                       <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(self.k_variables)]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.variable_names = variable_names</span>
+
+        <span class="s1">self.smoothers = self._make_smoothers_list()</span>
+        <span class="s1">self.basis = np.hstack(list(smoother.basis</span>
+                               <span class="s3">for </span><span class="s1">smoother </span><span class="s3">in </span><span class="s1">self.smoothers))</span>
+        <span class="s1">self.dim_basis = self.basis.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">self.penalty_matrices = [smoother.cov_der2</span>
+                                 <span class="s3">for </span><span class="s1">smoother </span><span class="s3">in </span><span class="s1">self.smoothers]</span>
+        <span class="s1">self.col_names = []</span>
+        <span class="s3">for </span><span class="s1">smoother </span><span class="s3">in </span><span class="s1">self.smoothers:</span>
+            <span class="s1">self.col_names.extend(smoother.col_names)</span>
+
+        <span class="s1">self.mask = []</span>
+        <span class="s1">last_column = </span><span class="s4">0</span>
+        <span class="s3">for </span><span class="s1">smoother </span><span class="s3">in </span><span class="s1">self.smoothers:</span>
+            <span class="s1">mask = np.array([</span><span class="s3">False</span><span class="s1">] * self.dim_basis)</span>
+            <span class="s1">mask[last_column:smoother.dim_basis + last_column] = </span><span class="s3">True</span>
+            <span class="s1">last_column = last_column + smoother.dim_basis</span>
+            <span class="s1">self.mask.append(mask)</span>
+
+    <span class="s1">@abstractmethod</span>
+    <span class="s3">def </span><span class="s1">_make_smoothers_list(self):</span>
+        <span class="s3">pass</span>
+
+    <span class="s3">def </span><span class="s1">transform(self</span><span class="s3">, </span><span class="s1">x_new):</span>
+        <span class="s2">&quot;&quot;&quot;create the spline basis for new observations 
+ 
+        The main use of this stateful transformation is for prediction 
+        using the same specification of the spline basis. 
+ 
+        Parameters 
+        ---------- 
+        x_new: ndarray 
+            observations of the underlying explanatory variable 
+ 
+        Returns 
+        ------- 
+        basis : ndarray 
+            design matrix for the spline basis for given ``x_new``. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">x_new.ndim == </span><span class="s4">1 </span><span class="s3">and </span><span class="s1">self.k_variables == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">x_new = x_new.reshape(-</span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">exog = np.hstack(list(self.smoothers[i].transform(x_new[:</span><span class="s3">, </span><span class="s1">i])</span>
+                         <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(self.k_variables)))</span>
+        <span class="s3">return </span><span class="s1">exog</span>
+
+
+<span class="s3">class </span><span class="s1">GenericSmoothers(AdditiveGamSmoother):</span>
+    <span class="s2">&quot;&quot;&quot;generic class for additive smooth components for GAM 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">smoothers):</span>
+        <span class="s1">self.smoothers = smoothers</span>
+        <span class="s1">super(GenericSmoothers</span><span class="s3">, </span><span class="s1">self).__init__(x</span><span class="s3">, </span><span class="s1">variable_names=</span><span class="s3">None</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">_make_smoothers_list(self):</span>
+        <span class="s3">return </span><span class="s1">self.smoothers</span>
+
+
+<span class="s3">class </span><span class="s1">PolynomialSmoother(AdditiveGamSmoother):</span>
+    <span class="s2">&quot;&quot;&quot;additive polynomial components for GAM 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">degrees</span><span class="s3">, </span><span class="s1">variable_names=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s1">self.degrees = degrees</span>
+        <span class="s1">super(PolynomialSmoother</span><span class="s3">, </span><span class="s1">self).__init__(x</span><span class="s3">,</span>
+                                                 <span class="s1">variable_names=variable_names)</span>
+
+    <span class="s3">def </span><span class="s1">_make_smoothers_list(self):</span>
+        <span class="s1">smoothers = []</span>
+        <span class="s3">for </span><span class="s1">v </span><span class="s3">in </span><span class="s1">range(self.k_variables):</span>
+            <span class="s1">uv_smoother = UnivariatePolynomialSmoother(</span>
+                <span class="s1">self.x[:</span><span class="s3">, </span><span class="s1">v]</span><span class="s3">,</span>
+                <span class="s1">degree=self.degrees[v]</span><span class="s3">,</span>
+                <span class="s1">variable_name=self.variable_names[v])</span>
+            <span class="s1">smoothers.append(uv_smoother)</span>
+        <span class="s3">return </span><span class="s1">smoothers</span>
+
+
+<span class="s3">class </span><span class="s1">BSplines(AdditiveGamSmoother):</span>
+    <span class="s2">&quot;&quot;&quot;additive smooth components using B-Splines 
+ 
+    This creates and holds the B-Spline basis function for several 
+    components. 
+ 
+    Parameters 
+    ---------- 
+    x : array_like, 1-D or 2-D 
+        underlying explanatory variable for smooth terms. 
+        If 2-dimensional, then observations should be in rows and 
+        explanatory variables in columns. 
+    df :  {int, array_like[int]} 
+        number of basis functions or degrees of freedom; should be equal 
+        in length to the number of columns of `x`; may be an integer if 
+        `x` has one column or is 1-D. 
+    degree : {int, array_like[int]} 
+        degree(s) of the spline; the same length and type rules apply as 
+        to `df` 
+    include_intercept : bool 
+        If False, then the basis functions are transformed so that they 
+        do not include a constant. This avoids perfect collinearity if 
+        a constant or several components are included in the model. 
+    constraints : {None, str, array} 
+        Constraints are used to transform the basis functions to satisfy 
+        those constraints. 
+        `constraints = 'center'` applies a linear transform to remove the 
+        constant and center the basis functions. 
+    variable_names : {list[str], None} 
+        The names for the underlying explanatory variables, x used in for 
+        creating the column and parameter names for the basis functions. 
+        If ``x`` is a pandas object, then the names will be taken from it. 
+    knot_kwds : None or list of dict 
+        option for the knot selection. 
+        By default knots are selected in the same way as in patsy, however the 
+        number of knots is independent of keeping or removing the constant. 
+        Interior knot selection is based on quantiles of the data and is the 
+        same in patsy and mgcv. Boundary points are at the limits of the data 
+        range. 
+        The available options use with `get_knots_bsplines` are 
+ 
+        - knots : None or array 
+          interior knots 
+        - spacing : 'quantile' or 'equal' 
+        - lower_bound : None or float 
+          location of lower boundary knots, all boundary knots are at the same 
+          point 
+        - upper_bound : None or float 
+          location of upper boundary knots, all boundary knots are at the same 
+          point 
+        - all_knots : None or array 
+          If all knots are provided, then those will be taken as given and 
+          all other options will be ignored. 
+ 
+ 
+    Attributes 
+    ---------- 
+    smoothers : list of univariate smooth component instances 
+    basis : design matrix, array of spline bases columns for all components 
+    penalty_matrices : list of penalty matrices, one for each smooth term 
+    dim_basis : number of columns in the basis 
+    k_variables : number of smooth components 
+    col_names : created names for the basis columns 
+ 
+    There are additional attributes about the specification of the splines 
+    and some attributes mainly for internal use. 
+ 
+    Notes 
+    ----- 
+    A constant in the spline basis function can be removed in two different 
+    ways. 
+    The first is by dropping one basis column and normalizing the 
+    remaining columns. This is obtained by the default 
+    ``include_intercept=False, constraints=None`` 
+    The second option is by using the centering transform which is a linear 
+    transformation of all basis functions. As a consequence of the 
+    transformation, the B-spline basis functions do not have locally bounded 
+    support anymore. This is obtained ``constraints='center'``. In this case 
+    ``include_intercept`` will be automatically set to True to avoid 
+    dropping an additional column. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">df</span><span class="s3">, </span><span class="s1">degree</span><span class="s3">, </span><span class="s1">include_intercept=</span><span class="s3">False,</span>
+                 <span class="s1">constraints=</span><span class="s3">None, </span><span class="s1">variable_names=</span><span class="s3">None, </span><span class="s1">knot_kwds=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s3">if </span><span class="s1">isinstance(degree</span><span class="s3">, </span><span class="s1">int):</span>
+            <span class="s1">self.degrees = np.array([degree]</span><span class="s3">, </span><span class="s1">dtype=int)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.degrees = degree</span>
+        <span class="s3">if </span><span class="s1">isinstance(df</span><span class="s3">, </span><span class="s1">int):</span>
+            <span class="s1">self.dfs = np.array([df]</span><span class="s3">, </span><span class="s1">dtype=int)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.dfs = df</span>
+        <span class="s1">self.knot_kwds = knot_kwds</span>
+        <span class="s0"># TODO: move attaching constraints to super call</span>
+        <span class="s1">self.constraints = constraints</span>
+        <span class="s3">if </span><span class="s1">constraints == </span><span class="s5">'center'</span><span class="s1">:</span>
+            <span class="s1">include_intercept = </span><span class="s3">True</span>
+
+        <span class="s1">super(BSplines</span><span class="s3">, </span><span class="s1">self).__init__(x</span><span class="s3">, </span><span class="s1">include_intercept=include_intercept</span><span class="s3">,</span>
+                                       <span class="s1">variable_names=variable_names)</span>
+
+    <span class="s3">def </span><span class="s1">_make_smoothers_list(self):</span>
+        <span class="s1">smoothers = []</span>
+        <span class="s3">for </span><span class="s1">v </span><span class="s3">in </span><span class="s1">range(self.k_variables):</span>
+            <span class="s1">kwds = self.knot_kwds[v] </span><span class="s3">if </span><span class="s1">self.knot_kwds </span><span class="s3">else </span><span class="s1">{}</span>
+            <span class="s1">uv_smoother = UnivariateBSplines(</span>
+                <span class="s1">self.x[:</span><span class="s3">, </span><span class="s1">v]</span><span class="s3">,</span>
+                <span class="s1">df=self.dfs[v]</span><span class="s3">, </span><span class="s1">degree=self.degrees[v]</span><span class="s3">,</span>
+                <span class="s1">include_intercept=self.include_intercept[v]</span><span class="s3">,</span>
+                <span class="s1">constraints=self.constraints</span><span class="s3">,</span>
+                <span class="s1">variable_name=self.variable_names[v]</span><span class="s3">, </span><span class="s1">**kwds)</span>
+            <span class="s1">smoothers.append(uv_smoother)</span>
+
+        <span class="s3">return </span><span class="s1">smoothers</span>
+
+
+<span class="s3">class </span><span class="s1">CubicSplines(AdditiveGamSmoother):</span>
+    <span class="s2">&quot;&quot;&quot;additive smooth components using cubic splines as in Wood 2006. 
+ 
+    Note, these splines do NOT use the same spline basis as 
+    ``Cubic Regression Splines``. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">df</span><span class="s3">, </span><span class="s1">constraints=</span><span class="s5">'center'</span><span class="s3">, </span><span class="s1">transform=</span><span class="s5">'domain'</span><span class="s3">,</span>
+                 <span class="s1">variable_names=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s1">self.dfs = df</span>
+        <span class="s1">self.constraints = constraints</span>
+        <span class="s1">self.transform = transform</span>
+        <span class="s1">super(CubicSplines</span><span class="s3">, </span><span class="s1">self).__init__(x</span><span class="s3">, </span><span class="s1">constraints=constraints</span><span class="s3">,</span>
+                                           <span class="s1">variable_names=variable_names)</span>
+
+    <span class="s3">def </span><span class="s1">_make_smoothers_list(self):</span>
+        <span class="s1">smoothers = []</span>
+        <span class="s3">for </span><span class="s1">v </span><span class="s3">in </span><span class="s1">range(self.k_variables):</span>
+            <span class="s1">uv_smoother = UnivariateCubicSplines(</span>
+                            <span class="s1">self.x[:</span><span class="s3">, </span><span class="s1">v]</span><span class="s3">, </span><span class="s1">df=self.dfs[v]</span><span class="s3">,</span>
+                            <span class="s1">constraints=self.constraints</span><span class="s3">,</span>
+                            <span class="s1">transform=self.transform</span><span class="s3">,</span>
+                            <span class="s1">variable_name=self.variable_names[v])</span>
+            <span class="s1">smoothers.append(uv_smoother)</span>
+
+        <span class="s3">return </span><span class="s1">smoothers</span>
+
+
+<span class="s3">class </span><span class="s1">CyclicCubicSplines(AdditiveGamSmoother):</span>
+    <span class="s2">&quot;&quot;&quot;additive smooth components using cyclic cubic regression splines 
+ 
+    This spline basis is the same as in patsy. 
+ 
+    Parameters 
+    ---------- 
+    x : array_like, 1-D or 2-D 
+        underlying explanatory variable for smooth terms. 
+        If 2-dimensional, then observations should be in rows and 
+        explanatory variables in columns. 
+    df :  int 
+        numer of basis functions or degrees of freedom 
+    constraints : {None, str, array} 
+        Constraints are used to transform the basis functions to satisfy 
+        those constraints. 
+    variable_names : {list[str], None} 
+        The names for the underlying explanatory variables, x used in for 
+        creating the column and parameter names for the basis functions. 
+        If ``x`` is a pandas object, then the names will be taken from it. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">df</span><span class="s3">, </span><span class="s1">constraints=</span><span class="s3">None, </span><span class="s1">variable_names=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s1">self.dfs = df</span>
+        <span class="s0"># TODO: move attaching constraints to super call</span>
+        <span class="s1">self.constraints = constraints</span>
+        <span class="s1">super(CyclicCubicSplines</span><span class="s3">, </span><span class="s1">self).__init__(x</span><span class="s3">,</span>
+                                                 <span class="s1">variable_names=variable_names)</span>
+
+    <span class="s3">def </span><span class="s1">_make_smoothers_list(self):</span>
+        <span class="s1">smoothers = []</span>
+        <span class="s3">for </span><span class="s1">v </span><span class="s3">in </span><span class="s1">range(self.k_variables):</span>
+            <span class="s1">uv_smoother = UnivariateCubicCyclicSplines(</span>
+                <span class="s1">self.x[:</span><span class="s3">, </span><span class="s1">v]</span><span class="s3">,</span>
+                <span class="s1">df=self.dfs[v]</span><span class="s3">, </span><span class="s1">constraints=self.constraints</span><span class="s3">,</span>
+                <span class="s1">variable_name=self.variable_names[v])</span>
+            <span class="s1">smoothers.append(uv_smoother)</span>
+
+        <span class="s3">return </span><span class="s1">smoothers</span>
+
+<span class="s0"># class CubicRegressionSplines(BaseCubicSplines):</span>
+<span class="s0">#     # TODO: this class is still not tested</span>
+<span class="s0">#</span>
+<span class="s0">#     def __init__(self, x, df=10):</span>
+<span class="s0">#         import warnings</span>
+<span class="s0">#         warnings.warn(&quot;This class is still not tested and it is probably&quot;</span>
+<span class="s0">#                       &quot; not working properly. &quot;</span>
+<span class="s0">#                       &quot;I suggest to use another smoother&quot;, Warning)</span>
+<span class="s0">#</span>
+<span class="s0">#         super(CubicRegressionSplines, self).__init__(x, df)</span>
+<span class="s0">#</span>
+<span class="s0">#         self.basis = dmatrix(&quot;cc(x, df=&quot; + str(df) + &quot;) - 1&quot;, {&quot;x&quot;: x})</span>
+<span class="s0">#         n_inner_knots = df - 2 + 1 # +n_constraints</span>
+<span class="s0">#         # TODO: ACcording to CubicRegressionSplines class this should be</span>
+<span class="s0">#         #  n_inner_knots = df - 2</span>
+<span class="s0">#         all_knots = _get_all_sorted_knots(x, n_inner_knots=n_inner_knots,</span>
+<span class="s0">#                                           inner_knots=None,</span>
+<span class="s0">#                                           lower_bound=None, upper_bound=None)</span>
+<span class="s0">#</span>
+<span class="s0">#         b, d = self._get_b_and_d(all_knots)</span>
+<span class="s0">#         self.s = self._get_s(b, d)</span>
+<span class="s0">#</span>
+<span class="s0">#         self.dim_basis = self.basis.shape[1]</span>
+<span class="s0">#</span>
+<span class="s0">#     def _get_b_and_d(self, knots):</span>
+<span class="s0">#</span>
+<span class="s0">#         h = knots[1:] - knots[:-1]</span>
+<span class="s0">#         n = knots.size - 1</span>
+<span class="s0">#</span>
+<span class="s0">#         # b and d are defined such that the penalty matrix is equivalent to:</span>
+<span class="s0">#         # s = d.T.dot(b^-1).dot(d)</span>
+<span class="s0">#         # reference in particular to pag 146 of Wood's book</span>
+<span class="s0">#         b = np.zeros((n, n)) # the b matrix on page 146 of Wood's book</span>
+<span class="s0">#         d = np.zeros((n, n)) # the d matrix on page 146 of Wood's book</span>
+<span class="s0">#</span>
+<span class="s0">#         for i in range(n-2):</span>
+<span class="s0">#             d[i, i] = 1/h[i]</span>
+<span class="s0">#             d[i, i+1] = -1/h[i] - 1/h[i+1]</span>
+<span class="s0">#             d[i, i+2] = 1/h[i+1]</span>
+<span class="s0">#</span>
+<span class="s0">#             b[i, i] = (h[i] + h[i+1])/3</span>
+<span class="s0">#</span>
+<span class="s0">#         for i in range(n-3):</span>
+<span class="s0">#             b[i, i+1] = h[i+1]/6</span>
+<span class="s0">#             b[i+1, i] = h[i+1]/6</span>
+<span class="s0">#</span>
+<span class="s0">#         return b, d</span>
+<span class="s0">#</span>
+<span class="s0">#     def _get_s(self, b, d):</span>
+<span class="s0">#</span>
+<span class="s0">#         return d.T.dot(np.linalg.pinv(b)).dot(d)</span>
+</pre>
+</body>
+</html>

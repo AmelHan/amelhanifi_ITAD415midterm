@@ -1,0 +1,392 @@
+<html>
+<head>
+<title>optimization.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+optimization.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">from </span><span class="s1">collections.abc </span><span class="s0">import </span><span class="s1">Callable</span>
+<span class="s0">from </span><span class="s1">itertools </span><span class="s0">import </span><span class="s1">zip_longest</span>
+<span class="s0">from </span><span class="s1">numbers </span><span class="s0">import </span><span class="s1">Integral</span>
+<span class="s0">from </span><span class="s1">typing </span><span class="s0">import </span><span class="s1">Any</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">from </span><span class="s1">dask </span><span class="s0">import </span><span class="s1">config</span>
+<span class="s0">from </span><span class="s1">dask.array.chunk </span><span class="s0">import </span><span class="s1">getitem</span>
+<span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">getter</span><span class="s0">, </span><span class="s1">getter_inline</span><span class="s0">, </span><span class="s1">getter_nofancy</span>
+<span class="s0">from </span><span class="s1">dask.blockwise </span><span class="s0">import </span><span class="s1">fuse_roots</span><span class="s0">, </span><span class="s1">optimize_blockwise</span>
+<span class="s0">from </span><span class="s1">dask.core </span><span class="s0">import </span><span class="s1">flatten</span><span class="s0">, </span><span class="s1">reverse_dict</span>
+<span class="s0">from </span><span class="s1">dask.highlevelgraph </span><span class="s0">import </span><span class="s1">HighLevelGraph</span>
+<span class="s0">from </span><span class="s1">dask.optimization </span><span class="s0">import </span><span class="s1">SubgraphCallable</span><span class="s0">, </span><span class="s1">fuse</span><span class="s0">, </span><span class="s1">inline_functions</span>
+<span class="s0">from </span><span class="s1">dask.utils </span><span class="s0">import </span><span class="s1">ensure_dict</span>
+
+<span class="s2"># All get* functions the optimizations know about</span>
+<span class="s1">GETTERS = (getter</span><span class="s0">, </span><span class="s1">getter_nofancy</span><span class="s0">, </span><span class="s1">getter_inline</span><span class="s0">, </span><span class="s1">getitem)</span>
+<span class="s2"># These get* functions aren't ever completely removed from the graph,</span>
+<span class="s2"># even if the index should be a no-op by numpy semantics. Some array-like's</span>
+<span class="s2"># don't completely follow semantics, making indexing always necessary.</span>
+<span class="s1">GETNOREMOVE = (getter</span><span class="s0">, </span><span class="s1">getter_nofancy)</span>
+
+
+<span class="s0">def </span><span class="s1">optimize(</span>
+    <span class="s1">dsk</span><span class="s0">,</span>
+    <span class="s1">keys</span><span class="s0">,</span>
+    <span class="s1">fuse_keys=</span><span class="s0">None,</span>
+    <span class="s1">fast_functions=</span><span class="s0">None,</span>
+    <span class="s1">inline_functions_fast_functions=(getter_inline</span><span class="s0">,</span><span class="s1">)</span><span class="s0">,</span>
+    <span class="s1">rename_fused_keys=</span><span class="s0">True,</span>
+    <span class="s1">**kwargs</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Optimize dask for array computation 
+ 
+    1.  Cull tasks not necessary to evaluate keys 
+    2.  Remove full slicing, e.g. x[:] 
+    3.  Inline fast functions like getitem and np.transpose 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if not </span><span class="s1">isinstance(keys</span><span class="s0">, </span><span class="s1">(list</span><span class="s0">, </span><span class="s1">set)):</span>
+        <span class="s1">keys = [keys]</span>
+    <span class="s1">keys = list(flatten(keys))</span>
+
+    <span class="s0">if not </span><span class="s1">isinstance(dsk</span><span class="s0">, </span><span class="s1">HighLevelGraph):</span>
+        <span class="s1">dsk = HighLevelGraph.from_collections(id(dsk)</span><span class="s0">, </span><span class="s1">dsk</span><span class="s0">, </span><span class="s1">dependencies=())</span>
+
+    <span class="s1">dsk = optimize_blockwise(dsk</span><span class="s0">, </span><span class="s1">keys=keys)</span>
+    <span class="s1">dsk = fuse_roots(dsk</span><span class="s0">, </span><span class="s1">keys=keys)</span>
+    <span class="s1">dsk = dsk.cull(set(keys))</span>
+
+    <span class="s2"># Perform low-level fusion unless the user has</span>
+    <span class="s2"># specified False explicitly.</span>
+    <span class="s0">if </span><span class="s1">config.get(</span><span class="s4">&quot;optimization.fuse.active&quot;</span><span class="s1">) </span><span class="s0">is False</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">dsk</span>
+
+    <span class="s1">dependencies = dsk.get_all_dependencies()</span>
+    <span class="s1">dsk = ensure_dict(dsk)</span>
+
+    <span class="s2"># Low level task optimizations</span>
+    <span class="s0">if </span><span class="s1">fast_functions </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s1">inline_functions_fast_functions = fast_functions</span>
+
+    <span class="s1">hold = hold_keys(dsk</span><span class="s0">, </span><span class="s1">dependencies)</span>
+
+    <span class="s1">dsk</span><span class="s0">, </span><span class="s1">dependencies = fuse(</span>
+        <span class="s1">dsk</span><span class="s0">,</span>
+        <span class="s1">hold + keys + (fuse_keys </span><span class="s0">or </span><span class="s1">[])</span><span class="s0">,</span>
+        <span class="s1">dependencies</span><span class="s0">,</span>
+        <span class="s1">rename_keys=rename_fused_keys</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">inline_functions_fast_functions:</span>
+        <span class="s1">dsk = inline_functions(</span>
+            <span class="s1">dsk</span><span class="s0">,</span>
+            <span class="s1">keys</span><span class="s0">,</span>
+            <span class="s1">dependencies=dependencies</span><span class="s0">,</span>
+            <span class="s1">fast_functions=inline_functions_fast_functions</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+    <span class="s0">return </span><span class="s1">optimize_slices(dsk)</span>
+
+
+<span class="s0">def </span><span class="s1">hold_keys(dsk</span><span class="s0">, </span><span class="s1">dependencies):</span>
+    <span class="s3">&quot;&quot;&quot;Find keys to avoid fusion 
+ 
+    We don't want to fuse data present in the graph because it is easier to 
+    serialize as a raw value. 
+ 
+    We don't want to fuse chains after getitem/GETTERS because we want to 
+    move around only small pieces of data, rather than the underlying arrays. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">dependents = reverse_dict(dependencies)</span>
+    <span class="s1">data = {k </span><span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">dsk.items() </span><span class="s0">if </span><span class="s1">type(v) </span><span class="s0">not in </span><span class="s1">(tuple</span><span class="s0">, </span><span class="s1">str)}</span>
+
+    <span class="s1">hold_keys = list(data)</span>
+    <span class="s0">for </span><span class="s1">dat </span><span class="s0">in </span><span class="s1">data:</span>
+        <span class="s1">deps = dependents[dat]</span>
+        <span class="s0">for </span><span class="s1">dep </span><span class="s0">in </span><span class="s1">deps:</span>
+            <span class="s1">task = dsk[dep]</span>
+            <span class="s2"># If the task is a get* function, we walk up the chain, and stop</span>
+            <span class="s2"># when there's either more than one dependent, or the dependent is</span>
+            <span class="s2"># no longer a get* function or an alias. We then add the final</span>
+            <span class="s2"># key to the list of keys not to fuse.</span>
+            <span class="s0">if </span><span class="s1">_is_getter_task(task):</span>
+                <span class="s0">try</span><span class="s1">:</span>
+                    <span class="s0">while </span><span class="s1">len(dependents[dep]) == </span><span class="s5">1</span><span class="s1">:</span>
+                        <span class="s1">new_dep = next(iter(dependents[dep]))</span>
+                        <span class="s1">new_task = dsk[new_dep]</span>
+                        <span class="s2"># If the task is a get* or an alias, continue up the</span>
+                        <span class="s2"># linear chain</span>
+                        <span class="s0">if </span><span class="s1">_is_getter_task(new_task) </span><span class="s0">or </span><span class="s1">new_task </span><span class="s0">in </span><span class="s1">dsk:</span>
+                            <span class="s1">dep = new_dep</span>
+                        <span class="s0">else</span><span class="s1">:</span>
+                            <span class="s0">break</span>
+                <span class="s0">except </span><span class="s1">(IndexError</span><span class="s0">, </span><span class="s1">TypeError):</span>
+                    <span class="s0">pass</span>
+                <span class="s1">hold_keys.append(dep)</span>
+    <span class="s0">return </span><span class="s1">hold_keys</span>
+
+
+<span class="s0">def </span><span class="s1">_is_getter_task(</span>
+    <span class="s1">value</span><span class="s0">,</span>
+<span class="s1">) -&gt; tuple[Callable</span><span class="s0">, </span><span class="s1">Any</span><span class="s0">, </span><span class="s1">Any</span><span class="s0">, </span><span class="s1">bool</span><span class="s0">, </span><span class="s1">bool | </span><span class="s0">None</span><span class="s1">] | </span><span class="s0">None</span><span class="s1">:</span>
+    <span class="s3">&quot;&quot;&quot;Check if a value in a Dask graph looks like a getter. 
+ 
+    1. Is it a tuple with the first element a known getter. 
+    2. Is it a SubgraphCallable with a single element in its 
+       dsk which is a known getter. 
+ 
+    If a getter is found, it returns a tuple with (getter, array, index, asarray, lock). 
+    Otherwise it returns ``None``. 
+ 
+    TODO: the second check is a hack to allow for slice fusion between tasks produced 
+    from blockwise layers and slicing operations. Once slicing operations have 
+    HighLevelGraph layers which can talk to Blockwise layers this check *should* be 
+    removed, and we should not have to introspect SubgraphCallables. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">type(value) </span><span class="s0">is not </span><span class="s1">tuple:</span>
+        <span class="s0">return None</span>
+    <span class="s1">first = value[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">get: Callable | </span><span class="s0">None </span><span class="s1">= </span><span class="s0">None</span>
+    <span class="s0">if </span><span class="s1">first </span><span class="s0">in </span><span class="s1">GETTERS:</span>
+        <span class="s1">get = first</span>
+    <span class="s2"># We only accept SubgraphCallables with a single sub-task right now as it's</span>
+    <span class="s2"># not clear which task to inspect if there is more than one, or how to resolve</span>
+    <span class="s2"># conflicts if they occur.</span>
+    <span class="s0">elif </span><span class="s1">isinstance(first</span><span class="s0">, </span><span class="s1">SubgraphCallable) </span><span class="s0">and </span><span class="s1">len(first.dsk) == </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s1">v = next(iter(first.dsk.values()))</span>
+        <span class="s0">if </span><span class="s1">type(v) </span><span class="s0">is </span><span class="s1">tuple </span><span class="s0">and </span><span class="s1">len(v) &gt; </span><span class="s5">1 </span><span class="s0">and </span><span class="s1">v[</span><span class="s5">0</span><span class="s1">] </span><span class="s0">in </span><span class="s1">GETTERS:</span>
+            <span class="s1">get = v[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">get </span><span class="s0">is None</span><span class="s1">:  </span><span class="s2"># Didn't find a getter</span>
+        <span class="s0">return None</span>
+
+    <span class="s1">length = len(value)</span>
+    <span class="s0">if </span><span class="s1">length == </span><span class="s5">3</span><span class="s1">:</span>
+        <span class="s2"># getter defaults to asarray=True, getitem is semantically False</span>
+        <span class="s0">return </span><span class="s1">get</span><span class="s0">, </span><span class="s1">value[</span><span class="s5">1</span><span class="s1">]</span><span class="s0">, </span><span class="s1">value[</span><span class="s5">2</span><span class="s1">]</span><span class="s0">, </span><span class="s1">get </span><span class="s0">is not </span><span class="s1">getitem</span><span class="s0">, None</span>
+    <span class="s0">elif </span><span class="s1">length == </span><span class="s5">5</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">get</span><span class="s0">, </span><span class="s1">*value[</span><span class="s5">1</span><span class="s1">:]  </span><span class="s2"># type: ignore</span>
+
+    <span class="s0">return None</span>
+
+
+<span class="s0">def </span><span class="s1">optimize_slices(dsk):</span>
+    <span class="s3">&quot;&quot;&quot;Optimize slices 
+ 
+    1.  Fuse repeated slices, like x[5:][2:6] -&gt; x[7:11] 
+    2.  Remove full slices, like         x[:] -&gt; x 
+ 
+    See also: 
+        fuse_slice_dict 
+    &quot;&quot;&quot;</span>
+    <span class="s1">fancy_ind_types = (list</span><span class="s0">, </span><span class="s1">np.ndarray)</span>
+    <span class="s1">dsk = dsk.copy()</span>
+    <span class="s0">for </span><span class="s1">k</span><span class="s0">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">dsk.items():</span>
+        <span class="s0">if </span><span class="s1">a_task := _is_getter_task(v):</span>
+            <span class="s1">get</span><span class="s0">, </span><span class="s1">a</span><span class="s0">, </span><span class="s1">a_index</span><span class="s0">, </span><span class="s1">a_asarray</span><span class="s0">, </span><span class="s1">a_lock = a_task</span>
+
+            <span class="s0">while </span><span class="s1">b_task := _is_getter_task(a):</span>
+                <span class="s1">f2</span><span class="s0">, </span><span class="s1">b</span><span class="s0">, </span><span class="s1">b_index</span><span class="s0">, </span><span class="s1">b_asarray</span><span class="s0">, </span><span class="s1">b_lock = b_task</span>
+
+                <span class="s0">if </span><span class="s1">a_lock </span><span class="s0">and </span><span class="s1">a_lock </span><span class="s0">is not </span><span class="s1">b_lock:</span>
+                    <span class="s0">break</span>
+                <span class="s0">if </span><span class="s1">(type(a_index) </span><span class="s0">is </span><span class="s1">tuple) != (type(b_index) </span><span class="s0">is </span><span class="s1">tuple):</span>
+                    <span class="s0">break</span>
+                <span class="s0">if </span><span class="s1">type(a_index) </span><span class="s0">is </span><span class="s1">tuple:</span>
+                    <span class="s1">indices = b_index + a_index</span>
+                    <span class="s0">if </span><span class="s1">len(a_index) != len(b_index) </span><span class="s0">and </span><span class="s1">any(i </span><span class="s0">is None for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">indices):</span>
+                        <span class="s0">break</span>
+                    <span class="s0">if </span><span class="s1">f2 </span><span class="s0">is </span><span class="s1">getter_nofancy </span><span class="s0">and </span><span class="s1">any(</span>
+                        <span class="s1">isinstance(i</span><span class="s0">, </span><span class="s1">fancy_ind_types) </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">indices</span>
+                    <span class="s1">):</span>
+                        <span class="s0">break</span>
+                <span class="s0">elif </span><span class="s1">f2 </span><span class="s0">is </span><span class="s1">getter_nofancy </span><span class="s0">and </span><span class="s1">(</span>
+                    <span class="s1">type(a_index) </span><span class="s0">in </span><span class="s1">fancy_ind_types </span><span class="s0">or </span><span class="s1">type(b_index) </span><span class="s0">in </span><span class="s1">fancy_ind_types</span>
+                <span class="s1">):</span>
+                    <span class="s0">break</span>
+                <span class="s0">try</span><span class="s1">:</span>
+                    <span class="s1">c_index = fuse_slice(b_index</span><span class="s0">, </span><span class="s1">a_index)</span>
+                    <span class="s2"># rely on fact that nested gets never decrease in</span>
+                    <span class="s2"># strictness e.g. `(getter_nofancy, (getter, ...))` never</span>
+                    <span class="s2"># happens</span>
+                    <span class="s1">get = getter </span><span class="s0">if </span><span class="s1">f2 </span><span class="s0">is </span><span class="s1">getter_inline </span><span class="s0">else </span><span class="s1">f2</span>
+                <span class="s0">except </span><span class="s1">NotImplementedError:</span>
+                    <span class="s0">break</span>
+                <span class="s1">a</span><span class="s0">, </span><span class="s1">a_index</span><span class="s0">, </span><span class="s1">a_lock = b</span><span class="s0">, </span><span class="s1">c_index</span><span class="s0">, </span><span class="s1">b_lock</span>
+                <span class="s1">a_asarray |= b_asarray</span>
+
+            <span class="s2"># Skip the get call if not from from_array and nothing to do</span>
+            <span class="s0">if </span><span class="s1">get </span><span class="s0">not in </span><span class="s1">GETNOREMOVE </span><span class="s0">and </span><span class="s1">(</span>
+                <span class="s1">(</span>
+                    <span class="s1">type(a_index) </span><span class="s0">is </span><span class="s1">slice</span>
+                    <span class="s0">and not </span><span class="s1">a_index.start</span>
+                    <span class="s0">and </span><span class="s1">a_index.stop </span><span class="s0">is None</span>
+                    <span class="s0">and </span><span class="s1">a_index.step </span><span class="s0">is None</span>
+                <span class="s1">)</span>
+                <span class="s0">or </span><span class="s1">(</span>
+                    <span class="s1">type(a_index) </span><span class="s0">is </span><span class="s1">tuple</span>
+                    <span class="s0">and </span><span class="s1">all(</span>
+                        <span class="s1">type(s) </span><span class="s0">is </span><span class="s1">slice</span>
+                        <span class="s0">and not </span><span class="s1">s.start</span>
+                        <span class="s0">and </span><span class="s1">s.stop </span><span class="s0">is None</span>
+                        <span class="s0">and </span><span class="s1">s.step </span><span class="s0">is None</span>
+                        <span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">a_index</span>
+                    <span class="s1">)</span>
+                <span class="s1">)</span>
+            <span class="s1">):</span>
+                <span class="s1">dsk[k] = a</span>
+            <span class="s0">elif </span><span class="s1">get </span><span class="s0">is </span><span class="s1">getitem </span><span class="s0">or </span><span class="s1">(a_asarray </span><span class="s0">and not </span><span class="s1">a_lock):</span>
+                <span class="s2"># default settings are fine, drop the extra parameters Since we</span>
+                <span class="s2"># always fallback to inner `get` functions, `get is getitem`</span>
+                <span class="s2"># can only occur if all gets are getitem, meaning all</span>
+                <span class="s2"># parameters must be getitem defaults.</span>
+                <span class="s1">dsk[k] = (get</span><span class="s0">, </span><span class="s1">a</span><span class="s0">, </span><span class="s1">a_index)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">dsk[k] = (get</span><span class="s0">, </span><span class="s1">a</span><span class="s0">, </span><span class="s1">a_index</span><span class="s0">, </span><span class="s1">a_asarray</span><span class="s0">, </span><span class="s1">a_lock)</span>
+
+    <span class="s0">return </span><span class="s1">dsk</span>
+
+
+<span class="s0">def </span><span class="s1">normalize_slice(s):</span>
+    <span class="s3">&quot;&quot;&quot;Replace Nones in slices with integers 
+ 
+    &gt;&gt;&gt; normalize_slice(slice(None, None, None)) 
+    slice(0, None, 1) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step = s.start</span><span class="s0">, </span><span class="s1">s.stop</span><span class="s0">, </span><span class="s1">s.step</span>
+    <span class="s0">if </span><span class="s1">start </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">start = </span><span class="s5">0</span>
+    <span class="s0">if </span><span class="s1">step </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">step = </span><span class="s5">1</span>
+    <span class="s0">if </span><span class="s1">start &lt; </span><span class="s5">0 </span><span class="s0">or </span><span class="s1">step &lt; </span><span class="s5">0 </span><span class="s0">or </span><span class="s1">stop </span><span class="s0">is not None and </span><span class="s1">stop &lt; </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError()</span>
+    <span class="s0">return </span><span class="s1">slice(start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step)</span>
+
+
+<span class="s0">def </span><span class="s1">check_for_nonfusible_fancy_indexing(fancy</span><span class="s0">, </span><span class="s1">normal):</span>
+    <span class="s2"># Check for fancy indexing and normal indexing, where the fancy</span>
+    <span class="s2"># indexed dimensions != normal indexed dimensions with integers. E.g.:</span>
+    <span class="s2"># disallow things like:</span>
+    <span class="s2"># x[:, [1, 2], :][0, :, :] -&gt; x[0, [1, 2], :] or</span>
+    <span class="s2"># x[0, :, :][:, [1, 2], :] -&gt; x[0, [1, 2], :]</span>
+    <span class="s0">for </span><span class="s1">f</span><span class="s0">, </span><span class="s1">n </span><span class="s0">in </span><span class="s1">zip_longest(fancy</span><span class="s0">, </span><span class="s1">normal</span><span class="s0">, </span><span class="s1">fillvalue=slice(</span><span class="s0">None</span><span class="s1">)):</span>
+        <span class="s0">if </span><span class="s1">type(f) </span><span class="s0">is not </span><span class="s1">list </span><span class="s0">and </span><span class="s1">isinstance(n</span><span class="s0">, </span><span class="s1">Integral):</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError(</span>
+                <span class="s4">&quot;Can't handle normal indexing with &quot;</span>
+                <span class="s4">&quot;integers and fancy indexing if the &quot;</span>
+                <span class="s4">&quot;integers and fancy indices don't &quot;</span>
+                <span class="s4">&quot;align with the same dimensions.&quot;</span>
+            <span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">fuse_slice(a</span><span class="s0">, </span><span class="s1">b):</span>
+    <span class="s3">&quot;&quot;&quot;Fuse stacked slices together 
+ 
+    Fuse a pair of repeated slices into a single slice: 
+ 
+    &gt;&gt;&gt; fuse_slice(slice(1000, 2000), slice(10, 15)) 
+    slice(1010, 1015, None) 
+ 
+    This also works for tuples of slices 
+ 
+    &gt;&gt;&gt; fuse_slice((slice(100, 200), slice(100, 200, 10)), 
+    ...            (slice(10, 15), [5, 2])) 
+    (slice(110, 115, None), [150, 120]) 
+ 
+    And a variety of other interesting cases 
+ 
+    &gt;&gt;&gt; fuse_slice(slice(1000, 2000), 10)  # integers 
+    1010 
+ 
+    &gt;&gt;&gt; fuse_slice(slice(1000, 2000, 5), slice(10, 20, 2)) 
+    slice(1050, 1100, 10) 
+ 
+    &gt;&gt;&gt; fuse_slice(slice(1000, 2000, 5), [1, 2, 3])  # lists 
+    [1005, 1010, 1015] 
+ 
+    &gt;&gt;&gt; fuse_slice(None, slice(None, None))  # doctest: +SKIP 
+    None 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># None only works if the second side is a full slice</span>
+    <span class="s0">if </span><span class="s1">a </span><span class="s0">is None and </span><span class="s1">isinstance(b</span><span class="s0">, </span><span class="s1">slice) </span><span class="s0">and </span><span class="s1">b == slice(</span><span class="s0">None, None</span><span class="s1">):</span>
+        <span class="s0">return None</span>
+
+    <span class="s2"># Replace None with 0 and one in start and step</span>
+    <span class="s0">if </span><span class="s1">isinstance(a</span><span class="s0">, </span><span class="s1">slice):</span>
+        <span class="s1">a = normalize_slice(a)</span>
+    <span class="s0">if </span><span class="s1">isinstance(b</span><span class="s0">, </span><span class="s1">slice):</span>
+        <span class="s1">b = normalize_slice(b)</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(a</span><span class="s0">, </span><span class="s1">slice) </span><span class="s0">and </span><span class="s1">isinstance(b</span><span class="s0">, </span><span class="s1">Integral):</span>
+        <span class="s0">if </span><span class="s1">b &lt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError()</span>
+        <span class="s0">return </span><span class="s1">a.start + b * a.step</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(a</span><span class="s0">, </span><span class="s1">slice) </span><span class="s0">and </span><span class="s1">isinstance(b</span><span class="s0">, </span><span class="s1">slice):</span>
+        <span class="s1">start = a.start + a.step * b.start</span>
+        <span class="s0">if </span><span class="s1">b.stop </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">stop = a.start + a.step * b.stop</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">stop = </span><span class="s0">None</span>
+        <span class="s0">if </span><span class="s1">a.stop </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s0">if </span><span class="s1">stop </span><span class="s0">is not None</span><span class="s1">:</span>
+                <span class="s1">stop = min(a.stop</span><span class="s0">, </span><span class="s1">stop)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">stop = a.stop</span>
+        <span class="s1">step = a.step * b.step</span>
+        <span class="s0">if </span><span class="s1">step == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">step = </span><span class="s0">None</span>
+        <span class="s0">return </span><span class="s1">slice(start</span><span class="s0">, </span><span class="s1">stop</span><span class="s0">, </span><span class="s1">step)</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(b</span><span class="s0">, </span><span class="s1">list):</span>
+        <span class="s0">return </span><span class="s1">[fuse_slice(a</span><span class="s0">, </span><span class="s1">bb) </span><span class="s0">for </span><span class="s1">bb </span><span class="s0">in </span><span class="s1">b]</span>
+    <span class="s0">if </span><span class="s1">isinstance(a</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">and </span><span class="s1">isinstance(b</span><span class="s0">, </span><span class="s1">(Integral</span><span class="s0">, </span><span class="s1">slice)):</span>
+        <span class="s0">return </span><span class="s1">a[b]</span>
+
+    <span class="s0">if </span><span class="s1">isinstance(a</span><span class="s0">, </span><span class="s1">tuple) </span><span class="s0">and not </span><span class="s1">isinstance(b</span><span class="s0">, </span><span class="s1">tuple):</span>
+        <span class="s1">b = (b</span><span class="s0">,</span><span class="s1">)</span>
+
+    <span class="s2"># If given two tuples walk through both, being mindful of uneven sizes</span>
+    <span class="s2"># and newaxes</span>
+    <span class="s0">if </span><span class="s1">isinstance(a</span><span class="s0">, </span><span class="s1">tuple) </span><span class="s0">and </span><span class="s1">isinstance(b</span><span class="s0">, </span><span class="s1">tuple):</span>
+        <span class="s2"># Check for non-fusible cases with fancy-indexing</span>
+        <span class="s1">a_has_lists = any(isinstance(item</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">for </span><span class="s1">item </span><span class="s0">in </span><span class="s1">a)</span>
+        <span class="s1">b_has_lists = any(isinstance(item</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">for </span><span class="s1">item </span><span class="s0">in </span><span class="s1">b)</span>
+        <span class="s0">if </span><span class="s1">a_has_lists </span><span class="s0">and </span><span class="s1">b_has_lists:</span>
+            <span class="s0">raise </span><span class="s1">NotImplementedError(</span><span class="s4">&quot;Can't handle multiple list indexing&quot;</span><span class="s1">)</span>
+        <span class="s0">elif </span><span class="s1">a_has_lists:</span>
+            <span class="s1">check_for_nonfusible_fancy_indexing(a</span><span class="s0">, </span><span class="s1">b)</span>
+        <span class="s0">elif </span><span class="s1">b_has_lists:</span>
+            <span class="s1">check_for_nonfusible_fancy_indexing(b</span><span class="s0">, </span><span class="s1">a)</span>
+
+        <span class="s1">j = </span><span class="s5">0</span>
+        <span class="s1">result = list()</span>
+        <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(len(a)):</span>
+            <span class="s2">#  axis ceased to exist  or we're out of b</span>
+            <span class="s0">if </span><span class="s1">isinstance(a[i]</span><span class="s0">, </span><span class="s1">Integral) </span><span class="s0">or </span><span class="s1">j == len(b):</span>
+                <span class="s1">result.append(a[i])</span>
+                <span class="s0">continue</span>
+            <span class="s0">while </span><span class="s1">b[j] </span><span class="s0">is None</span><span class="s1">:  </span><span class="s2"># insert any Nones on the rhs</span>
+                <span class="s1">result.append(</span><span class="s0">None</span><span class="s1">)</span>
+                <span class="s1">j += </span><span class="s5">1</span>
+            <span class="s1">result.append(fuse_slice(a[i]</span><span class="s0">, </span><span class="s1">b[j]))  </span><span class="s2"># Common case</span>
+            <span class="s1">j += </span><span class="s5">1</span>
+        <span class="s0">while </span><span class="s1">j &lt; len(b):  </span><span class="s2"># anything leftover on the right?</span>
+            <span class="s1">result.append(b[j])</span>
+            <span class="s1">j += </span><span class="s5">1</span>
+        <span class="s0">return </span><span class="s1">tuple(result)</span>
+    <span class="s0">raise </span><span class="s1">NotImplementedError()</span>
+</pre>
+</body>
+</html>

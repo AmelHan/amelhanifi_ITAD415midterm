@@ -1,0 +1,828 @@
+<html>
+<head>
+<title>gufunc.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #6a8759;}
+.s4 { color: #629755; font-style: italic;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+gufunc.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">re</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">from </span><span class="s1">tlz </span><span class="s0">import </span><span class="s1">concat</span><span class="s0">, </span><span class="s1">merge</span><span class="s0">, </span><span class="s1">unique</span>
+
+<span class="s0">from </span><span class="s1">dask.array.core </span><span class="s0">import </span><span class="s1">Array</span><span class="s0">, </span><span class="s1">apply_infer_dtype</span><span class="s0">, </span><span class="s1">asarray</span><span class="s0">, </span><span class="s1">blockwise</span><span class="s0">, </span><span class="s1">getitem</span>
+<span class="s0">from </span><span class="s1">dask.array.utils </span><span class="s0">import </span><span class="s1">meta_from_array</span>
+<span class="s0">from </span><span class="s1">dask.core </span><span class="s0">import </span><span class="s1">flatten</span>
+<span class="s0">from </span><span class="s1">dask.highlevelgraph </span><span class="s0">import </span><span class="s1">HighLevelGraph</span>
+
+<span class="s2"># Modified version of `numpy.lib.function_base._parse_gufunc_signature`</span>
+<span class="s2"># Modifications:</span>
+<span class="s2">#   - Allow for zero input arguments</span>
+<span class="s2"># See https://docs.scipy.org/doc/numpy/reference/c-api/generalized-ufuncs.html</span>
+<span class="s1">_DIMENSION_NAME = </span><span class="s3">r&quot;\w+&quot;</span>
+<span class="s1">_CORE_DIMENSION_LIST = </span><span class="s3">&quot;(?:{0:}(?:,{0:})*,?)?&quot;</span><span class="s1">.format(_DIMENSION_NAME)</span>
+<span class="s1">_ARGUMENT = </span><span class="s3">rf&quot;\(</span><span class="s0">{</span><span class="s1">_CORE_DIMENSION_LIST</span><span class="s0">}</span><span class="s3">\)&quot;</span>
+<span class="s1">_INPUT_ARGUMENTS = </span><span class="s3">&quot;(?:{0:}(?:,{0:})*,?)?&quot;</span><span class="s1">.format(_ARGUMENT)</span>
+<span class="s1">_OUTPUT_ARGUMENTS = </span><span class="s3">&quot;{0:}(?:,{0:})*&quot;</span><span class="s1">.format(</span>
+    <span class="s1">_ARGUMENT</span>
+<span class="s1">)  </span><span class="s2"># Use `'{0:}(?:,{0:})*,?'` if gufunc-</span>
+<span class="s2"># signature should be allowed for length 1 tuple returns</span>
+<span class="s1">_SIGNATURE = </span><span class="s3">f&quot;^</span><span class="s0">{</span><span class="s1">_INPUT_ARGUMENTS</span><span class="s0">}</span><span class="s3">-&gt;</span><span class="s0">{</span><span class="s1">_OUTPUT_ARGUMENTS</span><span class="s0">}</span><span class="s3">$&quot;</span>
+
+
+<span class="s0">def </span><span class="s1">_parse_gufunc_signature(signature):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Parse string signatures for a generalized universal function. 
+ 
+    Arguments 
+    --------- 
+    signature : string 
+        Generalized universal function signature, e.g., ``(m,n),(n,p)-&gt;(m,p)`` 
+        for ``np.matmul``. 
+ 
+    Returns 
+    ------- 
+    Tuple of input and output core dimensions parsed from the signature, each 
+    of the form List[Tuple[str, ...]], except for one output. For one output 
+    core dimension is not a list, but of the form Tuple[str, ...] 
+    &quot;&quot;&quot;</span>
+    <span class="s1">signature = re.sub(</span><span class="s3">r&quot;\s+&quot;</span><span class="s0">, </span><span class="s3">&quot;&quot;</span><span class="s0">, </span><span class="s1">signature)</span>
+    <span class="s0">if not </span><span class="s1">re.match(_SIGNATURE</span><span class="s0">, </span><span class="s1">signature):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">f&quot;Not a valid gufunc signature: </span><span class="s0">{</span><span class="s1">signature</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s1">)</span>
+    <span class="s1">in_txt</span><span class="s0">, </span><span class="s1">out_txt = signature.split(</span><span class="s3">&quot;-&gt;&quot;</span><span class="s1">)</span>
+    <span class="s1">ins = [</span>
+        <span class="s1">tuple(re.findall(_DIMENSION_NAME</span><span class="s0">, </span><span class="s1">arg)) </span><span class="s0">for </span><span class="s1">arg </span><span class="s0">in </span><span class="s1">re.findall(_ARGUMENT</span><span class="s0">, </span><span class="s1">in_txt)</span>
+    <span class="s1">]</span>
+    <span class="s1">outs = [</span>
+        <span class="s1">tuple(re.findall(_DIMENSION_NAME</span><span class="s0">, </span><span class="s1">arg))</span>
+        <span class="s0">for </span><span class="s1">arg </span><span class="s0">in </span><span class="s1">re.findall(_ARGUMENT</span><span class="s0">, </span><span class="s1">out_txt)</span>
+    <span class="s1">]</span>
+    <span class="s1">outs = outs[</span><span class="s5">0</span><span class="s1">] </span><span class="s0">if </span><span class="s1">((len(outs) == </span><span class="s5">1</span><span class="s1">) </span><span class="s0">and </span><span class="s1">(out_txt[-</span><span class="s5">1</span><span class="s1">] != </span><span class="s3">&quot;,&quot;</span><span class="s1">)) </span><span class="s0">else </span><span class="s1">outs</span>
+    <span class="s0">return </span><span class="s1">ins</span><span class="s0">, </span><span class="s1">outs</span>
+
+
+<span class="s0">def </span><span class="s1">_validate_normalize_axes(axes</span><span class="s0">, </span><span class="s1">axis</span><span class="s0">, </span><span class="s1">keepdims</span><span class="s0">, </span><span class="s1">input_coredimss</span><span class="s0">, </span><span class="s1">output_coredimss):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Validates logic of `axes`/`axis`/`keepdims` arguments and normalize them. 
+    Refer to [1]_ for details 
+ 
+    Arguments 
+    --------- 
+    axes: List of tuples 
+    axis: int 
+    keepdims: bool 
+    input_coredimss: List of Tuple of dims 
+    output_coredimss: List of Tuple of dims 
+ 
+    Returns 
+    ------- 
+    input_axes: List of tuple of int 
+    output_axes: List of tuple of int 
+ 
+    References 
+    ---------- 
+    .. [1] https://docs.scipy.org/doc/numpy/reference/ufuncs.html#optional-keyword-arguments 
+    &quot;&quot;&quot;</span>
+    <span class="s1">nin = len(input_coredimss)</span>
+    <span class="s1">nout = </span><span class="s5">1 </span><span class="s0">if not </span><span class="s1">isinstance(output_coredimss</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">else </span><span class="s1">len(output_coredimss)</span>
+
+    <span class="s0">if </span><span class="s1">axes </span><span class="s0">is not None and </span><span class="s1">axis </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s3">&quot;Only one of `axis` or `axes` keyword arguments should be given&quot;</span>
+        <span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">axes </span><span class="s0">and not </span><span class="s1">isinstance(axes</span><span class="s0">, </span><span class="s1">list):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;`axes` has to be of type list&quot;</span><span class="s1">)</span>
+
+    <span class="s1">output_coredimss = output_coredimss </span><span class="s0">if </span><span class="s1">nout &gt; </span><span class="s5">1 </span><span class="s0">else </span><span class="s1">[output_coredimss]</span>
+    <span class="s1">filtered_core_dims = list(filter(len</span><span class="s0">, </span><span class="s1">input_coredimss))</span>
+    <span class="s1">nr_outputs_with_coredims = len([</span><span class="s0">True for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">output_coredimss </span><span class="s0">if </span><span class="s1">len(x) &gt; </span><span class="s5">0</span><span class="s1">])</span>
+
+    <span class="s0">if </span><span class="s1">keepdims:</span>
+        <span class="s0">if </span><span class="s1">nr_outputs_with_coredims &gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;`keepdims` can only be used for scalar outputs&quot;</span><span class="s1">)</span>
+        <span class="s1">output_coredimss = len(output_coredimss) * [filtered_core_dims[</span><span class="s5">0</span><span class="s1">]]</span>
+
+    <span class="s1">core_dims = input_coredimss + output_coredimss</span>
+    <span class="s0">if </span><span class="s1">axis </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s0">if not </span><span class="s1">isinstance(axis</span><span class="s0">, </span><span class="s1">int):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;`axis` argument has to be an integer value&quot;</span><span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">filtered_core_dims:</span>
+            <span class="s1">cd0 = filtered_core_dims[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s0">if </span><span class="s1">len(cd0) != </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">&quot;`axis` can be used only, if one core dimension is present&quot;</span>
+                <span class="s1">)</span>
+            <span class="s0">for </span><span class="s1">cd </span><span class="s0">in </span><span class="s1">filtered_core_dims:</span>
+                <span class="s0">if </span><span class="s1">cd0 != cd:</span>
+                    <span class="s0">raise </span><span class="s1">ValueError(</span>
+                        <span class="s3">&quot;To use `axis`, all core dimensions have to be equal&quot;</span>
+                    <span class="s1">)</span>
+
+    <span class="s2"># Expand dafaults or axis</span>
+    <span class="s0">if </span><span class="s1">axes </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">axis </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">axes = [(axis</span><span class="s0">,</span><span class="s1">) </span><span class="s0">if </span><span class="s1">cd </span><span class="s0">else </span><span class="s1">tuple() </span><span class="s0">for </span><span class="s1">cd </span><span class="s0">in </span><span class="s1">core_dims]</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">axes = [tuple(range(-len(icd)</span><span class="s0">, </span><span class="s5">0</span><span class="s1">)) </span><span class="s0">for </span><span class="s1">icd </span><span class="s0">in </span><span class="s1">core_dims]</span>
+    <span class="s0">elif not </span><span class="s1">isinstance(axes</span><span class="s0">, </span><span class="s1">list):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;`axes` argument has to be a list&quot;</span><span class="s1">)</span>
+    <span class="s1">axes = [(a</span><span class="s0">,</span><span class="s1">) </span><span class="s0">if </span><span class="s1">isinstance(a</span><span class="s0">, </span><span class="s1">int) </span><span class="s0">else </span><span class="s1">a </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">axes]</span>
+
+    <span class="s0">if </span><span class="s1">(</span>
+        <span class="s1">(nr_outputs_with_coredims == </span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s0">and </span><span class="s1">(nin != len(axes))</span>
+        <span class="s0">and </span><span class="s1">(nin + nout != len(axes))</span>
+    <span class="s1">) </span><span class="s0">or </span><span class="s1">((nr_outputs_with_coredims &gt; </span><span class="s5">0</span><span class="s1">) </span><span class="s0">and </span><span class="s1">(nin + nout != len(axes))):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s3">&quot;The number of `axes` entries is not equal the number of input and output arguments&quot;</span>
+        <span class="s1">)</span>
+
+    <span class="s2"># Treat outputs</span>
+    <span class="s1">output_axes = axes[nin:]</span>
+    <span class="s1">output_axes = (</span>
+        <span class="s1">output_axes</span>
+        <span class="s0">if </span><span class="s1">output_axes</span>
+        <span class="s0">else </span><span class="s1">[tuple(range(-len(ocd)</span><span class="s0">, </span><span class="s5">0</span><span class="s1">)) </span><span class="s0">for </span><span class="s1">ocd </span><span class="s0">in </span><span class="s1">output_coredimss]</span>
+    <span class="s1">)</span>
+    <span class="s1">input_axes = axes[:nin]</span>
+
+    <span class="s2"># Assert we have as many axes as output core dimensions</span>
+    <span class="s0">for </span><span class="s1">idx</span><span class="s0">, </span><span class="s1">(iax</span><span class="s0">, </span><span class="s1">icd) </span><span class="s0">in </span><span class="s1">enumerate(zip(input_axes</span><span class="s0">, </span><span class="s1">input_coredimss)):</span>
+        <span class="s0">if </span><span class="s1">len(iax) != len(icd):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">&quot;The number of `axes` entries for argument #{} is not equal &quot;</span>
+                <span class="s3">&quot;the number of respective input core dimensions in signature&quot;</span><span class="s1">.format(</span>
+                    <span class="s1">idx</span>
+                <span class="s1">)</span>
+            <span class="s1">)</span>
+    <span class="s0">if not </span><span class="s1">keepdims:</span>
+        <span class="s0">for </span><span class="s1">idx</span><span class="s0">, </span><span class="s1">(oax</span><span class="s0">, </span><span class="s1">ocd) </span><span class="s0">in </span><span class="s1">enumerate(zip(output_axes</span><span class="s0">, </span><span class="s1">output_coredimss)):</span>
+            <span class="s0">if </span><span class="s1">len(oax) != len(ocd):</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">&quot;The number of `axes` entries for argument #{} is not equal &quot;</span>
+                    <span class="s3">&quot;the number of respective output core dimensions in signature&quot;</span><span class="s1">.format(</span>
+                        <span class="s1">idx</span>
+                    <span class="s1">)</span>
+                <span class="s1">)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">input_coredimss:</span>
+            <span class="s1">icd0 = input_coredimss[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s0">for </span><span class="s1">icd </span><span class="s0">in </span><span class="s1">input_coredimss:</span>
+                <span class="s0">if </span><span class="s1">icd0 != icd:</span>
+                    <span class="s0">raise </span><span class="s1">ValueError(</span>
+                        <span class="s3">&quot;To use `keepdims`, all core dimensions have to be equal&quot;</span>
+                    <span class="s1">)</span>
+            <span class="s1">iax0 = input_axes[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s1">output_axes = [iax0 </span><span class="s0">for </span><span class="s1">_ </span><span class="s0">in </span><span class="s1">output_coredimss]</span>
+
+    <span class="s0">return </span><span class="s1">input_axes</span><span class="s0">, </span><span class="s1">output_axes</span>
+
+
+<span class="s0">def </span><span class="s1">apply_gufunc(</span>
+    <span class="s1">func</span><span class="s0">,</span>
+    <span class="s1">signature</span><span class="s0">,</span>
+    <span class="s1">*args</span><span class="s0">,</span>
+    <span class="s1">axes=</span><span class="s0">None,</span>
+    <span class="s1">axis=</span><span class="s0">None,</span>
+    <span class="s1">keepdims=</span><span class="s0">False,</span>
+    <span class="s1">output_dtypes=</span><span class="s0">None,</span>
+    <span class="s1">output_sizes=</span><span class="s0">None,</span>
+    <span class="s1">vectorize=</span><span class="s0">None,</span>
+    <span class="s1">allow_rechunk=</span><span class="s0">False,</span>
+    <span class="s1">meta=</span><span class="s0">None,</span>
+    <span class="s1">**kwargs</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Apply a generalized ufunc or similar python function to arrays. 
+ 
+    ``signature`` determines if the function consumes or produces core 
+    dimensions. The remaining dimensions in given input arrays (``*args``) 
+    are considered loop dimensions and are required to broadcast 
+    naturally against each other. 
+ 
+    In other terms, this function is like ``np.vectorize``, but for 
+    the blocks of dask arrays. If the function itself shall also 
+    be vectorized use ``vectorize=True`` for convenience. 
+ 
+    Parameters 
+    ---------- 
+    func : callable 
+        Function to call like ``func(*args, **kwargs)`` on input arrays 
+        (``*args``) that returns an array or tuple of arrays. If multiple 
+        arguments with non-matching dimensions are supplied, this function is 
+        expected to vectorize (broadcast) over axes of positional arguments in 
+        the style of NumPy universal functions [1]_ (if this is not the case, 
+        set ``vectorize=True``). If this function returns multiple outputs, 
+        ``output_core_dims`` has to be set as well. 
+    signature: string 
+        Specifies what core dimensions are consumed and produced by ``func``. 
+        According to the specification of numpy.gufunc signature [2]_ 
+    *args : numeric 
+        Input arrays or scalars to the callable function. 
+    axes: List of tuples, optional, keyword only 
+        A list of tuples with indices of axes a generalized ufunc should operate on. 
+        For instance, for a signature of ``&quot;(i,j),(j,k)-&gt;(i,k)&quot;`` appropriate for 
+        matrix multiplication, the base elements are two-dimensional matrices 
+        and these are taken to be stored in the two last axes of each argument. The 
+        corresponding axes keyword would be ``[(-2, -1), (-2, -1), (-2, -1)]``. 
+        For simplicity, for generalized ufuncs that operate on 1-dimensional arrays 
+        (vectors), a single integer is accepted instead of a single-element tuple, 
+        and for generalized ufuncs for which all outputs are scalars, the output 
+        tuples can be omitted. 
+    axis: int, optional, keyword only 
+        A single axis over which a generalized ufunc should operate. This is a short-cut 
+        for ufuncs that operate over a single, shared core dimension, equivalent to passing 
+        in axes with entries of (axis,) for each single-core-dimension argument and ``()`` for 
+        all others. For instance, for a signature ``&quot;(i),(i)-&gt;()&quot;``, it is equivalent to passing 
+        in ``axes=[(axis,), (axis,), ()]``. 
+    keepdims: bool, optional, keyword only 
+        If this is set to True, axes which are reduced over will be left in the result as 
+        a dimension with size one, so that the result will broadcast correctly against the 
+        inputs. This option can only be used for generalized ufuncs that operate on inputs 
+        that all have the same number of core dimensions and with outputs that have no core 
+        dimensions , i.e., with signatures like ``&quot;(i),(i)-&gt;()&quot;`` or ``&quot;(m,m)-&gt;()&quot;``. 
+        If used, the location of the dimensions in the output can be controlled with axes 
+        and axis. 
+    output_dtypes : Optional, dtype or list of dtypes, keyword only 
+        Valid numpy dtype specification or list thereof. 
+        If not given, a call of ``func`` with a small set of data 
+        is performed in order to try to automatically determine the 
+        output dtypes. 
+    output_sizes : dict, optional, keyword only 
+        Optional mapping from dimension names to sizes for outputs. Only used if 
+        new core dimensions (not found on inputs) appear on outputs. 
+    vectorize: bool, keyword only 
+        If set to ``True``, ``np.vectorize`` is applied to ``func`` for 
+        convenience. Defaults to ``False``. 
+    allow_rechunk: Optional, bool, keyword only 
+        Allows rechunking, otherwise chunk sizes need to match and core 
+        dimensions are to consist only of one chunk. 
+        Warning: enabling this can increase memory usage significantly. 
+        Defaults to ``False``. 
+    meta: Optional, tuple, keyword only 
+        tuple of empty ndarrays describing the shape and dtype of the output of the gufunc. 
+        Defaults to ``None``. 
+    **kwargs : dict 
+        Extra keyword arguments to pass to `func` 
+ 
+    Returns 
+    ------- 
+    Single dask.array.Array or tuple of dask.array.Array 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import dask.array as da 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; def stats(x): 
+    ...     return np.mean(x, axis=-1), np.std(x, axis=-1) 
+    &gt;&gt;&gt; a = da.random.normal(size=(10,20,30), chunks=(5, 10, 30)) 
+    &gt;&gt;&gt; mean, std = da.apply_gufunc(stats, &quot;(i)-&gt;(),()&quot;, a) 
+    &gt;&gt;&gt; mean.compute().shape 
+    (10, 20) 
+ 
+ 
+    &gt;&gt;&gt; def outer_product(x, y): 
+    ...     return np.einsum(&quot;i,j-&gt;ij&quot;, x, y) 
+    &gt;&gt;&gt; a = da.random.normal(size=(   20,30), chunks=(10, 30)) 
+    &gt;&gt;&gt; b = da.random.normal(size=(10, 1,40), chunks=(5, 1, 40)) 
+    &gt;&gt;&gt; c = da.apply_gufunc(outer_product, &quot;(i),(j)-&gt;(i,j)&quot;, a, b, vectorize=True) 
+    &gt;&gt;&gt; c.compute().shape 
+    (10, 20, 30, 40) 
+ 
+    References 
+    ---------- 
+    .. [1] https://docs.scipy.org/doc/numpy/reference/ufuncs.html 
+    .. [2] https://docs.scipy.org/doc/numpy/reference/c-api/generalized-ufuncs.html 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># Input processing:</span>
+    <span class="s2">## Signature</span>
+    <span class="s0">if not </span><span class="s1">isinstance(signature</span><span class="s0">, </span><span class="s1">str):</span>
+        <span class="s0">raise </span><span class="s1">TypeError(</span><span class="s3">&quot;`signature` has to be of type string&quot;</span><span class="s1">)</span>
+    <span class="s2"># NumPy versions before https://github.com/numpy/numpy/pull/19627</span>
+    <span class="s2"># would not ignore whitespace characters in `signature` like they</span>
+    <span class="s2"># are supposed to. We remove the whitespace here as a workaround.</span>
+    <span class="s1">signature = re.sub(</span><span class="s3">r&quot;\s+&quot;</span><span class="s0">, </span><span class="s3">&quot;&quot;</span><span class="s0">, </span><span class="s1">signature)</span>
+    <span class="s1">input_coredimss</span><span class="s0">, </span><span class="s1">output_coredimss = _parse_gufunc_signature(signature)</span>
+
+    <span class="s2">## Determine nout: nout = None for functions of one direct return; nout = int for return tuples</span>
+    <span class="s1">nout = </span><span class="s0">None if not </span><span class="s1">isinstance(output_coredimss</span><span class="s0">, </span><span class="s1">list) </span><span class="s0">else </span><span class="s1">len(output_coredimss)</span>
+
+    <span class="s2">## Consolidate onto `meta`</span>
+    <span class="s0">if </span><span class="s1">meta </span><span class="s0">is not None and </span><span class="s1">output_dtypes </span><span class="s0">is not None</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s3">&quot;Only one of `meta` and `output_dtypes` should be given (`meta` is preferred).&quot;</span>
+        <span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">meta </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">output_dtypes </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s2">## Infer `output_dtypes`</span>
+            <span class="s0">if </span><span class="s1">vectorize:</span>
+                <span class="s1">tempfunc = np.vectorize(func</span><span class="s0">, </span><span class="s1">signature=signature)</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s1">tempfunc = func</span>
+            <span class="s1">output_dtypes = apply_infer_dtype(</span>
+                <span class="s1">tempfunc</span><span class="s0">, </span><span class="s1">args</span><span class="s0">, </span><span class="s1">kwargs</span><span class="s0">, </span><span class="s3">&quot;apply_gufunc&quot;</span><span class="s0">, </span><span class="s3">&quot;output_dtypes&quot;</span><span class="s0">, </span><span class="s1">nout</span>
+            <span class="s1">)</span>
+
+        <span class="s2">## Turn `output_dtypes` into `meta`</span>
+        <span class="s0">if </span><span class="s1">(</span>
+            <span class="s1">nout </span><span class="s0">is None</span>
+            <span class="s0">and </span><span class="s1">isinstance(output_dtypes</span><span class="s0">, </span><span class="s1">(tuple</span><span class="s0">, </span><span class="s1">list))</span>
+            <span class="s0">and </span><span class="s1">len(output_dtypes) == </span><span class="s5">1</span>
+        <span class="s1">):</span>
+            <span class="s1">output_dtypes = output_dtypes[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">sample = args[</span><span class="s5">0</span><span class="s1">] </span><span class="s0">if </span><span class="s1">args </span><span class="s0">else None</span>
+        <span class="s0">if </span><span class="s1">nout </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">meta = meta_from_array(sample</span><span class="s0">, </span><span class="s1">dtype=output_dtypes)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">meta = tuple(meta_from_array(sample</span><span class="s0">, </span><span class="s1">dtype=odt) </span><span class="s0">for </span><span class="s1">odt </span><span class="s0">in </span><span class="s1">output_dtypes)</span>
+
+    <span class="s2">## Normalize `meta` format</span>
+    <span class="s1">meta = meta_from_array(meta)</span>
+    <span class="s0">if </span><span class="s1">isinstance(meta</span><span class="s0">, </span><span class="s1">list):</span>
+        <span class="s1">meta = tuple(meta)</span>
+
+    <span class="s2">## Validate `meta`</span>
+    <span class="s0">if </span><span class="s1">nout </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">if </span><span class="s1">isinstance(meta</span><span class="s0">, </span><span class="s1">tuple):</span>
+            <span class="s0">if </span><span class="s1">len(meta) == </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">meta = meta[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s0">else</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">&quot;For a function with one output, must give a single item for `output_dtypes`/`meta`, &quot;</span>
+                    <span class="s3">&quot;not a tuple or list.&quot;</span>
+                <span class="s1">)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">if not </span><span class="s1">isinstance(meta</span><span class="s0">, </span><span class="s1">tuple):</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">f&quot;For a function with </span><span class="s0">{</span><span class="s1">nout</span><span class="s0">} </span><span class="s3">outputs, must give a tuple or list for `output_dtypes`/`meta`, &quot;</span>
+                <span class="s3">&quot;not a single item.&quot;</span>
+            <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">len(meta) != nout:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">f&quot;For a function with </span><span class="s0">{</span><span class="s1">nout</span><span class="s0">} </span><span class="s3">outputs, must give a tuple or list of </span><span class="s0">{</span><span class="s1">nout</span><span class="s0">} </span><span class="s3">items for &quot;</span>
+                <span class="s3">f&quot;`output_dtypes`/`meta`, not </span><span class="s0">{</span><span class="s1">len(meta)</span><span class="s0">}</span><span class="s3">.&quot;</span>
+            <span class="s1">)</span>
+
+    <span class="s2">## Vectorize function, if required</span>
+    <span class="s0">if </span><span class="s1">vectorize:</span>
+        <span class="s1">otypes = [x.dtype </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">meta] </span><span class="s0">if </span><span class="s1">isinstance(meta</span><span class="s0">, </span><span class="s1">tuple) </span><span class="s0">else </span><span class="s1">[meta.dtype]</span>
+        <span class="s1">func = np.vectorize(func</span><span class="s0">, </span><span class="s1">signature=signature</span><span class="s0">, </span><span class="s1">otypes=otypes)</span>
+
+    <span class="s2">## Miscellaneous</span>
+    <span class="s0">if </span><span class="s1">output_sizes </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">output_sizes = {}</span>
+
+    <span class="s2">## Axes</span>
+    <span class="s1">input_axes</span><span class="s0">, </span><span class="s1">output_axes = _validate_normalize_axes(</span>
+        <span class="s1">axes</span><span class="s0">, </span><span class="s1">axis</span><span class="s0">, </span><span class="s1">keepdims</span><span class="s0">, </span><span class="s1">input_coredimss</span><span class="s0">, </span><span class="s1">output_coredimss</span>
+    <span class="s1">)</span>
+
+    <span class="s2"># Main code:</span>
+    <span class="s2">## Cast all input arrays to dask</span>
+    <span class="s1">args = [asarray(a) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">args]</span>
+
+    <span class="s0">if </span><span class="s1">len(input_coredimss) != len(args):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s3">&quot;According to `signature`, `func` requires %d arguments, but %s given&quot;</span>
+            <span class="s1">% (len(input_coredimss)</span><span class="s0">, </span><span class="s1">len(args))</span>
+        <span class="s1">)</span>
+
+    <span class="s2">## Axes: transpose input arguments</span>
+    <span class="s1">transposed_args = []</span>
+    <span class="s0">for </span><span class="s1">arg</span><span class="s0">, </span><span class="s1">iax </span><span class="s0">in </span><span class="s1">zip(args</span><span class="s0">, </span><span class="s1">input_axes):</span>
+        <span class="s1">shape = arg.shape</span>
+        <span class="s1">iax = tuple(a </span><span class="s0">if </span><span class="s1">a &lt; </span><span class="s5">0 </span><span class="s0">else </span><span class="s1">a - len(shape) </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">iax)</span>
+        <span class="s1">tidc = tuple(i </span><span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range(-len(shape) + </span><span class="s5">0</span><span class="s0">, </span><span class="s5">0</span><span class="s1">) </span><span class="s0">if </span><span class="s1">i </span><span class="s0">not in </span><span class="s1">iax) + iax</span>
+        <span class="s1">transposed_arg = arg.transpose(tidc)</span>
+        <span class="s1">transposed_args.append(transposed_arg)</span>
+    <span class="s1">args = transposed_args</span>
+
+    <span class="s2">## Assess input args for loop dims</span>
+    <span class="s1">input_shapes = [a.shape </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">args]</span>
+    <span class="s1">input_chunkss = [a.chunks </span><span class="s0">for </span><span class="s1">a </span><span class="s0">in </span><span class="s1">args]</span>
+    <span class="s1">num_loopdims = [len(s) - len(cd) </span><span class="s0">for </span><span class="s1">s</span><span class="s0">, </span><span class="s1">cd </span><span class="s0">in </span><span class="s1">zip(input_shapes</span><span class="s0">, </span><span class="s1">input_coredimss)]</span>
+    <span class="s1">max_loopdims = max(num_loopdims) </span><span class="s0">if </span><span class="s1">num_loopdims </span><span class="s0">else None</span>
+    <span class="s1">core_input_shapes = [</span>
+        <span class="s1">dict(zip(icd</span><span class="s0">, </span><span class="s1">s[n:]))</span>
+        <span class="s0">for </span><span class="s1">s</span><span class="s0">, </span><span class="s1">n</span><span class="s0">, </span><span class="s1">icd </span><span class="s0">in </span><span class="s1">zip(input_shapes</span><span class="s0">, </span><span class="s1">num_loopdims</span><span class="s0">, </span><span class="s1">input_coredimss)</span>
+    <span class="s1">]</span>
+    <span class="s1">core_shapes = merge(*core_input_shapes)</span>
+    <span class="s1">core_shapes.update(output_sizes)</span>
+
+    <span class="s1">loop_input_dimss = [</span>
+        <span class="s1">tuple(</span><span class="s3">&quot;__loopdim%d__&quot; </span><span class="s1">% d </span><span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">range(max_loopdims - n</span><span class="s0">, </span><span class="s1">max_loopdims))</span>
+        <span class="s0">for </span><span class="s1">n </span><span class="s0">in </span><span class="s1">num_loopdims</span>
+    <span class="s1">]</span>
+    <span class="s1">input_dimss = [l + c </span><span class="s0">for </span><span class="s1">l</span><span class="s0">, </span><span class="s1">c </span><span class="s0">in </span><span class="s1">zip(loop_input_dimss</span><span class="s0">, </span><span class="s1">input_coredimss)]</span>
+
+    <span class="s1">loop_output_dims = max(loop_input_dimss</span><span class="s0">, </span><span class="s1">key=len) </span><span class="s0">if </span><span class="s1">loop_input_dimss </span><span class="s0">else </span><span class="s1">tuple()</span>
+
+    <span class="s2">## Assess input args for same size and chunk sizes</span>
+    <span class="s2">### Collect sizes and chunksizes of all dims in all arrays</span>
+    <span class="s1">dimsizess = {}</span>
+    <span class="s1">chunksizess = {}</span>
+    <span class="s0">for </span><span class="s1">dims</span><span class="s0">, </span><span class="s1">shape</span><span class="s0">, </span><span class="s1">chunksizes </span><span class="s0">in </span><span class="s1">zip(input_dimss</span><span class="s0">, </span><span class="s1">input_shapes</span><span class="s0">, </span><span class="s1">input_chunkss):</span>
+        <span class="s0">for </span><span class="s1">dim</span><span class="s0">, </span><span class="s1">size</span><span class="s0">, </span><span class="s1">chunksize </span><span class="s0">in </span><span class="s1">zip(dims</span><span class="s0">, </span><span class="s1">shape</span><span class="s0">, </span><span class="s1">chunksizes):</span>
+            <span class="s1">dimsizes = dimsizess.get(dim</span><span class="s0">, </span><span class="s1">[])</span>
+            <span class="s1">dimsizes.append(size)</span>
+            <span class="s1">dimsizess[dim] = dimsizes</span>
+            <span class="s1">chunksizes_ = chunksizess.get(dim</span><span class="s0">, </span><span class="s1">[])</span>
+            <span class="s1">chunksizes_.append(chunksize)</span>
+            <span class="s1">chunksizess[dim] = chunksizes_</span>
+    <span class="s2">### Assert correct partitioning, for case:</span>
+    <span class="s0">for </span><span class="s1">dim</span><span class="s0">, </span><span class="s1">sizes </span><span class="s0">in </span><span class="s1">dimsizess.items():</span>
+        <span class="s2">#### Check that the arrays have same length for same dimensions or dimension `1`</span>
+        <span class="s0">if </span><span class="s1">set(sizes) | {</span><span class="s5">1</span><span class="s1">} != {</span><span class="s5">1</span><span class="s0">, </span><span class="s1">max(sizes)}:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s3">f&quot;Dimension `'</span><span class="s0">{</span><span class="s1">dim</span><span class="s0">}</span><span class="s3">'` with different lengths in arrays&quot;</span><span class="s1">)</span>
+        <span class="s0">if not </span><span class="s1">allow_rechunk:</span>
+            <span class="s1">chunksizes = chunksizess[dim]</span>
+            <span class="s2">#### Check if core dimensions consist of only one chunk</span>
+            <span class="s0">if </span><span class="s1">(dim </span><span class="s0">in </span><span class="s1">core_shapes) </span><span class="s0">and </span><span class="s1">(chunksizes[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">] &lt; core_shapes[dim]):</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">&quot;Core dimension `'{}'` consists of multiple chunks. To fix, rechunk into a single </span><span class="s0">\ 
+</span><span class="s3">chunk along this dimension or set `allow_rechunk=True`, but beware that this may increase memory usage </span><span class="s0">\ 
+</span><span class="s3">significantly.&quot;</span><span class="s1">.format(</span>
+                        <span class="s1">dim</span>
+                    <span class="s1">)</span>
+                <span class="s1">)</span>
+            <span class="s2">#### Check if loop dimensions consist of same chunksizes, when they have sizes &gt; 1</span>
+            <span class="s1">relevant_chunksizes = list(</span>
+                <span class="s1">unique(c </span><span class="s0">for </span><span class="s1">s</span><span class="s0">, </span><span class="s1">c </span><span class="s0">in </span><span class="s1">zip(sizes</span><span class="s0">, </span><span class="s1">chunksizes) </span><span class="s0">if </span><span class="s1">s &gt; </span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s1">)</span>
+            <span class="s0">if </span><span class="s1">len(relevant_chunksizes) &gt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError(</span>
+                    <span class="s3">f&quot;Dimension `'</span><span class="s0">{</span><span class="s1">dim</span><span class="s0">}</span><span class="s3">'` with different chunksize present&quot;</span>
+                <span class="s1">)</span>
+
+    <span class="s2">## Apply function - use blockwise here</span>
+    <span class="s1">arginds = list(concat(zip(args</span><span class="s0">, </span><span class="s1">input_dimss)))</span>
+
+    <span class="s2">### Use existing `blockwise` but only with loopdims to enforce</span>
+    <span class="s2">### concatenation for coredims that appear also at the output</span>
+    <span class="s2">### Modifying `blockwise` could improve things here.</span>
+    <span class="s1">tmp = blockwise(</span>
+        <span class="s1">func</span><span class="s0">, </span><span class="s1">loop_output_dims</span><span class="s0">, </span><span class="s1">*arginds</span><span class="s0">, </span><span class="s1">concatenate=</span><span class="s0">True, </span><span class="s1">meta=meta</span><span class="s0">, </span><span class="s1">**kwargs</span>
+    <span class="s1">)</span>
+
+    <span class="s2"># NOTE: we likely could just use `meta` instead of `tmp._meta`,</span>
+    <span class="s2"># but we use it and validate it anyway just to be sure nothing odd has happened.</span>
+    <span class="s1">metas = tmp._meta</span>
+    <span class="s0">if </span><span class="s1">nout </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">assert not </span><span class="s1">isinstance(</span>
+            <span class="s1">metas</span><span class="s0">, </span><span class="s1">(list</span><span class="s0">, </span><span class="s1">tuple)</span>
+        <span class="s1">)</span><span class="s0">, </span><span class="s3">f&quot;meta changed from single output to multiple output during blockwise: </span><span class="s0">{</span><span class="s1">meta</span><span class="s0">} </span><span class="s3">-&gt; </span><span class="s0">{</span><span class="s1">metas</span><span class="s0">}</span><span class="s3">&quot;</span>
+        <span class="s1">metas = (metas</span><span class="s0">,</span><span class="s1">)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">assert </span><span class="s1">isinstance(</span>
+            <span class="s1">metas</span><span class="s0">, </span><span class="s1">(list</span><span class="s0">, </span><span class="s1">tuple)</span>
+        <span class="s1">)</span><span class="s0">, </span><span class="s3">f&quot;meta changed from multiple output to single output during blockwise: </span><span class="s0">{</span><span class="s1">meta</span><span class="s0">} </span><span class="s3">-&gt; </span><span class="s0">{</span><span class="s1">metas</span><span class="s0">}</span><span class="s3">&quot;</span>
+        <span class="s0">assert </span><span class="s1">(</span>
+            <span class="s1">len(metas) == nout</span>
+        <span class="s1">)</span><span class="s0">, </span><span class="s3">f&quot;Number of outputs changed from </span><span class="s0">{</span><span class="s1">nout</span><span class="s0">} </span><span class="s3">to </span><span class="s0">{</span><span class="s1">len(metas)</span><span class="s0">} </span><span class="s3">during blockwise&quot;</span>
+
+    <span class="s2">## Prepare output shapes</span>
+    <span class="s1">loop_output_shape = tmp.shape</span>
+    <span class="s1">loop_output_chunks = tmp.chunks</span>
+    <span class="s1">keys = list(flatten(tmp.__dask_keys__()))</span>
+    <span class="s1">name</span><span class="s0">, </span><span class="s1">token = keys[</span><span class="s5">0</span><span class="s1">][</span><span class="s5">0</span><span class="s1">].split(</span><span class="s3">&quot;-&quot;</span><span class="s1">)</span>
+
+    <span class="s2">### *) Treat direct output</span>
+    <span class="s0">if </span><span class="s1">nout </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">output_coredimss = [output_coredimss]</span>
+
+    <span class="s2">## Split output</span>
+    <span class="s1">leaf_arrs = []</span>
+    <span class="s0">for </span><span class="s1">i</span><span class="s0">, </span><span class="s1">(ocd</span><span class="s0">, </span><span class="s1">oax</span><span class="s0">, </span><span class="s1">meta) </span><span class="s0">in </span><span class="s1">enumerate(zip(output_coredimss</span><span class="s0">, </span><span class="s1">output_axes</span><span class="s0">, </span><span class="s1">metas)):</span>
+        <span class="s1">core_output_shape = tuple(core_shapes[d] </span><span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">ocd)</span>
+        <span class="s1">core_chunkinds = len(ocd) * (</span><span class="s5">0</span><span class="s0">,</span><span class="s1">)</span>
+        <span class="s1">output_shape = loop_output_shape + core_output_shape</span>
+        <span class="s1">output_chunks = loop_output_chunks + core_output_shape</span>
+        <span class="s1">leaf_name = </span><span class="s3">&quot;%s_%d-%s&quot; </span><span class="s1">% (name</span><span class="s0">, </span><span class="s1">i</span><span class="s0">, </span><span class="s1">token)</span>
+        <span class="s1">leaf_dsk = {</span>
+            <span class="s1">(leaf_name</span><span class="s0">,</span><span class="s1">)</span>
+            <span class="s1">+ key[</span><span class="s5">1</span><span class="s1">:]</span>
+            <span class="s1">+ core_chunkinds: ((getitem</span><span class="s0">, </span><span class="s1">key</span><span class="s0">, </span><span class="s1">i) </span><span class="s0">if </span><span class="s1">nout </span><span class="s0">else </span><span class="s1">key)</span>
+            <span class="s0">for </span><span class="s1">key </span><span class="s0">in </span><span class="s1">keys</span>
+        <span class="s1">}</span>
+        <span class="s1">graph = HighLevelGraph.from_collections(leaf_name</span><span class="s0">, </span><span class="s1">leaf_dsk</span><span class="s0">, </span><span class="s1">dependencies=[tmp])</span>
+        <span class="s1">meta = meta_from_array(meta</span><span class="s0">, </span><span class="s1">len(output_shape))</span>
+        <span class="s1">leaf_arr = Array(</span>
+            <span class="s1">graph</span><span class="s0">, </span><span class="s1">leaf_name</span><span class="s0">, </span><span class="s1">chunks=output_chunks</span><span class="s0">, </span><span class="s1">shape=output_shape</span><span class="s0">, </span><span class="s1">meta=meta</span>
+        <span class="s1">)</span>
+
+        <span class="s2">### Axes:</span>
+        <span class="s0">if </span><span class="s1">keepdims:</span>
+            <span class="s1">slices = len(leaf_arr.shape) * (slice(</span><span class="s0">None</span><span class="s1">)</span><span class="s0">,</span><span class="s1">) + len(oax) * (np.newaxis</span><span class="s0">,</span><span class="s1">)</span>
+            <span class="s1">leaf_arr = leaf_arr[slices]</span>
+
+        <span class="s1">tidcs = [</span><span class="s0">None</span><span class="s1">] * len(leaf_arr.shape)</span>
+        <span class="s0">for </span><span class="s1">ii</span><span class="s0">, </span><span class="s1">oa </span><span class="s0">in </span><span class="s1">zip(range(-len(oax)</span><span class="s0">, </span><span class="s5">0</span><span class="s1">)</span><span class="s0">, </span><span class="s1">oax):</span>
+            <span class="s1">tidcs[oa] = ii</span>
+        <span class="s1">j = </span><span class="s5">0</span>
+        <span class="s0">for </span><span class="s1">ii </span><span class="s0">in </span><span class="s1">range(len(tidcs)):</span>
+            <span class="s0">if </span><span class="s1">tidcs[ii] </span><span class="s0">is None</span><span class="s1">:</span>
+                <span class="s1">tidcs[ii] = j</span>
+                <span class="s1">j += </span><span class="s5">1</span>
+        <span class="s1">leaf_arr = leaf_arr.transpose(tidcs)</span>
+        <span class="s1">leaf_arrs.append(leaf_arr)</span>
+
+    <span class="s0">return </span><span class="s1">(*leaf_arrs</span><span class="s0">,</span><span class="s1">) </span><span class="s0">if </span><span class="s1">nout </span><span class="s0">else </span><span class="s1">leaf_arrs[</span><span class="s5">0</span><span class="s1">]  </span><span class="s2"># Undo *) from above</span>
+
+
+<span class="s0">class </span><span class="s1">gufunc:</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Binds `pyfunc` into ``dask.array.apply_gufunc`` when called. 
+ 
+    Parameters 
+    ---------- 
+    pyfunc : callable 
+        Function to call like ``func(*args, **kwargs)`` on input arrays 
+        (``*args``) that returns an array or tuple of arrays. If multiple 
+        arguments with non-matching dimensions are supplied, this function is 
+        expected to vectorize (broadcast) over axes of positional arguments in 
+        the style of NumPy universal functions [1]_ (if this is not the case, 
+        set ``vectorize=True``). If this function returns multiple outputs, 
+        ``output_core_dims`` has to be set as well. 
+    signature : String, keyword only 
+        Specifies what core dimensions are consumed and produced by ``func``. 
+        According to the specification of numpy.gufunc signature [2]_ 
+    axes: List of tuples, optional, keyword only 
+        A list of tuples with indices of axes a generalized ufunc should operate on. 
+        For instance, for a signature of ``&quot;(i,j),(j,k)-&gt;(i,k)&quot;`` appropriate for 
+        matrix multiplication, the base elements are two-dimensional matrices 
+        and these are taken to be stored in the two last axes of each argument. The 
+        corresponding axes keyword would be ``[(-2, -1), (-2, -1), (-2, -1)]``. 
+        For simplicity, for generalized ufuncs that operate on 1-dimensional arrays 
+        (vectors), a single integer is accepted instead of a single-element tuple, 
+        and for generalized ufuncs for which all outputs are scalars, the output 
+        tuples can be omitted. 
+    axis: int, optional, keyword only 
+        A single axis over which a generalized ufunc should operate. This is a short-cut 
+        for ufuncs that operate over a single, shared core dimension, equivalent to passing 
+        in axes with entries of (axis,) for each single-core-dimension argument and ``()`` for 
+        all others. For instance, for a signature ``&quot;(i),(i)-&gt;()&quot;``, it is equivalent to passing 
+        in ``axes=[(axis,), (axis,), ()]``. 
+    keepdims: bool, optional, keyword only 
+        If this is set to True, axes which are reduced over will be left in the result as 
+        a dimension with size one, so that the result will broadcast correctly against the 
+        inputs. This option can only be used for generalized ufuncs that operate on inputs 
+        that all have the same number of core dimensions and with outputs that have no core 
+        dimensions , i.e., with signatures like ``&quot;(i),(i)-&gt;()&quot;`` or ``&quot;(m,m)-&gt;()&quot;``. 
+        If used, the location of the dimensions in the output can be controlled with axes 
+        and axis. 
+    output_dtypes : Optional, dtype or list of dtypes, keyword only 
+        Valid numpy dtype specification or list thereof. 
+        If not given, a call of ``func`` with a small set of data 
+        is performed in order to try to automatically determine the 
+        output dtypes. 
+    output_sizes : dict, optional, keyword only 
+        Optional mapping from dimension names to sizes for outputs. Only used if 
+        new core dimensions (not found on inputs) appear on outputs. 
+    vectorize: bool, keyword only 
+        If set to ``True``, ``np.vectorize`` is applied to ``func`` for 
+        convenience. Defaults to ``False``. 
+    allow_rechunk: Optional, bool, keyword only 
+        Allows rechunking, otherwise chunk sizes need to match and core 
+        dimensions are to consist only of one chunk. 
+        Warning: enabling this can increase memory usage significantly. 
+        Defaults to ``False``. 
+    meta: Optional, tuple, keyword only 
+        tuple of empty ndarrays describing the shape and dtype of the output of the gufunc. 
+        Defaults to ``None``. 
+ 
+    Returns 
+    ------- 
+    Wrapped function 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import dask.array as da 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; a = da.random.normal(size=(10,20,30), chunks=(5, 10, 30)) 
+    &gt;&gt;&gt; def stats(x): 
+    ...     return np.mean(x, axis=-1), np.std(x, axis=-1) 
+    &gt;&gt;&gt; gustats = da.gufunc(stats, signature=&quot;(i)-&gt;(),()&quot;, output_dtypes=(float, float)) 
+    &gt;&gt;&gt; mean, std = gustats(a) 
+    &gt;&gt;&gt; mean.compute().shape 
+    (10, 20) 
+ 
+    &gt;&gt;&gt; a = da.random.normal(size=(   20,30), chunks=(10, 30)) 
+    &gt;&gt;&gt; b = da.random.normal(size=(10, 1,40), chunks=(5, 1, 40)) 
+    &gt;&gt;&gt; def outer_product(x, y): 
+    ...     return np.einsum(&quot;i,j-&gt;ij&quot;, x, y) 
+    &gt;&gt;&gt; guouter_product = da.gufunc(outer_product, signature=&quot;(i),(j)-&gt;(i,j)&quot;, output_dtypes=float, vectorize=True) 
+    &gt;&gt;&gt; c = guouter_product(a, b) 
+    &gt;&gt;&gt; c.compute().shape 
+    (10, 20, 30, 40) 
+ 
+    &gt;&gt;&gt; a = da.ones((1, 5, 10), chunks=(-1, -1, -1)) 
+    &gt;&gt;&gt; def stats(x): 
+    ...     return np.atleast_1d(x.mean()), np.atleast_1d(x.max()) 
+    &gt;&gt;&gt; meta = (np.array((), dtype=np.float64), np.array((), dtype=np.float64)) 
+    &gt;&gt;&gt; gustats = da.gufunc(stats, signature=&quot;(i,j)-&gt;(),()&quot;, meta=meta) 
+    &gt;&gt;&gt; result = gustats(a) 
+    &gt;&gt;&gt; result[0].compute().shape 
+    (1,) 
+    &gt;&gt;&gt; result[1].compute().shape 
+    (1,) 
+ 
+    References 
+    ---------- 
+    .. [1] https://docs.scipy.org/doc/numpy/reference/ufuncs.html 
+    .. [2] https://docs.scipy.org/doc/numpy/reference/c-api/generalized-ufuncs.html 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s0">,</span>
+        <span class="s1">pyfunc</span><span class="s0">,</span>
+        <span class="s1">*</span><span class="s0">,</span>
+        <span class="s1">signature=</span><span class="s0">None,</span>
+        <span class="s1">vectorize=</span><span class="s0">False,</span>
+        <span class="s1">axes=</span><span class="s0">None,</span>
+        <span class="s1">axis=</span><span class="s0">None,</span>
+        <span class="s1">keepdims=</span><span class="s0">False,</span>
+        <span class="s1">output_sizes=</span><span class="s0">None,</span>
+        <span class="s1">output_dtypes=</span><span class="s0">None,</span>
+        <span class="s1">allow_rechunk=</span><span class="s0">False,</span>
+        <span class="s1">meta=</span><span class="s0">None,</span>
+    <span class="s1">):</span>
+        <span class="s1">self.pyfunc = pyfunc</span>
+        <span class="s1">self.signature = signature</span>
+        <span class="s1">self.vectorize = vectorize</span>
+        <span class="s1">self.axes = axes</span>
+        <span class="s1">self.axis = axis</span>
+        <span class="s1">self.keepdims = keepdims</span>
+        <span class="s1">self.output_sizes = output_sizes</span>
+        <span class="s1">self.output_dtypes = output_dtypes</span>
+        <span class="s1">self.allow_rechunk = allow_rechunk</span>
+        <span class="s1">self.meta = meta</span>
+
+        <span class="s1">self.__doc__ = </span><span class="s3">&quot;&quot;&quot; 
+        Bound ``dask.array.gufunc`` 
+        func: ``{func}`` 
+        signature: ``'{signature}'`` 
+ 
+        Parameters 
+        ---------- 
+        *args : numpy/dask arrays or scalars 
+            Arrays to which to apply to ``func``. Core dimensions as specified in 
+            ``signature`` need to come last. 
+        **kwargs : dict 
+            Extra keyword arguments to pass to ``func`` 
+ 
+        Returns 
+        ------- 
+        Single dask.array.Array or tuple of dask.array.Array 
+        &quot;&quot;&quot;</span><span class="s1">.format(</span>
+            <span class="s1">func=str(self.pyfunc)</span><span class="s0">, </span><span class="s1">signature=self.signature</span>
+        <span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">__call__(self</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">allow_rechunk=</span><span class="s0">False, </span><span class="s1">**kwargs):</span>
+        <span class="s0">return </span><span class="s1">apply_gufunc(</span>
+            <span class="s1">self.pyfunc</span><span class="s0">,</span>
+            <span class="s1">self.signature</span><span class="s0">,</span>
+            <span class="s1">*args</span><span class="s0">,</span>
+            <span class="s1">vectorize=self.vectorize</span><span class="s0">,</span>
+            <span class="s1">axes=self.axes</span><span class="s0">,</span>
+            <span class="s1">axis=self.axis</span><span class="s0">,</span>
+            <span class="s1">keepdims=self.keepdims</span><span class="s0">,</span>
+            <span class="s1">output_sizes=self.output_sizes</span><span class="s0">,</span>
+            <span class="s1">output_dtypes=self.output_dtypes</span><span class="s0">,</span>
+            <span class="s1">allow_rechunk=self.allow_rechunk </span><span class="s0">or </span><span class="s1">allow_rechunk</span><span class="s0">,</span>
+            <span class="s1">meta=self.meta</span><span class="s0">,</span>
+            <span class="s1">**kwargs</span><span class="s0">,</span>
+        <span class="s1">)</span>
+
+
+<span class="s0">def </span><span class="s1">as_gufunc(signature=</span><span class="s0">None, </span><span class="s1">**kwargs):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Decorator for ``dask.array.gufunc``. 
+ 
+    Parameters 
+    ---------- 
+    signature : String 
+        Specifies what core dimensions are consumed and produced by ``func``. 
+        According to the specification of numpy.gufunc signature [2]_ 
+    axes: List of tuples, optional, keyword only 
+        A list of tuples with indices of axes a generalized ufunc should operate on. 
+        For instance, for a signature of ``&quot;(i,j),(j,k)-&gt;(i,k)&quot;`` appropriate for 
+        matrix multiplication, the base elements are two-dimensional matrices 
+        and these are taken to be stored in the two last axes of each argument. The 
+        corresponding axes keyword would be ``[(-2, -1), (-2, -1), (-2, -1)]``. 
+        For simplicity, for generalized ufuncs that operate on 1-dimensional arrays 
+        (vectors), a single integer is accepted instead of a single-element tuple, 
+        and for generalized ufuncs for which all outputs are scalars, the output 
+        tuples can be omitted. 
+    axis: int, optional, keyword only 
+        A single axis over which a generalized ufunc should operate. This is a short-cut 
+        for ufuncs that operate over a single, shared core dimension, equivalent to passing 
+        in axes with entries of (axis,) for each single-core-dimension argument and ``()`` for 
+        all others. For instance, for a signature ``&quot;(i),(i)-&gt;()&quot;``, it is equivalent to passing 
+        in ``axes=[(axis,), (axis,), ()]``. 
+    keepdims: bool, optional, keyword only 
+        If this is set to True, axes which are reduced over will be left in the result as 
+        a dimension with size one, so that the result will broadcast correctly against the 
+        inputs. This option can only be used for generalized ufuncs that operate on inputs 
+        that all have the same number of core dimensions and with outputs that have no core 
+        dimensions , i.e., with signatures like ``&quot;(i),(i)-&gt;()&quot;`` or ``&quot;(m,m)-&gt;()&quot;``. 
+        If used, the location of the dimensions in the output can be controlled with axes 
+        and axis. 
+    output_dtypes : Optional, dtype or list of dtypes, keyword only 
+        Valid numpy dtype specification or list thereof. 
+        If not given, a call of ``func`` with a small set of data 
+        is performed in order to try to automatically determine the 
+        output dtypes. 
+    output_sizes : dict, optional, keyword only 
+        Optional mapping from dimension names to sizes for outputs. Only used if 
+        new core dimensions (not found on inputs) appear on outputs. 
+    vectorize: bool, keyword only 
+        If set to ``True``, ``np.vectorize`` is applied to ``func`` for 
+        convenience. Defaults to ``False``. 
+    allow_rechunk: Optional, bool, keyword only 
+        Allows rechunking, otherwise chunk sizes need to match and core 
+        dimensions are to consist only of one chunk. 
+        Warning: enabling this can increase memory usage significantly. 
+        Defaults to ``False``. 
+    meta: Optional, tuple, keyword only 
+        tuple of empty ndarrays describing the shape and dtype of the output of the gufunc. 
+        Defaults to ``None``. 
+ 
+    Returns 
+    ------- 
+    Decorator for `pyfunc` that itself returns a `gufunc`. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import dask.array as da 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; a = da.random.normal(size=(10,20,30), chunks=(5, 10, 30)) 
+    &gt;&gt;&gt; @da.as_gufunc(&quot;(i)-&gt;(),()&quot;, output_dtypes=(float, float)) 
+    ... def stats(x): 
+    ...     return np.mean(x, axis=-1), np.std(x, axis=-1) 
+    &gt;&gt;&gt; mean, std = stats(a) 
+    &gt;&gt;&gt; mean.compute().shape 
+    (10, 20) 
+ 
+    &gt;&gt;&gt; a = da.random.normal(size=(   20,30), chunks=(10, 30)) 
+    &gt;&gt;&gt; b = da.random.normal(size=(10, 1,40), chunks=(5, 1, 40)) 
+    &gt;&gt;&gt; @da.as_gufunc(&quot;(i),(j)-&gt;(i,j)&quot;, output_dtypes=float, vectorize=True) 
+    ... def outer_product(x, y): 
+    ...     return np.einsum(&quot;i,j-&gt;ij&quot;, x, y) 
+    &gt;&gt;&gt; c = outer_product(a, b) 
+    &gt;&gt;&gt; c.compute().shape 
+    (10, 20, 30, 40) 
+ 
+    References 
+    ---------- 
+    .. [1] https://docs.scipy.org/doc/numpy/reference/ufuncs.html 
+    .. [2] https://docs.scipy.org/doc/numpy/reference/c-api/generalized-ufuncs.html 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_allowedkeys = {</span>
+        <span class="s3">&quot;vectorize&quot;</span><span class="s0">,</span>
+        <span class="s3">&quot;axes&quot;</span><span class="s0">,</span>
+        <span class="s3">&quot;axis&quot;</span><span class="s0">,</span>
+        <span class="s3">&quot;keepdims&quot;</span><span class="s0">,</span>
+        <span class="s3">&quot;output_sizes&quot;</span><span class="s0">,</span>
+        <span class="s3">&quot;output_dtypes&quot;</span><span class="s0">,</span>
+        <span class="s3">&quot;allow_rechunk&quot;</span><span class="s0">,</span>
+        <span class="s3">&quot;meta&quot;</span><span class="s0">,</span>
+    <span class="s1">}</span>
+    <span class="s0">if </span><span class="s1">kwargs.keys() - _allowedkeys:</span>
+        <span class="s0">raise </span><span class="s1">TypeError(</span><span class="s3">&quot;Unsupported keyword argument(s) provided&quot;</span><span class="s1">)</span>
+
+    <span class="s0">def </span><span class="s1">_as_gufunc(pyfunc):</span>
+        <span class="s0">return </span><span class="s1">gufunc(pyfunc</span><span class="s0">, </span><span class="s1">signature=signature</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s1">_as_gufunc.__doc__ = </span><span class="s3">&quot;&quot;&quot; 
+        Decorator to make ``dask.array.gufunc`` 
+        signature: ``'{signature}'`` 
+ 
+        Parameters 
+        ---------- 
+        pyfunc : callable 
+            Function matching signature ``'{signature}'``. 
+ 
+        Returns 
+        ------- 
+        ``dask.array.gufunc`` 
+        &quot;&quot;&quot;</span><span class="s1">.format(</span>
+        <span class="s1">signature=signature</span>
+    <span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">_as_gufunc</span>
+</pre>
+</body>
+</html>

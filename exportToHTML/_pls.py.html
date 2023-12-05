@@ -1,0 +1,1093 @@
+<html>
+<head>
+<title>_pls.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #808080;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_pls.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+The :mod:`sklearn.pls` module implements Partial Least Squares (PLS). 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># Author: Edouard Duchesnay &lt;edouard.duchesnay@cea.fr&gt;</span>
+<span class="s2"># License: BSD 3 clause</span>
+
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">from </span><span class="s1">abc </span><span class="s3">import </span><span class="s1">ABCMeta</span><span class="s3">, </span><span class="s1">abstractmethod</span>
+<span class="s3">from </span><span class="s1">numbers </span><span class="s3">import </span><span class="s1">Integral</span><span class="s3">, </span><span class="s1">Real</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">scipy.linalg </span><span class="s3">import </span><span class="s1">svd</span>
+
+<span class="s3">from </span><span class="s1">..base </span><span class="s3">import </span><span class="s1">(</span>
+    <span class="s1">BaseEstimator</span><span class="s3">,</span>
+    <span class="s1">ClassNamePrefixFeaturesOutMixin</span><span class="s3">,</span>
+    <span class="s1">MultiOutputMixin</span><span class="s3">,</span>
+    <span class="s1">RegressorMixin</span><span class="s3">,</span>
+    <span class="s1">TransformerMixin</span><span class="s3">,</span>
+    <span class="s1">_fit_context</span><span class="s3">,</span>
+<span class="s1">)</span>
+<span class="s3">from </span><span class="s1">..exceptions </span><span class="s3">import </span><span class="s1">ConvergenceWarning</span>
+<span class="s3">from </span><span class="s1">..utils </span><span class="s3">import </span><span class="s1">check_array</span><span class="s3">, </span><span class="s1">check_consistent_length</span>
+<span class="s3">from </span><span class="s1">..utils._param_validation </span><span class="s3">import </span><span class="s1">Interval</span><span class="s3">, </span><span class="s1">StrOptions</span>
+<span class="s3">from </span><span class="s1">..utils.extmath </span><span class="s3">import </span><span class="s1">svd_flip</span>
+<span class="s3">from </span><span class="s1">..utils.fixes </span><span class="s3">import </span><span class="s1">parse_version</span><span class="s3">, </span><span class="s1">sp_version</span>
+<span class="s3">from </span><span class="s1">..utils.validation </span><span class="s3">import </span><span class="s1">FLOAT_DTYPES</span><span class="s3">, </span><span class="s1">check_is_fitted</span>
+
+<span class="s1">__all__ = [</span><span class="s4">&quot;PLSCanonical&quot;</span><span class="s3">, </span><span class="s4">&quot;PLSRegression&quot;</span><span class="s3">, </span><span class="s4">&quot;PLSSVD&quot;</span><span class="s1">]</span>
+
+
+<span class="s3">if </span><span class="s1">sp_version &gt;= parse_version(</span><span class="s4">&quot;1.7&quot;</span><span class="s1">):</span>
+    <span class="s2"># Starting in scipy 1.7 pinv2 was deprecated in favor of pinv.</span>
+    <span class="s2"># pinv now uses the svd to compute the pseudo-inverse.</span>
+    <span class="s3">from </span><span class="s1">scipy.linalg </span><span class="s3">import </span><span class="s1">pinv </span><span class="s3">as </span><span class="s1">pinv2</span>
+<span class="s3">else</span><span class="s1">:</span>
+    <span class="s3">from </span><span class="s1">scipy.linalg </span><span class="s3">import </span><span class="s1">pinv2</span>
+
+
+<span class="s3">def </span><span class="s1">_pinv2_old(a):</span>
+    <span class="s2"># Used previous scipy pinv2 that was updated in:</span>
+    <span class="s2"># https://github.com/scipy/scipy/pull/10067</span>
+    <span class="s2"># We can not set `cond` or `rcond` for pinv2 in scipy &gt;= 1.3 to keep the</span>
+    <span class="s2"># same behavior of pinv2 for scipy &lt; 1.3, because the condition used to</span>
+    <span class="s2"># determine the rank is dependent on the output of svd.</span>
+    <span class="s1">u</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">vh = svd(a</span><span class="s3">, </span><span class="s1">full_matrices=</span><span class="s3">False, </span><span class="s1">check_finite=</span><span class="s3">False</span><span class="s1">)</span>
+
+    <span class="s1">t = u.dtype.char.lower()</span>
+    <span class="s1">factor = {</span><span class="s4">&quot;f&quot;</span><span class="s1">: </span><span class="s5">1e3</span><span class="s3">, </span><span class="s4">&quot;d&quot;</span><span class="s1">: </span><span class="s5">1e6</span><span class="s1">}</span>
+    <span class="s1">cond = np.max(s) * factor[t] * np.finfo(t).eps</span>
+    <span class="s1">rank = np.sum(s &gt; cond)</span>
+
+    <span class="s1">u = u[:</span><span class="s3">, </span><span class="s1">:rank]</span>
+    <span class="s1">u /= s[:rank]</span>
+    <span class="s3">return </span><span class="s1">np.transpose(np.conjugate(np.dot(u</span><span class="s3">, </span><span class="s1">vh[:rank])))</span>
+
+
+<span class="s3">def </span><span class="s1">_get_first_singular_vectors_power_method(</span>
+    <span class="s1">X</span><span class="s3">, </span><span class="s1">Y</span><span class="s3">, </span><span class="s1">mode=</span><span class="s4">&quot;A&quot;</span><span class="s3">, </span><span class="s1">max_iter=</span><span class="s5">500</span><span class="s3">, </span><span class="s1">tol=</span><span class="s5">1e-06</span><span class="s3">, </span><span class="s1">norm_y_weights=</span><span class="s3">False</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Return the first left and right singular vectors of X'Y. 
+ 
+    Provides an alternative to the svd(X'Y) and uses the power method instead. 
+    With norm_y_weights to True and in mode A, this corresponds to the 
+    algorithm section 11.3 of the Wegelin's review, except this starts at the 
+    &quot;update saliences&quot; part. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">eps = np.finfo(X.dtype).eps</span>
+    <span class="s3">try</span><span class="s1">:</span>
+        <span class="s1">y_score = next(col </span><span class="s3">for </span><span class="s1">col </span><span class="s3">in </span><span class="s1">Y.T </span><span class="s3">if </span><span class="s1">np.any(np.abs(col) &gt; eps))</span>
+    <span class="s3">except </span><span class="s1">StopIteration </span><span class="s3">as </span><span class="s1">e:</span>
+        <span class="s3">raise </span><span class="s1">StopIteration(</span><span class="s4">&quot;Y residual is constant&quot;</span><span class="s1">) </span><span class="s3">from </span><span class="s1">e</span>
+
+    <span class="s1">x_weights_old = </span><span class="s5">100  </span><span class="s2"># init to big value for first convergence check</span>
+
+    <span class="s3">if </span><span class="s1">mode == </span><span class="s4">&quot;B&quot;</span><span class="s1">:</span>
+        <span class="s2"># Precompute pseudo inverse matrices</span>
+        <span class="s2"># Basically: X_pinv = (X.T X)^-1 X.T</span>
+        <span class="s2"># Which requires inverting a (n_features, n_features) matrix.</span>
+        <span class="s2"># As a result, and as detailed in the Wegelin's review, CCA (i.e. mode</span>
+        <span class="s2"># B) will be unstable if n_features &gt; n_samples or n_targets &gt;</span>
+        <span class="s2"># n_samples</span>
+        <span class="s1">X_pinv</span><span class="s3">, </span><span class="s1">Y_pinv = _pinv2_old(X)</span><span class="s3">, </span><span class="s1">_pinv2_old(Y)</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(max_iter):</span>
+        <span class="s3">if </span><span class="s1">mode == </span><span class="s4">&quot;B&quot;</span><span class="s1">:</span>
+            <span class="s1">x_weights = np.dot(X_pinv</span><span class="s3">, </span><span class="s1">y_score)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">x_weights = np.dot(X.T</span><span class="s3">, </span><span class="s1">y_score) / np.dot(y_score</span><span class="s3">, </span><span class="s1">y_score)</span>
+
+        <span class="s1">x_weights /= np.sqrt(np.dot(x_weights</span><span class="s3">, </span><span class="s1">x_weights)) + eps</span>
+        <span class="s1">x_score = np.dot(X</span><span class="s3">, </span><span class="s1">x_weights)</span>
+
+        <span class="s3">if </span><span class="s1">mode == </span><span class="s4">&quot;B&quot;</span><span class="s1">:</span>
+            <span class="s1">y_weights = np.dot(Y_pinv</span><span class="s3">, </span><span class="s1">x_score)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">y_weights = np.dot(Y.T</span><span class="s3">, </span><span class="s1">x_score) / np.dot(x_score.T</span><span class="s3">, </span><span class="s1">x_score)</span>
+
+        <span class="s3">if </span><span class="s1">norm_y_weights:</span>
+            <span class="s1">y_weights /= np.sqrt(np.dot(y_weights</span><span class="s3">, </span><span class="s1">y_weights)) + eps</span>
+
+        <span class="s1">y_score = np.dot(Y</span><span class="s3">, </span><span class="s1">y_weights) / (np.dot(y_weights</span><span class="s3">, </span><span class="s1">y_weights) + eps)</span>
+
+        <span class="s1">x_weights_diff = x_weights - x_weights_old</span>
+        <span class="s3">if </span><span class="s1">np.dot(x_weights_diff</span><span class="s3">, </span><span class="s1">x_weights_diff) &lt; tol </span><span class="s3">or </span><span class="s1">Y.shape[</span><span class="s5">1</span><span class="s1">] == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s3">break</span>
+        <span class="s1">x_weights_old = x_weights</span>
+
+    <span class="s1">n_iter = i + </span><span class="s5">1</span>
+    <span class="s3">if </span><span class="s1">n_iter == max_iter:</span>
+        <span class="s1">warnings.warn(</span><span class="s4">&quot;Maximum number of iterations reached&quot;</span><span class="s3">, </span><span class="s1">ConvergenceWarning)</span>
+
+    <span class="s3">return </span><span class="s1">x_weights</span><span class="s3">, </span><span class="s1">y_weights</span><span class="s3">, </span><span class="s1">n_iter</span>
+
+
+<span class="s3">def </span><span class="s1">_get_first_singular_vectors_svd(X</span><span class="s3">, </span><span class="s1">Y):</span>
+    <span class="s0">&quot;&quot;&quot;Return the first left and right singular vectors of X'Y. 
+ 
+    Here the whole SVD is computed. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">C = np.dot(X.T</span><span class="s3">, </span><span class="s1">Y)</span>
+    <span class="s1">U</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">Vt = svd(C</span><span class="s3">, </span><span class="s1">full_matrices=</span><span class="s3">False</span><span class="s1">)</span>
+    <span class="s3">return </span><span class="s1">U[:</span><span class="s3">, </span><span class="s5">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">Vt[</span><span class="s5">0</span><span class="s3">, </span><span class="s1">:]</span>
+
+
+<span class="s3">def </span><span class="s1">_center_scale_xy(X</span><span class="s3">, </span><span class="s1">Y</span><span class="s3">, </span><span class="s1">scale=</span><span class="s3">True</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Center X, Y and scale if the scale parameter==True 
+ 
+    Returns 
+    ------- 
+        X, Y, x_mean, y_mean, x_std, y_std 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># center</span>
+    <span class="s1">x_mean = X.mean(axis=</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">X -= x_mean</span>
+    <span class="s1">y_mean = Y.mean(axis=</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">Y -= y_mean</span>
+    <span class="s2"># scale</span>
+    <span class="s3">if </span><span class="s1">scale:</span>
+        <span class="s1">x_std = X.std(axis=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">ddof=</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">x_std[x_std == </span><span class="s5">0.0</span><span class="s1">] = </span><span class="s5">1.0</span>
+        <span class="s1">X /= x_std</span>
+        <span class="s1">y_std = Y.std(axis=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">ddof=</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">y_std[y_std == </span><span class="s5">0.0</span><span class="s1">] = </span><span class="s5">1.0</span>
+        <span class="s1">Y /= y_std</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">x_std = np.ones(X.shape[</span><span class="s5">1</span><span class="s1">])</span>
+        <span class="s1">y_std = np.ones(Y.shape[</span><span class="s5">1</span><span class="s1">])</span>
+    <span class="s3">return </span><span class="s1">X</span><span class="s3">, </span><span class="s1">Y</span><span class="s3">, </span><span class="s1">x_mean</span><span class="s3">, </span><span class="s1">y_mean</span><span class="s3">, </span><span class="s1">x_std</span><span class="s3">, </span><span class="s1">y_std</span>
+
+
+<span class="s3">def </span><span class="s1">_svd_flip_1d(u</span><span class="s3">, </span><span class="s1">v):</span>
+    <span class="s0">&quot;&quot;&quot;Same as svd_flip but works on 1d arrays, and is inplace&quot;&quot;&quot;</span>
+    <span class="s2"># svd_flip would force us to convert to 2d array and would also return 2d</span>
+    <span class="s2"># arrays. We don't want that.</span>
+    <span class="s1">biggest_abs_val_idx = np.argmax(np.abs(u))</span>
+    <span class="s1">sign = np.sign(u[biggest_abs_val_idx])</span>
+    <span class="s1">u *= sign</span>
+    <span class="s1">v *= sign</span>
+
+
+<span class="s3">class </span><span class="s1">_PLS(</span>
+    <span class="s1">ClassNamePrefixFeaturesOutMixin</span><span class="s3">,</span>
+    <span class="s1">TransformerMixin</span><span class="s3">,</span>
+    <span class="s1">RegressorMixin</span><span class="s3">,</span>
+    <span class="s1">MultiOutputMixin</span><span class="s3">,</span>
+    <span class="s1">BaseEstimator</span><span class="s3">,</span>
+    <span class="s1">metaclass=ABCMeta</span><span class="s3">,</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Partial Least Squares (PLS) 
+ 
+    This class implements the generic PLS algorithm. 
+ 
+    Main ref: Wegelin, a survey of Partial Least Squares (PLS) methods, 
+    with emphasis on the two-block case 
+    https://stat.uw.edu/sites/default/files/files/reports/2000/tr371.pdf 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span>
+        <span class="s4">&quot;n_components&quot;</span><span class="s1">: [Interval(Integral</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, None, </span><span class="s1">closed=</span><span class="s4">&quot;left&quot;</span><span class="s1">)]</span><span class="s3">,</span>
+        <span class="s4">&quot;scale&quot;</span><span class="s1">: [</span><span class="s4">&quot;boolean&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s4">&quot;deflation_mode&quot;</span><span class="s1">: [StrOptions({</span><span class="s4">&quot;regression&quot;</span><span class="s3">, </span><span class="s4">&quot;canonical&quot;</span><span class="s1">})]</span><span class="s3">,</span>
+        <span class="s4">&quot;mode&quot;</span><span class="s1">: [StrOptions({</span><span class="s4">&quot;A&quot;</span><span class="s3">, </span><span class="s4">&quot;B&quot;</span><span class="s1">})]</span><span class="s3">,</span>
+        <span class="s4">&quot;algorithm&quot;</span><span class="s1">: [StrOptions({</span><span class="s4">&quot;svd&quot;</span><span class="s3">, </span><span class="s4">&quot;nipals&quot;</span><span class="s1">})]</span><span class="s3">,</span>
+        <span class="s4">&quot;max_iter&quot;</span><span class="s1">: [Interval(Integral</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, None, </span><span class="s1">closed=</span><span class="s4">&quot;left&quot;</span><span class="s1">)]</span><span class="s3">,</span>
+        <span class="s4">&quot;tol&quot;</span><span class="s1">: [Interval(Real</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, None, </span><span class="s1">closed=</span><span class="s4">&quot;left&quot;</span><span class="s1">)]</span><span class="s3">,</span>
+        <span class="s4">&quot;copy&quot;</span><span class="s1">: [</span><span class="s4">&quot;boolean&quot;</span><span class="s1">]</span><span class="s3">,</span>
+    <span class="s1">}</span>
+
+    <span class="s1">@abstractmethod</span>
+    <span class="s3">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">n_components=</span><span class="s5">2</span><span class="s3">,</span>
+        <span class="s1">*</span><span class="s3">,</span>
+        <span class="s1">scale=</span><span class="s3">True,</span>
+        <span class="s1">deflation_mode=</span><span class="s4">&quot;regression&quot;</span><span class="s3">,</span>
+        <span class="s1">mode=</span><span class="s4">&quot;A&quot;</span><span class="s3">,</span>
+        <span class="s1">algorithm=</span><span class="s4">&quot;nipals&quot;</span><span class="s3">,</span>
+        <span class="s1">max_iter=</span><span class="s5">500</span><span class="s3">,</span>
+        <span class="s1">tol=</span><span class="s5">1e-06</span><span class="s3">,</span>
+        <span class="s1">copy=</span><span class="s3">True,</span>
+    <span class="s1">):</span>
+        <span class="s1">self.n_components = n_components</span>
+        <span class="s1">self.deflation_mode = deflation_mode</span>
+        <span class="s1">self.mode = mode</span>
+        <span class="s1">self.scale = scale</span>
+        <span class="s1">self.algorithm = algorithm</span>
+        <span class="s1">self.max_iter = max_iter</span>
+        <span class="s1">self.tol = tol</span>
+        <span class="s1">self.copy = copy</span>
+
+    <span class="s1">@_fit_context(prefer_skip_nested_validation=</span><span class="s3">True</span><span class="s1">)</span>
+    <span class="s3">def </span><span class="s1">fit(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">Y):</span>
+        <span class="s0">&quot;&quot;&quot;Fit model to data. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training vectors, where `n_samples` is the number of samples and 
+            `n_features` is the number of predictors. 
+ 
+        Y : array-like of shape (n_samples,) or (n_samples, n_targets) 
+            Target vectors, where `n_samples` is the number of samples and 
+            `n_targets` is the number of response variables. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Fitted model. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_consistent_length(X</span><span class="s3">, </span><span class="s1">Y)</span>
+        <span class="s1">X = self._validate_data(</span>
+            <span class="s1">X</span><span class="s3">, </span><span class="s1">dtype=np.float64</span><span class="s3">, </span><span class="s1">copy=self.copy</span><span class="s3">, </span><span class="s1">ensure_min_samples=</span><span class="s5">2</span>
+        <span class="s1">)</span>
+        <span class="s1">Y = check_array(</span>
+            <span class="s1">Y</span><span class="s3">, </span><span class="s1">input_name=</span><span class="s4">&quot;Y&quot;</span><span class="s3">, </span><span class="s1">dtype=np.float64</span><span class="s3">, </span><span class="s1">copy=self.copy</span><span class="s3">, </span><span class="s1">ensure_2d=</span><span class="s3">False</span>
+        <span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">Y.ndim == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">self._predict_1d = </span><span class="s3">True</span>
+            <span class="s1">Y = Y.reshape(-</span><span class="s5">1</span><span class="s3">, </span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self._predict_1d = </span><span class="s3">False</span>
+
+        <span class="s1">n = X.shape[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s1">p = X.shape[</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">q = Y.shape[</span><span class="s5">1</span><span class="s1">]</span>
+
+        <span class="s1">n_components = self.n_components</span>
+        <span class="s2"># With PLSRegression n_components is bounded by the rank of (X.T X) see</span>
+        <span class="s2"># Wegelin page 25. With CCA and PLSCanonical, n_components is bounded</span>
+        <span class="s2"># by the rank of X and the rank of Y: see Wegelin page 12</span>
+        <span class="s1">rank_upper_bound = p </span><span class="s3">if </span><span class="s1">self.deflation_mode == </span><span class="s4">&quot;regression&quot; </span><span class="s3">else </span><span class="s1">min(n</span><span class="s3">, </span><span class="s1">p</span><span class="s3">, </span><span class="s1">q)</span>
+        <span class="s3">if </span><span class="s1">n_components &gt; rank_upper_bound:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">f&quot;`n_components` upper bound is </span><span class="s3">{</span><span class="s1">rank_upper_bound</span><span class="s3">}</span><span class="s4">. &quot;</span>
+                <span class="s4">f&quot;Got </span><span class="s3">{</span><span class="s1">n_components</span><span class="s3">} </span><span class="s4">instead. Reduce `n_components`.&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">self._norm_y_weights = self.deflation_mode == </span><span class="s4">&quot;canonical&quot;  </span><span class="s2"># 1.1</span>
+        <span class="s1">norm_y_weights = self._norm_y_weights</span>
+
+        <span class="s2"># Scale (in place)</span>
+        <span class="s1">Xk</span><span class="s3">, </span><span class="s1">Yk</span><span class="s3">, </span><span class="s1">self._x_mean</span><span class="s3">, </span><span class="s1">self._y_mean</span><span class="s3">, </span><span class="s1">self._x_std</span><span class="s3">, </span><span class="s1">self._y_std = _center_scale_xy(</span>
+            <span class="s1">X</span><span class="s3">, </span><span class="s1">Y</span><span class="s3">, </span><span class="s1">self.scale</span>
+        <span class="s1">)</span>
+
+        <span class="s1">self.x_weights_ = np.zeros((p</span><span class="s3">, </span><span class="s1">n_components))  </span><span class="s2"># U</span>
+        <span class="s1">self.y_weights_ = np.zeros((q</span><span class="s3">, </span><span class="s1">n_components))  </span><span class="s2"># V</span>
+        <span class="s1">self._x_scores = np.zeros((n</span><span class="s3">, </span><span class="s1">n_components))  </span><span class="s2"># Xi</span>
+        <span class="s1">self._y_scores = np.zeros((n</span><span class="s3">, </span><span class="s1">n_components))  </span><span class="s2"># Omega</span>
+        <span class="s1">self.x_loadings_ = np.zeros((p</span><span class="s3">, </span><span class="s1">n_components))  </span><span class="s2"># Gamma</span>
+        <span class="s1">self.y_loadings_ = np.zeros((q</span><span class="s3">, </span><span class="s1">n_components))  </span><span class="s2"># Delta</span>
+        <span class="s1">self.n_iter_ = []</span>
+
+        <span class="s2"># This whole thing corresponds to the algorithm in section 4.1 of the</span>
+        <span class="s2"># review from Wegelin. See above for a notation mapping from code to</span>
+        <span class="s2"># paper.</span>
+        <span class="s1">Y_eps = np.finfo(Yk.dtype).eps</span>
+        <span class="s3">for </span><span class="s1">k </span><span class="s3">in </span><span class="s1">range(n_components):</span>
+            <span class="s2"># Find first left and right singular vectors of the X.T.dot(Y)</span>
+            <span class="s2"># cross-covariance matrix.</span>
+            <span class="s3">if </span><span class="s1">self.algorithm == </span><span class="s4">&quot;nipals&quot;</span><span class="s1">:</span>
+                <span class="s2"># Replace columns that are all close to zero with zeros</span>
+                <span class="s1">Yk_mask = np.all(np.abs(Yk) &lt; </span><span class="s5">10 </span><span class="s1">* Y_eps</span><span class="s3">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+                <span class="s1">Yk[:</span><span class="s3">, </span><span class="s1">Yk_mask] = </span><span class="s5">0.0</span>
+
+                <span class="s3">try</span><span class="s1">:</span>
+                    <span class="s1">(</span>
+                        <span class="s1">x_weights</span><span class="s3">,</span>
+                        <span class="s1">y_weights</span><span class="s3">,</span>
+                        <span class="s1">n_iter_</span><span class="s3">,</span>
+                    <span class="s1">) = _get_first_singular_vectors_power_method(</span>
+                        <span class="s1">Xk</span><span class="s3">,</span>
+                        <span class="s1">Yk</span><span class="s3">,</span>
+                        <span class="s1">mode=self.mode</span><span class="s3">,</span>
+                        <span class="s1">max_iter=self.max_iter</span><span class="s3">,</span>
+                        <span class="s1">tol=self.tol</span><span class="s3">,</span>
+                        <span class="s1">norm_y_weights=norm_y_weights</span><span class="s3">,</span>
+                    <span class="s1">)</span>
+                <span class="s3">except </span><span class="s1">StopIteration </span><span class="s3">as </span><span class="s1">e:</span>
+                    <span class="s3">if </span><span class="s1">str(e) != </span><span class="s4">&quot;Y residual is constant&quot;</span><span class="s1">:</span>
+                        <span class="s3">raise</span>
+                    <span class="s1">warnings.warn(</span><span class="s4">f&quot;Y residual is constant at iteration </span><span class="s3">{</span><span class="s1">k</span><span class="s3">}</span><span class="s4">&quot;</span><span class="s1">)</span>
+                    <span class="s3">break</span>
+
+                <span class="s1">self.n_iter_.append(n_iter_)</span>
+
+            <span class="s3">elif </span><span class="s1">self.algorithm == </span><span class="s4">&quot;svd&quot;</span><span class="s1">:</span>
+                <span class="s1">x_weights</span><span class="s3">, </span><span class="s1">y_weights = _get_first_singular_vectors_svd(Xk</span><span class="s3">, </span><span class="s1">Yk)</span>
+
+            <span class="s2"># inplace sign flip for consistency across solvers and archs</span>
+            <span class="s1">_svd_flip_1d(x_weights</span><span class="s3">, </span><span class="s1">y_weights)</span>
+
+            <span class="s2"># compute scores, i.e. the projections of X and Y</span>
+            <span class="s1">x_scores = np.dot(Xk</span><span class="s3">, </span><span class="s1">x_weights)</span>
+            <span class="s3">if </span><span class="s1">norm_y_weights:</span>
+                <span class="s1">y_ss = </span><span class="s5">1</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">y_ss = np.dot(y_weights</span><span class="s3">, </span><span class="s1">y_weights)</span>
+            <span class="s1">y_scores = np.dot(Yk</span><span class="s3">, </span><span class="s1">y_weights) / y_ss</span>
+
+            <span class="s2"># Deflation: subtract rank-one approx to obtain Xk+1 and Yk+1</span>
+            <span class="s1">x_loadings = np.dot(x_scores</span><span class="s3">, </span><span class="s1">Xk) / np.dot(x_scores</span><span class="s3">, </span><span class="s1">x_scores)</span>
+            <span class="s1">Xk -= np.outer(x_scores</span><span class="s3">, </span><span class="s1">x_loadings)</span>
+
+            <span class="s3">if </span><span class="s1">self.deflation_mode == </span><span class="s4">&quot;canonical&quot;</span><span class="s1">:</span>
+                <span class="s2"># regress Yk on y_score</span>
+                <span class="s1">y_loadings = np.dot(y_scores</span><span class="s3">, </span><span class="s1">Yk) / np.dot(y_scores</span><span class="s3">, </span><span class="s1">y_scores)</span>
+                <span class="s1">Yk -= np.outer(y_scores</span><span class="s3">, </span><span class="s1">y_loadings)</span>
+            <span class="s3">if </span><span class="s1">self.deflation_mode == </span><span class="s4">&quot;regression&quot;</span><span class="s1">:</span>
+                <span class="s2"># regress Yk on x_score</span>
+                <span class="s1">y_loadings = np.dot(x_scores</span><span class="s3">, </span><span class="s1">Yk) / np.dot(x_scores</span><span class="s3">, </span><span class="s1">x_scores)</span>
+                <span class="s1">Yk -= np.outer(x_scores</span><span class="s3">, </span><span class="s1">y_loadings)</span>
+
+            <span class="s1">self.x_weights_[:</span><span class="s3">, </span><span class="s1">k] = x_weights</span>
+            <span class="s1">self.y_weights_[:</span><span class="s3">, </span><span class="s1">k] = y_weights</span>
+            <span class="s1">self._x_scores[:</span><span class="s3">, </span><span class="s1">k] = x_scores</span>
+            <span class="s1">self._y_scores[:</span><span class="s3">, </span><span class="s1">k] = y_scores</span>
+            <span class="s1">self.x_loadings_[:</span><span class="s3">, </span><span class="s1">k] = x_loadings</span>
+            <span class="s1">self.y_loadings_[:</span><span class="s3">, </span><span class="s1">k] = y_loadings</span>
+
+        <span class="s2"># X was approximated as Xi . Gamma.T + X_(R+1)</span>
+        <span class="s2"># Xi . Gamma.T is a sum of n_components rank-1 matrices. X_(R+1) is</span>
+        <span class="s2"># whatever is left to fully reconstruct X, and can be 0 if X is of rank</span>
+        <span class="s2"># n_components.</span>
+        <span class="s2"># Similarly, Y was approximated as Omega . Delta.T + Y_(R+1)</span>
+
+        <span class="s2"># Compute transformation matrices (rotations_). See User Guide.</span>
+        <span class="s1">self.x_rotations_ = np.dot(</span>
+            <span class="s1">self.x_weights_</span><span class="s3">,</span>
+            <span class="s1">pinv2(np.dot(self.x_loadings_.T</span><span class="s3">, </span><span class="s1">self.x_weights_)</span><span class="s3">, </span><span class="s1">check_finite=</span><span class="s3">False</span><span class="s1">)</span><span class="s3">,</span>
+        <span class="s1">)</span>
+        <span class="s1">self.y_rotations_ = np.dot(</span>
+            <span class="s1">self.y_weights_</span><span class="s3">,</span>
+            <span class="s1">pinv2(np.dot(self.y_loadings_.T</span><span class="s3">, </span><span class="s1">self.y_weights_)</span><span class="s3">, </span><span class="s1">check_finite=</span><span class="s3">False</span><span class="s1">)</span><span class="s3">,</span>
+        <span class="s1">)</span>
+        <span class="s1">self.coef_ = np.dot(self.x_rotations_</span><span class="s3">, </span><span class="s1">self.y_loadings_.T)</span>
+        <span class="s1">self.coef_ = (self.coef_ * self._y_std).T</span>
+        <span class="s1">self.intercept_ = self._y_mean</span>
+        <span class="s1">self._n_features_out = self.x_rotations_.shape[</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">transform(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">Y=</span><span class="s3">None, </span><span class="s1">copy=</span><span class="s3">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Apply the dimension reduction. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Samples to transform. 
+ 
+        Y : array-like of shape (n_samples, n_targets), default=None 
+            Target vectors. 
+ 
+        copy : bool, default=True 
+            Whether to copy `X` and `Y`, or perform in-place normalization. 
+ 
+        Returns 
+        ------- 
+        x_scores, y_scores : array-like or tuple of array-like 
+            Return `x_scores` if `Y` is not given, `(x_scores, y_scores)` otherwise. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted(self)</span>
+        <span class="s1">X = self._validate_data(X</span><span class="s3">, </span><span class="s1">copy=copy</span><span class="s3">, </span><span class="s1">dtype=FLOAT_DTYPES</span><span class="s3">, </span><span class="s1">reset=</span><span class="s3">False</span><span class="s1">)</span>
+        <span class="s2"># Normalize</span>
+        <span class="s1">X -= self._x_mean</span>
+        <span class="s1">X /= self._x_std</span>
+        <span class="s2"># Apply rotation</span>
+        <span class="s1">x_scores = np.dot(X</span><span class="s3">, </span><span class="s1">self.x_rotations_)</span>
+        <span class="s3">if </span><span class="s1">Y </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">Y = check_array(</span>
+                <span class="s1">Y</span><span class="s3">, </span><span class="s1">input_name=</span><span class="s4">&quot;Y&quot;</span><span class="s3">, </span><span class="s1">ensure_2d=</span><span class="s3">False, </span><span class="s1">copy=copy</span><span class="s3">, </span><span class="s1">dtype=FLOAT_DTYPES</span>
+            <span class="s1">)</span>
+            <span class="s3">if </span><span class="s1">Y.ndim == </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">Y = Y.reshape(-</span><span class="s5">1</span><span class="s3">, </span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s1">Y -= self._y_mean</span>
+            <span class="s1">Y /= self._y_std</span>
+            <span class="s1">y_scores = np.dot(Y</span><span class="s3">, </span><span class="s1">self.y_rotations_)</span>
+            <span class="s3">return </span><span class="s1">x_scores</span><span class="s3">, </span><span class="s1">y_scores</span>
+
+        <span class="s3">return </span><span class="s1">x_scores</span>
+
+    <span class="s3">def </span><span class="s1">inverse_transform(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">Y=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Transform data back to its original space. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_components) 
+            New data, where `n_samples` is the number of samples 
+            and `n_components` is the number of pls components. 
+ 
+        Y : array-like of shape (n_samples, n_components) 
+            New target, where `n_samples` is the number of samples 
+            and `n_components` is the number of pls components. 
+ 
+        Returns 
+        ------- 
+        X_reconstructed : ndarray of shape (n_samples, n_features) 
+            Return the reconstructed `X` data. 
+ 
+        Y_reconstructed : ndarray of shape (n_samples, n_targets) 
+            Return the reconstructed `X` target. Only returned when `Y` is given. 
+ 
+        Notes 
+        ----- 
+        This transformation will only be exact if `n_components=n_features`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted(self)</span>
+        <span class="s1">X = check_array(X</span><span class="s3">, </span><span class="s1">input_name=</span><span class="s4">&quot;X&quot;</span><span class="s3">, </span><span class="s1">dtype=FLOAT_DTYPES)</span>
+        <span class="s2"># From pls space to original space</span>
+        <span class="s1">X_reconstructed = np.matmul(X</span><span class="s3">, </span><span class="s1">self.x_loadings_.T)</span>
+        <span class="s2"># Denormalize</span>
+        <span class="s1">X_reconstructed *= self._x_std</span>
+        <span class="s1">X_reconstructed += self._x_mean</span>
+
+        <span class="s3">if </span><span class="s1">Y </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">Y = check_array(Y</span><span class="s3">, </span><span class="s1">input_name=</span><span class="s4">&quot;Y&quot;</span><span class="s3">, </span><span class="s1">dtype=FLOAT_DTYPES)</span>
+            <span class="s2"># From pls space to original space</span>
+            <span class="s1">Y_reconstructed = np.matmul(Y</span><span class="s3">, </span><span class="s1">self.y_loadings_.T)</span>
+            <span class="s2"># Denormalize</span>
+            <span class="s1">Y_reconstructed *= self._y_std</span>
+            <span class="s1">Y_reconstructed += self._y_mean</span>
+            <span class="s3">return </span><span class="s1">X_reconstructed</span><span class="s3">, </span><span class="s1">Y_reconstructed</span>
+
+        <span class="s3">return </span><span class="s1">X_reconstructed</span>
+
+    <span class="s3">def </span><span class="s1">predict(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">copy=</span><span class="s3">True</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Predict targets of given samples. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Samples. 
+ 
+        copy : bool, default=True 
+            Whether to copy `X` and `Y`, or perform in-place normalization. 
+ 
+        Returns 
+        ------- 
+        y_pred : ndarray of shape (n_samples,) or (n_samples, n_targets) 
+            Returns predicted values. 
+ 
+        Notes 
+        ----- 
+        This call requires the estimation of a matrix of shape 
+        `(n_features, n_targets)`, which may be an issue in high dimensional 
+        space. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted(self)</span>
+        <span class="s1">X = self._validate_data(X</span><span class="s3">, </span><span class="s1">copy=copy</span><span class="s3">, </span><span class="s1">dtype=FLOAT_DTYPES</span><span class="s3">, </span><span class="s1">reset=</span><span class="s3">False</span><span class="s1">)</span>
+        <span class="s2"># Normalize</span>
+        <span class="s1">X -= self._x_mean</span>
+        <span class="s1">X /= self._x_std</span>
+        <span class="s1">Ypred = X @ self.coef_.T + self.intercept_</span>
+        <span class="s3">return </span><span class="s1">Ypred.ravel() </span><span class="s3">if </span><span class="s1">self._predict_1d </span><span class="s3">else </span><span class="s1">Ypred</span>
+
+    <span class="s3">def </span><span class="s1">fit_transform(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Learn and apply the dimension reduction on the train data. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training vectors, where `n_samples` is the number of samples and 
+            `n_features` is the number of predictors. 
+ 
+        y : array-like of shape (n_samples, n_targets), default=None 
+            Target vectors, where `n_samples` is the number of samples and 
+            `n_targets` is the number of response variables. 
+ 
+        Returns 
+        ------- 
+        self : ndarray of shape (n_samples, n_components) 
+            Return `x_scores` if `Y` is not given, `(x_scores, y_scores)` otherwise. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self.fit(X</span><span class="s3">, </span><span class="s1">y).transform(X</span><span class="s3">, </span><span class="s1">y)</span>
+
+    <span class="s3">def </span><span class="s1">_more_tags(self):</span>
+        <span class="s3">return </span><span class="s1">{</span><span class="s4">&quot;poor_score&quot;</span><span class="s1">: </span><span class="s3">True, </span><span class="s4">&quot;requires_y&quot;</span><span class="s1">: </span><span class="s3">False</span><span class="s1">}</span>
+
+
+<span class="s3">class </span><span class="s1">PLSRegression(_PLS):</span>
+    <span class="s0">&quot;&quot;&quot;PLS regression. 
+ 
+    PLSRegression is also known as PLS2 or PLS1, depending on the number of 
+    targets. 
+ 
+    Read more in the :ref:`User Guide &lt;cross_decomposition&gt;`. 
+ 
+    .. versionadded:: 0.8 
+ 
+    Parameters 
+    ---------- 
+    n_components : int, default=2 
+        Number of components to keep. Should be in `[1, min(n_samples, 
+        n_features, n_targets)]`. 
+ 
+    scale : bool, default=True 
+        Whether to scale `X` and `Y`. 
+ 
+    max_iter : int, default=500 
+        The maximum number of iterations of the power method when 
+        `algorithm='nipals'`. Ignored otherwise. 
+ 
+    tol : float, default=1e-06 
+        The tolerance used as convergence criteria in the power method: the 
+        algorithm stops whenever the squared norm of `u_i - u_{i-1}` is less 
+        than `tol`, where `u` corresponds to the left singular vector. 
+ 
+    copy : bool, default=True 
+        Whether to copy `X` and `Y` in :term:`fit` before applying centering, 
+        and potentially scaling. If `False`, these operations will be done 
+        inplace, modifying both arrays. 
+ 
+    Attributes 
+    ---------- 
+    x_weights_ : ndarray of shape (n_features, n_components) 
+        The left singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    y_weights_ : ndarray of shape (n_targets, n_components) 
+        The right singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    x_loadings_ : ndarray of shape (n_features, n_components) 
+        The loadings of `X`. 
+ 
+    y_loadings_ : ndarray of shape (n_targets, n_components) 
+        The loadings of `Y`. 
+ 
+    x_scores_ : ndarray of shape (n_samples, n_components) 
+        The transformed training samples. 
+ 
+    y_scores_ : ndarray of shape (n_samples, n_components) 
+        The transformed training targets. 
+ 
+    x_rotations_ : ndarray of shape (n_features, n_components) 
+        The projection matrix used to transform `X`. 
+ 
+    y_rotations_ : ndarray of shape (n_features, n_components) 
+        The projection matrix used to transform `Y`. 
+ 
+    coef_ : ndarray of shape (n_target, n_features) 
+        The coefficients of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+    intercept_ : ndarray of shape (n_targets,) 
+        The intercepts of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+        .. versionadded:: 1.1 
+ 
+    n_iter_ : list of shape (n_components,) 
+        Number of iterations of the power method, for each 
+        component. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    PLSCanonical : Partial Least Squares transformer and regressor. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.cross_decomposition import PLSRegression 
+    &gt;&gt;&gt; X = [[0., 0., 1.], [1.,0.,0.], [2.,2.,2.], [2.,5.,4.]] 
+    &gt;&gt;&gt; Y = [[0.1, -0.2], [0.9, 1.1], [6.2, 5.9], [11.9, 12.3]] 
+    &gt;&gt;&gt; pls2 = PLSRegression(n_components=2) 
+    &gt;&gt;&gt; pls2.fit(X, Y) 
+    PLSRegression() 
+    &gt;&gt;&gt; Y_pred = pls2.predict(X) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {**_PLS._parameter_constraints}</span>
+    <span class="s3">for </span><span class="s1">param </span><span class="s3">in </span><span class="s1">(</span><span class="s4">&quot;deflation_mode&quot;</span><span class="s3">, </span><span class="s4">&quot;mode&quot;</span><span class="s3">, </span><span class="s4">&quot;algorithm&quot;</span><span class="s1">):</span>
+        <span class="s1">_parameter_constraints.pop(param)</span>
+
+    <span class="s2"># This implementation provides the same results that 3 PLS packages</span>
+    <span class="s2"># provided in the R language (R-project):</span>
+    <span class="s2">#     - &quot;mixOmics&quot; with function pls(X, Y, mode = &quot;regression&quot;)</span>
+    <span class="s2">#     - &quot;plspm &quot; with function plsreg2(X, Y)</span>
+    <span class="s2">#     - &quot;pls&quot; with function oscorespls.fit(X, Y)</span>
+
+    <span class="s3">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s3">, </span><span class="s1">n_components=</span><span class="s5">2</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">scale=</span><span class="s3">True, </span><span class="s1">max_iter=</span><span class="s5">500</span><span class="s3">, </span><span class="s1">tol=</span><span class="s5">1e-06</span><span class="s3">, </span><span class="s1">copy=</span><span class="s3">True</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__(</span>
+            <span class="s1">n_components=n_components</span><span class="s3">,</span>
+            <span class="s1">scale=scale</span><span class="s3">,</span>
+            <span class="s1">deflation_mode=</span><span class="s4">&quot;regression&quot;</span><span class="s3">,</span>
+            <span class="s1">mode=</span><span class="s4">&quot;A&quot;</span><span class="s3">,</span>
+            <span class="s1">algorithm=</span><span class="s4">&quot;nipals&quot;</span><span class="s3">,</span>
+            <span class="s1">max_iter=max_iter</span><span class="s3">,</span>
+            <span class="s1">tol=tol</span><span class="s3">,</span>
+            <span class="s1">copy=copy</span><span class="s3">,</span>
+        <span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">fit(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">Y):</span>
+        <span class="s0">&quot;&quot;&quot;Fit model to data. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training vectors, where `n_samples` is the number of samples and 
+            `n_features` is the number of predictors. 
+ 
+        Y : array-like of shape (n_samples,) or (n_samples, n_targets) 
+            Target vectors, where `n_samples` is the number of samples and 
+            `n_targets` is the number of response variables. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Fitted model. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">super().fit(X</span><span class="s3">, </span><span class="s1">Y)</span>
+        <span class="s2"># expose the fitted attributes `x_scores_` and `y_scores_`</span>
+        <span class="s1">self.x_scores_ = self._x_scores</span>
+        <span class="s1">self.y_scores_ = self._y_scores</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+
+<span class="s3">class </span><span class="s1">PLSCanonical(_PLS):</span>
+    <span class="s0">&quot;&quot;&quot;Partial Least Squares transformer and regressor. 
+ 
+    Read more in the :ref:`User Guide &lt;cross_decomposition&gt;`. 
+ 
+    .. versionadded:: 0.8 
+ 
+    Parameters 
+    ---------- 
+    n_components : int, default=2 
+        Number of components to keep. Should be in `[1, min(n_samples, 
+        n_features, n_targets)]`. 
+ 
+    scale : bool, default=True 
+        Whether to scale `X` and `Y`. 
+ 
+    algorithm : {'nipals', 'svd'}, default='nipals' 
+        The algorithm used to estimate the first singular vectors of the 
+        cross-covariance matrix. 'nipals' uses the power method while 'svd' 
+        will compute the whole SVD. 
+ 
+    max_iter : int, default=500 
+        The maximum number of iterations of the power method when 
+        `algorithm='nipals'`. Ignored otherwise. 
+ 
+    tol : float, default=1e-06 
+        The tolerance used as convergence criteria in the power method: the 
+        algorithm stops whenever the squared norm of `u_i - u_{i-1}` is less 
+        than `tol`, where `u` corresponds to the left singular vector. 
+ 
+    copy : bool, default=True 
+        Whether to copy `X` and `Y` in fit before applying centering, and 
+        potentially scaling. If False, these operations will be done inplace, 
+        modifying both arrays. 
+ 
+    Attributes 
+    ---------- 
+    x_weights_ : ndarray of shape (n_features, n_components) 
+        The left singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    y_weights_ : ndarray of shape (n_targets, n_components) 
+        The right singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    x_loadings_ : ndarray of shape (n_features, n_components) 
+        The loadings of `X`. 
+ 
+    y_loadings_ : ndarray of shape (n_targets, n_components) 
+        The loadings of `Y`. 
+ 
+    x_rotations_ : ndarray of shape (n_features, n_components) 
+        The projection matrix used to transform `X`. 
+ 
+    y_rotations_ : ndarray of shape (n_features, n_components) 
+        The projection matrix used to transform `Y`. 
+ 
+    coef_ : ndarray of shape (n_targets, n_features) 
+        The coefficients of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+    intercept_ : ndarray of shape (n_targets,) 
+        The intercepts of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+        .. versionadded:: 1.1 
+ 
+    n_iter_ : list of shape (n_components,) 
+        Number of iterations of the power method, for each 
+        component. Empty if `algorithm='svd'`. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    CCA : Canonical Correlation Analysis. 
+    PLSSVD : Partial Least Square SVD. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.cross_decomposition import PLSCanonical 
+    &gt;&gt;&gt; X = [[0., 0., 1.], [1.,0.,0.], [2.,2.,2.], [2.,5.,4.]] 
+    &gt;&gt;&gt; Y = [[0.1, -0.2], [0.9, 1.1], [6.2, 5.9], [11.9, 12.3]] 
+    &gt;&gt;&gt; plsca = PLSCanonical(n_components=2) 
+    &gt;&gt;&gt; plsca.fit(X, Y) 
+    PLSCanonical() 
+    &gt;&gt;&gt; X_c, Y_c = plsca.transform(X, Y) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {**_PLS._parameter_constraints}</span>
+    <span class="s3">for </span><span class="s1">param </span><span class="s3">in </span><span class="s1">(</span><span class="s4">&quot;deflation_mode&quot;</span><span class="s3">, </span><span class="s4">&quot;mode&quot;</span><span class="s1">):</span>
+        <span class="s1">_parameter_constraints.pop(param)</span>
+
+    <span class="s2"># This implementation provides the same results that the &quot;plspm&quot; package</span>
+    <span class="s2"># provided in the R language (R-project), using the function plsca(X, Y).</span>
+    <span class="s2"># Results are equal or collinear with the function</span>
+    <span class="s2"># ``pls(..., mode = &quot;canonical&quot;)`` of the &quot;mixOmics&quot; package. The</span>
+    <span class="s2"># difference relies in the fact that mixOmics implementation does not</span>
+    <span class="s2"># exactly implement the Wold algorithm since it does not normalize</span>
+    <span class="s2"># y_weights to one.</span>
+
+    <span class="s3">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">n_components=</span><span class="s5">2</span><span class="s3">,</span>
+        <span class="s1">*</span><span class="s3">,</span>
+        <span class="s1">scale=</span><span class="s3">True,</span>
+        <span class="s1">algorithm=</span><span class="s4">&quot;nipals&quot;</span><span class="s3">,</span>
+        <span class="s1">max_iter=</span><span class="s5">500</span><span class="s3">,</span>
+        <span class="s1">tol=</span><span class="s5">1e-06</span><span class="s3">,</span>
+        <span class="s1">copy=</span><span class="s3">True,</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__(</span>
+            <span class="s1">n_components=n_components</span><span class="s3">,</span>
+            <span class="s1">scale=scale</span><span class="s3">,</span>
+            <span class="s1">deflation_mode=</span><span class="s4">&quot;canonical&quot;</span><span class="s3">,</span>
+            <span class="s1">mode=</span><span class="s4">&quot;A&quot;</span><span class="s3">,</span>
+            <span class="s1">algorithm=algorithm</span><span class="s3">,</span>
+            <span class="s1">max_iter=max_iter</span><span class="s3">,</span>
+            <span class="s1">tol=tol</span><span class="s3">,</span>
+            <span class="s1">copy=copy</span><span class="s3">,</span>
+        <span class="s1">)</span>
+
+
+<span class="s3">class </span><span class="s1">CCA(_PLS):</span>
+    <span class="s0">&quot;&quot;&quot;Canonical Correlation Analysis, also known as &quot;Mode B&quot; PLS. 
+ 
+    Read more in the :ref:`User Guide &lt;cross_decomposition&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    n_components : int, default=2 
+        Number of components to keep. Should be in `[1, min(n_samples, 
+        n_features, n_targets)]`. 
+ 
+    scale : bool, default=True 
+        Whether to scale `X` and `Y`. 
+ 
+    max_iter : int, default=500 
+        The maximum number of iterations of the power method. 
+ 
+    tol : float, default=1e-06 
+        The tolerance used as convergence criteria in the power method: the 
+        algorithm stops whenever the squared norm of `u_i - u_{i-1}` is less 
+        than `tol`, where `u` corresponds to the left singular vector. 
+ 
+    copy : bool, default=True 
+        Whether to copy `X` and `Y` in fit before applying centering, and 
+        potentially scaling. If False, these operations will be done inplace, 
+        modifying both arrays. 
+ 
+    Attributes 
+    ---------- 
+    x_weights_ : ndarray of shape (n_features, n_components) 
+        The left singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    y_weights_ : ndarray of shape (n_targets, n_components) 
+        The right singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    x_loadings_ : ndarray of shape (n_features, n_components) 
+        The loadings of `X`. 
+ 
+    y_loadings_ : ndarray of shape (n_targets, n_components) 
+        The loadings of `Y`. 
+ 
+    x_rotations_ : ndarray of shape (n_features, n_components) 
+        The projection matrix used to transform `X`. 
+ 
+    y_rotations_ : ndarray of shape (n_features, n_components) 
+        The projection matrix used to transform `Y`. 
+ 
+    coef_ : ndarray of shape (n_targets, n_features) 
+        The coefficients of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+    intercept_ : ndarray of shape (n_targets,) 
+        The intercepts of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+        .. versionadded:: 1.1 
+ 
+    n_iter_ : list of shape (n_components,) 
+        Number of iterations of the power method, for each 
+        component. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    PLSCanonical : Partial Least Squares transformer and regressor. 
+    PLSSVD : Partial Least Square SVD. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.cross_decomposition import CCA 
+    &gt;&gt;&gt; X = [[0., 0., 1.], [1.,0.,0.], [2.,2.,2.], [3.,5.,4.]] 
+    &gt;&gt;&gt; Y = [[0.1, -0.2], [0.9, 1.1], [6.2, 5.9], [11.9, 12.3]] 
+    &gt;&gt;&gt; cca = CCA(n_components=1) 
+    &gt;&gt;&gt; cca.fit(X, Y) 
+    CCA(n_components=1) 
+    &gt;&gt;&gt; X_c, Y_c = cca.transform(X, Y) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {**_PLS._parameter_constraints}</span>
+    <span class="s3">for </span><span class="s1">param </span><span class="s3">in </span><span class="s1">(</span><span class="s4">&quot;deflation_mode&quot;</span><span class="s3">, </span><span class="s4">&quot;mode&quot;</span><span class="s3">, </span><span class="s4">&quot;algorithm&quot;</span><span class="s1">):</span>
+        <span class="s1">_parameter_constraints.pop(param)</span>
+
+    <span class="s3">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s3">, </span><span class="s1">n_components=</span><span class="s5">2</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">scale=</span><span class="s3">True, </span><span class="s1">max_iter=</span><span class="s5">500</span><span class="s3">, </span><span class="s1">tol=</span><span class="s5">1e-06</span><span class="s3">, </span><span class="s1">copy=</span><span class="s3">True</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__(</span>
+            <span class="s1">n_components=n_components</span><span class="s3">,</span>
+            <span class="s1">scale=scale</span><span class="s3">,</span>
+            <span class="s1">deflation_mode=</span><span class="s4">&quot;canonical&quot;</span><span class="s3">,</span>
+            <span class="s1">mode=</span><span class="s4">&quot;B&quot;</span><span class="s3">,</span>
+            <span class="s1">algorithm=</span><span class="s4">&quot;nipals&quot;</span><span class="s3">,</span>
+            <span class="s1">max_iter=max_iter</span><span class="s3">,</span>
+            <span class="s1">tol=tol</span><span class="s3">,</span>
+            <span class="s1">copy=copy</span><span class="s3">,</span>
+        <span class="s1">)</span>
+
+
+<span class="s3">class </span><span class="s1">PLSSVD(ClassNamePrefixFeaturesOutMixin</span><span class="s3">, </span><span class="s1">TransformerMixin</span><span class="s3">, </span><span class="s1">BaseEstimator):</span>
+    <span class="s0">&quot;&quot;&quot;Partial Least Square SVD. 
+ 
+    This transformer simply performs a SVD on the cross-covariance matrix 
+    `X'Y`. It is able to project both the training data `X` and the targets 
+    `Y`. The training data `X` is projected on the left singular vectors, while 
+    the targets are projected on the right singular vectors. 
+ 
+    Read more in the :ref:`User Guide &lt;cross_decomposition&gt;`. 
+ 
+    .. versionadded:: 0.8 
+ 
+    Parameters 
+    ---------- 
+    n_components : int, default=2 
+        The number of components to keep. Should be in `[1, 
+        min(n_samples, n_features, n_targets)]`. 
+ 
+    scale : bool, default=True 
+        Whether to scale `X` and `Y`. 
+ 
+    copy : bool, default=True 
+        Whether to copy `X` and `Y` in fit before applying centering, and 
+        potentially scaling. If `False`, these operations will be done inplace, 
+        modifying both arrays. 
+ 
+    Attributes 
+    ---------- 
+    x_weights_ : ndarray of shape (n_features, n_components) 
+        The left singular vectors of the SVD of the cross-covariance matrix. 
+        Used to project `X` in :meth:`transform`. 
+ 
+    y_weights_ : ndarray of (n_targets, n_components) 
+        The right singular vectors of the SVD of the cross-covariance matrix. 
+        Used to project `X` in :meth:`transform`. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    PLSCanonical : Partial Least Squares transformer and regressor. 
+    CCA : Canonical Correlation Analysis. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from sklearn.cross_decomposition import PLSSVD 
+    &gt;&gt;&gt; X = np.array([[0., 0., 1.], 
+    ...               [1., 0., 0.], 
+    ...               [2., 2., 2.], 
+    ...               [2., 5., 4.]]) 
+    &gt;&gt;&gt; Y = np.array([[0.1, -0.2], 
+    ...               [0.9, 1.1], 
+    ...               [6.2, 5.9], 
+    ...               [11.9, 12.3]]) 
+    &gt;&gt;&gt; pls = PLSSVD(n_components=2).fit(X, Y) 
+    &gt;&gt;&gt; X_c, Y_c = pls.transform(X, Y) 
+    &gt;&gt;&gt; X_c.shape, Y_c.shape 
+    ((4, 2), (4, 2)) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints: dict = {</span>
+        <span class="s4">&quot;n_components&quot;</span><span class="s1">: [Interval(Integral</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, None, </span><span class="s1">closed=</span><span class="s4">&quot;left&quot;</span><span class="s1">)]</span><span class="s3">,</span>
+        <span class="s4">&quot;scale&quot;</span><span class="s1">: [</span><span class="s4">&quot;boolean&quot;</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s4">&quot;copy&quot;</span><span class="s1">: [</span><span class="s4">&quot;boolean&quot;</span><span class="s1">]</span><span class="s3">,</span>
+    <span class="s1">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">n_components=</span><span class="s5">2</span><span class="s3">, </span><span class="s1">*</span><span class="s3">, </span><span class="s1">scale=</span><span class="s3">True, </span><span class="s1">copy=</span><span class="s3">True</span><span class="s1">):</span>
+        <span class="s1">self.n_components = n_components</span>
+        <span class="s1">self.scale = scale</span>
+        <span class="s1">self.copy = copy</span>
+
+    <span class="s1">@_fit_context(prefer_skip_nested_validation=</span><span class="s3">True</span><span class="s1">)</span>
+    <span class="s3">def </span><span class="s1">fit(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">Y):</span>
+        <span class="s0">&quot;&quot;&quot;Fit model to data. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training samples. 
+ 
+        Y : array-like of shape (n_samples,) or (n_samples, n_targets) 
+            Targets. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Fitted estimator. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_consistent_length(X</span><span class="s3">, </span><span class="s1">Y)</span>
+        <span class="s1">X = self._validate_data(</span>
+            <span class="s1">X</span><span class="s3">, </span><span class="s1">dtype=np.float64</span><span class="s3">, </span><span class="s1">copy=self.copy</span><span class="s3">, </span><span class="s1">ensure_min_samples=</span><span class="s5">2</span>
+        <span class="s1">)</span>
+        <span class="s1">Y = check_array(</span>
+            <span class="s1">Y</span><span class="s3">, </span><span class="s1">input_name=</span><span class="s4">&quot;Y&quot;</span><span class="s3">, </span><span class="s1">dtype=np.float64</span><span class="s3">, </span><span class="s1">copy=self.copy</span><span class="s3">, </span><span class="s1">ensure_2d=</span><span class="s3">False</span>
+        <span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">Y.ndim == </span><span class="s5">1</span><span class="s1">:</span>
+            <span class="s1">Y = Y.reshape(-</span><span class="s5">1</span><span class="s3">, </span><span class="s5">1</span><span class="s1">)</span>
+
+        <span class="s2"># we'll compute the SVD of the cross-covariance matrix = X.T.dot(Y)</span>
+        <span class="s2"># This matrix rank is at most min(n_samples, n_features, n_targets) so</span>
+        <span class="s2"># n_components cannot be bigger than that.</span>
+        <span class="s1">n_components = self.n_components</span>
+        <span class="s1">rank_upper_bound = min(X.shape[</span><span class="s5">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">X.shape[</span><span class="s5">1</span><span class="s1">]</span><span class="s3">, </span><span class="s1">Y.shape[</span><span class="s5">1</span><span class="s1">])</span>
+        <span class="s3">if </span><span class="s1">n_components &gt; rank_upper_bound:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span>
+                <span class="s4">f&quot;`n_components` upper bound is </span><span class="s3">{</span><span class="s1">rank_upper_bound</span><span class="s3">}</span><span class="s4">. &quot;</span>
+                <span class="s4">f&quot;Got </span><span class="s3">{</span><span class="s1">n_components</span><span class="s3">} </span><span class="s4">instead. Reduce `n_components`.&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">X</span><span class="s3">, </span><span class="s1">Y</span><span class="s3">, </span><span class="s1">self._x_mean</span><span class="s3">, </span><span class="s1">self._y_mean</span><span class="s3">, </span><span class="s1">self._x_std</span><span class="s3">, </span><span class="s1">self._y_std = _center_scale_xy(</span>
+            <span class="s1">X</span><span class="s3">, </span><span class="s1">Y</span><span class="s3">, </span><span class="s1">self.scale</span>
+        <span class="s1">)</span>
+
+        <span class="s2"># Compute SVD of cross-covariance matrix</span>
+        <span class="s1">C = np.dot(X.T</span><span class="s3">, </span><span class="s1">Y)</span>
+        <span class="s1">U</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">Vt = svd(C</span><span class="s3">, </span><span class="s1">full_matrices=</span><span class="s3">False</span><span class="s1">)</span>
+        <span class="s1">U = U[:</span><span class="s3">, </span><span class="s1">:n_components]</span>
+        <span class="s1">Vt = Vt[:n_components]</span>
+        <span class="s1">U</span><span class="s3">, </span><span class="s1">Vt = svd_flip(U</span><span class="s3">, </span><span class="s1">Vt)</span>
+        <span class="s1">V = Vt.T</span>
+
+        <span class="s1">self.x_weights_ = U</span>
+        <span class="s1">self.y_weights_ = V</span>
+        <span class="s1">self._n_features_out = self.x_weights_.shape[</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">transform(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">Y=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Apply the dimensionality reduction. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Samples to be transformed. 
+ 
+        Y : array-like of shape (n_samples,) or (n_samples, n_targets), \ 
+                default=None 
+            Targets. 
+ 
+        Returns 
+        ------- 
+        x_scores : array-like or tuple of array-like 
+            The transformed data `X_transformed` if `Y is not None`, 
+            `(X_transformed, Y_transformed)` otherwise. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted(self)</span>
+        <span class="s1">X = self._validate_data(X</span><span class="s3">, </span><span class="s1">dtype=np.float64</span><span class="s3">, </span><span class="s1">reset=</span><span class="s3">False</span><span class="s1">)</span>
+        <span class="s1">Xr = (X - self._x_mean) / self._x_std</span>
+        <span class="s1">x_scores = np.dot(Xr</span><span class="s3">, </span><span class="s1">self.x_weights_)</span>
+        <span class="s3">if </span><span class="s1">Y </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">Y = check_array(Y</span><span class="s3">, </span><span class="s1">input_name=</span><span class="s4">&quot;Y&quot;</span><span class="s3">, </span><span class="s1">ensure_2d=</span><span class="s3">False, </span><span class="s1">dtype=np.float64)</span>
+            <span class="s3">if </span><span class="s1">Y.ndim == </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">Y = Y.reshape(-</span><span class="s5">1</span><span class="s3">, </span><span class="s5">1</span><span class="s1">)</span>
+            <span class="s1">Yr = (Y - self._y_mean) / self._y_std</span>
+            <span class="s1">y_scores = np.dot(Yr</span><span class="s3">, </span><span class="s1">self.y_weights_)</span>
+            <span class="s3">return </span><span class="s1">x_scores</span><span class="s3">, </span><span class="s1">y_scores</span>
+        <span class="s3">return </span><span class="s1">x_scores</span>
+
+    <span class="s3">def </span><span class="s1">fit_transform(self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Learn and apply the dimensionality reduction. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training samples. 
+ 
+        y : array-like of shape (n_samples,) or (n_samples, n_targets), \ 
+                default=None 
+            Targets. 
+ 
+        Returns 
+        ------- 
+        out : array-like or tuple of array-like 
+            The transformed data `X_transformed` if `Y is not None`, 
+            `(X_transformed, Y_transformed)` otherwise. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self.fit(X</span><span class="s3">, </span><span class="s1">y).transform(X</span><span class="s3">, </span><span class="s1">y)</span>
+</pre>
+</body>
+</html>

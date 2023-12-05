@@ -1,0 +1,914 @@
+<html>
+<head>
+<title>process_regression.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+process_regression.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+<span class="s2">&quot;&quot;&quot; 
+This module implements maximum likelihood-based estimation (MLE) of 
+Gaussian regression models for finite-dimensional observations made on 
+infinite-dimensional processes. 
+ 
+The ProcessMLE class supports regression analyses on grouped data, 
+where the observations within a group are dependent (they are made on 
+the same underlying process).  One use-case is repeated measures 
+regression for temporal (longitudinal) data, in which the repeated 
+measures occur at arbitrary real-valued time points. 
+ 
+The mean structure is specified as a linear model.  The covariance 
+parameters depend on covariates via a link function. 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">import </span><span class="s1">pandas </span><span class="s3">as </span><span class="s1">pd</span>
+<span class="s3">import </span><span class="s1">patsy</span>
+<span class="s3">import </span><span class="s1">statsmodels.base.model </span><span class="s3">as </span><span class="s1">base</span>
+<span class="s3">from </span><span class="s1">statsmodels.regression.linear_model </span><span class="s3">import </span><span class="s1">OLS</span>
+<span class="s3">import </span><span class="s1">collections</span>
+<span class="s3">from </span><span class="s1">scipy.optimize </span><span class="s3">import </span><span class="s1">minimize</span>
+<span class="s3">from </span><span class="s1">statsmodels.iolib </span><span class="s3">import </span><span class="s1">summary2</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.numdiff </span><span class="s3">import </span><span class="s1">approx_fprime</span>
+<span class="s3">import </span><span class="s1">warnings</span>
+
+
+<span class="s3">class </span><span class="s1">ProcessCovariance:</span>
+    <span class="s2">r&quot;&quot;&quot; 
+    A covariance model for a process indexed by a real parameter. 
+ 
+    An implementation of this class is based on a positive definite 
+    correlation function h that maps real numbers to the interval [0, 
+    1], such as the Gaussian (squared exponential) correlation 
+    function :math:`\exp(-x^2)`.  It also depends on a positive 
+    scaling function `s` and a positive smoothness function `u`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">get_cov(self</span><span class="s3">, </span><span class="s1">time</span><span class="s3">, </span><span class="s1">sc</span><span class="s3">, </span><span class="s1">sm):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Returns the covariance matrix for given time values. 
+ 
+        Parameters 
+        ---------- 
+        time : array_like 
+            The time points for the observations.  If len(time) = p, 
+            a pxp covariance matrix is returned. 
+        sc : array_like 
+            The scaling parameters for the observations. 
+        sm : array_like 
+            The smoothness parameters for the observation.  See class 
+            docstring for details. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s3">def </span><span class="s1">jac(self</span><span class="s3">, </span><span class="s1">time</span><span class="s3">, </span><span class="s1">sc</span><span class="s3">, </span><span class="s1">sm):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        The Jacobian of the covariance with respect to the parameters. 
+ 
+        See get_cov for parameters. 
+ 
+        Returns 
+        ------- 
+        jsc : list-like 
+            jsc[i] is the derivative of the covariance matrix 
+            with respect to the i^th scaling parameter. 
+        jsm : list-like 
+            jsm[i] is the derivative of the covariance matrix 
+            with respect to the i^th smoothness parameter. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError</span>
+
+
+<span class="s3">class </span><span class="s1">GaussianCovariance(ProcessCovariance):</span>
+    <span class="s2">r&quot;&quot;&quot; 
+    An implementation of ProcessCovariance using the Gaussian kernel. 
+ 
+    This class represents a parametric covariance model for a Gaussian 
+    process as described in the work of Paciorek et al. cited below. 
+ 
+    Following Paciorek et al [1]_, the covariance between observations with 
+    index `i` and `j` is given by: 
+ 
+    .. math:: 
+ 
+      s[i] \cdot s[j] \cdot h(|time[i] - time[j]| / \sqrt{(u[i] + u[j]) / 
+      2}) \cdot \frac{u[i]^{1/4}u[j]^{1/4}}{\sqrt{(u[i] + u[j])/2}} 
+ 
+    The ProcessMLE class allows linear models with this covariance 
+    structure to be fit using maximum likelihood (ML). The mean and 
+    covariance parameters of the model are fit jointly. 
+ 
+    The mean, scaling, and smoothing parameters can be linked to 
+    covariates.  The mean parameters are linked linearly, and the 
+    scaling and smoothing parameters use an log link function to 
+    preserve positivity. 
+ 
+    The reference of Paciorek et al. below provides more details. 
+    Note that here we only implement the 1-dimensional version of 
+    their approach. 
+ 
+    References 
+    ---------- 
+    .. [1] Paciorek, C. J. and Schervish, M. J. (2006). Spatial modeling using 
+        a new class of nonstationary covariance functions. Environmetrics, 
+        17:483–506. 
+        https://papers.nips.cc/paper/2350-nonstationary-covariance-functions-for-gaussian-process-regression.pdf 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">get_cov(self</span><span class="s3">, </span><span class="s1">time</span><span class="s3">, </span><span class="s1">sc</span><span class="s3">, </span><span class="s1">sm):</span>
+
+        <span class="s1">da = np.subtract.outer(time</span><span class="s3">, </span><span class="s1">time)</span>
+        <span class="s1">ds = np.add.outer(sm</span><span class="s3">, </span><span class="s1">sm) / </span><span class="s4">2</span>
+
+        <span class="s1">qmat = da * da / ds</span>
+        <span class="s1">cm = np.exp(-qmat / </span><span class="s4">2</span><span class="s1">) / np.sqrt(ds)</span>
+        <span class="s1">cm *= np.outer(sm</span><span class="s3">, </span><span class="s1">sm)**</span><span class="s4">0.25</span>
+        <span class="s1">cm *= np.outer(sc</span><span class="s3">, </span><span class="s1">sc)</span>
+
+        <span class="s3">return </span><span class="s1">cm</span>
+
+    <span class="s3">def </span><span class="s1">jac(self</span><span class="s3">, </span><span class="s1">time</span><span class="s3">, </span><span class="s1">sc</span><span class="s3">, </span><span class="s1">sm):</span>
+
+        <span class="s1">da = np.subtract.outer(time</span><span class="s3">, </span><span class="s1">time)</span>
+        <span class="s1">ds = np.add.outer(sm</span><span class="s3">, </span><span class="s1">sm) / </span><span class="s4">2</span>
+        <span class="s1">sds = np.sqrt(ds)</span>
+        <span class="s1">daa = da * da</span>
+        <span class="s1">qmat = daa / ds</span>
+        <span class="s1">p = len(time)</span>
+        <span class="s1">eqm = np.exp(-qmat / </span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s1">sm4 = np.outer(sm</span><span class="s3">, </span><span class="s1">sm)**</span><span class="s4">0.25</span>
+        <span class="s1">cmx = eqm * sm4 / sds</span>
+        <span class="s1">dq0 = -daa / ds**</span><span class="s4">2</span>
+        <span class="s1">di = np.zeros((p</span><span class="s3">, </span><span class="s1">p))</span>
+        <span class="s1">fi = np.zeros((p</span><span class="s3">, </span><span class="s1">p))</span>
+        <span class="s1">scc = np.outer(sc</span><span class="s3">, </span><span class="s1">sc)</span>
+
+        <span class="s0"># Derivatives with respect to the smoothing parameters.</span>
+        <span class="s1">jsm = []</span>
+        <span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">enumerate(sm):</span>
+            <span class="s1">di *= </span><span class="s4">0</span>
+            <span class="s1">di[i</span><span class="s3">, </span><span class="s1">:] += </span><span class="s4">0.5</span>
+            <span class="s1">di[:</span><span class="s3">, </span><span class="s1">i] += </span><span class="s4">0.5</span>
+            <span class="s1">dbottom = </span><span class="s4">0.5 </span><span class="s1">* di / sds</span>
+            <span class="s1">dtop = -</span><span class="s4">0.5 </span><span class="s1">* eqm * dq0 * di</span>
+            <span class="s1">b = dtop / sds - eqm * dbottom / ds</span>
+            <span class="s1">c = eqm / sds</span>
+            <span class="s1">v = </span><span class="s4">0.25 </span><span class="s1">* sm**</span><span class="s4">0.25 </span><span class="s1">/ sm[i]**</span><span class="s4">0.75</span>
+            <span class="s1">fi *= </span><span class="s4">0</span>
+            <span class="s1">fi[i</span><span class="s3">, </span><span class="s1">:] = v</span>
+            <span class="s1">fi[:</span><span class="s3">, </span><span class="s1">i] = v</span>
+            <span class="s1">fi[i</span><span class="s3">, </span><span class="s1">i] = </span><span class="s4">0.5 </span><span class="s1">/ sm[i]**</span><span class="s4">0.5</span>
+            <span class="s1">b = c * fi + b * sm4</span>
+            <span class="s1">b *= scc</span>
+            <span class="s1">jsm.append(b)</span>
+
+        <span class="s0"># Derivatives with respect to the scaling parameters.</span>
+        <span class="s1">jsc = []</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">len(sc)):</span>
+            <span class="s1">b = np.zeros((p</span><span class="s3">, </span><span class="s1">p))</span>
+            <span class="s1">b[i</span><span class="s3">, </span><span class="s1">:] = cmx[i</span><span class="s3">, </span><span class="s1">:] * sc</span>
+            <span class="s1">b[:</span><span class="s3">, </span><span class="s1">i] += cmx[:</span><span class="s3">, </span><span class="s1">i] * sc</span>
+            <span class="s1">jsc.append(b)</span>
+
+        <span class="s3">return </span><span class="s1">jsc</span><span class="s3">, </span><span class="s1">jsm</span>
+
+
+<span class="s3">def </span><span class="s1">_check_args(endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">exog_scale</span><span class="s3">, </span><span class="s1">exog_smooth</span><span class="s3">, </span><span class="s1">exog_noise</span><span class="s3">, </span><span class="s1">time</span><span class="s3">,</span>
+                <span class="s1">groups):</span>
+
+    <span class="s1">v = [</span>
+        <span class="s1">len(endog)</span><span class="s3">,</span>
+        <span class="s1">exog.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s1">exog_scale.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s1">exog_smooth.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s1">len(time)</span><span class="s3">,</span>
+        <span class="s1">len(groups)</span>
+    <span class="s1">]</span>
+
+    <span class="s3">if </span><span class="s1">exog_noise </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s1">v.append(exog_noise.shape[</span><span class="s4">0</span><span class="s1">])</span>
+
+    <span class="s3">if </span><span class="s1">min(v) != max(v):</span>
+        <span class="s1">msg = (</span><span class="s5">&quot;The leading dimensions of all array arguments &quot; </span><span class="s1">+</span>
+               <span class="s5">&quot;must be equal.&quot;</span><span class="s1">)</span>
+        <span class="s3">raise </span><span class="s1">ValueError(msg)</span>
+
+
+<span class="s3">class </span><span class="s1">ProcessMLE(base.LikelihoodModel):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Fit a Gaussian mean/variance regression model. 
+ 
+    This class fits a one-dimensional Gaussian process model with 
+    parametrized mean and covariance structures to grouped data.  For 
+    each group, there is an independent realization of a latent 
+    Gaussian process indexed by an observed real-valued time 
+    variable..  The data consist of the Gaussian process observed at a 
+    finite number of `time` values. 
+ 
+    The process mean and variance can be lined to covariates.  The 
+    mean structure is linear in the covariates.  The covariance 
+    structure is non-stationary, and is defined parametrically through 
+    'scaling', and 'smoothing' parameters.  The covariance of the 
+    process between two observations in the same group is a function 
+    of the distance between the time values of the two observations. 
+    The scaling and smoothing parameters can be linked to covariates. 
+ 
+    The observed data are modeled as the sum of the Gaussian process 
+    realization and (optionally) independent white noise.  The standard 
+    deviation of the white noise can be linked to covariates. 
+ 
+    The data should be provided in 'long form', with a group label to 
+    indicate which observations belong to the same group. 
+    Observations in different groups are always independent. 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        The dependent variable. 
+    exog : array_like 
+        The design matrix for the mean structure 
+    exog_scale : array_like 
+        The design matrix for the scaling structure 
+    exog_smooth : array_like 
+        The design matrix for the smoothness structure 
+    exog_noise : array_like 
+        The design matrix for the additive white noise. The 
+        linear predictor is the log of the white noise standard 
+        deviation.  If None, there is no additive noise (the 
+        process is observed directly). 
+    time : array_like (1-dimensional) 
+        The univariate index values, used to calculate distances 
+        between observations in the same group, which determines 
+        their correlations. 
+    groups : array_like (1-dimensional) 
+        The group values. 
+    cov : a ProcessCovariance instance 
+        Defaults to GaussianCovariance. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">,</span>
+                 <span class="s1">endog</span><span class="s3">,</span>
+                 <span class="s1">exog</span><span class="s3">,</span>
+                 <span class="s1">exog_scale</span><span class="s3">,</span>
+                 <span class="s1">exog_smooth</span><span class="s3">,</span>
+                 <span class="s1">exog_noise</span><span class="s3">,</span>
+                 <span class="s1">time</span><span class="s3">,</span>
+                 <span class="s1">groups</span><span class="s3">,</span>
+                 <span class="s1">cov=</span><span class="s3">None,</span>
+                 <span class="s1">**kwargs):</span>
+
+        <span class="s1">super(ProcessMLE</span><span class="s3">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">endog</span><span class="s3">,</span>
+            <span class="s1">exog</span><span class="s3">,</span>
+            <span class="s1">exog_scale=exog_scale</span><span class="s3">,</span>
+            <span class="s1">exog_smooth=exog_smooth</span><span class="s3">,</span>
+            <span class="s1">exog_noise=exog_noise</span><span class="s3">,</span>
+            <span class="s1">time=time</span><span class="s3">,</span>
+            <span class="s1">groups=groups</span><span class="s3">,</span>
+            <span class="s1">**kwargs)</span>
+
+        <span class="s1">self._has_noise = exog_noise </span><span class="s3">is not None</span>
+
+        <span class="s0"># Create parameter names</span>
+        <span class="s1">xnames = []</span>
+        <span class="s3">if </span><span class="s1">hasattr(exog</span><span class="s3">, </span><span class="s5">&quot;columns&quot;</span><span class="s1">):</span>
+            <span class="s1">xnames = list(exog.columns)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">xnames = [</span><span class="s5">&quot;Mean%d&quot; </span><span class="s1">% j </span><span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(exog.shape[</span><span class="s4">1</span><span class="s1">])]</span>
+
+        <span class="s3">if </span><span class="s1">hasattr(exog_scale</span><span class="s3">, </span><span class="s5">&quot;columns&quot;</span><span class="s1">):</span>
+            <span class="s1">xnames += list(exog_scale.columns)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">xnames += [</span><span class="s5">&quot;Scale%d&quot; </span><span class="s1">% j </span><span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(exog_scale.shape[</span><span class="s4">1</span><span class="s1">])]</span>
+
+        <span class="s3">if </span><span class="s1">hasattr(exog_smooth</span><span class="s3">, </span><span class="s5">&quot;columns&quot;</span><span class="s1">):</span>
+            <span class="s1">xnames += list(exog_smooth.columns)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">xnames += [</span><span class="s5">&quot;Smooth%d&quot; </span><span class="s1">% j </span><span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(exog_smooth.shape[</span><span class="s4">1</span><span class="s1">])]</span>
+
+        <span class="s3">if </span><span class="s1">self._has_noise:</span>
+            <span class="s3">if </span><span class="s1">hasattr(exog_noise</span><span class="s3">, </span><span class="s5">&quot;columns&quot;</span><span class="s1">):</span>
+                <span class="s0"># If pandas-like, get the actual column names</span>
+                <span class="s1">xnames += list(exog_noise.columns)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s0"># If numpy-like, create default names</span>
+                <span class="s1">xnames += [</span><span class="s5">&quot;Noise%d&quot; </span><span class="s1">% j </span><span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(exog_noise.shape[</span><span class="s4">1</span><span class="s1">])]</span>
+
+        <span class="s1">self.data.param_names = xnames</span>
+
+        <span class="s3">if </span><span class="s1">cov </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">cov = GaussianCovariance()</span>
+        <span class="s1">self.cov = cov</span>
+
+        <span class="s1">_check_args(endog</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">exog_scale</span><span class="s3">, </span><span class="s1">exog_smooth</span><span class="s3">, </span><span class="s1">exog_noise</span><span class="s3">,</span>
+                    <span class="s1">time</span><span class="s3">, </span><span class="s1">groups)</span>
+
+        <span class="s1">groups_ix = collections.defaultdict(</span><span class="s3">lambda</span><span class="s1">: [])</span>
+        <span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">g </span><span class="s3">in </span><span class="s1">enumerate(groups):</span>
+            <span class="s1">groups_ix[g].append(i)</span>
+        <span class="s1">self._groups_ix = groups_ix</span>
+
+        <span class="s0"># Default, can be set in call to fit.</span>
+        <span class="s1">self.verbose = </span><span class="s3">False</span>
+
+        <span class="s1">self.k_exog = self.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">self.k_scale = self.exog_scale.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">self.k_smooth = self.exog_smooth.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s3">if </span><span class="s1">self._has_noise:</span>
+            <span class="s1">self.k_noise = self.exog_noise.shape[</span><span class="s4">1</span><span class="s1">]</span>
+
+    <span class="s3">def </span><span class="s1">_split_param_names(self):</span>
+        <span class="s1">xnames = self.data.param_names</span>
+        <span class="s1">q = </span><span class="s4">0</span>
+        <span class="s1">mean_names = xnames[q:q+self.k_exog]</span>
+        <span class="s1">q += self.k_exog</span>
+        <span class="s1">scale_names = xnames[q:q+self.k_scale]</span>
+        <span class="s1">q += self.k_scale</span>
+        <span class="s1">smooth_names = xnames[q:q+self.k_smooth]</span>
+
+        <span class="s3">if </span><span class="s1">self._has_noise:</span>
+            <span class="s1">q += self.k_noise</span>
+            <span class="s1">noise_names = xnames[q:q+self.k_noise]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">noise_names = []</span>
+
+        <span class="s3">return </span><span class="s1">mean_names</span><span class="s3">, </span><span class="s1">scale_names</span><span class="s3">, </span><span class="s1">smooth_names</span><span class="s3">, </span><span class="s1">noise_names</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s3">def </span><span class="s1">from_formula(cls</span><span class="s3">,</span>
+                     <span class="s1">formula</span><span class="s3">,</span>
+                     <span class="s1">data</span><span class="s3">,</span>
+                     <span class="s1">subset=</span><span class="s3">None,</span>
+                     <span class="s1">drop_cols=</span><span class="s3">None,</span>
+                     <span class="s1">*args</span><span class="s3">,</span>
+                     <span class="s1">**kwargs):</span>
+
+        <span class="s3">if </span><span class="s5">&quot;scale_formula&quot; </span><span class="s3">in </span><span class="s1">kwargs:</span>
+            <span class="s1">scale_formula = kwargs[</span><span class="s5">&quot;scale_formula&quot;</span><span class="s1">]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;scale_formula is a required argument&quot;</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s5">&quot;smooth_formula&quot; </span><span class="s3">in </span><span class="s1">kwargs:</span>
+            <span class="s1">smooth_formula = kwargs[</span><span class="s5">&quot;smooth_formula&quot;</span><span class="s1">]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;smooth_formula is a required argument&quot;</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s5">&quot;noise_formula&quot; </span><span class="s3">in </span><span class="s1">kwargs:</span>
+            <span class="s1">noise_formula = kwargs[</span><span class="s5">&quot;noise_formula&quot;</span><span class="s1">]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">noise_formula = </span><span class="s3">None</span>
+
+        <span class="s3">if </span><span class="s5">&quot;time&quot; </span><span class="s3">in </span><span class="s1">kwargs:</span>
+            <span class="s1">time = kwargs[</span><span class="s5">&quot;time&quot;</span><span class="s1">]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;time is a required argument&quot;</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s5">&quot;groups&quot; </span><span class="s3">in </span><span class="s1">kwargs:</span>
+            <span class="s1">groups = kwargs[</span><span class="s5">&quot;groups&quot;</span><span class="s1">]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">&quot;groups is a required argument&quot;</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s1">subset </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">warnings.warn(</span><span class="s5">&quot;'subset' is ignored&quot;</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s1">drop_cols </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">warnings.warn(</span><span class="s5">&quot;'drop_cols' is ignored&quot;</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s1">isinstance(time</span><span class="s3">, </span><span class="s1">str):</span>
+            <span class="s1">time = np.asarray(data[time])</span>
+
+        <span class="s3">if </span><span class="s1">isinstance(groups</span><span class="s3">, </span><span class="s1">str):</span>
+            <span class="s1">groups = np.asarray(data[groups])</span>
+
+        <span class="s1">exog_scale = patsy.dmatrix(scale_formula</span><span class="s3">, </span><span class="s1">data)</span>
+        <span class="s1">scale_design_info = exog_scale.design_info</span>
+        <span class="s1">scale_names = scale_design_info.column_names</span>
+        <span class="s1">exog_scale = np.asarray(exog_scale)</span>
+
+        <span class="s1">exog_smooth = patsy.dmatrix(smooth_formula</span><span class="s3">, </span><span class="s1">data)</span>
+        <span class="s1">smooth_design_info = exog_smooth.design_info</span>
+        <span class="s1">smooth_names = smooth_design_info.column_names</span>
+        <span class="s1">exog_smooth = np.asarray(exog_smooth)</span>
+
+        <span class="s3">if </span><span class="s1">noise_formula </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">exog_noise = patsy.dmatrix(noise_formula</span><span class="s3">, </span><span class="s1">data)</span>
+            <span class="s1">noise_design_info = exog_noise.design_info</span>
+            <span class="s1">noise_names = noise_design_info.column_names</span>
+            <span class="s1">exog_noise = np.asarray(exog_noise)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">exog_noise</span><span class="s3">, </span><span class="s1">noise_design_info</span><span class="s3">, </span><span class="s1">noise_names</span><span class="s3">, </span><span class="s1">exog_noise =\</span>
+                <span class="s3">None, None, </span><span class="s1">[]</span><span class="s3">, None</span>
+
+        <span class="s1">mod = super(ProcessMLE</span><span class="s3">, </span><span class="s1">cls).from_formula(</span>
+            <span class="s1">formula</span><span class="s3">,</span>
+            <span class="s1">data=data</span><span class="s3">,</span>
+            <span class="s1">subset=</span><span class="s3">None,</span>
+            <span class="s1">exog_scale=exog_scale</span><span class="s3">,</span>
+            <span class="s1">exog_smooth=exog_smooth</span><span class="s3">,</span>
+            <span class="s1">exog_noise=exog_noise</span><span class="s3">,</span>
+            <span class="s1">time=time</span><span class="s3">,</span>
+            <span class="s1">groups=groups)</span>
+
+        <span class="s1">mod.data.scale_design_info = scale_design_info</span>
+        <span class="s1">mod.data.smooth_design_info = smooth_design_info</span>
+
+        <span class="s3">if </span><span class="s1">mod._has_noise:</span>
+            <span class="s1">mod.data.noise_design_info = noise_design_info</span>
+
+        <span class="s1">mod.data.param_names = (mod.exog_names + scale_names +</span>
+                                <span class="s1">smooth_names + noise_names)</span>
+
+        <span class="s3">return </span><span class="s1">mod</span>
+
+    <span class="s3">def </span><span class="s1">unpack(self</span><span class="s3">, </span><span class="s1">z):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Split the packed parameter vector into blocks. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0"># Mean parameters</span>
+        <span class="s1">pm = self.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">mnpar = z[</span><span class="s4">0</span><span class="s1">:pm]</span>
+
+        <span class="s0"># Standard deviation parameters</span>
+        <span class="s1">pv = self.exog_scale.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">scpar = z[pm:pm + pv]</span>
+
+        <span class="s0"># Smoothness parameters</span>
+        <span class="s1">ps = self.exog_smooth.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">smpar = z[pm + pv:pm + pv + ps]</span>
+
+        <span class="s0"># Observation white noise standard deviation.</span>
+        <span class="s0"># Empty if has_noise = False.</span>
+        <span class="s1">nopar = z[pm + pv + ps:]</span>
+
+        <span class="s3">return </span><span class="s1">mnpar</span><span class="s3">, </span><span class="s1">scpar</span><span class="s3">, </span><span class="s1">smpar</span><span class="s3">, </span><span class="s1">nopar</span>
+
+    <span class="s3">def </span><span class="s1">_get_start(self):</span>
+
+        <span class="s0"># Use OLS to get starting values for mean structure parameters</span>
+        <span class="s1">model = OLS(self.endog</span><span class="s3">, </span><span class="s1">self.exog)</span>
+        <span class="s1">result = model.fit()</span>
+
+        <span class="s1">m = self.exog_scale.shape[</span><span class="s4">1</span><span class="s1">] + self.exog_smooth.shape[</span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s3">if </span><span class="s1">self._has_noise:</span>
+            <span class="s1">m += self.exog_noise.shape[</span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s3">return </span><span class="s1">np.concatenate((result.params</span><span class="s3">, </span><span class="s1">np.zeros(m)))</span>
+
+    <span class="s3">def </span><span class="s1">loglike(self</span><span class="s3">, </span><span class="s1">params):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Calculate the log-likelihood function for the model. 
+ 
+        Parameters 
+        ---------- 
+        params : array_like 
+            The packed parameters for the model. 
+ 
+        Returns 
+        ------- 
+        The log-likelihood value at the given parameter point. 
+ 
+        Notes 
+        ----- 
+        The mean, scaling, and smoothing parameters are packed into 
+        a vector.  Use `unpack` to access the component vectors. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">mnpar</span><span class="s3">, </span><span class="s1">scpar</span><span class="s3">, </span><span class="s1">smpar</span><span class="s3">, </span><span class="s1">nopar = self.unpack(params)</span>
+
+        <span class="s0"># Residuals</span>
+        <span class="s1">resid = self.endog - np.dot(self.exog</span><span class="s3">, </span><span class="s1">mnpar)</span>
+
+        <span class="s0"># Scaling parameters</span>
+        <span class="s1">sc = np.exp(np.dot(self.exog_scale</span><span class="s3">, </span><span class="s1">scpar))</span>
+
+        <span class="s0"># Smoothness parameters</span>
+        <span class="s1">sm = np.exp(np.dot(self.exog_smooth</span><span class="s3">, </span><span class="s1">smpar))</span>
+
+        <span class="s0"># White noise standard deviation</span>
+        <span class="s3">if </span><span class="s1">self._has_noise:</span>
+            <span class="s1">no = np.exp(np.dot(self.exog_noise</span><span class="s3">, </span><span class="s1">nopar))</span>
+
+        <span class="s0"># Get the log-likelihood</span>
+        <span class="s1">ll = </span><span class="s4">0.</span>
+        <span class="s3">for </span><span class="s1">_</span><span class="s3">, </span><span class="s1">ix </span><span class="s3">in </span><span class="s1">self._groups_ix.items():</span>
+
+            <span class="s0"># Get the covariance matrix for this person.</span>
+            <span class="s1">cm = self.cov.get_cov(self.time[ix]</span><span class="s3">, </span><span class="s1">sc[ix]</span><span class="s3">, </span><span class="s1">sm[ix])</span>
+
+            <span class="s0"># The variance of the additive noise, if present.</span>
+            <span class="s3">if </span><span class="s1">self._has_noise:</span>
+                <span class="s1">cm.flat[::cm.shape[</span><span class="s4">0</span><span class="s1">] + </span><span class="s4">1</span><span class="s1">] += no[ix]**</span><span class="s4">2</span>
+
+            <span class="s1">re = resid[ix]</span>
+            <span class="s1">ll -= </span><span class="s4">0.5 </span><span class="s1">* np.linalg.slogdet(cm)[</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">ll -= </span><span class="s4">0.5 </span><span class="s1">* np.dot(re</span><span class="s3">, </span><span class="s1">np.linalg.solve(cm</span><span class="s3">, </span><span class="s1">re))</span>
+
+        <span class="s3">if </span><span class="s1">self.verbose:</span>
+            <span class="s1">print(</span><span class="s5">&quot;L=&quot;</span><span class="s3">, </span><span class="s1">ll)</span>
+
+        <span class="s3">return </span><span class="s1">ll</span>
+
+    <span class="s3">def </span><span class="s1">score(self</span><span class="s3">, </span><span class="s1">params):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Calculate the score function for the model. 
+ 
+        Parameters 
+        ---------- 
+        params : array_like 
+            The packed parameters for the model. 
+ 
+        Returns 
+        ------- 
+        The score vector at the given parameter point. 
+ 
+        Notes 
+        ----- 
+        The mean, scaling, and smoothing parameters are packed into 
+        a vector.  Use `unpack` to access the component vectors. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">mnpar</span><span class="s3">, </span><span class="s1">scpar</span><span class="s3">, </span><span class="s1">smpar</span><span class="s3">, </span><span class="s1">nopar = self.unpack(params)</span>
+        <span class="s1">pm</span><span class="s3">, </span><span class="s1">pv</span><span class="s3">, </span><span class="s1">ps = len(mnpar)</span><span class="s3">, </span><span class="s1">len(scpar)</span><span class="s3">, </span><span class="s1">len(smpar)</span>
+
+        <span class="s0"># Residuals</span>
+        <span class="s1">resid = self.endog - np.dot(self.exog</span><span class="s3">, </span><span class="s1">mnpar)</span>
+
+        <span class="s0"># Scaling</span>
+        <span class="s1">sc = np.exp(np.dot(self.exog_scale</span><span class="s3">, </span><span class="s1">scpar))</span>
+
+        <span class="s0"># Smoothness</span>
+        <span class="s1">sm = np.exp(np.dot(self.exog_smooth</span><span class="s3">, </span><span class="s1">smpar))</span>
+
+        <span class="s0"># White noise standard deviation</span>
+        <span class="s3">if </span><span class="s1">self._has_noise:</span>
+            <span class="s1">no = np.exp(np.dot(self.exog_noise</span><span class="s3">, </span><span class="s1">nopar))</span>
+
+        <span class="s0"># Get the log-likelihood</span>
+        <span class="s1">score = np.zeros(len(mnpar) + len(scpar) + len(smpar) + len(nopar))</span>
+        <span class="s3">for </span><span class="s1">_</span><span class="s3">, </span><span class="s1">ix </span><span class="s3">in </span><span class="s1">self._groups_ix.items():</span>
+
+            <span class="s1">sc_i = sc[ix]</span>
+            <span class="s1">sm_i = sm[ix]</span>
+            <span class="s1">resid_i = resid[ix]</span>
+            <span class="s1">time_i = self.time[ix]</span>
+            <span class="s1">exog_i = self.exog[ix</span><span class="s3">, </span><span class="s1">:]</span>
+            <span class="s1">exog_scale_i = self.exog_scale[ix</span><span class="s3">, </span><span class="s1">:]</span>
+            <span class="s1">exog_smooth_i = self.exog_smooth[ix</span><span class="s3">, </span><span class="s1">:]</span>
+
+            <span class="s0"># Get the covariance matrix for this person.</span>
+            <span class="s1">cm = self.cov.get_cov(time_i</span><span class="s3">, </span><span class="s1">sc_i</span><span class="s3">, </span><span class="s1">sm_i)</span>
+
+            <span class="s3">if </span><span class="s1">self._has_noise:</span>
+                <span class="s1">no_i = no[ix]</span>
+                <span class="s1">exog_noise_i = self.exog_noise[ix</span><span class="s3">, </span><span class="s1">:]</span>
+                <span class="s1">cm.flat[::cm.shape[</span><span class="s4">0</span><span class="s1">] + </span><span class="s4">1</span><span class="s1">] += no[ix]**</span><span class="s4">2</span>
+
+            <span class="s1">cmi = np.linalg.inv(cm)</span>
+
+            <span class="s1">jacv</span><span class="s3">, </span><span class="s1">jacs = self.cov.jac(time_i</span><span class="s3">, </span><span class="s1">sc_i</span><span class="s3">, </span><span class="s1">sm_i)</span>
+
+            <span class="s0"># The derivatives for the mean parameters.</span>
+            <span class="s1">dcr = np.linalg.solve(cm</span><span class="s3">, </span><span class="s1">resid_i)</span>
+            <span class="s1">score[</span><span class="s4">0</span><span class="s1">:pm] += np.dot(exog_i.T</span><span class="s3">, </span><span class="s1">dcr)</span>
+
+            <span class="s0"># The derivatives for the scaling parameters.</span>
+            <span class="s1">rx = np.outer(resid_i</span><span class="s3">, </span><span class="s1">resid_i)</span>
+            <span class="s1">qm = np.linalg.solve(cm</span><span class="s3">, </span><span class="s1">rx)</span>
+            <span class="s1">qm = </span><span class="s4">0.5 </span><span class="s1">* np.linalg.solve(cm</span><span class="s3">, </span><span class="s1">qm.T)</span>
+            <span class="s1">scx = sc_i[:</span><span class="s3">, None</span><span class="s1">] * exog_scale_i</span>
+            <span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">enumerate(ix):</span>
+                <span class="s1">jq = np.sum(jacv[i] * qm)</span>
+                <span class="s1">score[pm:pm + pv] += jq * scx[i</span><span class="s3">, </span><span class="s1">:]</span>
+                <span class="s1">score[pm:pm + pv] -= </span><span class="s4">0.5 </span><span class="s1">* np.sum(jacv[i] * cmi) * scx[i</span><span class="s3">, </span><span class="s1">:]</span>
+
+            <span class="s0"># The derivatives for the smoothness parameters.</span>
+            <span class="s1">smx = sm_i[:</span><span class="s3">, None</span><span class="s1">] * exog_smooth_i</span>
+            <span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">enumerate(ix):</span>
+                <span class="s1">jq = np.sum(jacs[i] * qm)</span>
+                <span class="s1">score[pm + pv:pm + pv + ps] += jq * smx[i</span><span class="s3">, </span><span class="s1">:]</span>
+                <span class="s1">score[pm + pv:pm + pv + ps] -= (</span>
+                         <span class="s4">0.5 </span><span class="s1">* np.sum(jacs[i] * cmi) * smx[i</span><span class="s3">, </span><span class="s1">:])</span>
+
+            <span class="s0"># The derivatives with respect to the standard deviation parameters</span>
+            <span class="s3">if </span><span class="s1">self._has_noise:</span>
+                <span class="s1">sno = no_i[:</span><span class="s3">, None</span><span class="s1">]**</span><span class="s4">2 </span><span class="s1">* exog_noise_i</span>
+                <span class="s1">score[pm + pv + ps:] -= np.dot(cmi.flat[::cm.shape[</span><span class="s4">0</span><span class="s1">] + </span><span class="s4">1</span><span class="s1">]</span><span class="s3">,</span>
+                                               <span class="s1">sno)</span>
+                <span class="s1">bm = np.dot(cmi</span><span class="s3">, </span><span class="s1">np.dot(rx</span><span class="s3">, </span><span class="s1">cmi))</span>
+                <span class="s1">score[pm + pv + ps:] += np.dot(bm.flat[::bm.shape[</span><span class="s4">0</span><span class="s1">] + </span><span class="s4">1</span><span class="s1">]</span><span class="s3">, </span><span class="s1">sno)</span>
+
+        <span class="s3">if </span><span class="s1">self.verbose:</span>
+            <span class="s1">print(</span><span class="s5">&quot;|G|=&quot;</span><span class="s3">, </span><span class="s1">np.sqrt(np.sum(score * score)))</span>
+
+        <span class="s3">return </span><span class="s1">score</span>
+
+    <span class="s3">def </span><span class="s1">hessian(self</span><span class="s3">, </span><span class="s1">params):</span>
+
+        <span class="s1">hess = approx_fprime(params</span><span class="s3">, </span><span class="s1">self.score)</span>
+        <span class="s3">return </span><span class="s1">hess</span>
+
+    <span class="s3">def </span><span class="s1">fit(self</span><span class="s3">, </span><span class="s1">start_params=</span><span class="s3">None, </span><span class="s1">method=</span><span class="s3">None, </span><span class="s1">maxiter=</span><span class="s3">None,</span>
+            <span class="s1">**kwargs):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Fit a grouped Gaussian process regression using MLE. 
+ 
+        Parameters 
+        ---------- 
+        start_params : array_like 
+            Optional starting values. 
+        method : str or array of str 
+            Method or sequence of methods for scipy optimize. 
+        maxiter : int 
+            The maximum number of iterations in the optimization. 
+ 
+        Returns 
+        ------- 
+        An instance of ProcessMLEResults. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">if </span><span class="s5">&quot;verbose&quot; </span><span class="s3">in </span><span class="s1">kwargs:</span>
+            <span class="s1">self.verbose = kwargs[</span><span class="s5">&quot;verbose&quot;</span><span class="s1">]</span>
+
+        <span class="s1">minim_opts = {}</span>
+        <span class="s3">if </span><span class="s5">&quot;minim_opts&quot; </span><span class="s3">in </span><span class="s1">kwargs:</span>
+            <span class="s1">minim_opts = kwargs[</span><span class="s5">&quot;minim_opts&quot;</span><span class="s1">]</span>
+
+        <span class="s3">if </span><span class="s1">start_params </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">start_params = self._get_start()</span>
+
+        <span class="s3">if </span><span class="s1">isinstance(method</span><span class="s3">, </span><span class="s1">str):</span>
+            <span class="s1">method = [method]</span>
+        <span class="s3">elif </span><span class="s1">method </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">method = [</span><span class="s5">&quot;powell&quot;</span><span class="s3">, </span><span class="s5">&quot;bfgs&quot;</span><span class="s1">]</span>
+
+        <span class="s3">for </span><span class="s1">j</span><span class="s3">, </span><span class="s1">meth </span><span class="s3">in </span><span class="s1">enumerate(method):</span>
+
+            <span class="s3">if </span><span class="s1">meth </span><span class="s3">not in </span><span class="s1">(</span><span class="s5">&quot;powell&quot;</span><span class="s3">,</span><span class="s1">):</span>
+                <span class="s3">def </span><span class="s1">jac(x):</span>
+                    <span class="s3">return </span><span class="s1">-self.score(x)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">jac = </span><span class="s3">None</span>
+
+            <span class="s3">if </span><span class="s1">maxiter </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s3">if </span><span class="s1">np.isscalar(maxiter):</span>
+                    <span class="s1">minim_opts[</span><span class="s5">&quot;maxiter&quot;</span><span class="s1">] = maxiter</span>
+                <span class="s3">else</span><span class="s1">:</span>
+                    <span class="s1">minim_opts[</span><span class="s5">&quot;maxiter&quot;</span><span class="s1">] = maxiter[j % len(maxiter)]</span>
+
+            <span class="s1">f = minimize(</span>
+                <span class="s3">lambda </span><span class="s1">x: -self.loglike(x)</span><span class="s3">,</span>
+                <span class="s1">method=meth</span><span class="s3">,</span>
+                <span class="s1">x0=start_params</span><span class="s3">,</span>
+                <span class="s1">jac=jac</span><span class="s3">,</span>
+                <span class="s1">options=minim_opts)</span>
+
+            <span class="s3">if not </span><span class="s1">f.success:</span>
+                <span class="s1">msg = </span><span class="s5">&quot;Fitting did not converge&quot;</span>
+                <span class="s3">if </span><span class="s1">jac </span><span class="s3">is not None</span><span class="s1">:</span>
+                    <span class="s1">msg += </span><span class="s5">&quot;, |gradient|=%.6f&quot; </span><span class="s1">% np.sqrt(np.sum(f.jac**</span><span class="s4">2</span><span class="s1">))</span>
+                <span class="s3">if </span><span class="s1">j &lt; len(method) - </span><span class="s4">1</span><span class="s1">:</span>
+                    <span class="s1">msg += </span><span class="s5">&quot;, trying %s next...&quot; </span><span class="s1">% method[j+</span><span class="s4">1</span><span class="s1">]</span>
+                <span class="s1">warnings.warn(msg)</span>
+
+            <span class="s3">if </span><span class="s1">np.isfinite(f.x).all():</span>
+                <span class="s1">start_params = f.x</span>
+
+        <span class="s1">hess = self.hessian(f.x)</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">cov_params = -np.linalg.inv(hess)</span>
+        <span class="s3">except </span><span class="s1">Exception:</span>
+            <span class="s1">cov_params = </span><span class="s3">None</span>
+
+        <span class="s3">class </span><span class="s1">rslt:</span>
+            <span class="s3">pass</span>
+
+        <span class="s1">r = rslt()</span>
+        <span class="s1">r.params = f.x</span>
+        <span class="s1">r.normalized_cov_params = cov_params</span>
+        <span class="s1">r.optim_retvals = f</span>
+        <span class="s1">r.scale = </span><span class="s4">1</span>
+
+        <span class="s1">rslt = ProcessMLEResults(self</span><span class="s3">, </span><span class="s1">r)</span>
+
+        <span class="s3">return </span><span class="s1">rslt</span>
+
+    <span class="s3">def </span><span class="s1">covariance(self</span><span class="s3">, </span><span class="s1">time</span><span class="s3">, </span><span class="s1">scale_params</span><span class="s3">, </span><span class="s1">smooth_params</span><span class="s3">, </span><span class="s1">scale_data</span><span class="s3">,</span>
+                   <span class="s1">smooth_data):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Returns a Gaussian process covariance matrix. 
+ 
+        Parameters 
+        ---------- 
+        time : array_like 
+            The time points at which the fitted covariance matrix is 
+            calculated. 
+        scale_params : array_like 
+            The regression parameters for the scaling part 
+            of the covariance structure. 
+        smooth_params : array_like 
+            The regression parameters for the smoothing part 
+            of the covariance structure. 
+        scale_data : DataFrame 
+            The data used to determine the scale parameter, 
+            must have len(time) rows. 
+        smooth_data : DataFrame 
+            The data used to determine the smoothness parameter, 
+            must have len(time) rows. 
+ 
+        Returns 
+        ------- 
+        A covariance matrix. 
+ 
+        Notes 
+        ----- 
+        If the model was fit using formulas, `scale` and `smooth` should 
+        be Dataframes, containing all variables that were present in the 
+        respective scaling and smoothing formulas used to fit the model. 
+        Otherwise, `scale` and `smooth` should contain data arrays whose 
+        columns align with the fitted scaling and smoothing parameters. 
+ 
+        The covariance is only for the Gaussian process and does not include 
+        the white noise variance. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">if not </span><span class="s1">hasattr(self.data</span><span class="s3">, </span><span class="s5">&quot;scale_design_info&quot;</span><span class="s1">):</span>
+            <span class="s1">sca = np.dot(scale_data</span><span class="s3">, </span><span class="s1">scale_params)</span>
+            <span class="s1">smo = np.dot(smooth_data</span><span class="s3">, </span><span class="s1">smooth_params)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">sc = patsy.dmatrix(self.data.scale_design_info</span><span class="s3">, </span><span class="s1">scale_data)</span>
+            <span class="s1">sm = patsy.dmatrix(self.data.smooth_design_info</span><span class="s3">, </span><span class="s1">smooth_data)</span>
+            <span class="s1">sca = np.exp(np.dot(sc</span><span class="s3">, </span><span class="s1">scale_params))</span>
+            <span class="s1">smo = np.exp(np.dot(sm</span><span class="s3">, </span><span class="s1">smooth_params))</span>
+
+        <span class="s3">return </span><span class="s1">self.cov.get_cov(time</span><span class="s3">, </span><span class="s1">sca</span><span class="s3">, </span><span class="s1">smo)</span>
+
+    <span class="s3">def </span><span class="s1">predict(self</span><span class="s3">, </span><span class="s1">params</span><span class="s3">, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Obtain predictions of the mean structure. 
+ 
+        Parameters 
+        ---------- 
+        params : array_like 
+            The model parameters, may be truncated to include only mean 
+            parameters. 
+        exog : array_like 
+            The design matrix for the mean structure.  If not provided, 
+            the model's design matrix is used. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">if </span><span class="s1">exog </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">exog = self.exog</span>
+        <span class="s3">elif </span><span class="s1">hasattr(self.data</span><span class="s3">, </span><span class="s5">&quot;design_info&quot;</span><span class="s1">):</span>
+            <span class="s0"># Run the provided data through the formula if present</span>
+            <span class="s1">exog = patsy.dmatrix(self.data.design_info</span><span class="s3">, </span><span class="s1">exog)</span>
+
+        <span class="s3">if </span><span class="s1">len(params) &gt; exog.shape[</span><span class="s4">1</span><span class="s1">]:</span>
+            <span class="s1">params = params[</span><span class="s4">0</span><span class="s1">:exog.shape[</span><span class="s4">1</span><span class="s1">]]</span>
+
+        <span class="s3">return </span><span class="s1">np.dot(exog</span><span class="s3">, </span><span class="s1">params)</span>
+
+
+<span class="s3">class </span><span class="s1">ProcessMLEResults(base.GenericLikelihoodModelResults):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Results class for Gaussian process regression models. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">model</span><span class="s3">, </span><span class="s1">mlefit):</span>
+
+        <span class="s1">super(ProcessMLEResults</span><span class="s3">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">model</span><span class="s3">, </span><span class="s1">mlefit)</span>
+
+        <span class="s1">pa = model.unpack(mlefit.params)</span>
+
+        <span class="s1">self.mean_params = pa[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">self.scale_params = pa[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">self.smooth_params = pa[</span><span class="s4">2</span><span class="s1">]</span>
+        <span class="s1">self.no_params = pa[</span><span class="s4">3</span><span class="s1">]</span>
+
+        <span class="s1">self.df_resid = model.endog.shape[</span><span class="s4">0</span><span class="s1">] - len(mlefit.params)</span>
+
+        <span class="s1">self.k_exog = self.model.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">self.k_scale = self.model.exog_scale.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">self.k_smooth = self.model.exog_smooth.shape[</span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s1">self._has_noise = model._has_noise</span>
+        <span class="s3">if </span><span class="s1">model._has_noise:</span>
+            <span class="s1">self.k_noise = self.model.exog_noise.shape[</span><span class="s4">1</span><span class="s1">]</span>
+
+    <span class="s3">def </span><span class="s1">predict(self</span><span class="s3">, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">transform=</span><span class="s3">True, </span><span class="s1">*args</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+
+        <span class="s3">if not </span><span class="s1">transform:</span>
+            <span class="s1">warnings.warn(</span><span class="s5">&quot;'transform=False' is ignored in predict&quot;</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s1">len(args) &gt; </span><span class="s4">0 </span><span class="s3">or </span><span class="s1">len(kwargs) &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">warnings.warn(</span><span class="s5">&quot;extra arguments ignored in 'predict'&quot;</span><span class="s1">)</span>
+
+        <span class="s3">return </span><span class="s1">self.model.predict(self.params</span><span class="s3">, </span><span class="s1">exog)</span>
+
+    <span class="s3">def </span><span class="s1">covariance(self</span><span class="s3">, </span><span class="s1">time</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">, </span><span class="s1">smooth):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Returns a fitted covariance matrix. 
+ 
+        Parameters 
+        ---------- 
+        time : array_like 
+            The time points at which the fitted covariance 
+            matrix is calculated. 
+        scale : array_like 
+            The data used to determine the scale parameter, 
+            must have len(time) rows. 
+        smooth : array_like 
+            The data used to determine the smoothness parameter, 
+            must have len(time) rows. 
+ 
+        Returns 
+        ------- 
+        A covariance matrix. 
+ 
+        Notes 
+        ----- 
+        If the model was fit using formulas, `scale` and `smooth` should 
+        be Dataframes, containing all variables that were present in the 
+        respective scaling and smoothing formulas used to fit the model. 
+        Otherwise, `scale` and `smooth` should be data arrays whose 
+        columns align with the fitted scaling and smoothing parameters. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">return </span><span class="s1">self.model.covariance(time</span><span class="s3">, </span><span class="s1">self.scale_params</span><span class="s3">,</span>
+                                     <span class="s1">self.smooth_params</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">, </span><span class="s1">smooth)</span>
+
+    <span class="s3">def </span><span class="s1">covariance_group(self</span><span class="s3">, </span><span class="s1">group):</span>
+
+        <span class="s0"># Check if the group exists, since _groups_ix is a</span>
+        <span class="s0"># DefaultDict use len instead of catching a KeyError.</span>
+        <span class="s1">ix = self.model._groups_ix[group]</span>
+        <span class="s3">if </span><span class="s1">len(ix) == </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">msg = </span><span class="s5">&quot;Group '%s' does not exist&quot; </span><span class="s1">% str(group)</span>
+            <span class="s3">raise </span><span class="s1">ValueError(msg)</span>
+
+        <span class="s1">scale_data = self.model.exog_scale[ix</span><span class="s3">, </span><span class="s1">:]</span>
+        <span class="s1">smooth_data = self.model.exog_smooth[ix</span><span class="s3">, </span><span class="s1">:]</span>
+
+        <span class="s1">_</span><span class="s3">, </span><span class="s1">scale_names</span><span class="s3">, </span><span class="s1">smooth_names</span><span class="s3">, </span><span class="s1">_ = self.model._split_param_names()</span>
+
+        <span class="s1">scale_data = pd.DataFrame(scale_data</span><span class="s3">, </span><span class="s1">columns=scale_names)</span>
+        <span class="s1">smooth_data = pd.DataFrame(smooth_data</span><span class="s3">, </span><span class="s1">columns=smooth_names)</span>
+        <span class="s1">time = self.model.time[ix]</span>
+
+        <span class="s3">return </span><span class="s1">self.model.covariance(time</span><span class="s3">,</span>
+                                     <span class="s1">self.scale_params</span><span class="s3">,</span>
+                                     <span class="s1">self.smooth_params</span><span class="s3">,</span>
+                                     <span class="s1">scale_data</span><span class="s3">,</span>
+                                     <span class="s1">smooth_data)</span>
+
+    <span class="s3">def </span><span class="s1">summary(self</span><span class="s3">, </span><span class="s1">yname=</span><span class="s3">None, </span><span class="s1">xname=</span><span class="s3">None, </span><span class="s1">title=</span><span class="s3">None, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s1">):</span>
+
+        <span class="s1">df = pd.DataFrame()</span>
+
+        <span class="s1">typ = ([</span><span class="s5">&quot;Mean&quot;</span><span class="s1">] * self.k_exog + [</span><span class="s5">&quot;Scale&quot;</span><span class="s1">] * self.k_scale +</span>
+               <span class="s1">[</span><span class="s5">&quot;Smooth&quot;</span><span class="s1">] * self.k_smooth)</span>
+        <span class="s3">if </span><span class="s1">self._has_noise:</span>
+            <span class="s1">typ += [</span><span class="s5">&quot;SD&quot;</span><span class="s1">] * self.k_noise</span>
+        <span class="s1">df[</span><span class="s5">&quot;Type&quot;</span><span class="s1">] = typ</span>
+
+        <span class="s1">df[</span><span class="s5">&quot;coef&quot;</span><span class="s1">] = self.params</span>
+
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">df[</span><span class="s5">&quot;std err&quot;</span><span class="s1">] = np.sqrt(np.diag(self.cov_params()))</span>
+        <span class="s3">except </span><span class="s1">Exception:</span>
+            <span class="s1">df[</span><span class="s5">&quot;std err&quot;</span><span class="s1">] = np.nan</span>
+
+        <span class="s3">from </span><span class="s1">scipy.stats.distributions </span><span class="s3">import </span><span class="s1">norm</span>
+        <span class="s1">df[</span><span class="s5">&quot;tvalues&quot;</span><span class="s1">] = df.coef / df[</span><span class="s5">&quot;std err&quot;</span><span class="s1">]</span>
+        <span class="s1">df[</span><span class="s5">&quot;P&gt;|t|&quot;</span><span class="s1">] = </span><span class="s4">2 </span><span class="s1">* norm.sf(np.abs(df.tvalues))</span>
+
+        <span class="s1">f = norm.ppf(</span><span class="s4">1 </span><span class="s1">- alpha / </span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s1">df[</span><span class="s5">&quot;[%.3f&quot; </span><span class="s1">% (alpha / </span><span class="s4">2</span><span class="s1">)] = df.coef - f * df[</span><span class="s5">&quot;std err&quot;</span><span class="s1">]</span>
+        <span class="s1">df[</span><span class="s5">&quot;%.3f]&quot; </span><span class="s1">% (</span><span class="s4">1 </span><span class="s1">- alpha / </span><span class="s4">2</span><span class="s1">)] = df.coef + f * df[</span><span class="s5">&quot;std err&quot;</span><span class="s1">]</span>
+
+        <span class="s1">df.index = self.model.data.param_names</span>
+
+        <span class="s1">summ = summary2.Summary()</span>
+        <span class="s3">if </span><span class="s1">title </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">title = </span><span class="s5">&quot;Gaussian process regression results&quot;</span>
+        <span class="s1">summ.add_title(title)</span>
+        <span class="s1">summ.add_df(df)</span>
+
+        <span class="s3">return </span><span class="s1">summ</span>
+</pre>
+</body>
+</html>

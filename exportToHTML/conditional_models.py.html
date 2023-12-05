@@ -1,0 +1,656 @@
+<html>
+<head>
+<title>conditional_models.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+conditional_models.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Conditional logistic, Poisson, and multinomial logit regression 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">statsmodels.base.model </span><span class="s2">as </span><span class="s1">base</span>
+<span class="s2">import </span><span class="s1">statsmodels.regression.linear_model </span><span class="s2">as </span><span class="s1">lm</span>
+<span class="s2">import </span><span class="s1">statsmodels.base.wrapper </span><span class="s2">as </span><span class="s1">wrap</span>
+<span class="s2">from </span><span class="s1">statsmodels.discrete.discrete_model </span><span class="s2">import </span><span class="s1">(MultinomialResults</span><span class="s2">,</span>
+      <span class="s1">MultinomialResultsWrapper)</span>
+<span class="s2">import </span><span class="s1">collections</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">import </span><span class="s1">itertools</span>
+
+
+<span class="s2">class </span><span class="s1">_ConditionalModel(base.LikelihoodModel):</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">missing=</span><span class="s3">'none'</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+
+        <span class="s2">if </span><span class="s3">&quot;groups&quot; </span><span class="s2">not in </span><span class="s1">kwargs:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;'groups' is a required argument&quot;</span><span class="s1">)</span>
+        <span class="s1">groups = kwargs[</span><span class="s3">&quot;groups&quot;</span><span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">groups.size != endog.size:</span>
+            <span class="s1">msg = </span><span class="s3">&quot;'endog' and 'groups' should have the same dimensions&quot;</span>
+            <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+
+        <span class="s2">if </span><span class="s1">exog.shape[</span><span class="s4">0</span><span class="s1">] != endog.size:</span>
+            <span class="s1">msg = </span><span class="s3">&quot;The leading dimension of 'exog' should equal the length of 'endog'&quot;</span>
+            <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+
+        <span class="s1">super(_ConditionalModel</span><span class="s2">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">missing=missing</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s2">if </span><span class="s1">self.data.const_idx </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">msg = (</span><span class="s3">&quot;Conditional models should not have an intercept in the &quot; </span><span class="s1">+</span>
+                  <span class="s3">&quot;design matrix&quot;</span><span class="s1">)</span>
+            <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+
+        <span class="s1">exog = self.exog</span>
+        <span class="s1">self.k_params = exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s5"># Get the row indices for each group</span>
+        <span class="s1">row_ix = {}</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">g </span><span class="s2">in </span><span class="s1">enumerate(groups):</span>
+            <span class="s2">if </span><span class="s1">g </span><span class="s2">not in </span><span class="s1">row_ix:</span>
+                <span class="s1">row_ix[g] = []</span>
+            <span class="s1">row_ix[g].append(i)</span>
+
+        <span class="s5"># Split the data into groups and remove groups with no variation</span>
+        <span class="s1">endog</span><span class="s2">, </span><span class="s1">exog = np.asarray(endog)</span><span class="s2">, </span><span class="s1">np.asarray(exog)</span>
+        <span class="s1">offset = kwargs.get(</span><span class="s3">&quot;offset&quot;</span><span class="s1">)</span>
+        <span class="s1">self._endog_grp = []</span>
+        <span class="s1">self._exog_grp = []</span>
+        <span class="s1">self._groupsize = []</span>
+        <span class="s2">if </span><span class="s1">offset </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">offset = np.asarray(offset)</span>
+            <span class="s1">self._offset_grp = []</span>
+        <span class="s1">self._offset = []</span>
+        <span class="s1">self._sumy = []</span>
+        <span class="s1">self.nobs = </span><span class="s4">0</span>
+        <span class="s1">drops = [</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s2">for </span><span class="s1">g</span><span class="s2">, </span><span class="s1">ix </span><span class="s2">in </span><span class="s1">row_ix.items():</span>
+            <span class="s1">y = endog[ix].flat</span>
+            <span class="s2">if </span><span class="s1">np.std(y) == </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">drops[</span><span class="s4">0</span><span class="s1">] += </span><span class="s4">1</span>
+                <span class="s1">drops[</span><span class="s4">1</span><span class="s1">] += len(y)</span>
+                <span class="s2">continue</span>
+            <span class="s1">self.nobs += len(y)</span>
+            <span class="s1">self._endog_grp.append(y)</span>
+            <span class="s2">if </span><span class="s1">offset </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">self._offset_grp.append(offset[ix])</span>
+            <span class="s1">self._groupsize.append(len(y))</span>
+            <span class="s1">self._exog_grp.append(exog[ix</span><span class="s2">, </span><span class="s1">:])</span>
+            <span class="s1">self._sumy.append(np.sum(y))</span>
+
+        <span class="s2">if </span><span class="s1">drops[</span><span class="s4">0</span><span class="s1">] &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">msg = (</span><span class="s3">&quot;Dropped %d groups and %d observations for having &quot; </span><span class="s1">+</span>
+                   <span class="s3">&quot;no within-group variance&quot;</span><span class="s1">) % tuple(drops)</span>
+            <span class="s1">warnings.warn(msg)</span>
+
+        <span class="s5"># This can be pre-computed</span>
+        <span class="s2">if </span><span class="s1">offset </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self._endofs = []</span>
+            <span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">ofs </span><span class="s2">in </span><span class="s1">enumerate(self._offset_grp):</span>
+                <span class="s1">self._endofs.append(np.dot(self._endog_grp[k]</span><span class="s2">, </span><span class="s1">ofs))</span>
+
+        <span class="s5"># Number of groups</span>
+        <span class="s1">self._n_groups = len(self._endog_grp)</span>
+
+        <span class="s5"># These are the sufficient statistics</span>
+        <span class="s1">self._xy = []</span>
+        <span class="s1">self._n1 = []</span>
+        <span class="s2">for </span><span class="s1">g </span><span class="s2">in </span><span class="s1">range(self._n_groups):</span>
+            <span class="s1">self._xy.append(np.dot(self._endog_grp[g]</span><span class="s2">, </span><span class="s1">self._exog_grp[g]))</span>
+            <span class="s1">self._n1.append(np.sum(self._endog_grp[g]))</span>
+
+    <span class="s2">def </span><span class="s1">hessian(self</span><span class="s2">, </span><span class="s1">params):</span>
+
+        <span class="s2">from </span><span class="s1">statsmodels.tools.numdiff </span><span class="s2">import </span><span class="s1">approx_fprime</span>
+        <span class="s1">hess = approx_fprime(params</span><span class="s2">, </span><span class="s1">self.score)</span>
+        <span class="s1">hess = np.atleast_2d(hess)</span>
+        <span class="s2">return </span><span class="s1">hess</span>
+
+    <span class="s2">def </span><span class="s1">fit(self</span><span class="s2">,</span>
+            <span class="s1">start_params=</span><span class="s2">None,</span>
+            <span class="s1">method=</span><span class="s3">'BFGS'</span><span class="s2">,</span>
+            <span class="s1">maxiter=</span><span class="s4">100</span><span class="s2">,</span>
+            <span class="s1">full_output=</span><span class="s2">True,</span>
+            <span class="s1">disp=</span><span class="s2">False,</span>
+            <span class="s1">fargs=()</span><span class="s2">,</span>
+            <span class="s1">callback=</span><span class="s2">None,</span>
+            <span class="s1">retall=</span><span class="s2">False,</span>
+            <span class="s1">skip_hessian=</span><span class="s2">False,</span>
+            <span class="s1">**kwargs):</span>
+
+        <span class="s1">rslt = super(_ConditionalModel</span><span class="s2">, </span><span class="s1">self).fit(</span>
+            <span class="s1">start_params=start_params</span><span class="s2">,</span>
+            <span class="s1">method=method</span><span class="s2">,</span>
+            <span class="s1">maxiter=maxiter</span><span class="s2">,</span>
+            <span class="s1">full_output=full_output</span><span class="s2">,</span>
+            <span class="s1">disp=disp</span><span class="s2">,</span>
+            <span class="s1">skip_hessian=skip_hessian)</span>
+
+        <span class="s1">crslt = ConditionalResults(self</span><span class="s2">, </span><span class="s1">rslt.params</span><span class="s2">, </span><span class="s1">rslt.cov_params()</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">crslt.method = method</span>
+        <span class="s1">crslt.nobs = self.nobs</span>
+        <span class="s1">crslt.n_groups = self._n_groups</span>
+        <span class="s1">crslt._group_stats = [</span>
+            <span class="s3">&quot;%d&quot; </span><span class="s1">% min(self._groupsize)</span><span class="s2">,</span>
+            <span class="s3">&quot;%d&quot; </span><span class="s1">% max(self._groupsize)</span><span class="s2">,</span>
+            <span class="s3">&quot;%.1f&quot; </span><span class="s1">% np.mean(self._groupsize)</span>
+        <span class="s1">]</span>
+        <span class="s1">rslt = ConditionalResultsWrapper(crslt)</span>
+        <span class="s2">return </span><span class="s1">rslt</span>
+
+    <span class="s2">def </span><span class="s1">fit_regularized(self</span><span class="s2">,</span>
+                        <span class="s1">method=</span><span class="s3">&quot;elastic_net&quot;</span><span class="s2">,</span>
+                        <span class="s1">alpha=</span><span class="s4">0.</span><span class="s2">,</span>
+                        <span class="s1">start_params=</span><span class="s2">None,</span>
+                        <span class="s1">refit=</span><span class="s2">False,</span>
+                        <span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a regularized fit to a linear regression model. 
+ 
+        Parameters 
+        ---------- 
+        method : {'elastic_net'} 
+            Only the `elastic_net` approach is currently implemented. 
+        alpha : scalar or array_like 
+            The penalty weight.  If a scalar, the same penalty weight 
+            applies to all variables in the model.  If a vector, it 
+            must have the same length as `params`, and contains a 
+            penalty weight for each coefficient. 
+        start_params : array_like 
+            Starting values for `params`. 
+        refit : bool 
+            If True, the model is refit using only the variables that 
+            have non-zero coefficients in the regularized fit.  The 
+            refitted model is not regularized. 
+        **kwargs 
+            Additional keyword argument that are used when fitting the model. 
+ 
+        Returns 
+        ------- 
+        Results 
+            A results instance. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s2">from </span><span class="s1">statsmodels.base.elastic_net </span><span class="s2">import </span><span class="s1">fit_elasticnet</span>
+
+        <span class="s2">if </span><span class="s1">method != </span><span class="s3">&quot;elastic_net&quot;</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;method for fit_regularized must be elastic_net&quot;</span><span class="s1">)</span>
+
+        <span class="s1">defaults = {</span><span class="s3">&quot;maxiter&quot;</span><span class="s1">: </span><span class="s4">50</span><span class="s2">, </span><span class="s3">&quot;L1_wt&quot;</span><span class="s1">: </span><span class="s4">1</span><span class="s2">, </span><span class="s3">&quot;cnvrg_tol&quot;</span><span class="s1">: </span><span class="s4">1e-10</span><span class="s2">,</span>
+                    <span class="s3">&quot;zero_tol&quot;</span><span class="s1">: </span><span class="s4">1e-10</span><span class="s1">}</span>
+        <span class="s1">defaults.update(kwargs)</span>
+
+        <span class="s2">return </span><span class="s1">fit_elasticnet(self</span><span class="s2">, </span><span class="s1">method=method</span><span class="s2">,</span>
+                              <span class="s1">alpha=alpha</span><span class="s2">,</span>
+                              <span class="s1">start_params=start_params</span><span class="s2">,</span>
+                              <span class="s1">refit=refit</span><span class="s2">,</span>
+                              <span class="s1">**defaults)</span>
+
+    <span class="s5"># Override to allow groups to be passed as a variable name.</span>
+    <span class="s1">@classmethod</span>
+    <span class="s2">def </span><span class="s1">from_formula(cls</span><span class="s2">,</span>
+                     <span class="s1">formula</span><span class="s2">,</span>
+                     <span class="s1">data</span><span class="s2">,</span>
+                     <span class="s1">subset=</span><span class="s2">None,</span>
+                     <span class="s1">drop_cols=</span><span class="s2">None,</span>
+                     <span class="s1">*args</span><span class="s2">,</span>
+                     <span class="s1">**kwargs):</span>
+
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">groups = kwargs[</span><span class="s3">&quot;groups&quot;</span><span class="s1">]</span>
+            <span class="s2">del </span><span class="s1">kwargs[</span><span class="s3">&quot;groups&quot;</span><span class="s1">]</span>
+        <span class="s2">except </span><span class="s1">KeyError:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;'groups' is a required argument&quot;</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(groups</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s1">groups = data[groups]</span>
+
+        <span class="s2">if </span><span class="s3">&quot;0+&quot; </span><span class="s2">not in </span><span class="s1">formula.replace(</span><span class="s3">&quot; &quot;</span><span class="s2">, </span><span class="s3">&quot;&quot;</span><span class="s1">):</span>
+            <span class="s1">warnings.warn(</span><span class="s3">&quot;Conditional models should not include an intercept&quot;</span><span class="s1">)</span>
+
+        <span class="s1">model = super(_ConditionalModel</span><span class="s2">, </span><span class="s1">cls).from_formula(</span>
+            <span class="s1">formula</span><span class="s2">, </span><span class="s1">data=data</span><span class="s2">, </span><span class="s1">groups=groups</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s2">return </span><span class="s1">model</span>
+
+
+<span class="s2">class </span><span class="s1">ConditionalLogit(_ConditionalModel):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Fit a conditional logistic regression model to grouped data. 
+ 
+    Every group is implicitly given an intercept, but the model is fit using 
+    a conditional likelihood in which the intercepts are not present.  Thus, 
+    intercept estimates are not given, but the other parameter estimates can 
+    be interpreted as being adjusted for any group-level confounders. 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        The response variable, must contain only 0 and 1. 
+    exog : array_like 
+        The array of covariates.  Do not include an intercept 
+        in this array. 
+    groups : array_like 
+        Codes defining the groups. This is a required keyword parameter. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">missing=</span><span class="s3">'none'</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+
+        <span class="s1">super(ConditionalLogit</span><span class="s2">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">missing=missing</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s2">if </span><span class="s1">np.any(np.unique(self.endog) != np.r_[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">1</span><span class="s1">]):</span>
+            <span class="s1">msg = </span><span class="s3">&quot;endog must be coded as 0, 1&quot;</span>
+            <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+
+        <span class="s1">self.K = self.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s5"># i.e. self.k_params, for compatibility with MNLogit</span>
+
+    <span class="s2">def </span><span class="s1">loglike(self</span><span class="s2">, </span><span class="s1">params):</span>
+
+        <span class="s1">ll = </span><span class="s4">0</span>
+        <span class="s2">for </span><span class="s1">g </span><span class="s2">in </span><span class="s1">range(len(self._endog_grp)):</span>
+            <span class="s1">ll += self.loglike_grp(g</span><span class="s2">, </span><span class="s1">params)</span>
+
+        <span class="s2">return </span><span class="s1">ll</span>
+
+    <span class="s2">def </span><span class="s1">score(self</span><span class="s2">, </span><span class="s1">params):</span>
+
+        <span class="s1">score = </span><span class="s4">0</span>
+        <span class="s2">for </span><span class="s1">g </span><span class="s2">in </span><span class="s1">range(self._n_groups):</span>
+            <span class="s1">score += self.score_grp(g</span><span class="s2">, </span><span class="s1">params)</span>
+
+        <span class="s2">return </span><span class="s1">score</span>
+
+    <span class="s2">def </span><span class="s1">_denom(self</span><span class="s2">, </span><span class="s1">grp</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">ofs=</span><span class="s2">None</span><span class="s1">):</span>
+
+        <span class="s2">if </span><span class="s1">ofs </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">ofs = </span><span class="s4">0</span>
+
+        <span class="s1">exb = np.exp(np.dot(self._exog_grp[grp]</span><span class="s2">, </span><span class="s1">params) + ofs)</span>
+
+        <span class="s5"># In the recursions, f may be called multiple times with the</span>
+        <span class="s5"># same arguments, so we memoize the results.</span>
+        <span class="s1">memo = {}</span>
+
+        <span class="s2">def </span><span class="s1">f(t</span><span class="s2">, </span><span class="s1">k):</span>
+            <span class="s2">if </span><span class="s1">t &lt; k:</span>
+                <span class="s2">return </span><span class="s4">0</span>
+            <span class="s2">if </span><span class="s1">k == </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s4">1</span>
+
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">memo[(t</span><span class="s2">, </span><span class="s1">k)]</span>
+            <span class="s2">except </span><span class="s1">KeyError:</span>
+                <span class="s2">pass</span>
+
+            <span class="s1">v = f(t - </span><span class="s4">1</span><span class="s2">, </span><span class="s1">k) + f(t - </span><span class="s4">1</span><span class="s2">, </span><span class="s1">k - </span><span class="s4">1</span><span class="s1">) * exb[t - </span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">memo[(t</span><span class="s2">, </span><span class="s1">k)] = v</span>
+
+            <span class="s2">return </span><span class="s1">v</span>
+
+        <span class="s2">return </span><span class="s1">f(self._groupsize[grp]</span><span class="s2">, </span><span class="s1">self._n1[grp])</span>
+
+    <span class="s2">def </span><span class="s1">_denom_grad(self</span><span class="s2">, </span><span class="s1">grp</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">ofs=</span><span class="s2">None</span><span class="s1">):</span>
+
+        <span class="s2">if </span><span class="s1">ofs </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">ofs = </span><span class="s4">0</span>
+
+        <span class="s1">ex = self._exog_grp[grp]</span>
+        <span class="s1">exb = np.exp(np.dot(ex</span><span class="s2">, </span><span class="s1">params) + ofs)</span>
+
+        <span class="s5"># s may be called multiple times in the recursions with the</span>
+        <span class="s5"># same arguments, so memoize the results.</span>
+        <span class="s1">memo = {}</span>
+
+        <span class="s2">def </span><span class="s1">s(t</span><span class="s2">, </span><span class="s1">k):</span>
+
+            <span class="s2">if </span><span class="s1">t &lt; k:</span>
+                <span class="s2">return </span><span class="s4">0</span><span class="s2">, </span><span class="s1">np.zeros(self.k_params)</span>
+            <span class="s2">if </span><span class="s1">k == </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span>
+
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s2">return </span><span class="s1">memo[(t</span><span class="s2">, </span><span class="s1">k)]</span>
+            <span class="s2">except </span><span class="s1">KeyError:</span>
+                <span class="s2">pass</span>
+
+            <span class="s1">h = exb[t - </span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">a</span><span class="s2">, </span><span class="s1">b = s(t - </span><span class="s4">1</span><span class="s2">, </span><span class="s1">k)</span>
+            <span class="s1">c</span><span class="s2">, </span><span class="s1">e = s(t - </span><span class="s4">1</span><span class="s2">, </span><span class="s1">k - </span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s1">d = c * h * ex[t - </span><span class="s4">1</span><span class="s2">, </span><span class="s1">:]</span>
+
+            <span class="s1">u</span><span class="s2">, </span><span class="s1">v = a + c * h</span><span class="s2">, </span><span class="s1">b + d + e * h</span>
+            <span class="s1">memo[(t</span><span class="s2">, </span><span class="s1">k)] = (u</span><span class="s2">, </span><span class="s1">v)</span>
+
+            <span class="s2">return </span><span class="s1">u</span><span class="s2">, </span><span class="s1">v</span>
+
+        <span class="s2">return </span><span class="s1">s(self._groupsize[grp]</span><span class="s2">, </span><span class="s1">self._n1[grp])</span>
+
+    <span class="s2">def </span><span class="s1">loglike_grp(self</span><span class="s2">, </span><span class="s1">grp</span><span class="s2">, </span><span class="s1">params):</span>
+
+        <span class="s1">ofs = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">'offset'</span><span class="s1">):</span>
+            <span class="s1">ofs = self._offset_grp[grp]</span>
+
+        <span class="s1">llg = np.dot(self._xy[grp]</span><span class="s2">, </span><span class="s1">params)</span>
+
+        <span class="s2">if </span><span class="s1">ofs </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">llg += self._endofs[grp]</span>
+
+        <span class="s1">llg -= np.log(self._denom(grp</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">ofs))</span>
+
+        <span class="s2">return </span><span class="s1">llg</span>
+
+    <span class="s2">def </span><span class="s1">score_grp(self</span><span class="s2">, </span><span class="s1">grp</span><span class="s2">, </span><span class="s1">params):</span>
+
+        <span class="s1">ofs = </span><span class="s4">0</span>
+        <span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">'offset'</span><span class="s1">):</span>
+            <span class="s1">ofs = self._offset_grp[grp]</span>
+
+        <span class="s1">d</span><span class="s2">, </span><span class="s1">h = self._denom_grad(grp</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">ofs)</span>
+        <span class="s2">return </span><span class="s1">self._xy[grp] - h / d</span>
+
+
+<span class="s2">class </span><span class="s1">ConditionalPoisson(_ConditionalModel):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Fit a conditional Poisson regression model to grouped data. 
+ 
+    Every group is implicitly given an intercept, but the model is fit using 
+    a conditional likelihood in which the intercepts are not present.  Thus, 
+    intercept estimates are not given, but the other parameter estimates can 
+    be interpreted as being adjusted for any group-level confounders. 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        The response variable 
+    exog : array_like 
+        The covariates 
+    groups : array_like 
+        Codes defining the groups. This is a required keyword parameter. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">loglike(self</span><span class="s2">, </span><span class="s1">params):</span>
+
+        <span class="s1">ofs = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">'offset'</span><span class="s1">):</span>
+            <span class="s1">ofs = self._offset_grp</span>
+
+        <span class="s1">ll = </span><span class="s4">0.0</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(self._endog_grp)):</span>
+
+            <span class="s1">xb = np.dot(self._exog_grp[i]</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">ofs </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">xb += ofs[i]</span>
+            <span class="s1">exb = np.exp(xb)</span>
+            <span class="s1">y = self._endog_grp[i]</span>
+            <span class="s1">ll += np.dot(y</span><span class="s2">, </span><span class="s1">xb)</span>
+            <span class="s1">s = exb.sum()</span>
+            <span class="s1">ll -= self._sumy[i] * np.log(s)</span>
+
+        <span class="s2">return </span><span class="s1">ll</span>
+
+    <span class="s2">def </span><span class="s1">score(self</span><span class="s2">, </span><span class="s1">params):</span>
+
+        <span class="s1">ofs = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s3">'offset'</span><span class="s1">):</span>
+            <span class="s1">ofs = self._offset_grp</span>
+
+        <span class="s1">score = </span><span class="s4">0.0</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(self._endog_grp)):</span>
+
+            <span class="s1">x = self._exog_grp[i]</span>
+            <span class="s1">xb = np.dot(x</span><span class="s2">, </span><span class="s1">params)</span>
+            <span class="s2">if </span><span class="s1">ofs </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">xb += ofs[i]</span>
+            <span class="s1">exb = np.exp(xb)</span>
+            <span class="s1">s = exb.sum()</span>
+            <span class="s1">y = self._endog_grp[i]</span>
+            <span class="s1">score += np.dot(y</span><span class="s2">, </span><span class="s1">x)</span>
+            <span class="s1">score -= self._sumy[i] * np.dot(exb</span><span class="s2">, </span><span class="s1">x) / s</span>
+
+        <span class="s2">return </span><span class="s1">score</span>
+
+
+<span class="s2">class </span><span class="s1">ConditionalResults(base.LikelihoodModelResults):</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">model</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">normalized_cov_params</span><span class="s2">, </span><span class="s1">scale):</span>
+
+        <span class="s1">super(ConditionalResults</span><span class="s2">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">model</span><span class="s2">,</span>
+            <span class="s1">params</span><span class="s2">,</span>
+            <span class="s1">normalized_cov_params=normalized_cov_params</span><span class="s2">,</span>
+            <span class="s1">scale=scale)</span>
+
+    <span class="s2">def </span><span class="s1">summary(self</span><span class="s2">, </span><span class="s1">yname=</span><span class="s2">None, </span><span class="s1">xname=</span><span class="s2">None, </span><span class="s1">title=</span><span class="s2">None, </span><span class="s1">alpha=</span><span class="s4">.05</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Summarize the fitted model. 
+ 
+        Parameters 
+        ---------- 
+        yname : str, optional 
+            Default is `y` 
+        xname : list[str], optional 
+            Names for the exogenous variables, default is &quot;var_xx&quot;. 
+            Must match the number of parameters in the model 
+        title : str, optional 
+            Title for the top table. If not None, then this replaces the 
+            default title 
+        alpha : float 
+            Significance level for the confidence intervals 
+ 
+        Returns 
+        ------- 
+        smry : Summary instance 
+            This holds the summary tables and text, which can be printed or 
+            converted to various output formats. 
+ 
+        See Also 
+        -------- 
+        statsmodels.iolib.summary.Summary : class to hold summary 
+            results 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">top_left = [</span>
+            <span class="s1">(</span><span class="s3">'Dep. Variable:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s3">'Model:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s3">'Log-Likelihood:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s3">'Method:'</span><span class="s2">, </span><span class="s1">[self.method])</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s3">'Date:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s3">'Time:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+        <span class="s1">]</span>
+
+        <span class="s1">top_right = [</span>
+            <span class="s1">(</span><span class="s3">'No. Observations:'</span><span class="s2">, None</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s3">'No. groups:'</span><span class="s2">, </span><span class="s1">[self.n_groups])</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s3">'Min group size:'</span><span class="s2">, </span><span class="s1">[self._group_stats[</span><span class="s4">0</span><span class="s1">]])</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s3">'Max group size:'</span><span class="s2">, </span><span class="s1">[self._group_stats[</span><span class="s4">1</span><span class="s1">]])</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s3">'Mean group size:'</span><span class="s2">, </span><span class="s1">[self._group_stats[</span><span class="s4">2</span><span class="s1">]])</span><span class="s2">,</span>
+        <span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">title </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">title = </span><span class="s3">&quot;Conditional Logit Model Regression Results&quot;</span>
+
+        <span class="s5"># create summary tables</span>
+        <span class="s2">from </span><span class="s1">statsmodels.iolib.summary </span><span class="s2">import </span><span class="s1">Summary</span>
+        <span class="s1">smry = Summary()</span>
+        <span class="s1">smry.add_table_2cols(</span>
+            <span class="s1">self</span><span class="s2">,</span>
+            <span class="s1">gleft=top_left</span><span class="s2">,</span>
+            <span class="s1">gright=top_right</span><span class="s2">,  </span><span class="s5"># [],</span>
+            <span class="s1">yname=yname</span><span class="s2">,</span>
+            <span class="s1">xname=xname</span><span class="s2">,</span>
+            <span class="s1">title=title)</span>
+        <span class="s1">smry.add_table_params(</span>
+            <span class="s1">self</span><span class="s2">, </span><span class="s1">yname=yname</span><span class="s2">, </span><span class="s1">xname=xname</span><span class="s2">, </span><span class="s1">alpha=alpha</span><span class="s2">, </span><span class="s1">use_t=self.use_t)</span>
+
+        <span class="s2">return </span><span class="s1">smry</span>
+
+<span class="s2">class </span><span class="s1">ConditionalMNLogit(_ConditionalModel):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Fit a conditional multinomial logit model to grouped data. 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        The dependent variable, must be integer-valued, coded 
+        0, 1, ..., c-1, where c is the number of response 
+        categories. 
+    exog : array_like 
+        The independent variables. 
+    groups : array_like 
+        Codes defining the groups. This is a required keyword parameter. 
+ 
+    Notes 
+    ----- 
+    Equivalent to femlogit in Stata. 
+ 
+    References 
+    ---------- 
+    Gary Chamberlain (1980).  Analysis of covariance with qualitative 
+    data. The Review of Economic Studies.  Vol. 47, No. 1, pp. 225-238. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">missing=</span><span class="s3">'none'</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+
+        <span class="s1">super(ConditionalMNLogit</span><span class="s2">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">missing=missing</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s5"># endog must be integers</span>
+        <span class="s1">self.endog = self.endog.astype(int)</span>
+
+        <span class="s1">self.k_cat = self.endog.max() + </span><span class="s4">1</span>
+        <span class="s1">self.df_model = (self.k_cat - </span><span class="s4">1</span><span class="s1">) * self.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">self.df_resid = self.nobs - self.df_model</span>
+        <span class="s1">self._ynames_map = {j: str(j) </span><span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range(self.k_cat)}</span>
+        <span class="s1">self.J = self.k_cat  </span><span class="s5"># Unfortunate name, needed for results</span>
+        <span class="s1">self.K = self.exog.shape[</span><span class="s4">1</span><span class="s1">]  </span><span class="s5"># for compatibility with MNLogit</span>
+
+        <span class="s2">if </span><span class="s1">self.endog.min() &lt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">msg = </span><span class="s3">&quot;endog may not contain negative values&quot;</span>
+            <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+
+        <span class="s1">grx = collections.defaultdict(list)</span>
+        <span class="s2">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">enumerate(self.groups):</span>
+            <span class="s1">grx[v].append(k)</span>
+        <span class="s1">self._group_labels = list(grx.keys())</span>
+        <span class="s1">self._group_labels.sort()</span>
+        <span class="s1">self._grp_ix = [grx[k] </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">self._group_labels]</span>
+
+    <span class="s2">def </span><span class="s1">fit(self</span><span class="s2">,</span>
+            <span class="s1">start_params=</span><span class="s2">None,</span>
+            <span class="s1">method=</span><span class="s3">'BFGS'</span><span class="s2">,</span>
+            <span class="s1">maxiter=</span><span class="s4">100</span><span class="s2">,</span>
+            <span class="s1">full_output=</span><span class="s2">True,</span>
+            <span class="s1">disp=</span><span class="s2">False,</span>
+            <span class="s1">fargs=()</span><span class="s2">,</span>
+            <span class="s1">callback=</span><span class="s2">None,</span>
+            <span class="s1">retall=</span><span class="s2">False,</span>
+            <span class="s1">skip_hessian=</span><span class="s2">False,</span>
+            <span class="s1">**kwargs):</span>
+
+        <span class="s2">if </span><span class="s1">start_params </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">q = self.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">c = self.k_cat - </span><span class="s4">1</span>
+            <span class="s1">start_params = np.random.normal(size=q * c)</span>
+
+        <span class="s5"># Do not call super(...).fit because it cannot handle the 2d-params.</span>
+        <span class="s1">rslt = base.LikelihoodModel.fit(</span>
+            <span class="s1">self</span><span class="s2">,</span>
+            <span class="s1">start_params=start_params</span><span class="s2">,</span>
+            <span class="s1">method=method</span><span class="s2">,</span>
+            <span class="s1">maxiter=maxiter</span><span class="s2">,</span>
+            <span class="s1">full_output=full_output</span><span class="s2">,</span>
+            <span class="s1">disp=disp</span><span class="s2">,</span>
+            <span class="s1">skip_hessian=skip_hessian)</span>
+
+        <span class="s1">rslt.params = rslt.params.reshape((self.exog.shape[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">))</span>
+        <span class="s1">rslt = MultinomialResults(self</span><span class="s2">, </span><span class="s1">rslt)</span>
+
+        <span class="s5"># Not clear what the null likelihood should be, there is no intercept</span>
+        <span class="s5"># so the null model is not clearly defined.  This is needed for summary</span>
+        <span class="s5"># to work.</span>
+        <span class="s1">rslt.set_null_options(llnull=np.nan)</span>
+
+        <span class="s2">return </span><span class="s1">MultinomialResultsWrapper(rslt)</span>
+
+    <span class="s2">def </span><span class="s1">loglike(self</span><span class="s2">, </span><span class="s1">params):</span>
+
+        <span class="s1">q = self.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">c = self.k_cat - </span><span class="s4">1</span>
+
+        <span class="s1">pmat = params.reshape((q</span><span class="s2">, </span><span class="s1">c))</span>
+        <span class="s1">pmat = np.concatenate((np.zeros((q</span><span class="s2">, </span><span class="s4">1</span><span class="s1">))</span><span class="s2">, </span><span class="s1">pmat)</span><span class="s2">, </span><span class="s1">axis=</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">lpr = np.dot(self.exog</span><span class="s2">, </span><span class="s1">pmat)</span>
+
+        <span class="s1">ll = </span><span class="s4">0.0</span>
+        <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">self._grp_ix:</span>
+            <span class="s1">x = lpr[ii</span><span class="s2">, </span><span class="s1">:]</span>
+            <span class="s1">jj = np.arange(x.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=int)</span>
+            <span class="s1">y = self.endog[ii]</span>
+            <span class="s1">denom = </span><span class="s4">0.0</span>
+            <span class="s2">for </span><span class="s1">p </span><span class="s2">in </span><span class="s1">itertools.permutations(y):</span>
+                <span class="s1">denom += np.exp(x[(jj</span><span class="s2">, </span><span class="s1">p)].sum())</span>
+            <span class="s1">ll += x[(jj</span><span class="s2">, </span><span class="s1">y)].sum() - np.log(denom)</span>
+
+        <span class="s2">return </span><span class="s1">ll</span>
+
+
+    <span class="s2">def </span><span class="s1">score(self</span><span class="s2">, </span><span class="s1">params):</span>
+
+        <span class="s1">q = self.exog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">c = self.k_cat - </span><span class="s4">1</span>
+
+        <span class="s1">pmat = params.reshape((q</span><span class="s2">, </span><span class="s1">c))</span>
+        <span class="s1">pmat = np.concatenate((np.zeros((q</span><span class="s2">, </span><span class="s4">1</span><span class="s1">))</span><span class="s2">, </span><span class="s1">pmat)</span><span class="s2">, </span><span class="s1">axis=</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">lpr = np.dot(self.exog</span><span class="s2">, </span><span class="s1">pmat)</span>
+
+        <span class="s1">grad = np.zeros((q</span><span class="s2">, </span><span class="s1">c))</span>
+        <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">self._grp_ix:</span>
+            <span class="s1">x = lpr[ii</span><span class="s2">, </span><span class="s1">:]</span>
+            <span class="s1">jj = np.arange(x.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">dtype=int)</span>
+            <span class="s1">y = self.endog[ii]</span>
+            <span class="s1">denom = </span><span class="s4">0.0</span>
+            <span class="s1">denomg = np.zeros((q</span><span class="s2">, </span><span class="s1">c))</span>
+            <span class="s2">for </span><span class="s1">p </span><span class="s2">in </span><span class="s1">itertools.permutations(y):</span>
+                <span class="s1">v = np.exp(x[(jj</span><span class="s2">, </span><span class="s1">p)].sum())</span>
+                <span class="s1">denom += v</span>
+                <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">r </span><span class="s2">in </span><span class="s1">enumerate(p):</span>
+                    <span class="s2">if </span><span class="s1">r != </span><span class="s4">0</span><span class="s1">:</span>
+                        <span class="s1">denomg[:</span><span class="s2">, </span><span class="s1">r - </span><span class="s4">1</span><span class="s1">] += v * self.exog[ii[i]</span><span class="s2">, </span><span class="s1">:]</span>
+
+            <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">r </span><span class="s2">in </span><span class="s1">enumerate(y):</span>
+                <span class="s2">if </span><span class="s1">r != </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">grad[:</span><span class="s2">, </span><span class="s1">r - </span><span class="s4">1</span><span class="s1">] += self.exog[ii[i]</span><span class="s2">, </span><span class="s1">:]</span>
+
+            <span class="s1">grad -= denomg / denom</span>
+
+        <span class="s2">return </span><span class="s1">grad.flatten()</span>
+
+
+
+<span class="s2">class </span><span class="s1">ConditionalResultsWrapper(lm.RegressionResultsWrapper):</span>
+    <span class="s2">pass</span>
+
+
+<span class="s1">wrap.populate_wrapper(ConditionalResultsWrapper</span><span class="s2">, </span><span class="s1">ConditionalResults)</span>
+</pre>
+</body>
+</html>

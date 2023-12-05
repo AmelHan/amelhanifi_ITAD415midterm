@@ -1,0 +1,1260 @@
+<html>
+<head>
+<title>varmax.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+varmax.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+<span class="s2">&quot;&quot;&quot; 
+Vector Autoregressive Moving Average with eXogenous regressors model 
+ 
+Author: Chad Fulton 
+License: Simplified-BSD 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">contextlib</span>
+<span class="s3">from </span><span class="s1">warnings </span><span class="s3">import </span><span class="s1">warn</span>
+
+<span class="s3">import </span><span class="s1">pandas </span><span class="s3">as </span><span class="s1">pd</span>
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+
+<span class="s3">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s3">import </span><span class="s1">Appender</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.tools </span><span class="s3">import </span><span class="s1">Bunch</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.data </span><span class="s3">import </span><span class="s1">_is_using_pandas</span>
+<span class="s3">from </span><span class="s1">statsmodels.tsa.vector_ar </span><span class="s3">import </span><span class="s1">var_model</span>
+<span class="s3">import </span><span class="s1">statsmodels.base.wrapper </span><span class="s3">as </span><span class="s1">wrap</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.sm_exceptions </span><span class="s3">import </span><span class="s1">EstimationWarning</span>
+
+<span class="s3">from </span><span class="s1">.kalman_filter </span><span class="s3">import </span><span class="s1">INVERT_UNIVARIATE</span><span class="s3">, </span><span class="s1">SOLVE_LU</span>
+<span class="s3">from </span><span class="s1">.mlemodel </span><span class="s3">import </span><span class="s1">MLEModel</span><span class="s3">, </span><span class="s1">MLEResults</span><span class="s3">, </span><span class="s1">MLEResultsWrapper</span>
+<span class="s3">from </span><span class="s1">.initialization </span><span class="s3">import </span><span class="s1">Initialization</span>
+<span class="s3">from </span><span class="s1">.tools </span><span class="s3">import </span><span class="s1">(</span>
+    <span class="s1">is_invertible</span><span class="s3">, </span><span class="s1">concat</span><span class="s3">, </span><span class="s1">prepare_exog</span><span class="s3">,</span>
+    <span class="s1">constrain_stationary_multivariate</span><span class="s3">, </span><span class="s1">unconstrain_stationary_multivariate</span><span class="s3">,</span>
+    <span class="s1">prepare_trend_spec</span><span class="s3">, </span><span class="s1">prepare_trend_data</span>
+<span class="s1">)</span>
+
+
+<span class="s3">class </span><span class="s1">VARMAX(MLEModel):</span>
+    <span class="s2">r&quot;&quot;&quot; 
+    Vector Autoregressive Moving Average with eXogenous regressors model 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like 
+        The observed time-series process :math:`y`, , shaped nobs x k_endog. 
+    exog : array_like, optional 
+        Array of exogenous regressors, shaped nobs x k. 
+    order : iterable 
+        The (p,q) order of the model for the number of AR and MA parameters to 
+        use. 
+    trend : str{'n','c','t','ct'} or iterable, optional 
+        Parameter controlling the deterministic trend polynomial :math:`A(t)`. 
+        Can be specified as a string where 'c' indicates a constant (i.e. a 
+        degree zero component of the trend polynomial), 't' indicates a 
+        linear trend with time, and 'ct' is both. Can also be specified as an 
+        iterable defining the non-zero polynomial exponents to include, in 
+        increasing order. For example, `[1,1,0,1]` denotes 
+        :math:`a + bt + ct^3`. Default is a constant trend component. 
+    error_cov_type : {'diagonal', 'unstructured'}, optional 
+        The structure of the covariance matrix of the error term, where 
+        &quot;unstructured&quot; puts no restrictions on the matrix and &quot;diagonal&quot; 
+        requires it to be a diagonal matrix (uncorrelated errors). Default is 
+        &quot;unstructured&quot;. 
+    measurement_error : bool, optional 
+        Whether or not to assume the endogenous observations `endog` were 
+        measured with error. Default is False. 
+    enforce_stationarity : bool, optional 
+        Whether or not to transform the AR parameters to enforce stationarity 
+        in the autoregressive component of the model. Default is True. 
+    enforce_invertibility : bool, optional 
+        Whether or not to transform the MA parameters to enforce invertibility 
+        in the moving average component of the model. Default is True. 
+    trend_offset : int, optional 
+        The offset at which to start time trend values. Default is 1, so that 
+        if `trend='t'` the trend is equal to 1, 2, ..., nobs. Typically is only 
+        set when the model created by extending a previous dataset. 
+    **kwargs 
+        Keyword arguments may be used to provide default values for state space 
+        matrices or for Kalman filtering options. See `Representation`, and 
+        `KalmanFilter` for more details. 
+ 
+    Attributes 
+    ---------- 
+    order : iterable 
+        The (p,q) order of the model for the number of AR and MA parameters to 
+        use. 
+    trend : str{'n','c','t','ct'} or iterable 
+        Parameter controlling the deterministic trend polynomial :math:`A(t)`. 
+        Can be specified as a string where 'c' indicates a constant (i.e. a 
+        degree zero component of the trend polynomial), 't' indicates a 
+        linear trend with time, and 'ct' is both. Can also be specified as an 
+        iterable defining the non-zero polynomial exponents to include, in 
+        increasing order. For example, `[1,1,0,1]` denotes 
+        :math:`a + bt + ct^3`. 
+    error_cov_type : {'diagonal', 'unstructured'}, optional 
+        The structure of the covariance matrix of the error term, where 
+        &quot;unstructured&quot; puts no restrictions on the matrix and &quot;diagonal&quot; 
+        requires it to be a diagonal matrix (uncorrelated errors). Default is 
+        &quot;unstructured&quot;. 
+    measurement_error : bool, optional 
+        Whether or not to assume the endogenous observations `endog` were 
+        measured with error. Default is False. 
+    enforce_stationarity : bool, optional 
+        Whether or not to transform the AR parameters to enforce stationarity 
+        in the autoregressive component of the model. Default is True. 
+    enforce_invertibility : bool, optional 
+        Whether or not to transform the MA parameters to enforce invertibility 
+        in the moving average component of the model. Default is True. 
+ 
+    Notes 
+    ----- 
+    Generically, the VARMAX model is specified (see for example chapter 18 of 
+    [1]_): 
+ 
+    .. math:: 
+ 
+        y_t = A(t) + A_1 y_{t-1} + \dots + A_p y_{t-p} + B x_t + \epsilon_t + 
+        M_1 \epsilon_{t-1} + \dots M_q \epsilon_{t-q} 
+ 
+    where :math:`\epsilon_t \sim N(0, \Omega)`, and where :math:`y_t` is a 
+    `k_endog x 1` vector. Additionally, this model allows considering the case 
+    where the variables are measured with error. 
+ 
+    Note that in the full VARMA(p,q) case there is a fundamental identification 
+    problem in that the coefficient matrices :math:`\{A_i, M_j\}` are not 
+    generally unique, meaning that for a given time series process there may 
+    be multiple sets of matrices that equivalently represent it. See Chapter 12 
+    of [1]_ for more information. Although this class can be used to estimate 
+    VARMA(p,q) models, a warning is issued to remind users that no steps have 
+    been taken to ensure identification in this case. 
+ 
+    References 
+    ---------- 
+    .. [1] Lütkepohl, Helmut. 2007. 
+       New Introduction to Multiple Time Series Analysis. 
+       Berlin: Springer. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">order=(</span><span class="s4">1</span><span class="s3">, </span><span class="s4">0</span><span class="s1">)</span><span class="s3">, </span><span class="s1">trend=</span><span class="s5">'c'</span><span class="s3">,</span>
+                 <span class="s1">error_cov_type=</span><span class="s5">'unstructured'</span><span class="s3">, </span><span class="s1">measurement_error=</span><span class="s3">False,</span>
+                 <span class="s1">enforce_stationarity=</span><span class="s3">True, </span><span class="s1">enforce_invertibility=</span><span class="s3">True,</span>
+                 <span class="s1">trend_offset=</span><span class="s4">1</span><span class="s3">, </span><span class="s1">**kwargs):</span>
+
+        <span class="s0"># Model parameters</span>
+        <span class="s1">self.error_cov_type = error_cov_type</span>
+        <span class="s1">self.measurement_error = measurement_error</span>
+        <span class="s1">self.enforce_stationarity = enforce_stationarity</span>
+        <span class="s1">self.enforce_invertibility = enforce_invertibility</span>
+
+        <span class="s0"># Save the given orders</span>
+        <span class="s1">self.order = order</span>
+
+        <span class="s0"># Model orders</span>
+        <span class="s1">self.k_ar = int(order[</span><span class="s4">0</span><span class="s1">])</span>
+        <span class="s1">self.k_ma = int(order[</span><span class="s4">1</span><span class="s1">])</span>
+
+        <span class="s0"># Check for valid model</span>
+        <span class="s3">if </span><span class="s1">error_cov_type </span><span class="s3">not in </span><span class="s1">[</span><span class="s5">'diagonal'</span><span class="s3">, </span><span class="s5">'unstructured'</span><span class="s1">]:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">'Invalid error covariance matrix type'</span>
+                             <span class="s5">' specification.'</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">self.k_ar == </span><span class="s4">0 </span><span class="s3">and </span><span class="s1">self.k_ma == </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">'Invalid VARMAX(p,q) specification; at least one'</span>
+                             <span class="s5">' p,q must be greater than zero.'</span><span class="s1">)</span>
+
+        <span class="s0"># Warn for VARMA model</span>
+        <span class="s3">if </span><span class="s1">self.k_ar &gt; </span><span class="s4">0 </span><span class="s3">and </span><span class="s1">self.k_ma &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">warn(</span><span class="s5">'Estimation of VARMA(p,q) models is not generically robust,'</span>
+                 <span class="s5">' due especially to identification issues.'</span><span class="s3">,</span>
+                 <span class="s1">EstimationWarning)</span>
+
+        <span class="s0"># Trend</span>
+        <span class="s1">self.trend = trend</span>
+        <span class="s1">self.trend_offset = trend_offset</span>
+        <span class="s1">self.polynomial_trend</span><span class="s3">, </span><span class="s1">self.k_trend = prepare_trend_spec(self.trend)</span>
+        <span class="s1">self._trend_is_const = (self.polynomial_trend.size == </span><span class="s4">1 </span><span class="s3">and</span>
+                                <span class="s1">self.polynomial_trend[</span><span class="s4">0</span><span class="s1">] == </span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s0"># Exogenous data</span>
+        <span class="s1">(self.k_exog</span><span class="s3">, </span><span class="s1">exog) = prepare_exog(exog)</span>
+
+        <span class="s0"># Note: at some point in the future might add state regression, as in</span>
+        <span class="s0"># SARIMAX.</span>
+        <span class="s1">self.mle_regression = self.k_exog &gt; </span><span class="s4">0</span>
+
+        <span class="s0"># We need to have an array or pandas at this point</span>
+        <span class="s3">if not </span><span class="s1">_is_using_pandas(endog</span><span class="s3">, None</span><span class="s1">):</span>
+            <span class="s1">endog = np.asanyarray(endog)</span>
+
+        <span class="s0"># Model order</span>
+        <span class="s0"># Used internally in various places</span>
+        <span class="s1">_min_k_ar = max(self.k_ar</span><span class="s3">, </span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">self._k_order = _min_k_ar + self.k_ma</span>
+
+        <span class="s0"># Number of states</span>
+        <span class="s1">k_endog = endog.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">k_posdef = k_endog</span>
+        <span class="s1">k_states = k_endog * self._k_order</span>
+
+        <span class="s0"># By default, initialize as stationary</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'initialization'</span><span class="s3">, </span><span class="s5">'stationary'</span><span class="s1">)</span>
+
+        <span class="s0"># By default, use LU decomposition</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'inversion_method'</span><span class="s3">, </span><span class="s1">INVERT_UNIVARIATE | SOLVE_LU)</span>
+
+        <span class="s0"># Initialize the state space model</span>
+        <span class="s1">super(VARMAX</span><span class="s3">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">endog</span><span class="s3">, </span><span class="s1">exog=exog</span><span class="s3">, </span><span class="s1">k_states=k_states</span><span class="s3">, </span><span class="s1">k_posdef=k_posdef</span><span class="s3">, </span><span class="s1">**kwargs</span>
+        <span class="s1">)</span>
+
+        <span class="s0"># Set as time-varying model if we have time-trend or exog</span>
+        <span class="s3">if </span><span class="s1">self.k_exog &gt; </span><span class="s4">0 </span><span class="s3">or </span><span class="s1">(self.k_trend &gt; </span><span class="s4">0 </span><span class="s3">and not </span><span class="s1">self._trend_is_const):</span>
+            <span class="s1">self.ssm._time_invariant = </span><span class="s3">False</span>
+
+        <span class="s0"># Initialize the parameters</span>
+        <span class="s1">self.parameters = {}</span>
+        <span class="s1">self.parameters[</span><span class="s5">'trend'</span><span class="s1">] = self.k_endog * self.k_trend</span>
+        <span class="s1">self.parameters[</span><span class="s5">'ar'</span><span class="s1">] = self.k_endog**</span><span class="s4">2 </span><span class="s1">* self.k_ar</span>
+        <span class="s1">self.parameters[</span><span class="s5">'ma'</span><span class="s1">] = self.k_endog**</span><span class="s4">2 </span><span class="s1">* self.k_ma</span>
+        <span class="s1">self.parameters[</span><span class="s5">'regression'</span><span class="s1">] = self.k_endog * self.k_exog</span>
+        <span class="s3">if </span><span class="s1">self.error_cov_type == </span><span class="s5">'diagonal'</span><span class="s1">:</span>
+            <span class="s1">self.parameters[</span><span class="s5">'state_cov'</span><span class="s1">] = self.k_endog</span>
+        <span class="s0"># These parameters fill in a lower-triangular matrix which is then</span>
+        <span class="s0"># dotted with itself to get a positive definite matrix.</span>
+        <span class="s3">elif </span><span class="s1">self.error_cov_type == </span><span class="s5">'unstructured'</span><span class="s1">:</span>
+            <span class="s1">self.parameters[</span><span class="s5">'state_cov'</span><span class="s1">] = (</span>
+                <span class="s1">int(self.k_endog * (self.k_endog + </span><span class="s4">1</span><span class="s1">) / </span><span class="s4">2</span><span class="s1">)</span>
+            <span class="s1">)</span>
+        <span class="s1">self.parameters[</span><span class="s5">'obs_cov'</span><span class="s1">] = self.k_endog * self.measurement_error</span>
+        <span class="s1">self.k_params = sum(self.parameters.values())</span>
+
+        <span class="s0"># Initialize trend data: we create trend data with one more observation</span>
+        <span class="s0"># than we actually have, to make it easier to insert the appropriate</span>
+        <span class="s0"># trend component into the final state intercept.</span>
+        <span class="s1">trend_data = prepare_trend_data(</span>
+            <span class="s1">self.polynomial_trend</span><span class="s3">, </span><span class="s1">self.k_trend</span><span class="s3">, </span><span class="s1">self.nobs + </span><span class="s4">1</span><span class="s3">,</span>
+            <span class="s1">offset=self.trend_offset)</span>
+        <span class="s1">self._trend_data = trend_data[:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">self._final_trend = trend_data[-</span><span class="s4">1</span><span class="s1">:]</span>
+
+        <span class="s0"># Initialize known elements of the state space matrices</span>
+
+        <span class="s0"># If we have exog effects, then the state intercept needs to be</span>
+        <span class="s0"># time-varying</span>
+        <span class="s3">if </span><span class="s1">(self.k_trend &gt; </span><span class="s4">0 </span><span class="s3">and not </span><span class="s1">self._trend_is_const) </span><span class="s3">or </span><span class="s1">self.k_exog &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">self.ssm[</span><span class="s5">'state_intercept'</span><span class="s1">] = np.zeros((self.k_states</span><span class="s3">, </span><span class="s1">self.nobs))</span>
+            <span class="s0"># self.ssm['obs_intercept'] = np.zeros((self.k_endog, self.nobs))</span>
+
+        <span class="s0"># The design matrix is just an identity for the first k_endog states</span>
+        <span class="s1">idx = np.diag_indices(self.k_endog)</span>
+        <span class="s1">self.ssm[(</span><span class="s5">'design'</span><span class="s3">,</span><span class="s1">) + idx] = </span><span class="s4">1</span>
+
+        <span class="s0"># The transition matrix is described in four blocks, where the upper</span>
+        <span class="s0"># left block is in companion form with the autoregressive coefficient</span>
+        <span class="s0"># matrices (so it is shaped k_endog * k_ar x k_endog * k_ar) ...</span>
+        <span class="s3">if </span><span class="s1">self.k_ar &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">idx = np.diag_indices((self.k_ar - </span><span class="s4">1</span><span class="s1">) * self.k_endog)</span>
+            <span class="s1">idx = idx[</span><span class="s4">0</span><span class="s1">] + self.k_endog</span><span class="s3">, </span><span class="s1">idx[</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">self.ssm[(</span><span class="s5">'transition'</span><span class="s3">,</span><span class="s1">) + idx] = </span><span class="s4">1</span>
+        <span class="s0"># ... and the  lower right block is in companion form with zeros as the</span>
+        <span class="s0"># coefficient matrices (it is shaped k_endog * k_ma x k_endog * k_ma).</span>
+        <span class="s1">idx = np.diag_indices((self.k_ma - </span><span class="s4">1</span><span class="s1">) * self.k_endog)</span>
+        <span class="s1">idx = (idx[</span><span class="s4">0</span><span class="s1">] + (_min_k_ar + </span><span class="s4">1</span><span class="s1">) * self.k_endog</span><span class="s3">,</span>
+               <span class="s1">idx[</span><span class="s4">1</span><span class="s1">] + _min_k_ar * self.k_endog)</span>
+        <span class="s1">self.ssm[(</span><span class="s5">'transition'</span><span class="s3">,</span><span class="s1">) + idx] = </span><span class="s4">1</span>
+
+        <span class="s0"># The selection matrix is described in two blocks, where the upper</span>
+        <span class="s0"># block selects the all k_posdef errors in the first k_endog rows</span>
+        <span class="s0"># (the upper block is shaped k_endog * k_ar x k) and the lower block</span>
+        <span class="s0"># also selects all k_posdef errors in the first k_endog rows (the lower</span>
+        <span class="s0"># block is shaped k_endog * k_ma x k).</span>
+        <span class="s1">idx = np.diag_indices(self.k_endog)</span>
+        <span class="s1">self.ssm[(</span><span class="s5">'selection'</span><span class="s3">,</span><span class="s1">) + idx] = </span><span class="s4">1</span>
+        <span class="s1">idx = idx[</span><span class="s4">0</span><span class="s1">] + _min_k_ar * self.k_endog</span><span class="s3">, </span><span class="s1">idx[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s3">if </span><span class="s1">self.k_ma &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">self.ssm[(</span><span class="s5">'selection'</span><span class="s3">,</span><span class="s1">) + idx] = </span><span class="s4">1</span>
+
+        <span class="s0"># Cache some indices</span>
+        <span class="s3">if </span><span class="s1">self._trend_is_const </span><span class="s3">and </span><span class="s1">self.k_exog == </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">self._idx_state_intercept = np.s_[</span><span class="s5">'state_intercept'</span><span class="s3">, </span><span class="s1">:k_endog</span><span class="s3">, </span><span class="s1">:]</span>
+        <span class="s3">elif </span><span class="s1">self.k_trend &gt; </span><span class="s4">0 </span><span class="s3">or </span><span class="s1">self.k_exog &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">self._idx_state_intercept = np.s_[</span><span class="s5">'state_intercept'</span><span class="s3">, </span><span class="s1">:k_endog</span><span class="s3">, </span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s3">if </span><span class="s1">self.k_ar &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">self._idx_transition = np.s_[</span><span class="s5">'transition'</span><span class="s3">, </span><span class="s1">:k_endog</span><span class="s3">, </span><span class="s1">:]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self._idx_transition = np.s_[</span><span class="s5">'transition'</span><span class="s3">, </span><span class="s1">:k_endog</span><span class="s3">, </span><span class="s1">k_endog:]</span>
+        <span class="s3">if </span><span class="s1">self.error_cov_type == </span><span class="s5">'diagonal'</span><span class="s1">:</span>
+            <span class="s1">self._idx_state_cov = (</span>
+                <span class="s1">(</span><span class="s5">'state_cov'</span><span class="s3">,</span><span class="s1">) + np.diag_indices(self.k_endog))</span>
+        <span class="s3">elif </span><span class="s1">self.error_cov_type == </span><span class="s5">'unstructured'</span><span class="s1">:</span>
+            <span class="s1">self._idx_lower_state_cov = np.tril_indices(self.k_endog)</span>
+        <span class="s3">if </span><span class="s1">self.measurement_error:</span>
+            <span class="s1">self._idx_obs_cov = (</span><span class="s5">'obs_cov'</span><span class="s3">,</span><span class="s1">) + np.diag_indices(self.k_endog)</span>
+
+        <span class="s0"># Cache some slices</span>
+        <span class="s3">def </span><span class="s1">_slice(key</span><span class="s3">, </span><span class="s1">offset):</span>
+            <span class="s1">length = self.parameters[key]</span>
+            <span class="s1">param_slice = np.s_[offset:offset + length]</span>
+            <span class="s1">offset += length</span>
+            <span class="s3">return </span><span class="s1">param_slice</span><span class="s3">, </span><span class="s1">offset</span>
+
+        <span class="s1">offset = </span><span class="s4">0</span>
+        <span class="s1">self._params_trend</span><span class="s3">, </span><span class="s1">offset = _slice(</span><span class="s5">'trend'</span><span class="s3">, </span><span class="s1">offset)</span>
+        <span class="s1">self._params_ar</span><span class="s3">, </span><span class="s1">offset = _slice(</span><span class="s5">'ar'</span><span class="s3">, </span><span class="s1">offset)</span>
+        <span class="s1">self._params_ma</span><span class="s3">, </span><span class="s1">offset = _slice(</span><span class="s5">'ma'</span><span class="s3">, </span><span class="s1">offset)</span>
+        <span class="s1">self._params_regression</span><span class="s3">, </span><span class="s1">offset = _slice(</span><span class="s5">'regression'</span><span class="s3">, </span><span class="s1">offset)</span>
+        <span class="s1">self._params_state_cov</span><span class="s3">, </span><span class="s1">offset = _slice(</span><span class="s5">'state_cov'</span><span class="s3">, </span><span class="s1">offset)</span>
+        <span class="s1">self._params_obs_cov</span><span class="s3">, </span><span class="s1">offset = _slice(</span><span class="s5">'obs_cov'</span><span class="s3">, </span><span class="s1">offset)</span>
+
+        <span class="s0"># Variable holding optional final `exog`</span>
+        <span class="s0"># (note: self._final_trend was set earlier)</span>
+        <span class="s1">self._final_exog = </span><span class="s3">None</span>
+
+        <span class="s0"># Update _init_keys attached by super</span>
+        <span class="s1">self._init_keys += [</span><span class="s5">'order'</span><span class="s3">, </span><span class="s5">'trend'</span><span class="s3">, </span><span class="s5">'error_cov_type'</span><span class="s3">,</span>
+                            <span class="s5">'measurement_error'</span><span class="s3">, </span><span class="s5">'enforce_stationarity'</span><span class="s3">,</span>
+                            <span class="s5">'enforce_invertibility'</span><span class="s1">] + list(kwargs.keys())</span>
+
+    <span class="s3">def </span><span class="s1">clone(self</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3">return </span><span class="s1">self._clone_from_init_kwds(endog</span><span class="s3">, </span><span class="s1">exog=exog</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">_res_classes(self):</span>
+        <span class="s3">return </span><span class="s1">{</span><span class="s5">'fit'</span><span class="s1">: (VARMAXResults</span><span class="s3">, </span><span class="s1">VARMAXResultsWrapper)}</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">start_params(self):</span>
+        <span class="s1">params = np.zeros(self.k_params</span><span class="s3">, </span><span class="s1">dtype=np.float64)</span>
+
+        <span class="s0"># A. Run a multivariate regression to get beta estimates</span>
+        <span class="s1">endog = pd.DataFrame(self.endog.copy())</span>
+        <span class="s1">endog = endog.interpolate()</span>
+        <span class="s1">endog = np.require(endog.fillna(method=</span><span class="s5">'backfill'</span><span class="s1">)</span><span class="s3">, </span><span class="s1">requirements=</span><span class="s5">&quot;W&quot;</span><span class="s1">)</span>
+        <span class="s1">exog = </span><span class="s3">None</span>
+        <span class="s3">if </span><span class="s1">self.k_trend &gt; </span><span class="s4">0 </span><span class="s3">and </span><span class="s1">self.k_exog &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">exog = np.c_[self._trend_data</span><span class="s3">, </span><span class="s1">self.exog]</span>
+        <span class="s3">elif </span><span class="s1">self.k_trend &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">exog = self._trend_data</span>
+        <span class="s3">elif </span><span class="s1">self.k_exog &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">exog = self.exog</span>
+
+        <span class="s0"># Although the Kalman filter can deal with missing values in endog,</span>
+        <span class="s0"># conditional sum of squares cannot</span>
+        <span class="s3">if </span><span class="s1">np.any(np.isnan(endog)):</span>
+            <span class="s1">mask = ~np.any(np.isnan(endog)</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s1">endog = endog[mask]</span>
+            <span class="s3">if </span><span class="s1">exog </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">exog = exog[mask]</span>
+
+        <span class="s0"># Regression and trend effects via OLS</span>
+        <span class="s1">trend_params = np.zeros(</span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s1">exog_params = np.zeros(</span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">self.k_trend &gt; </span><span class="s4">0 </span><span class="s3">or </span><span class="s1">self.k_exog &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">trendexog_params = np.linalg.pinv(exog).dot(endog)</span>
+            <span class="s1">endog -= np.dot(exog</span><span class="s3">, </span><span class="s1">trendexog_params)</span>
+            <span class="s3">if </span><span class="s1">self.k_trend &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">trend_params = trendexog_params[:self.k_trend].T</span>
+            <span class="s3">if </span><span class="s1">self.k_endog &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">exog_params = trendexog_params[self.k_trend:].T</span>
+
+        <span class="s0"># B. Run a VAR model on endog to get trend, AR parameters</span>
+        <span class="s1">ar_params = []</span>
+        <span class="s1">k_ar = self.k_ar </span><span class="s3">if </span><span class="s1">self.k_ar &gt; </span><span class="s4">0 </span><span class="s3">else </span><span class="s4">1</span>
+        <span class="s1">mod_ar = var_model.VAR(endog)</span>
+        <span class="s1">res_ar = mod_ar.fit(maxlags=k_ar</span><span class="s3">, </span><span class="s1">ic=</span><span class="s3">None, </span><span class="s1">trend=</span><span class="s5">'n'</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">self.k_ar &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">ar_params = np.array(res_ar.params).T.ravel()</span>
+        <span class="s1">endog = res_ar.resid</span>
+
+        <span class="s0"># Test for stationarity</span>
+        <span class="s3">if </span><span class="s1">self.k_ar &gt; </span><span class="s4">0 </span><span class="s3">and </span><span class="s1">self.enforce_stationarity:</span>
+            <span class="s1">coefficient_matrices = (</span>
+                <span class="s1">ar_params.reshape(</span>
+                    <span class="s1">self.k_endog * self.k_ar</span><span class="s3">, </span><span class="s1">self.k_endog</span>
+                <span class="s1">).T</span>
+            <span class="s1">).reshape(self.k_endog</span><span class="s3">, </span><span class="s1">self.k_endog</span><span class="s3">, </span><span class="s1">self.k_ar).T</span>
+
+            <span class="s1">stationary = is_invertible([</span><span class="s4">1</span><span class="s1">] + list(-coefficient_matrices))</span>
+
+            <span class="s3">if not </span><span class="s1">stationary:</span>
+                <span class="s1">warn(</span><span class="s5">'Non-stationary starting autoregressive parameters'</span>
+                     <span class="s5">' found. Using zeros as starting parameters.'</span><span class="s1">)</span>
+                <span class="s1">ar_params *= </span><span class="s4">0</span>
+
+        <span class="s0"># C. Run a VAR model on the residuals to get MA parameters</span>
+        <span class="s1">ma_params = []</span>
+        <span class="s3">if </span><span class="s1">self.k_ma &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">mod_ma = var_model.VAR(endog)</span>
+            <span class="s1">res_ma = mod_ma.fit(maxlags=self.k_ma</span><span class="s3">, </span><span class="s1">ic=</span><span class="s3">None, </span><span class="s1">trend=</span><span class="s5">'n'</span><span class="s1">)</span>
+            <span class="s1">ma_params = np.array(res_ma.params.T).ravel()</span>
+
+            <span class="s0"># Test for invertibility</span>
+            <span class="s3">if </span><span class="s1">self.enforce_invertibility:</span>
+                <span class="s1">coefficient_matrices = (</span>
+                    <span class="s1">ma_params.reshape(</span>
+                        <span class="s1">self.k_endog * self.k_ma</span><span class="s3">, </span><span class="s1">self.k_endog</span>
+                    <span class="s1">).T</span>
+                <span class="s1">).reshape(self.k_endog</span><span class="s3">, </span><span class="s1">self.k_endog</span><span class="s3">, </span><span class="s1">self.k_ma).T</span>
+
+                <span class="s1">invertible = is_invertible([</span><span class="s4">1</span><span class="s1">] + list(-coefficient_matrices))</span>
+
+                <span class="s3">if not </span><span class="s1">invertible:</span>
+                    <span class="s1">warn(</span><span class="s5">'Non-stationary starting moving-average parameters'</span>
+                         <span class="s5">' found. Using zeros as starting parameters.'</span><span class="s1">)</span>
+                    <span class="s1">ma_params *= </span><span class="s4">0</span>
+
+        <span class="s0"># Transform trend / exog params from mean form to intercept form</span>
+        <span class="s3">if </span><span class="s1">self.k_ar &gt; </span><span class="s4">0 </span><span class="s3">and </span><span class="s1">(self.k_trend &gt; </span><span class="s4">0 </span><span class="s3">or </span><span class="s1">self.mle_regression):</span>
+            <span class="s1">coefficient_matrices = (</span>
+                <span class="s1">ar_params.reshape(</span>
+                    <span class="s1">self.k_endog * self.k_ar</span><span class="s3">, </span><span class="s1">self.k_endog</span>
+                <span class="s1">).T</span>
+            <span class="s1">).reshape(self.k_endog</span><span class="s3">, </span><span class="s1">self.k_endog</span><span class="s3">, </span><span class="s1">self.k_ar).T</span>
+
+            <span class="s1">tmp = np.eye(self.k_endog) - np.sum(coefficient_matrices</span><span class="s3">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+
+            <span class="s3">if </span><span class="s1">self.k_trend &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">trend_params = np.dot(tmp</span><span class="s3">, </span><span class="s1">trend_params)</span>
+            <span class="s3">if </span><span class="s1">self.mle_regression &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">exog_params = np.dot(tmp</span><span class="s3">, </span><span class="s1">exog_params)</span>
+
+        <span class="s0"># 1. Intercept terms</span>
+        <span class="s3">if </span><span class="s1">self.k_trend &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">params[self._params_trend] = trend_params.ravel()</span>
+
+        <span class="s0"># 2. AR terms</span>
+        <span class="s3">if </span><span class="s1">self.k_ar &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">params[self._params_ar] = ar_params</span>
+
+        <span class="s0"># 3. MA terms</span>
+        <span class="s3">if </span><span class="s1">self.k_ma &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">params[self._params_ma] = ma_params</span>
+
+        <span class="s0"># 4. Regression terms</span>
+        <span class="s3">if </span><span class="s1">self.mle_regression:</span>
+            <span class="s1">params[self._params_regression] = exog_params.ravel()</span>
+
+        <span class="s0"># 5. State covariance terms</span>
+        <span class="s3">if </span><span class="s1">self.error_cov_type == </span><span class="s5">'diagonal'</span><span class="s1">:</span>
+            <span class="s1">params[self._params_state_cov] = res_ar.sigma_u.diagonal()</span>
+        <span class="s3">elif </span><span class="s1">self.error_cov_type == </span><span class="s5">'unstructured'</span><span class="s1">:</span>
+            <span class="s1">cov_factor = np.linalg.cholesky(res_ar.sigma_u)</span>
+            <span class="s1">params[self._params_state_cov] = (</span>
+                <span class="s1">cov_factor[self._idx_lower_state_cov].ravel())</span>
+
+        <span class="s0"># 5. Measurement error variance terms</span>
+        <span class="s3">if </span><span class="s1">self.measurement_error:</span>
+            <span class="s3">if </span><span class="s1">self.k_ma &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">params[self._params_obs_cov] = res_ma.sigma_u.diagonal()</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">params[self._params_obs_cov] = res_ar.sigma_u.diagonal()</span>
+
+        <span class="s3">return </span><span class="s1">params</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">param_names(self):</span>
+        <span class="s1">param_names = []</span>
+        <span class="s1">endog_names = self.endog_names</span>
+        <span class="s3">if not </span><span class="s1">isinstance(self.endog_names</span><span class="s3">, </span><span class="s1">list):</span>
+            <span class="s1">endog_names = [endog_names]</span>
+
+        <span class="s0"># 1. Intercept terms</span>
+        <span class="s3">if </span><span class="s1">self.k_trend &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(self.k_endog):</span>
+                <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">self.polynomial_trend.nonzero()[</span><span class="s4">0</span><span class="s1">]:</span>
+                    <span class="s3">if </span><span class="s1">i == </span><span class="s4">0</span><span class="s1">:</span>
+                        <span class="s1">param_names += [</span><span class="s5">'intercept.%s' </span><span class="s1">% endog_names[j]]</span>
+                    <span class="s3">elif </span><span class="s1">i == </span><span class="s4">1</span><span class="s1">:</span>
+                        <span class="s1">param_names += [</span><span class="s5">'drift.%s' </span><span class="s1">% endog_names[j]]</span>
+                    <span class="s3">else</span><span class="s1">:</span>
+                        <span class="s1">param_names += [</span><span class="s5">'trend.%d.%s' </span><span class="s1">% (i</span><span class="s3">, </span><span class="s1">endog_names[j])]</span>
+
+        <span class="s0"># 2. AR terms</span>
+        <span class="s1">param_names += [</span>
+            <span class="s5">'L%d.%s.%s' </span><span class="s1">% (i+</span><span class="s4">1</span><span class="s3">, </span><span class="s1">endog_names[k]</span><span class="s3">, </span><span class="s1">endog_names[j])</span>
+            <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(self.k_endog)</span>
+            <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(self.k_ar)</span>
+            <span class="s3">for </span><span class="s1">k </span><span class="s3">in </span><span class="s1">range(self.k_endog)</span>
+        <span class="s1">]</span>
+
+        <span class="s0"># 3. MA terms</span>
+        <span class="s1">param_names += [</span>
+            <span class="s5">'L%d.e(%s).%s' </span><span class="s1">% (i+</span><span class="s4">1</span><span class="s3">, </span><span class="s1">endog_names[k]</span><span class="s3">, </span><span class="s1">endog_names[j])</span>
+            <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(self.k_endog)</span>
+            <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(self.k_ma)</span>
+            <span class="s3">for </span><span class="s1">k </span><span class="s3">in </span><span class="s1">range(self.k_endog)</span>
+        <span class="s1">]</span>
+
+        <span class="s0"># 4. Regression terms</span>
+        <span class="s1">param_names += [</span>
+            <span class="s5">'beta.%s.%s' </span><span class="s1">% (self.exog_names[j]</span><span class="s3">, </span><span class="s1">endog_names[i])</span>
+            <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(self.k_endog)</span>
+            <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(self.k_exog)</span>
+        <span class="s1">]</span>
+
+        <span class="s0"># 5. State covariance terms</span>
+        <span class="s3">if </span><span class="s1">self.error_cov_type == </span><span class="s5">'diagonal'</span><span class="s1">:</span>
+            <span class="s1">param_names += [</span>
+                <span class="s5">'sigma2.%s' </span><span class="s1">% endog_names[i]</span>
+                <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(self.k_endog)</span>
+            <span class="s1">]</span>
+        <span class="s3">elif </span><span class="s1">self.error_cov_type == </span><span class="s5">'unstructured'</span><span class="s1">:</span>
+            <span class="s1">param_names += [</span>
+                <span class="s1">(</span><span class="s5">'sqrt.var.%s' </span><span class="s1">% endog_names[i] </span><span class="s3">if </span><span class="s1">i == j </span><span class="s3">else</span>
+                 <span class="s5">'sqrt.cov.%s.%s' </span><span class="s1">% (endog_names[j]</span><span class="s3">, </span><span class="s1">endog_names[i]))</span>
+                <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(self.k_endog)</span>
+                <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(i+</span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s1">]</span>
+
+        <span class="s0"># 5. Measurement error variance terms</span>
+        <span class="s3">if </span><span class="s1">self.measurement_error:</span>
+            <span class="s1">param_names += [</span>
+                <span class="s5">'measurement_variance.%s' </span><span class="s1">% endog_names[i]</span>
+                <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(self.k_endog)</span>
+            <span class="s1">]</span>
+
+        <span class="s3">return </span><span class="s1">param_names</span>
+
+    <span class="s3">def </span><span class="s1">transform_params(self</span><span class="s3">, </span><span class="s1">unconstrained):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Transform unconstrained parameters used by the optimizer to constrained 
+        parameters used in likelihood evaluation 
+ 
+        Parameters 
+        ---------- 
+        unconstrained : array_like 
+            Array of unconstrained parameters used by the optimizer, to be 
+            transformed. 
+ 
+        Returns 
+        ------- 
+        constrained : array_like 
+            Array of constrained parameters which may be used in likelihood 
+            evaluation. 
+ 
+        Notes 
+        ----- 
+        Constrains the factor transition to be stationary and variances to be 
+        positive. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">unconstrained = np.array(unconstrained</span><span class="s3">, </span><span class="s1">ndmin=</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">constrained = np.zeros(unconstrained.shape</span><span class="s3">, </span><span class="s1">dtype=unconstrained.dtype)</span>
+
+        <span class="s0"># 1. Intercept terms: nothing to do</span>
+        <span class="s1">constrained[self._params_trend] = unconstrained[self._params_trend]</span>
+
+        <span class="s0"># 2. AR terms: optionally force to be stationary</span>
+        <span class="s3">if </span><span class="s1">self.k_ar &gt; </span><span class="s4">0 </span><span class="s3">and </span><span class="s1">self.enforce_stationarity:</span>
+            <span class="s0"># Create the state covariance matrix</span>
+            <span class="s3">if </span><span class="s1">self.error_cov_type == </span><span class="s5">'diagonal'</span><span class="s1">:</span>
+                <span class="s1">state_cov = np.diag(unconstrained[self._params_state_cov]**</span><span class="s4">2</span><span class="s1">)</span>
+            <span class="s3">elif </span><span class="s1">self.error_cov_type == </span><span class="s5">'unstructured'</span><span class="s1">:</span>
+                <span class="s1">state_cov_lower = np.zeros(self.ssm[</span><span class="s5">'state_cov'</span><span class="s1">].shape</span><span class="s3">,</span>
+                                           <span class="s1">dtype=unconstrained.dtype)</span>
+                <span class="s1">state_cov_lower[self._idx_lower_state_cov] = (</span>
+                    <span class="s1">unconstrained[self._params_state_cov])</span>
+                <span class="s1">state_cov = np.dot(state_cov_lower</span><span class="s3">, </span><span class="s1">state_cov_lower.T)</span>
+
+            <span class="s0"># Transform the parameters</span>
+            <span class="s1">coefficients = unconstrained[self._params_ar].reshape(</span>
+                <span class="s1">self.k_endog</span><span class="s3">, </span><span class="s1">self.k_endog * self.k_ar)</span>
+            <span class="s1">coefficient_matrices</span><span class="s3">, </span><span class="s1">variance = (</span>
+                <span class="s1">constrain_stationary_multivariate(coefficients</span><span class="s3">, </span><span class="s1">state_cov))</span>
+            <span class="s1">constrained[self._params_ar] = coefficient_matrices.ravel()</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">constrained[self._params_ar] = unconstrained[self._params_ar]</span>
+
+        <span class="s0"># 3. MA terms: optionally force to be invertible</span>
+        <span class="s3">if </span><span class="s1">self.k_ma &gt; </span><span class="s4">0 </span><span class="s3">and </span><span class="s1">self.enforce_invertibility:</span>
+            <span class="s0"># Transform the parameters, using an identity variance matrix</span>
+            <span class="s1">state_cov = np.eye(self.k_endog</span><span class="s3">, </span><span class="s1">dtype=unconstrained.dtype)</span>
+            <span class="s1">coefficients = unconstrained[self._params_ma].reshape(</span>
+                <span class="s1">self.k_endog</span><span class="s3">, </span><span class="s1">self.k_endog * self.k_ma)</span>
+            <span class="s1">coefficient_matrices</span><span class="s3">, </span><span class="s1">variance = (</span>
+                <span class="s1">constrain_stationary_multivariate(coefficients</span><span class="s3">, </span><span class="s1">state_cov))</span>
+            <span class="s1">constrained[self._params_ma] = coefficient_matrices.ravel()</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">constrained[self._params_ma] = unconstrained[self._params_ma]</span>
+
+        <span class="s0"># 4. Regression terms: nothing to do</span>
+        <span class="s1">constrained[self._params_regression] = (</span>
+            <span class="s1">unconstrained[self._params_regression])</span>
+
+        <span class="s0"># 5. State covariance terms</span>
+        <span class="s0"># If we have variances, force them to be positive</span>
+        <span class="s3">if </span><span class="s1">self.error_cov_type == </span><span class="s5">'diagonal'</span><span class="s1">:</span>
+            <span class="s1">constrained[self._params_state_cov] = (</span>
+                <span class="s1">unconstrained[self._params_state_cov]**</span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s0"># Otherwise, nothing needs to be done</span>
+        <span class="s3">elif </span><span class="s1">self.error_cov_type == </span><span class="s5">'unstructured'</span><span class="s1">:</span>
+            <span class="s1">constrained[self._params_state_cov] = (</span>
+                <span class="s1">unconstrained[self._params_state_cov])</span>
+
+        <span class="s0"># 5. Measurement error variance terms</span>
+        <span class="s3">if </span><span class="s1">self.measurement_error:</span>
+            <span class="s0"># Force these to be positive</span>
+            <span class="s1">constrained[self._params_obs_cov] = (</span>
+                <span class="s1">unconstrained[self._params_obs_cov]**</span><span class="s4">2</span><span class="s1">)</span>
+
+        <span class="s3">return </span><span class="s1">constrained</span>
+
+    <span class="s3">def </span><span class="s1">untransform_params(self</span><span class="s3">, </span><span class="s1">constrained):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Transform constrained parameters used in likelihood evaluation 
+        to unconstrained parameters used by the optimizer. 
+ 
+        Parameters 
+        ---------- 
+        constrained : array_like 
+            Array of constrained parameters used in likelihood evaluation, to 
+            be transformed. 
+ 
+        Returns 
+        ------- 
+        unconstrained : array_like 
+            Array of unconstrained parameters used by the optimizer. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">constrained = np.array(constrained</span><span class="s3">, </span><span class="s1">ndmin=</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">unconstrained = np.zeros(constrained.shape</span><span class="s3">, </span><span class="s1">dtype=constrained.dtype)</span>
+
+        <span class="s0"># 1. Intercept terms: nothing to do</span>
+        <span class="s1">unconstrained[self._params_trend] = constrained[self._params_trend]</span>
+
+        <span class="s0"># 2. AR terms: optionally were forced to be stationary</span>
+        <span class="s3">if </span><span class="s1">self.k_ar &gt; </span><span class="s4">0 </span><span class="s3">and </span><span class="s1">self.enforce_stationarity:</span>
+            <span class="s0"># Create the state covariance matrix</span>
+            <span class="s3">if </span><span class="s1">self.error_cov_type == </span><span class="s5">'diagonal'</span><span class="s1">:</span>
+                <span class="s1">state_cov = np.diag(constrained[self._params_state_cov])</span>
+            <span class="s3">elif </span><span class="s1">self.error_cov_type == </span><span class="s5">'unstructured'</span><span class="s1">:</span>
+                <span class="s1">state_cov_lower = np.zeros(self.ssm[</span><span class="s5">'state_cov'</span><span class="s1">].shape</span><span class="s3">,</span>
+                                           <span class="s1">dtype=constrained.dtype)</span>
+                <span class="s1">state_cov_lower[self._idx_lower_state_cov] = (</span>
+                    <span class="s1">constrained[self._params_state_cov])</span>
+                <span class="s1">state_cov = np.dot(state_cov_lower</span><span class="s3">, </span><span class="s1">state_cov_lower.T)</span>
+
+            <span class="s0"># Transform the parameters</span>
+            <span class="s1">coefficients = constrained[self._params_ar].reshape(</span>
+                <span class="s1">self.k_endog</span><span class="s3">, </span><span class="s1">self.k_endog * self.k_ar)</span>
+            <span class="s1">unconstrained_matrices</span><span class="s3">, </span><span class="s1">variance = (</span>
+                <span class="s1">unconstrain_stationary_multivariate(coefficients</span><span class="s3">, </span><span class="s1">state_cov))</span>
+            <span class="s1">unconstrained[self._params_ar] = unconstrained_matrices.ravel()</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">unconstrained[self._params_ar] = constrained[self._params_ar]</span>
+
+        <span class="s0"># 3. MA terms: optionally were forced to be invertible</span>
+        <span class="s3">if </span><span class="s1">self.k_ma &gt; </span><span class="s4">0 </span><span class="s3">and </span><span class="s1">self.enforce_invertibility:</span>
+            <span class="s0"># Transform the parameters, using an identity variance matrix</span>
+            <span class="s1">state_cov = np.eye(self.k_endog</span><span class="s3">, </span><span class="s1">dtype=constrained.dtype)</span>
+            <span class="s1">coefficients = constrained[self._params_ma].reshape(</span>
+                <span class="s1">self.k_endog</span><span class="s3">, </span><span class="s1">self.k_endog * self.k_ma)</span>
+            <span class="s1">unconstrained_matrices</span><span class="s3">, </span><span class="s1">variance = (</span>
+                <span class="s1">unconstrain_stationary_multivariate(coefficients</span><span class="s3">, </span><span class="s1">state_cov))</span>
+            <span class="s1">unconstrained[self._params_ma] = unconstrained_matrices.ravel()</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">unconstrained[self._params_ma] = constrained[self._params_ma]</span>
+
+        <span class="s0"># 4. Regression terms: nothing to do</span>
+        <span class="s1">unconstrained[self._params_regression] = (</span>
+            <span class="s1">constrained[self._params_regression])</span>
+
+        <span class="s0"># 5. State covariance terms</span>
+        <span class="s0"># If we have variances, then these were forced to be positive</span>
+        <span class="s3">if </span><span class="s1">self.error_cov_type == </span><span class="s5">'diagonal'</span><span class="s1">:</span>
+            <span class="s1">unconstrained[self._params_state_cov] = (</span>
+                <span class="s1">constrained[self._params_state_cov]**</span><span class="s4">0.5</span><span class="s1">)</span>
+        <span class="s0"># Otherwise, nothing needs to be done</span>
+        <span class="s3">elif </span><span class="s1">self.error_cov_type == </span><span class="s5">'unstructured'</span><span class="s1">:</span>
+            <span class="s1">unconstrained[self._params_state_cov] = (</span>
+                <span class="s1">constrained[self._params_state_cov])</span>
+
+        <span class="s0"># 5. Measurement error variance terms</span>
+        <span class="s3">if </span><span class="s1">self.measurement_error:</span>
+            <span class="s0"># These were forced to be positive</span>
+            <span class="s1">unconstrained[self._params_obs_cov] = (</span>
+                <span class="s1">constrained[self._params_obs_cov]**</span><span class="s4">0.5</span><span class="s1">)</span>
+
+        <span class="s3">return </span><span class="s1">unconstrained</span>
+
+    <span class="s3">def </span><span class="s1">_validate_can_fix_params(self</span><span class="s3">, </span><span class="s1">param_names):</span>
+        <span class="s1">super(VARMAX</span><span class="s3">, </span><span class="s1">self)._validate_can_fix_params(param_names)</span>
+
+        <span class="s1">ix = np.cumsum(list(self.parameters.values()))[:-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">(_</span><span class="s3">, </span><span class="s1">ar_names</span><span class="s3">, </span><span class="s1">ma_names</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_) = [</span>
+            <span class="s1">arr.tolist() </span><span class="s3">for </span><span class="s1">arr </span><span class="s3">in </span><span class="s1">np.array_split(self.param_names</span><span class="s3">, </span><span class="s1">ix)]</span>
+
+        <span class="s3">if </span><span class="s1">self.enforce_stationarity </span><span class="s3">and </span><span class="s1">self.k_ar &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">self.k_endog &gt; </span><span class="s4">1 </span><span class="s3">or </span><span class="s1">self.k_ar &gt; </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">fix_all = param_names.issuperset(ar_names)</span>
+                <span class="s1">fix_any = (</span>
+                    <span class="s1">len(param_names.intersection(ar_names)) &gt; </span><span class="s4">0</span><span class="s1">)</span>
+                <span class="s3">if </span><span class="s1">fix_any </span><span class="s3">and not </span><span class="s1">fix_all:</span>
+                    <span class="s3">raise </span><span class="s1">ValueError(</span>
+                        <span class="s5">'Cannot fix individual autoregressive parameters'</span>
+                        <span class="s5">' when `enforce_stationarity=True`. In this case,'</span>
+                        <span class="s5">' must either fix all autoregressive parameters or'</span>
+                        <span class="s5">' none.'</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">self.enforce_invertibility </span><span class="s3">and </span><span class="s1">self.k_ma &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">self.k_endog </span><span class="s3">or </span><span class="s1">self.k_ma &gt; </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">fix_all = param_names.issuperset(ma_names)</span>
+                <span class="s1">fix_any = (</span>
+                    <span class="s1">len(param_names.intersection(ma_names)) &gt; </span><span class="s4">0</span><span class="s1">)</span>
+                <span class="s3">if </span><span class="s1">fix_any </span><span class="s3">and not </span><span class="s1">fix_all:</span>
+                    <span class="s3">raise </span><span class="s1">ValueError(</span>
+                        <span class="s5">'Cannot fix individual moving average parameters'</span>
+                        <span class="s5">' when `enforce_invertibility=True`. In this case,'</span>
+                        <span class="s5">' must either fix all moving average parameters or'</span>
+                        <span class="s5">' none.'</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">update(self</span><span class="s3">, </span><span class="s1">params</span><span class="s3">, </span><span class="s1">transformed=</span><span class="s3">True, </span><span class="s1">includes_fixed=</span><span class="s3">False,</span>
+               <span class="s1">complex_step=</span><span class="s3">False</span><span class="s1">):</span>
+        <span class="s1">params = self.handle_params(params</span><span class="s3">, </span><span class="s1">transformed=transformed</span><span class="s3">,</span>
+                                    <span class="s1">includes_fixed=includes_fixed)</span>
+
+        <span class="s0"># 1. State intercept</span>
+        <span class="s0"># - Exog</span>
+        <span class="s3">if </span><span class="s1">self.mle_regression:</span>
+            <span class="s1">exog_params = params[self._params_regression].reshape(</span>
+                <span class="s1">self.k_endog</span><span class="s3">, </span><span class="s1">self.k_exog).T</span>
+            <span class="s1">intercept = np.dot(self.exog[</span><span class="s4">1</span><span class="s1">:]</span><span class="s3">, </span><span class="s1">exog_params)</span>
+            <span class="s1">self.ssm[self._idx_state_intercept] = intercept.T</span>
+
+            <span class="s3">if </span><span class="s1">self._final_exog </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">self.ssm[</span><span class="s5">'state_intercept'</span><span class="s3">, </span><span class="s1">:self.k_endog</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">] = np.dot(</span>
+                    <span class="s1">self._final_exog</span><span class="s3">, </span><span class="s1">exog_params)</span>
+
+        <span class="s0"># - Trend</span>
+        <span class="s3">if </span><span class="s1">self.k_trend &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s0"># If we did not set the intercept above, zero it out so we can</span>
+            <span class="s0"># just += later</span>
+            <span class="s3">if not </span><span class="s1">self.mle_regression:</span>
+                <span class="s1">zero = np.array(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">dtype=params.dtype)</span>
+                <span class="s1">self.ssm[</span><span class="s5">'state_intercept'</span><span class="s3">, </span><span class="s1">:] = zero</span>
+
+            <span class="s1">trend_params = params[self._params_trend].reshape(</span>
+                <span class="s1">self.k_endog</span><span class="s3">, </span><span class="s1">self.k_trend).T</span>
+            <span class="s3">if </span><span class="s1">self._trend_is_const:</span>
+                <span class="s1">intercept = trend_params</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">intercept = np.dot(self._trend_data[</span><span class="s4">1</span><span class="s1">:]</span><span class="s3">, </span><span class="s1">trend_params)</span>
+            <span class="s1">self.ssm[self._idx_state_intercept] += intercept.T</span>
+
+            <span class="s3">if </span><span class="s1">(self._final_trend </span><span class="s3">is not None</span>
+                    <span class="s3">and </span><span class="s1">self._idx_state_intercept[-</span><span class="s4">1</span><span class="s1">].stop == -</span><span class="s4">1</span><span class="s1">):</span>
+                <span class="s1">self.ssm[</span><span class="s5">'state_intercept'</span><span class="s3">, </span><span class="s1">:self.k_endog</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">:] += np.dot(</span>
+                    <span class="s1">self._final_trend</span><span class="s3">, </span><span class="s1">trend_params).T</span>
+
+        <span class="s0"># Need to set the last state intercept to np.nan (with appropriate</span>
+        <span class="s0"># dtype) if we don't have the final exog</span>
+        <span class="s3">if </span><span class="s1">self.mle_regression </span><span class="s3">and </span><span class="s1">self._final_exog </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">nan = np.array(np.nan</span><span class="s3">, </span><span class="s1">dtype=params.dtype)</span>
+            <span class="s1">self.ssm[</span><span class="s5">'state_intercept'</span><span class="s3">, </span><span class="s1">:self.k_endog</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">] = nan</span>
+
+        <span class="s0"># 2. Transition</span>
+        <span class="s1">ar = params[self._params_ar].reshape(</span>
+            <span class="s1">self.k_endog</span><span class="s3">, </span><span class="s1">self.k_endog * self.k_ar)</span>
+        <span class="s1">ma = params[self._params_ma].reshape(</span>
+            <span class="s1">self.k_endog</span><span class="s3">, </span><span class="s1">self.k_endog * self.k_ma)</span>
+        <span class="s1">self.ssm[self._idx_transition] = np.c_[ar</span><span class="s3">, </span><span class="s1">ma]</span>
+
+        <span class="s0"># 3. State covariance</span>
+        <span class="s3">if </span><span class="s1">self.error_cov_type == </span><span class="s5">'diagonal'</span><span class="s1">:</span>
+            <span class="s1">self.ssm[self._idx_state_cov] = (</span>
+                <span class="s1">params[self._params_state_cov]</span>
+            <span class="s1">)</span>
+        <span class="s3">elif </span><span class="s1">self.error_cov_type == </span><span class="s5">'unstructured'</span><span class="s1">:</span>
+            <span class="s1">state_cov_lower = np.zeros(self.ssm[</span><span class="s5">'state_cov'</span><span class="s1">].shape</span><span class="s3">,</span>
+                                       <span class="s1">dtype=params.dtype)</span>
+            <span class="s1">state_cov_lower[self._idx_lower_state_cov] = (</span>
+                <span class="s1">params[self._params_state_cov])</span>
+            <span class="s1">self.ssm[</span><span class="s5">'state_cov'</span><span class="s1">] = np.dot(state_cov_lower</span><span class="s3">, </span><span class="s1">state_cov_lower.T)</span>
+
+        <span class="s0"># 4. Observation covariance</span>
+        <span class="s3">if </span><span class="s1">self.measurement_error:</span>
+            <span class="s1">self.ssm[self._idx_obs_cov] = params[self._params_obs_cov]</span>
+
+    <span class="s1">@contextlib.contextmanager</span>
+    <span class="s3">def </span><span class="s1">_set_final_exog(self</span><span class="s3">, </span><span class="s1">exog):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Set the final state intercept value using out-of-sample `exog` / trend 
+ 
+        Parameters 
+        ---------- 
+        exog : ndarray 
+            Out-of-sample `exog` values, usually produced by 
+            `_validate_out_of_sample_exog` to ensure the correct shape (this 
+            method does not do any additional validation of its own). 
+        out_of_sample : int 
+            Number of out-of-sample periods. 
+ 
+        Notes 
+        ----- 
+        We need special handling for simulating or forecasting with `exog` or 
+        trend, because if we had these then the last predicted_state has been 
+        set to NaN since we did not have the appropriate `exog` to create it. 
+        Since we handle trend in the same way as `exog`, we still have this 
+        issue when only trend is used without `exog`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">cache_value = self._final_exog</span>
+        <span class="s3">if </span><span class="s1">self.k_exog &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">exog </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">exog = np.atleast_1d(exog)</span>
+                <span class="s3">if </span><span class="s1">exog.ndim == </span><span class="s4">2</span><span class="s1">:</span>
+                    <span class="s1">exog = exog[:</span><span class="s4">1</span><span class="s1">]</span>
+                <span class="s3">try</span><span class="s1">:</span>
+                    <span class="s1">exog = np.reshape(exog[:</span><span class="s4">1</span><span class="s1">]</span><span class="s3">, </span><span class="s1">(self.k_exog</span><span class="s3">,</span><span class="s1">))</span>
+                <span class="s3">except </span><span class="s1">ValueError:</span>
+                    <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">'Provided exogenous values are not of the'</span>
+                                     <span class="s5">' appropriate shape. Required %s, got %s.'</span>
+                                     <span class="s1">% (str((self.k_exog</span><span class="s3">,</span><span class="s1">))</span><span class="s3">,</span>
+                                        <span class="s1">str(exog.shape)))</span>
+            <span class="s1">self._final_exog = exog</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s3">yield</span>
+        <span class="s3">finally</span><span class="s1">:</span>
+            <span class="s1">self._final_exog = cache_value</span>
+
+    <span class="s1">@Appender(MLEModel.simulate.__doc__)</span>
+    <span class="s3">def </span><span class="s1">simulate(self</span><span class="s3">, </span><span class="s1">params</span><span class="s3">, </span><span class="s1">nsimulations</span><span class="s3">, </span><span class="s1">measurement_shocks=</span><span class="s3">None,</span>
+                 <span class="s1">state_shocks=</span><span class="s3">None, </span><span class="s1">initial_state=</span><span class="s3">None, </span><span class="s1">anchor=</span><span class="s3">None,</span>
+                 <span class="s1">repetitions=</span><span class="s3">None, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">extend_model=</span><span class="s3">None,</span>
+                 <span class="s1">extend_kwargs=</span><span class="s3">None, </span><span class="s1">transformed=</span><span class="s3">True, </span><span class="s1">includes_fixed=</span><span class="s3">False,</span>
+                 <span class="s1">**kwargs):</span>
+        <span class="s3">with </span><span class="s1">self._set_final_exog(exog):</span>
+            <span class="s1">out = super(VARMAX</span><span class="s3">, </span><span class="s1">self).simulate(</span>
+                <span class="s1">params</span><span class="s3">, </span><span class="s1">nsimulations</span><span class="s3">, </span><span class="s1">measurement_shocks=measurement_shocks</span><span class="s3">,</span>
+                <span class="s1">state_shocks=state_shocks</span><span class="s3">, </span><span class="s1">initial_state=initial_state</span><span class="s3">,</span>
+                <span class="s1">anchor=anchor</span><span class="s3">, </span><span class="s1">repetitions=repetitions</span><span class="s3">, </span><span class="s1">exog=exog</span><span class="s3">,</span>
+                <span class="s1">extend_model=extend_model</span><span class="s3">, </span><span class="s1">extend_kwargs=extend_kwargs</span><span class="s3">,</span>
+                <span class="s1">transformed=transformed</span><span class="s3">, </span><span class="s1">includes_fixed=includes_fixed</span><span class="s3">,</span>
+                <span class="s1">**kwargs)</span>
+        <span class="s3">return </span><span class="s1">out</span>
+
+
+<span class="s3">class </span><span class="s1">VARMAXResults(MLEResults):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Class to hold results from fitting an VARMAX model. 
+ 
+    Parameters 
+    ---------- 
+    model : VARMAX instance 
+        The fitted model instance 
+ 
+    Attributes 
+    ---------- 
+    specification : dictionary 
+        Dictionary including all attributes from the VARMAX model instance. 
+    coefficient_matrices_var : ndarray 
+        Array containing autoregressive lag polynomial coefficient matrices, 
+        ordered from lowest degree to highest. 
+    coefficient_matrices_vma : ndarray 
+        Array containing moving average lag polynomial coefficients, 
+        ordered from lowest degree to highest. 
+ 
+    See Also 
+    -------- 
+    statsmodels.tsa.statespace.kalman_filter.FilterResults 
+    statsmodels.tsa.statespace.mlemodel.MLEResults 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">model</span><span class="s3">, </span><span class="s1">params</span><span class="s3">, </span><span class="s1">filter_results</span><span class="s3">, </span><span class="s1">cov_type=</span><span class="s3">None,</span>
+                 <span class="s1">cov_kwds=</span><span class="s3">None, </span><span class="s1">**kwargs):</span>
+        <span class="s1">super(VARMAXResults</span><span class="s3">, </span><span class="s1">self).__init__(model</span><span class="s3">, </span><span class="s1">params</span><span class="s3">, </span><span class="s1">filter_results</span><span class="s3">,</span>
+                                            <span class="s1">cov_type</span><span class="s3">, </span><span class="s1">cov_kwds</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s1">self.specification = Bunch(**{</span>
+            <span class="s0"># Set additional model parameters</span>
+            <span class="s5">'error_cov_type'</span><span class="s1">: self.model.error_cov_type</span><span class="s3">,</span>
+            <span class="s5">'measurement_error'</span><span class="s1">: self.model.measurement_error</span><span class="s3">,</span>
+            <span class="s5">'enforce_stationarity'</span><span class="s1">: self.model.enforce_stationarity</span><span class="s3">,</span>
+            <span class="s5">'enforce_invertibility'</span><span class="s1">: self.model.enforce_invertibility</span><span class="s3">,</span>
+            <span class="s5">'trend_offset'</span><span class="s1">: self.model.trend_offset</span><span class="s3">,</span>
+
+            <span class="s5">'order'</span><span class="s1">: self.model.order</span><span class="s3">,</span>
+
+            <span class="s0"># Model order</span>
+            <span class="s5">'k_ar'</span><span class="s1">: self.model.k_ar</span><span class="s3">,</span>
+            <span class="s5">'k_ma'</span><span class="s1">: self.model.k_ma</span><span class="s3">,</span>
+
+            <span class="s0"># Trend / Regression</span>
+            <span class="s5">'trend'</span><span class="s1">: self.model.trend</span><span class="s3">,</span>
+            <span class="s5">'k_trend'</span><span class="s1">: self.model.k_trend</span><span class="s3">,</span>
+            <span class="s5">'k_exog'</span><span class="s1">: self.model.k_exog</span><span class="s3">,</span>
+        <span class="s1">})</span>
+
+        <span class="s0"># Polynomials / coefficient matrices</span>
+        <span class="s1">self.coefficient_matrices_var = </span><span class="s3">None</span>
+        <span class="s1">self.coefficient_matrices_vma = </span><span class="s3">None</span>
+        <span class="s3">if </span><span class="s1">self.model.k_ar &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">ar_params = np.array(self.params[self.model._params_ar])</span>
+            <span class="s1">k_endog = self.model.k_endog</span>
+            <span class="s1">k_ar = self.model.k_ar</span>
+            <span class="s1">self.coefficient_matrices_var = (</span>
+                <span class="s1">ar_params.reshape(k_endog * k_ar</span><span class="s3">, </span><span class="s1">k_endog).T</span>
+            <span class="s1">).reshape(k_endog</span><span class="s3">, </span><span class="s1">k_endog</span><span class="s3">, </span><span class="s1">k_ar).T</span>
+        <span class="s3">if </span><span class="s1">self.model.k_ma &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">ma_params = np.array(self.params[self.model._params_ma])</span>
+            <span class="s1">k_endog = self.model.k_endog</span>
+            <span class="s1">k_ma = self.model.k_ma</span>
+            <span class="s1">self.coefficient_matrices_vma = (</span>
+                <span class="s1">ma_params.reshape(k_endog * k_ma</span><span class="s3">, </span><span class="s1">k_endog).T</span>
+            <span class="s1">).reshape(k_endog</span><span class="s3">, </span><span class="s1">k_endog</span><span class="s3">, </span><span class="s1">k_ma).T</span>
+
+    <span class="s3">def </span><span class="s1">extend(self</span><span class="s3">, </span><span class="s1">endog</span><span class="s3">, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0"># If we have exog, then the last element of predicted_state and</span>
+        <span class="s0"># predicted_state_cov are nan (since they depend on the exog associated</span>
+        <span class="s0"># with the first out-of-sample point), so we need to compute them here</span>
+        <span class="s3">if </span><span class="s1">exog </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">fcast = self.get_prediction(self.nobs</span><span class="s3">, </span><span class="s1">self.nobs</span><span class="s3">, </span><span class="s1">exog=exog[:</span><span class="s4">1</span><span class="s1">])</span>
+            <span class="s1">fcast_results = fcast.prediction_results</span>
+            <span class="s1">initial_state = fcast_results.predicted_state[...</span><span class="s3">, </span><span class="s4">0</span><span class="s1">]</span>
+            <span class="s1">initial_state_cov = fcast_results.predicted_state_cov[...</span><span class="s3">, </span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">initial_state = self.predicted_state[...</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">initial_state_cov = self.predicted_state_cov[...</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'trend_offset'</span><span class="s3">, </span><span class="s1">self.nobs + self.model.trend_offset)</span>
+        <span class="s1">mod = self.model.clone(endog</span><span class="s3">, </span><span class="s1">exog=exog</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s1">mod.ssm.initialization = Initialization(</span>
+            <span class="s1">mod.k_states</span><span class="s3">, </span><span class="s5">'known'</span><span class="s3">, </span><span class="s1">constant=initial_state</span><span class="s3">,</span>
+            <span class="s1">stationary_cov=initial_state_cov)</span>
+
+        <span class="s3">if </span><span class="s1">self.smoother_results </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">res = mod.smooth(self.params)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">res = mod.filter(self.params)</span>
+
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s1">@contextlib.contextmanager</span>
+    <span class="s3">def </span><span class="s1">_set_final_exog(self</span><span class="s3">, </span><span class="s1">exog):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Set the final state intercept value using out-of-sample `exog` / trend 
+ 
+        Parameters 
+        ---------- 
+        exog : ndarray 
+            Out-of-sample `exog` values, usually produced by 
+            `_validate_out_of_sample_exog` to ensure the correct shape (this 
+            method does not do any additional validation of its own). 
+        out_of_sample : int 
+            Number of out-of-sample periods. 
+ 
+        Notes 
+        ----- 
+        This context manager calls the model-level context manager and 
+        additionally updates the last element of filter_results.state_intercept 
+        appropriately. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">mod = self.model</span>
+        <span class="s3">with </span><span class="s1">mod._set_final_exog(exog):</span>
+            <span class="s1">cache_value = self.filter_results.state_intercept[:</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">mod.update(self.params)</span>
+            <span class="s1">self.filter_results.state_intercept[:mod.k_endog</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">] = (</span>
+                <span class="s1">mod[</span><span class="s5">'state_intercept'</span><span class="s3">, </span><span class="s1">:mod.k_endog</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">])</span>
+            <span class="s3">try</span><span class="s1">:</span>
+                <span class="s3">yield</span>
+            <span class="s3">finally</span><span class="s1">:</span>
+                <span class="s1">self.filter_results.state_intercept[:</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">] = cache_value</span>
+
+    <span class="s1">@contextlib.contextmanager</span>
+    <span class="s3">def </span><span class="s1">_set_final_predicted_state(self</span><span class="s3">, </span><span class="s1">exog</span><span class="s3">, </span><span class="s1">out_of_sample):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Set the final predicted state value using out-of-sample `exog` / trend 
+ 
+        Parameters 
+        ---------- 
+        exog : ndarray 
+            Out-of-sample `exog` values, usually produced by 
+            `_validate_out_of_sample_exog` to ensure the correct shape (this 
+            method does not do any additional validation of its own). 
+        out_of_sample : int 
+            Number of out-of-sample periods. 
+ 
+        Notes 
+        ----- 
+        We need special handling for forecasting with `exog`, because 
+        if we had these then the last predicted_state has been set to NaN since 
+        we did not have the appropriate `exog` to create it. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">flag = out_of_sample </span><span class="s3">and </span><span class="s1">self.model.k_exog &gt; </span><span class="s4">0</span>
+
+        <span class="s3">if </span><span class="s1">flag:</span>
+            <span class="s1">tmp_endog = concat([</span>
+                <span class="s1">self.model.endog[-</span><span class="s4">1</span><span class="s1">:]</span><span class="s3">, </span><span class="s1">np.zeros((</span><span class="s4">1</span><span class="s3">, </span><span class="s1">self.model.k_endog))])</span>
+            <span class="s3">if </span><span class="s1">self.model.k_exog &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">tmp_exog = concat([self.model.exog[-</span><span class="s4">1</span><span class="s1">:]</span><span class="s3">, </span><span class="s1">exog[:</span><span class="s4">1</span><span class="s1">]])</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">tmp_exog = </span><span class="s3">None</span>
+
+            <span class="s1">tmp_trend_offset = self.model.trend_offset + self.nobs - </span><span class="s4">1</span>
+            <span class="s1">tmp_mod = self.model.clone(tmp_endog</span><span class="s3">, </span><span class="s1">exog=tmp_exog</span><span class="s3">,</span>
+                                       <span class="s1">trend_offset=tmp_trend_offset)</span>
+            <span class="s1">constant = self.filter_results.predicted_state[:</span><span class="s3">, </span><span class="s1">-</span><span class="s4">2</span><span class="s1">]</span>
+            <span class="s1">stationary_cov = self.filter_results.predicted_state_cov[:</span><span class="s3">, </span><span class="s1">:</span><span class="s3">, </span><span class="s1">-</span><span class="s4">2</span><span class="s1">]</span>
+            <span class="s1">tmp_mod.ssm.initialize_known(constant=constant</span><span class="s3">,</span>
+                                         <span class="s1">stationary_cov=stationary_cov)</span>
+            <span class="s1">tmp_res = tmp_mod.filter(self.params</span><span class="s3">, </span><span class="s1">transformed=</span><span class="s3">True,</span>
+                                     <span class="s1">includes_fixed=</span><span class="s3">True, </span><span class="s1">return_ssm=</span><span class="s3">True</span><span class="s1">)</span>
+
+            <span class="s0"># Patch up `predicted_state`</span>
+            <span class="s1">self.filter_results.predicted_state[:</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">] = (</span>
+                <span class="s1">tmp_res.predicted_state[:</span><span class="s3">, </span><span class="s1">-</span><span class="s4">2</span><span class="s1">])</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s3">yield</span>
+        <span class="s3">finally</span><span class="s1">:</span>
+            <span class="s3">if </span><span class="s1">flag:</span>
+                <span class="s1">self.filter_results.predicted_state[:</span><span class="s3">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">] = np.nan</span>
+
+    <span class="s1">@Appender(MLEResults.get_prediction.__doc__)</span>
+    <span class="s3">def </span><span class="s1">get_prediction(self</span><span class="s3">, </span><span class="s1">start=</span><span class="s3">None, </span><span class="s1">end=</span><span class="s3">None, </span><span class="s1">dynamic=</span><span class="s3">False,</span>
+                       <span class="s1">information_set=</span><span class="s5">'predicted'</span><span class="s3">, </span><span class="s1">index=</span><span class="s3">None, </span><span class="s1">exog=</span><span class="s3">None,</span>
+                       <span class="s1">**kwargs):</span>
+        <span class="s3">if </span><span class="s1">start </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">start = </span><span class="s4">0</span>
+
+        <span class="s0"># Handle end (e.g. date)</span>
+        <span class="s1">_start</span><span class="s3">, </span><span class="s1">_end</span><span class="s3">, </span><span class="s1">out_of_sample</span><span class="s3">, </span><span class="s1">_ = (</span>
+            <span class="s1">self.model._get_prediction_index(start</span><span class="s3">, </span><span class="s1">end</span><span class="s3">, </span><span class="s1">index</span><span class="s3">, </span><span class="s1">silent=</span><span class="s3">True</span><span class="s1">))</span>
+
+        <span class="s0"># Normalize `exog`</span>
+        <span class="s1">exog = self.model._validate_out_of_sample_exog(exog</span><span class="s3">, </span><span class="s1">out_of_sample)</span>
+
+        <span class="s0"># Handle trend offset for extended model</span>
+        <span class="s1">extend_kwargs = {}</span>
+        <span class="s3">if </span><span class="s1">self.model.k_trend &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">extend_kwargs[</span><span class="s5">'trend_offset'</span><span class="s1">] = (</span>
+                <span class="s1">self.model.trend_offset + self.nobs)</span>
+
+        <span class="s0"># Get the prediction</span>
+        <span class="s3">with </span><span class="s1">self._set_final_exog(exog):</span>
+            <span class="s3">with </span><span class="s1">self._set_final_predicted_state(exog</span><span class="s3">, </span><span class="s1">out_of_sample):</span>
+                <span class="s1">out = super(VARMAXResults</span><span class="s3">, </span><span class="s1">self).get_prediction(</span>
+                    <span class="s1">start=start</span><span class="s3">, </span><span class="s1">end=end</span><span class="s3">, </span><span class="s1">dynamic=dynamic</span><span class="s3">,</span>
+                    <span class="s1">information_set=information_set</span><span class="s3">, </span><span class="s1">index=index</span><span class="s3">, </span><span class="s1">exog=exog</span><span class="s3">,</span>
+                    <span class="s1">extend_kwargs=extend_kwargs</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+        <span class="s3">return </span><span class="s1">out</span>
+
+    <span class="s1">@Appender(MLEResults.simulate.__doc__)</span>
+    <span class="s3">def </span><span class="s1">simulate(self</span><span class="s3">, </span><span class="s1">nsimulations</span><span class="s3">, </span><span class="s1">measurement_shocks=</span><span class="s3">None,</span>
+                 <span class="s1">state_shocks=</span><span class="s3">None, </span><span class="s1">initial_state=</span><span class="s3">None, </span><span class="s1">anchor=</span><span class="s3">None,</span>
+                 <span class="s1">repetitions=</span><span class="s3">None, </span><span class="s1">exog=</span><span class="s3">None, </span><span class="s1">extend_model=</span><span class="s3">None,</span>
+                 <span class="s1">extend_kwargs=</span><span class="s3">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3">if </span><span class="s1">anchor </span><span class="s3">is None or </span><span class="s1">anchor == </span><span class="s5">'start'</span><span class="s1">:</span>
+            <span class="s1">iloc = </span><span class="s4">0</span>
+        <span class="s3">elif </span><span class="s1">anchor == </span><span class="s5">'end'</span><span class="s1">:</span>
+            <span class="s1">iloc = self.nobs</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">iloc</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_ = self.model._get_index_loc(anchor)</span>
+
+        <span class="s3">if </span><span class="s1">iloc &lt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">iloc = self.nobs + iloc</span>
+        <span class="s3">if </span><span class="s1">iloc &gt; self.nobs:</span>
+            <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s5">'Cannot anchor simulation after the estimated'</span>
+                             <span class="s5">' sample.'</span><span class="s1">)</span>
+
+        <span class="s1">out_of_sample = max(iloc + nsimulations - self.nobs</span><span class="s3">, </span><span class="s4">0</span><span class="s1">)</span>
+
+        <span class="s0"># Normalize `exog`</span>
+        <span class="s1">exog = self.model._validate_out_of_sample_exog(exog</span><span class="s3">, </span><span class="s1">out_of_sample)</span>
+
+        <span class="s3">with </span><span class="s1">self._set_final_predicted_state(exog</span><span class="s3">, </span><span class="s1">out_of_sample):</span>
+            <span class="s1">out = super(VARMAXResults</span><span class="s3">, </span><span class="s1">self).simulate(</span>
+                <span class="s1">nsimulations</span><span class="s3">, </span><span class="s1">measurement_shocks=measurement_shocks</span><span class="s3">,</span>
+                <span class="s1">state_shocks=state_shocks</span><span class="s3">, </span><span class="s1">initial_state=initial_state</span><span class="s3">,</span>
+                <span class="s1">anchor=anchor</span><span class="s3">, </span><span class="s1">repetitions=repetitions</span><span class="s3">, </span><span class="s1">exog=exog</span><span class="s3">,</span>
+                <span class="s1">extend_model=extend_model</span><span class="s3">, </span><span class="s1">extend_kwargs=extend_kwargs</span><span class="s3">,</span>
+                <span class="s1">**kwargs)</span>
+
+        <span class="s3">return </span><span class="s1">out</span>
+
+    <span class="s3">def </span><span class="s1">_news_previous_results(self</span><span class="s3">, </span><span class="s1">previous</span><span class="s3">, </span><span class="s1">start</span><span class="s3">, </span><span class="s1">end</span><span class="s3">, </span><span class="s1">periods</span><span class="s3">,</span>
+                               <span class="s1">state_index=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s0"># We need to figure out the out-of-sample exog, so that we can add back</span>
+        <span class="s0"># in the last exog, predicted state</span>
+        <span class="s1">exog = </span><span class="s3">None</span>
+        <span class="s1">out_of_sample = self.nobs - previous.nobs</span>
+        <span class="s3">if </span><span class="s1">self.model.k_exog &gt; </span><span class="s4">0 </span><span class="s3">and </span><span class="s1">out_of_sample &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">exog = self.model.exog[-out_of_sample:]</span>
+
+        <span class="s0"># We also need to manually compute the `revised` results,</span>
+        <span class="s1">rev_endog = self.model.endog[:previous.nobs].copy()</span>
+        <span class="s1">rev_endog[previous.filter_results.missing.astype(bool).T] = np.nan</span>
+        <span class="s1">has_revisions = </span><span class="s3">not </span><span class="s1">np.allclose(rev_endog</span><span class="s3">, </span><span class="s1">previous.model.endog</span><span class="s3">,</span>
+                                        <span class="s1">equal_nan=</span><span class="s3">True</span><span class="s1">)</span>
+        <span class="s1">revised_results = </span><span class="s3">None</span>
+        <span class="s3">if </span><span class="s1">has_revisions:</span>
+            <span class="s1">rev_exog = </span><span class="s3">None</span>
+            <span class="s3">if </span><span class="s1">self.model.exog </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">rev_exog = self.model.exog[:previous.nobs].copy()</span>
+            <span class="s1">rev_mod = previous.model.clone(rev_endog</span><span class="s3">, </span><span class="s1">exog=rev_exog)</span>
+            <span class="s1">revised = rev_mod.smooth(self.params)</span>
+
+        <span class="s0"># Compute the news</span>
+        <span class="s3">with </span><span class="s1">contextlib.ExitStack() </span><span class="s3">as </span><span class="s1">stack:</span>
+            <span class="s1">stack.enter_context(previous.model._set_final_exog(exog))</span>
+            <span class="s1">stack.enter_context(previous._set_final_predicted_state(</span>
+                <span class="s1">exog</span><span class="s3">, </span><span class="s1">out_of_sample))</span>
+
+            <span class="s3">if </span><span class="s1">has_revisions:</span>
+                <span class="s1">stack.enter_context(revised.model._set_final_exog(exog))</span>
+                <span class="s1">stack.enter_context(revised._set_final_predicted_state(</span>
+                    <span class="s1">exog</span><span class="s3">, </span><span class="s1">out_of_sample))</span>
+                <span class="s1">revised_results = revised.smoother_results</span>
+
+            <span class="s1">out = self.smoother_results.news(</span>
+                <span class="s1">previous.smoother_results</span><span class="s3">, </span><span class="s1">start=start</span><span class="s3">, </span><span class="s1">end=end</span><span class="s3">,</span>
+                <span class="s1">revised=revised_results</span><span class="s3">, </span><span class="s1">state_index=state_index)</span>
+        <span class="s3">return </span><span class="s1">out</span>
+
+    <span class="s1">@Appender(MLEResults.summary.__doc__)</span>
+    <span class="s3">def </span><span class="s1">summary(self</span><span class="s3">, </span><span class="s1">alpha=</span><span class="s4">.05</span><span class="s3">, </span><span class="s1">start=</span><span class="s3">None, </span><span class="s1">separate_params=</span><span class="s3">True</span><span class="s1">):</span>
+        <span class="s3">from </span><span class="s1">statsmodels.iolib.summary </span><span class="s3">import </span><span class="s1">summary_params</span>
+
+        <span class="s0"># Create the model name</span>
+        <span class="s1">spec = self.specification</span>
+        <span class="s3">if </span><span class="s1">spec.k_ar &gt; </span><span class="s4">0 </span><span class="s3">and </span><span class="s1">spec.k_ma &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">model_name = </span><span class="s5">'VARMA'</span>
+            <span class="s1">order = </span><span class="s5">'(%s,%s)' </span><span class="s1">% (spec.k_ar</span><span class="s3">, </span><span class="s1">spec.k_ma)</span>
+        <span class="s3">elif </span><span class="s1">spec.k_ar &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">model_name = </span><span class="s5">'VAR'</span>
+            <span class="s1">order = </span><span class="s5">'(%s)' </span><span class="s1">% (spec.k_ar)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">model_name = </span><span class="s5">'VMA'</span>
+            <span class="s1">order = </span><span class="s5">'(%s)' </span><span class="s1">% (spec.k_ma)</span>
+        <span class="s3">if </span><span class="s1">spec.k_exog &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">model_name += </span><span class="s5">'X'</span>
+        <span class="s1">model_name = [model_name + order]</span>
+
+        <span class="s3">if </span><span class="s1">spec.k_trend &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">model_name.append(</span><span class="s5">'intercept'</span><span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s1">spec.measurement_error:</span>
+            <span class="s1">model_name.append(</span><span class="s5">'measurement error'</span><span class="s1">)</span>
+
+        <span class="s1">summary = super(VARMAXResults</span><span class="s3">, </span><span class="s1">self).summary(</span>
+            <span class="s1">alpha=alpha</span><span class="s3">, </span><span class="s1">start=start</span><span class="s3">, </span><span class="s1">model_name=model_name</span><span class="s3">,</span>
+            <span class="s1">display_params=</span><span class="s3">not </span><span class="s1">separate_params</span>
+        <span class="s1">)</span>
+
+        <span class="s3">if </span><span class="s1">separate_params:</span>
+            <span class="s1">indices = np.arange(len(self.params))</span>
+
+            <span class="s3">def </span><span class="s1">make_table(self</span><span class="s3">, </span><span class="s1">mask</span><span class="s3">, </span><span class="s1">title</span><span class="s3">, </span><span class="s1">strip_end=</span><span class="s3">True</span><span class="s1">):</span>
+                <span class="s1">res = (self</span><span class="s3">, </span><span class="s1">self.params[mask]</span><span class="s3">, </span><span class="s1">self.bse[mask]</span><span class="s3">,</span>
+                       <span class="s1">self.zvalues[mask]</span><span class="s3">, </span><span class="s1">self.pvalues[mask]</span><span class="s3">,</span>
+                       <span class="s1">self.conf_int(alpha)[mask])</span>
+
+                <span class="s1">param_names = []</span>
+                <span class="s3">for </span><span class="s1">name </span><span class="s3">in </span><span class="s1">np.array(self.data.param_names)[mask].tolist():</span>
+                    <span class="s3">if </span><span class="s1">strip_end:</span>
+                        <span class="s1">param_name = </span><span class="s5">'.'</span><span class="s1">.join(name.split(</span><span class="s5">'.'</span><span class="s1">)[:-</span><span class="s4">1</span><span class="s1">])</span>
+                    <span class="s3">else</span><span class="s1">:</span>
+                        <span class="s1">param_name = name</span>
+                    <span class="s3">if </span><span class="s1">name </span><span class="s3">in </span><span class="s1">self.fixed_params:</span>
+                        <span class="s1">param_name = </span><span class="s5">'%s (fixed)' </span><span class="s1">% param_name</span>
+                    <span class="s1">param_names.append(param_name)</span>
+
+                <span class="s3">return </span><span class="s1">summary_params(res</span><span class="s3">, </span><span class="s1">yname=</span><span class="s3">None, </span><span class="s1">xname=param_names</span><span class="s3">,</span>
+                                      <span class="s1">alpha=alpha</span><span class="s3">, </span><span class="s1">use_t=</span><span class="s3">False, </span><span class="s1">title=title)</span>
+
+            <span class="s0"># Add parameter tables for each endogenous variable</span>
+            <span class="s1">k_endog = self.model.k_endog</span>
+            <span class="s1">k_ar = self.model.k_ar</span>
+            <span class="s1">k_ma = self.model.k_ma</span>
+            <span class="s1">k_trend = self.model.k_trend</span>
+            <span class="s1">k_exog = self.model.k_exog</span>
+            <span class="s1">endog_masks = []</span>
+            <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(k_endog):</span>
+                <span class="s1">masks = []</span>
+                <span class="s1">offset = </span><span class="s4">0</span>
+
+                <span class="s0"># 1. Intercept terms</span>
+                <span class="s3">if </span><span class="s1">k_trend &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">masks.append(np.arange(i</span><span class="s3">, </span><span class="s1">i + k_endog * k_trend</span><span class="s3">, </span><span class="s1">k_endog))</span>
+                    <span class="s1">offset += k_endog * k_trend</span>
+
+                <span class="s0"># 2. AR terms</span>
+                <span class="s3">if </span><span class="s1">k_ar &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">start = i * k_endog * k_ar</span>
+                    <span class="s1">end = (i + </span><span class="s4">1</span><span class="s1">) * k_endog * k_ar</span>
+                    <span class="s1">masks.append(</span>
+                        <span class="s1">offset + np.arange(start</span><span class="s3">, </span><span class="s1">end))</span>
+                    <span class="s1">offset += k_ar * k_endog**</span><span class="s4">2</span>
+
+                <span class="s0"># 3. MA terms</span>
+                <span class="s3">if </span><span class="s1">k_ma &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">start = i * k_endog * k_ma</span>
+                    <span class="s1">end = (i + </span><span class="s4">1</span><span class="s1">) * k_endog * k_ma</span>
+                    <span class="s1">masks.append(</span>
+                        <span class="s1">offset + np.arange(start</span><span class="s3">, </span><span class="s1">end))</span>
+                    <span class="s1">offset += k_ma * k_endog**</span><span class="s4">2</span>
+
+                <span class="s0"># 4. Regression terms</span>
+                <span class="s3">if </span><span class="s1">k_exog &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">masks.append(</span>
+                        <span class="s1">offset + np.arange(i * k_exog</span><span class="s3">, </span><span class="s1">(i + </span><span class="s4">1</span><span class="s1">) * k_exog))</span>
+                    <span class="s1">offset += k_endog * k_exog</span>
+
+                <span class="s0"># 5. Measurement error variance terms</span>
+                <span class="s3">if </span><span class="s1">self.model.measurement_error:</span>
+                    <span class="s1">masks.append(</span>
+                        <span class="s1">np.array(self.model.k_params - i - </span><span class="s4">1</span><span class="s3">, </span><span class="s1">ndmin=</span><span class="s4">1</span><span class="s1">))</span>
+
+                <span class="s0"># Create the table</span>
+                <span class="s1">mask = np.concatenate(masks)</span>
+                <span class="s1">endog_masks.append(mask)</span>
+
+                <span class="s1">endog_names = self.model.endog_names</span>
+                <span class="s3">if not </span><span class="s1">isinstance(endog_names</span><span class="s3">, </span><span class="s1">list):</span>
+                    <span class="s1">endog_names = [endog_names]</span>
+                <span class="s1">title = </span><span class="s5">&quot;Results for equation %s&quot; </span><span class="s1">% endog_names[i]</span>
+                <span class="s1">table = make_table(self</span><span class="s3">, </span><span class="s1">mask</span><span class="s3">, </span><span class="s1">title)</span>
+                <span class="s1">summary.tables.append(table)</span>
+
+            <span class="s0"># State covariance terms</span>
+            <span class="s1">state_cov_mask = (</span>
+                <span class="s1">np.arange(len(self.params))[self.model._params_state_cov])</span>
+            <span class="s1">table = make_table(self</span><span class="s3">, </span><span class="s1">state_cov_mask</span><span class="s3">, </span><span class="s5">&quot;Error covariance matrix&quot;</span><span class="s3">,</span>
+                               <span class="s1">strip_end=</span><span class="s3">False</span><span class="s1">)</span>
+            <span class="s1">summary.tables.append(table)</span>
+
+            <span class="s0"># Add a table for all other parameters</span>
+            <span class="s1">masks = []</span>
+            <span class="s3">for </span><span class="s1">m </span><span class="s3">in </span><span class="s1">(endog_masks</span><span class="s3">, </span><span class="s1">[state_cov_mask]):</span>
+                <span class="s1">m = np.array(m).flatten()</span>
+                <span class="s3">if </span><span class="s1">len(m) &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">masks.append(m)</span>
+            <span class="s1">masks = np.concatenate(masks)</span>
+            <span class="s1">inverse_mask = np.array(list(set(indices).difference(set(masks))))</span>
+            <span class="s3">if </span><span class="s1">len(inverse_mask) &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">table = make_table(self</span><span class="s3">, </span><span class="s1">inverse_mask</span><span class="s3">, </span><span class="s5">&quot;Other parameters&quot;</span><span class="s3">,</span>
+                                   <span class="s1">strip_end=</span><span class="s3">False</span><span class="s1">)</span>
+                <span class="s1">summary.tables.append(table)</span>
+
+        <span class="s3">return </span><span class="s1">summary</span>
+
+
+<span class="s3">class </span><span class="s1">VARMAXResultsWrapper(MLEResultsWrapper):</span>
+    <span class="s1">_attrs = {}</span>
+    <span class="s1">_wrap_attrs = wrap.union_dicts(MLEResultsWrapper._wrap_attrs</span><span class="s3">,</span>
+                                   <span class="s1">_attrs)</span>
+    <span class="s1">_methods = {}</span>
+    <span class="s1">_wrap_methods = wrap.union_dicts(MLEResultsWrapper._wrap_methods</span><span class="s3">,</span>
+                                     <span class="s1">_methods)</span>
+<span class="s1">wrap.populate_wrapper(VARMAXResultsWrapper</span><span class="s3">, </span><span class="s1">VARMAXResults)  </span><span class="s0"># noqa:E305</span>
+</pre>
+</body>
+</html>

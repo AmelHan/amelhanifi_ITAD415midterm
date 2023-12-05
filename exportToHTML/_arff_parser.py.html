@@ -1,0 +1,562 @@
+<html>
+<head>
+<title>_arff_parser.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_arff_parser.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Implementation of ARFF parsers: via LIAC-ARFF and pandas.&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">itertools</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">OrderedDict</span>
+<span class="s2">from </span><span class="s1">collections.abc </span><span class="s2">import </span><span class="s1">Generator</span>
+<span class="s2">from </span><span class="s1">typing </span><span class="s2">import </span><span class="s1">List</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">scipy </span><span class="s2">as </span><span class="s1">sp</span>
+
+<span class="s2">from </span><span class="s1">..externals </span><span class="s2">import </span><span class="s1">_arff</span>
+<span class="s2">from </span><span class="s1">..externals._arff </span><span class="s2">import </span><span class="s1">ArffSparseDataType</span>
+<span class="s2">from </span><span class="s1">..utils </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">_chunk_generator</span><span class="s2">,</span>
+    <span class="s1">check_pandas_support</span><span class="s2">,</span>
+    <span class="s1">get_chunk_n_rows</span><span class="s2">,</span>
+<span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">_split_sparse_columns(</span>
+    <span class="s1">arff_data: ArffSparseDataType</span><span class="s2">, </span><span class="s1">include_columns: List</span>
+<span class="s1">) -&gt; ArffSparseDataType:</span>
+    <span class="s0">&quot;&quot;&quot;Obtains several columns from sparse ARFF representation. Additionally, 
+    the column indices are re-labelled, given the columns that are not 
+    included. (e.g., when including [1, 2, 3], the columns will be relabelled 
+    to [0, 1, 2]). 
+ 
+    Parameters 
+    ---------- 
+    arff_data : tuple 
+        A tuple of three lists of equal size; first list indicating the value, 
+        second the x coordinate and the third the y coordinate. 
+ 
+    include_columns : list 
+        A list of columns to include. 
+ 
+    Returns 
+    ------- 
+    arff_data_new : tuple 
+        Subset of arff data with only the include columns indicated by the 
+        include_columns argument. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">arff_data_new: ArffSparseDataType = (list()</span><span class="s2">, </span><span class="s1">list()</span><span class="s2">, </span><span class="s1">list())</span>
+    <span class="s1">reindexed_columns = {</span>
+        <span class="s1">column_idx: array_idx </span><span class="s2">for </span><span class="s1">array_idx</span><span class="s2">, </span><span class="s1">column_idx </span><span class="s2">in </span><span class="s1">enumerate(include_columns)</span>
+    <span class="s1">}</span>
+    <span class="s2">for </span><span class="s1">val</span><span class="s2">, </span><span class="s1">row_idx</span><span class="s2">, </span><span class="s1">col_idx </span><span class="s2">in </span><span class="s1">zip(arff_data[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">arff_data[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">arff_data[</span><span class="s3">2</span><span class="s1">]):</span>
+        <span class="s2">if </span><span class="s1">col_idx </span><span class="s2">in </span><span class="s1">include_columns:</span>
+            <span class="s1">arff_data_new[</span><span class="s3">0</span><span class="s1">].append(val)</span>
+            <span class="s1">arff_data_new[</span><span class="s3">1</span><span class="s1">].append(row_idx)</span>
+            <span class="s1">arff_data_new[</span><span class="s3">2</span><span class="s1">].append(reindexed_columns[col_idx])</span>
+    <span class="s2">return </span><span class="s1">arff_data_new</span>
+
+
+<span class="s2">def </span><span class="s1">_sparse_data_to_array(</span>
+    <span class="s1">arff_data: ArffSparseDataType</span><span class="s2">, </span><span class="s1">include_columns: List</span>
+<span class="s1">) -&gt; np.ndarray:</span>
+    <span class="s4"># turns the sparse data back into an array (can't use toarray() function,</span>
+    <span class="s4"># as this does only work on numeric data)</span>
+    <span class="s1">num_obs = max(arff_data[</span><span class="s3">1</span><span class="s1">]) + </span><span class="s3">1</span>
+    <span class="s1">y_shape = (num_obs</span><span class="s2">, </span><span class="s1">len(include_columns))</span>
+    <span class="s1">reindexed_columns = {</span>
+        <span class="s1">column_idx: array_idx </span><span class="s2">for </span><span class="s1">array_idx</span><span class="s2">, </span><span class="s1">column_idx </span><span class="s2">in </span><span class="s1">enumerate(include_columns)</span>
+    <span class="s1">}</span>
+    <span class="s4"># TODO: improve for efficiency</span>
+    <span class="s1">y = np.empty(y_shape</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+    <span class="s2">for </span><span class="s1">val</span><span class="s2">, </span><span class="s1">row_idx</span><span class="s2">, </span><span class="s1">col_idx </span><span class="s2">in </span><span class="s1">zip(arff_data[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">arff_data[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">arff_data[</span><span class="s3">2</span><span class="s1">]):</span>
+        <span class="s2">if </span><span class="s1">col_idx </span><span class="s2">in </span><span class="s1">include_columns:</span>
+            <span class="s1">y[row_idx</span><span class="s2">, </span><span class="s1">reindexed_columns[col_idx]] = val</span>
+    <span class="s2">return </span><span class="s1">y</span>
+
+
+<span class="s2">def </span><span class="s1">_post_process_frame(frame</span><span class="s2">, </span><span class="s1">feature_names</span><span class="s2">, </span><span class="s1">target_names):</span>
+    <span class="s0">&quot;&quot;&quot;Post process a dataframe to select the desired columns in `X` and `y`. 
+ 
+    Parameters 
+    ---------- 
+    frame : dataframe 
+        The dataframe to split into `X` and `y`. 
+ 
+    feature_names : list of str 
+        The list of feature names to populate `X`. 
+ 
+    target_names : list of str 
+        The list of target names to populate `y`. 
+ 
+    Returns 
+    ------- 
+    X : dataframe 
+        The dataframe containing the features. 
+ 
+    y : {series, dataframe} or None 
+        The series or dataframe containing the target. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">X = frame[feature_names]</span>
+    <span class="s2">if </span><span class="s1">len(target_names) &gt;= </span><span class="s3">2</span><span class="s1">:</span>
+        <span class="s1">y = frame[target_names]</span>
+    <span class="s2">elif </span><span class="s1">len(target_names) == </span><span class="s3">1</span><span class="s1">:</span>
+        <span class="s1">y = frame[target_names[</span><span class="s3">0</span><span class="s1">]]</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">y = </span><span class="s2">None</span>
+    <span class="s2">return </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span>
+
+
+<span class="s2">def </span><span class="s1">_liac_arff_parser(</span>
+    <span class="s1">gzip_file</span><span class="s2">,</span>
+    <span class="s1">output_arrays_type</span><span class="s2">,</span>
+    <span class="s1">openml_columns_info</span><span class="s2">,</span>
+    <span class="s1">feature_names_to_select</span><span class="s2">,</span>
+    <span class="s1">target_names_to_select</span><span class="s2">,</span>
+    <span class="s1">shape=</span><span class="s2">None,</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;ARFF parser using the LIAC-ARFF library coded purely in Python. 
+ 
+    This parser is quite slow but consumes a generator. Currently it is needed 
+    to parse sparse datasets. For dense datasets, it is recommended to instead 
+    use the pandas-based parser, although it does not always handles the 
+    dtypes exactly the same. 
+ 
+    Parameters 
+    ---------- 
+    gzip_file : GzipFile instance 
+        The file compressed to be read. 
+ 
+    output_arrays_type : {&quot;numpy&quot;, &quot;sparse&quot;, &quot;pandas&quot;} 
+        The type of the arrays that will be returned. The possibilities ara: 
+ 
+        - `&quot;numpy&quot;`: both `X` and `y` will be NumPy arrays; 
+        - `&quot;sparse&quot;`: `X` will be sparse matrix and `y` will be a NumPy array; 
+        - `&quot;pandas&quot;`: `X` will be a pandas DataFrame and `y` will be either a 
+          pandas Series or DataFrame. 
+ 
+    columns_info : dict 
+        The information provided by OpenML regarding the columns of the ARFF 
+        file. 
+ 
+    feature_names_to_select : list of str 
+        A list of the feature names to be selected. 
+ 
+    target_names_to_select : list of str 
+        A list of the target names to be selected. 
+ 
+    Returns 
+    ------- 
+    X : {ndarray, sparse matrix, dataframe} 
+        The data matrix. 
+ 
+    y : {ndarray, dataframe, series} 
+        The target. 
+ 
+    frame : dataframe or None 
+        A dataframe containing both `X` and `y`. `None` if 
+        `output_array_type != &quot;pandas&quot;`. 
+ 
+    categories : list of str or None 
+        The names of the features that are categorical. `None` if 
+        `output_array_type == &quot;pandas&quot;`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">_io_to_generator(gzip_file):</span>
+        <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">gzip_file:</span>
+            <span class="s2">yield </span><span class="s1">line.decode(</span><span class="s5">&quot;utf-8&quot;</span><span class="s1">)</span>
+
+    <span class="s1">stream = _io_to_generator(gzip_file)</span>
+
+    <span class="s4"># find which type (dense or sparse) ARFF type we will have to deal with</span>
+    <span class="s1">return_type = _arff.COO </span><span class="s2">if </span><span class="s1">output_arrays_type == </span><span class="s5">&quot;sparse&quot; </span><span class="s2">else </span><span class="s1">_arff.DENSE_GEN</span>
+    <span class="s4"># we should not let LIAC-ARFF to encode the nominal attributes with NumPy</span>
+    <span class="s4"># arrays to have only numerical values.</span>
+    <span class="s1">encode_nominal = </span><span class="s2">not </span><span class="s1">(output_arrays_type == </span><span class="s5">&quot;pandas&quot;</span><span class="s1">)</span>
+    <span class="s1">arff_container = _arff.load(</span>
+        <span class="s1">stream</span><span class="s2">, </span><span class="s1">return_type=return_type</span><span class="s2">, </span><span class="s1">encode_nominal=encode_nominal</span>
+    <span class="s1">)</span>
+    <span class="s1">columns_to_select = feature_names_to_select + target_names_to_select</span>
+
+    <span class="s1">categories = {</span>
+        <span class="s1">name: cat</span>
+        <span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">cat </span><span class="s2">in </span><span class="s1">arff_container[</span><span class="s5">&quot;attributes&quot;</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">isinstance(cat</span><span class="s2">, </span><span class="s1">list) </span><span class="s2">and </span><span class="s1">name </span><span class="s2">in </span><span class="s1">columns_to_select</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">output_arrays_type == </span><span class="s5">&quot;pandas&quot;</span><span class="s1">:</span>
+        <span class="s1">pd = check_pandas_support(</span><span class="s5">&quot;fetch_openml with as_frame=True&quot;</span><span class="s1">)</span>
+
+        <span class="s1">columns_info = OrderedDict(arff_container[</span><span class="s5">&quot;attributes&quot;</span><span class="s1">])</span>
+        <span class="s1">columns_names = list(columns_info.keys())</span>
+
+        <span class="s4"># calculate chunksize</span>
+        <span class="s1">first_row = next(arff_container[</span><span class="s5">&quot;data&quot;</span><span class="s1">])</span>
+        <span class="s1">first_df = pd.DataFrame([first_row]</span><span class="s2">, </span><span class="s1">columns=columns_names</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">False</span><span class="s1">)</span>
+
+        <span class="s1">row_bytes = first_df.memory_usage(deep=</span><span class="s2">True</span><span class="s1">).sum()</span>
+        <span class="s1">chunksize = get_chunk_n_rows(row_bytes)</span>
+
+        <span class="s4"># read arff data with chunks</span>
+        <span class="s1">columns_to_keep = [col </span><span class="s2">for </span><span class="s1">col </span><span class="s2">in </span><span class="s1">columns_names </span><span class="s2">if </span><span class="s1">col </span><span class="s2">in </span><span class="s1">columns_to_select]</span>
+        <span class="s1">dfs = [first_df[columns_to_keep]]</span>
+        <span class="s2">for </span><span class="s1">data </span><span class="s2">in </span><span class="s1">_chunk_generator(arff_container[</span><span class="s5">&quot;data&quot;</span><span class="s1">]</span><span class="s2">, </span><span class="s1">chunksize):</span>
+            <span class="s1">dfs.append(</span>
+                <span class="s1">pd.DataFrame(data</span><span class="s2">, </span><span class="s1">columns=columns_names</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">False</span><span class="s1">)[columns_to_keep]</span>
+            <span class="s1">)</span>
+        <span class="s4"># dfs[0] contains only one row, which may not have enough data to infer to</span>
+        <span class="s4"># column's dtype. Here we use `dfs[1]` to configure the dtype in dfs[0]</span>
+        <span class="s2">if </span><span class="s1">len(dfs) &gt;= </span><span class="s3">2</span><span class="s1">:</span>
+            <span class="s1">dfs[</span><span class="s3">0</span><span class="s1">] = dfs[</span><span class="s3">0</span><span class="s1">].astype(dfs[</span><span class="s3">1</span><span class="s1">].dtypes)</span>
+
+        <span class="s4"># liac-arff parser does not depend on NumPy and uses None to represent</span>
+        <span class="s4"># missing values. To be consistent with the pandas parser, we replace</span>
+        <span class="s4"># None with np.nan.</span>
+        <span class="s1">frame = pd.concat(dfs</span><span class="s2">, </span><span class="s1">ignore_index=</span><span class="s2">True</span><span class="s1">).fillna(value=np.nan)</span>
+        <span class="s2">del </span><span class="s1">dfs</span><span class="s2">, </span><span class="s1">first_df</span>
+
+        <span class="s4"># cast the columns frame</span>
+        <span class="s1">dtypes = {}</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">frame.columns:</span>
+            <span class="s1">column_dtype = openml_columns_info[name][</span><span class="s5">&quot;data_type&quot;</span><span class="s1">]</span>
+            <span class="s2">if </span><span class="s1">column_dtype.lower() == </span><span class="s5">&quot;integer&quot;</span><span class="s1">:</span>
+                <span class="s4"># Use a pandas extension array instead of np.int64 to be able</span>
+                <span class="s4"># to support missing values.</span>
+                <span class="s1">dtypes[name] = </span><span class="s5">&quot;Int64&quot;</span>
+            <span class="s2">elif </span><span class="s1">column_dtype.lower() == </span><span class="s5">&quot;nominal&quot;</span><span class="s1">:</span>
+                <span class="s1">dtypes[name] = </span><span class="s5">&quot;category&quot;</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">dtypes[name] = frame.dtypes[name]</span>
+        <span class="s1">frame = frame.astype(dtypes)</span>
+
+        <span class="s1">X</span><span class="s2">, </span><span class="s1">y = _post_process_frame(</span>
+            <span class="s1">frame</span><span class="s2">, </span><span class="s1">feature_names_to_select</span><span class="s2">, </span><span class="s1">target_names_to_select</span>
+        <span class="s1">)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">arff_data = arff_container[</span><span class="s5">&quot;data&quot;</span><span class="s1">]</span>
+
+        <span class="s1">feature_indices_to_select = [</span>
+            <span class="s1">int(openml_columns_info[col_name][</span><span class="s5">&quot;index&quot;</span><span class="s1">])</span>
+            <span class="s2">for </span><span class="s1">col_name </span><span class="s2">in </span><span class="s1">feature_names_to_select</span>
+        <span class="s1">]</span>
+        <span class="s1">target_indices_to_select = [</span>
+            <span class="s1">int(openml_columns_info[col_name][</span><span class="s5">&quot;index&quot;</span><span class="s1">])</span>
+            <span class="s2">for </span><span class="s1">col_name </span><span class="s2">in </span><span class="s1">target_names_to_select</span>
+        <span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(arff_data</span><span class="s2">, </span><span class="s1">Generator):</span>
+            <span class="s2">if </span><span class="s1">shape </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span>
+                    <span class="s5">&quot;shape must be provided when arr['data'] is a Generator&quot;</span>
+                <span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">shape[</span><span class="s3">0</span><span class="s1">] == -</span><span class="s3">1</span><span class="s1">:</span>
+                <span class="s1">count = -</span><span class="s3">1</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">count = shape[</span><span class="s3">0</span><span class="s1">] * shape[</span><span class="s3">1</span><span class="s1">]</span>
+            <span class="s1">data = np.fromiter(</span>
+                <span class="s1">itertools.chain.from_iterable(arff_data)</span><span class="s2">,</span>
+                <span class="s1">dtype=</span><span class="s5">&quot;float64&quot;</span><span class="s2">,</span>
+                <span class="s1">count=count</span><span class="s2">,</span>
+            <span class="s1">)</span>
+            <span class="s1">data = data.reshape(*shape)</span>
+            <span class="s1">X = data[:</span><span class="s2">, </span><span class="s1">feature_indices_to_select]</span>
+            <span class="s1">y = data[:</span><span class="s2">, </span><span class="s1">target_indices_to_select]</span>
+        <span class="s2">elif </span><span class="s1">isinstance(arff_data</span><span class="s2">, </span><span class="s1">tuple):</span>
+            <span class="s1">arff_data_X = _split_sparse_columns(arff_data</span><span class="s2">, </span><span class="s1">feature_indices_to_select)</span>
+            <span class="s1">num_obs = max(arff_data[</span><span class="s3">1</span><span class="s1">]) + </span><span class="s3">1</span>
+            <span class="s1">X_shape = (num_obs</span><span class="s2">, </span><span class="s1">len(feature_indices_to_select))</span>
+            <span class="s1">X = sp.sparse.coo_matrix(</span>
+                <span class="s1">(arff_data_X[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">(arff_data_X[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">arff_data_X[</span><span class="s3">2</span><span class="s1">]))</span><span class="s2">,</span>
+                <span class="s1">shape=X_shape</span><span class="s2">,</span>
+                <span class="s1">dtype=np.float64</span><span class="s2">,</span>
+            <span class="s1">)</span>
+            <span class="s1">X = X.tocsr()</span>
+            <span class="s1">y = _sparse_data_to_array(arff_data</span><span class="s2">, </span><span class="s1">target_indices_to_select)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s4"># This should never happen</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">f&quot;Unexpected type for data obtained from arff: </span><span class="s2">{</span><span class="s1">type(arff_data)</span><span class="s2">}</span><span class="s5">&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">is_classification = {</span>
+            <span class="s1">col_name </span><span class="s2">in </span><span class="s1">categories </span><span class="s2">for </span><span class="s1">col_name </span><span class="s2">in </span><span class="s1">target_names_to_select</span>
+        <span class="s1">}</span>
+        <span class="s2">if not </span><span class="s1">is_classification:</span>
+            <span class="s4"># No target</span>
+            <span class="s2">pass</span>
+        <span class="s2">elif </span><span class="s1">all(is_classification):</span>
+            <span class="s1">y = np.hstack(</span>
+                <span class="s1">[</span>
+                    <span class="s1">np.take(</span>
+                        <span class="s1">np.asarray(categories.pop(col_name)</span><span class="s2">, </span><span class="s1">dtype=</span><span class="s5">&quot;O&quot;</span><span class="s1">)</span><span class="s2">,</span>
+                        <span class="s1">y[:</span><span class="s2">, </span><span class="s1">i : i + </span><span class="s3">1</span><span class="s1">].astype(int</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">False</span><span class="s1">)</span><span class="s2">,</span>
+                    <span class="s1">)</span>
+                    <span class="s2">for </span><span class="s1">i</span><span class="s2">, </span><span class="s1">col_name </span><span class="s2">in </span><span class="s1">enumerate(target_names_to_select)</span>
+                <span class="s1">]</span>
+            <span class="s1">)</span>
+        <span class="s2">elif </span><span class="s1">any(is_classification):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;Mix of nominal and non-nominal targets is not currently supported&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s4"># reshape y back to 1-D array, if there is only 1 target column;</span>
+        <span class="s4"># back to None if there are not target columns</span>
+        <span class="s2">if </span><span class="s1">y.shape[</span><span class="s3">1</span><span class="s1">] == </span><span class="s3">1</span><span class="s1">:</span>
+            <span class="s1">y = y.reshape((-</span><span class="s3">1</span><span class="s2">,</span><span class="s1">))</span>
+        <span class="s2">elif </span><span class="s1">y.shape[</span><span class="s3">1</span><span class="s1">] == </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s1">y = </span><span class="s2">None</span>
+
+    <span class="s2">if </span><span class="s1">output_arrays_type == </span><span class="s5">&quot;pandas&quot;</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">frame</span><span class="s2">, None</span>
+    <span class="s2">return </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, None, </span><span class="s1">categories</span>
+
+
+<span class="s2">def </span><span class="s1">_pandas_arff_parser(</span>
+    <span class="s1">gzip_file</span><span class="s2">,</span>
+    <span class="s1">output_arrays_type</span><span class="s2">,</span>
+    <span class="s1">openml_columns_info</span><span class="s2">,</span>
+    <span class="s1">feature_names_to_select</span><span class="s2">,</span>
+    <span class="s1">target_names_to_select</span><span class="s2">,</span>
+    <span class="s1">read_csv_kwargs=</span><span class="s2">None,</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;ARFF parser using `pandas.read_csv`. 
+ 
+    This parser uses the metadata fetched directly from OpenML and skips the metadata 
+    headers of ARFF file itself. The data is loaded as a CSV file. 
+ 
+    Parameters 
+    ---------- 
+    gzip_file : GzipFile instance 
+        The GZip compressed file with the ARFF formatted payload. 
+ 
+    output_arrays_type : {&quot;numpy&quot;, &quot;sparse&quot;, &quot;pandas&quot;} 
+        The type of the arrays that will be returned. The possibilities are: 
+ 
+        - `&quot;numpy&quot;`: both `X` and `y` will be NumPy arrays; 
+        - `&quot;sparse&quot;`: `X` will be sparse matrix and `y` will be a NumPy array; 
+        - `&quot;pandas&quot;`: `X` will be a pandas DataFrame and `y` will be either a 
+          pandas Series or DataFrame. 
+ 
+    openml_columns_info : dict 
+        The information provided by OpenML regarding the columns of the ARFF 
+        file. 
+ 
+    feature_names_to_select : list of str 
+        A list of the feature names to be selected to build `X`. 
+ 
+    target_names_to_select : list of str 
+        A list of the target names to be selected to build `y`. 
+ 
+    read_csv_kwargs : dict, default=None 
+        Keyword arguments to pass to `pandas.read_csv`. It allows to overwrite 
+        the default options. 
+ 
+    Returns 
+    ------- 
+    X : {ndarray, sparse matrix, dataframe} 
+        The data matrix. 
+ 
+    y : {ndarray, dataframe, series} 
+        The target. 
+ 
+    frame : dataframe or None 
+        A dataframe containing both `X` and `y`. `None` if 
+        `output_array_type != &quot;pandas&quot;`. 
+ 
+    categories : list of str or None 
+        The names of the features that are categorical. `None` if 
+        `output_array_type == &quot;pandas&quot;`. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">import </span><span class="s1">pandas </span><span class="s2">as </span><span class="s1">pd</span>
+
+    <span class="s4"># read the file until the data section to skip the ARFF metadata headers</span>
+    <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">gzip_file:</span>
+        <span class="s2">if </span><span class="s1">line.decode(</span><span class="s5">&quot;utf-8&quot;</span><span class="s1">).lower().startswith(</span><span class="s5">&quot;@data&quot;</span><span class="s1">):</span>
+            <span class="s2">break</span>
+
+    <span class="s1">dtypes = {}</span>
+    <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">openml_columns_info:</span>
+        <span class="s1">column_dtype = openml_columns_info[name][</span><span class="s5">&quot;data_type&quot;</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">column_dtype.lower() == </span><span class="s5">&quot;integer&quot;</span><span class="s1">:</span>
+            <span class="s4"># Use Int64 to infer missing values from data</span>
+            <span class="s4"># XXX: this line is not covered by our tests. Is this really needed?</span>
+            <span class="s1">dtypes[name] = </span><span class="s5">&quot;Int64&quot;</span>
+        <span class="s2">elif </span><span class="s1">column_dtype.lower() == </span><span class="s5">&quot;nominal&quot;</span><span class="s1">:</span>
+            <span class="s1">dtypes[name] = </span><span class="s5">&quot;category&quot;</span>
+    <span class="s4"># since we will not pass `names` when reading the ARFF file, we need to translate</span>
+    <span class="s4"># `dtypes` from column names to column indices to pass to `pandas.read_csv`</span>
+    <span class="s1">dtypes_positional = {</span>
+        <span class="s1">col_idx: dtypes[name]</span>
+        <span class="s2">for </span><span class="s1">col_idx</span><span class="s2">, </span><span class="s1">name </span><span class="s2">in </span><span class="s1">enumerate(openml_columns_info)</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">dtypes</span>
+    <span class="s1">}</span>
+
+    <span class="s1">default_read_csv_kwargs = {</span>
+        <span class="s5">&quot;header&quot;</span><span class="s1">: </span><span class="s2">None,</span>
+        <span class="s5">&quot;index_col&quot;</span><span class="s1">: </span><span class="s2">False,  </span><span class="s4"># always force pandas to not use the first column as index</span>
+        <span class="s5">&quot;na_values&quot;</span><span class="s1">: [</span><span class="s5">&quot;?&quot;</span><span class="s1">]</span><span class="s2">,  </span><span class="s4"># missing values are represented by `?`</span>
+        <span class="s5">&quot;keep_default_na&quot;</span><span class="s1">: </span><span class="s2">False,  </span><span class="s4"># only `?` is a missing value given the ARFF specs</span>
+        <span class="s5">&quot;comment&quot;</span><span class="s1">: </span><span class="s5">&quot;%&quot;</span><span class="s2">,  </span><span class="s4"># skip line starting by `%` since they are comments</span>
+        <span class="s5">&quot;quotechar&quot;</span><span class="s1">: </span><span class="s5">'&quot;'</span><span class="s2">,  </span><span class="s4"># delimiter to use for quoted strings</span>
+        <span class="s5">&quot;skipinitialspace&quot;</span><span class="s1">: </span><span class="s2">True,  </span><span class="s4"># skip spaces after delimiter to follow ARFF specs</span>
+        <span class="s5">&quot;escapechar&quot;</span><span class="s1">: </span><span class="s5">&quot;</span><span class="s2">\\</span><span class="s5">&quot;</span><span class="s2">,</span>
+        <span class="s5">&quot;dtype&quot;</span><span class="s1">: dtypes_positional</span><span class="s2">,</span>
+    <span class="s1">}</span>
+    <span class="s1">read_csv_kwargs = {**default_read_csv_kwargs</span><span class="s2">, </span><span class="s1">**(read_csv_kwargs </span><span class="s2">or </span><span class="s1">{})}</span>
+    <span class="s1">frame = pd.read_csv(gzip_file</span><span class="s2">, </span><span class="s1">**read_csv_kwargs)</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s4"># Setting the columns while reading the file will select the N first columns</span>
+        <span class="s4"># and not raise a ParserError. Instead, we set the columns after reading the</span>
+        <span class="s4"># file and raise a ParserError if the number of columns does not match the</span>
+        <span class="s4"># number of columns in the metadata given by OpenML.</span>
+        <span class="s1">frame.columns = [name </span><span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">openml_columns_info]</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">exc:</span>
+        <span class="s2">raise </span><span class="s1">pd.errors.ParserError(</span>
+            <span class="s5">&quot;The number of columns provided by OpenML does not match the number of &quot;</span>
+            <span class="s5">&quot;columns inferred by pandas when reading the file.&quot;</span>
+        <span class="s1">) </span><span class="s2">from </span><span class="s1">exc</span>
+
+    <span class="s1">columns_to_select = feature_names_to_select + target_names_to_select</span>
+    <span class="s1">columns_to_keep = [col </span><span class="s2">for </span><span class="s1">col </span><span class="s2">in </span><span class="s1">frame.columns </span><span class="s2">if </span><span class="s1">col </span><span class="s2">in </span><span class="s1">columns_to_select]</span>
+    <span class="s1">frame = frame[columns_to_keep]</span>
+
+    <span class="s4"># `pd.read_csv` automatically handles double quotes for quoting non-numeric</span>
+    <span class="s4"># CSV cell values. Contrary to LIAC-ARFF, `pd.read_csv` cannot be configured to</span>
+    <span class="s4"># consider either single quotes and double quotes as valid quoting chars at</span>
+    <span class="s4"># the same time since this case does not occur in regular (non-ARFF) CSV files.</span>
+    <span class="s4"># To mimic the behavior of LIAC-ARFF parser, we manually strip single quotes</span>
+    <span class="s4"># on categories as a post-processing steps if needed.</span>
+    <span class="s4">#</span>
+    <span class="s4"># Note however that we intentionally do not attempt to do this kind of manual</span>
+    <span class="s4"># post-processing of (non-categorical) string-typed columns because we cannot</span>
+    <span class="s4"># resolve the ambiguity of the case of CSV cell with nesting quoting such as</span>
+    <span class="s4"># `&quot;'some string value'&quot;` with pandas.</span>
+    <span class="s1">single_quote_pattern = re.compile(</span><span class="s5">r&quot;^'(?P&lt;contents&gt;.*)'$&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">strip_single_quotes(input_string):</span>
+        <span class="s1">match = re.search(single_quote_pattern</span><span class="s2">, </span><span class="s1">input_string)</span>
+        <span class="s2">if </span><span class="s1">match </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">input_string</span>
+
+        <span class="s2">return </span><span class="s1">match.group(</span><span class="s5">&quot;contents&quot;</span><span class="s1">)</span>
+
+    <span class="s1">categorical_columns = [</span>
+        <span class="s1">name</span>
+        <span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">dtype </span><span class="s2">in </span><span class="s1">frame.dtypes.items()</span>
+        <span class="s2">if </span><span class="s1">isinstance(dtype</span><span class="s2">, </span><span class="s1">pd.CategoricalDtype)</span>
+    <span class="s1">]</span>
+    <span class="s2">for </span><span class="s1">col </span><span class="s2">in </span><span class="s1">categorical_columns:</span>
+        <span class="s1">frame[col] = frame[col].cat.rename_categories(strip_single_quotes)</span>
+
+    <span class="s1">X</span><span class="s2">, </span><span class="s1">y = _post_process_frame(frame</span><span class="s2">, </span><span class="s1">feature_names_to_select</span><span class="s2">, </span><span class="s1">target_names_to_select)</span>
+
+    <span class="s2">if </span><span class="s1">output_arrays_type == </span><span class="s5">&quot;pandas&quot;</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">frame</span><span class="s2">, None</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">X</span><span class="s2">, </span><span class="s1">y = X.to_numpy()</span><span class="s2">, </span><span class="s1">y.to_numpy()</span>
+
+    <span class="s1">categories = {</span>
+        <span class="s1">name: dtype.categories.tolist()</span>
+        <span class="s2">for </span><span class="s1">name</span><span class="s2">, </span><span class="s1">dtype </span><span class="s2">in </span><span class="s1">frame.dtypes.items()</span>
+        <span class="s2">if </span><span class="s1">isinstance(dtype</span><span class="s2">, </span><span class="s1">pd.CategoricalDtype)</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">X</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, None, </span><span class="s1">categories</span>
+
+
+<span class="s2">def </span><span class="s1">load_arff_from_gzip_file(</span>
+    <span class="s1">gzip_file</span><span class="s2">,</span>
+    <span class="s1">parser</span><span class="s2">,</span>
+    <span class="s1">output_type</span><span class="s2">,</span>
+    <span class="s1">openml_columns_info</span><span class="s2">,</span>
+    <span class="s1">feature_names_to_select</span><span class="s2">,</span>
+    <span class="s1">target_names_to_select</span><span class="s2">,</span>
+    <span class="s1">shape=</span><span class="s2">None,</span>
+    <span class="s1">read_csv_kwargs=</span><span class="s2">None,</span>
+<span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Load a compressed ARFF file using a given parser. 
+ 
+    Parameters 
+    ---------- 
+    gzip_file : GzipFile instance 
+        The file compressed to be read. 
+ 
+    parser : {&quot;pandas&quot;, &quot;liac-arff&quot;} 
+        The parser used to parse the ARFF file. &quot;pandas&quot; is recommended 
+        but only supports loading dense datasets. 
+ 
+    output_type : {&quot;numpy&quot;, &quot;sparse&quot;, &quot;pandas&quot;} 
+        The type of the arrays that will be returned. The possibilities ara: 
+ 
+        - `&quot;numpy&quot;`: both `X` and `y` will be NumPy arrays; 
+        - `&quot;sparse&quot;`: `X` will be sparse matrix and `y` will be a NumPy array; 
+        - `&quot;pandas&quot;`: `X` will be a pandas DataFrame and `y` will be either a 
+          pandas Series or DataFrame. 
+ 
+    openml_columns_info : dict 
+        The information provided by OpenML regarding the columns of the ARFF 
+        file. 
+ 
+    feature_names_to_select : list of str 
+        A list of the feature names to be selected. 
+ 
+    target_names_to_select : list of str 
+        A list of the target names to be selected. 
+ 
+    read_csv_kwargs : dict, default=None 
+        Keyword arguments to pass to `pandas.read_csv`. It allows to overwrite 
+        the default options. 
+ 
+    Returns 
+    ------- 
+    X : {ndarray, sparse matrix, dataframe} 
+        The data matrix. 
+ 
+    y : {ndarray, dataframe, series} 
+        The target. 
+ 
+    frame : dataframe or None 
+        A dataframe containing both `X` and `y`. `None` if 
+        `output_array_type != &quot;pandas&quot;`. 
+ 
+    categories : list of str or None 
+        The names of the features that are categorical. `None` if 
+        `output_array_type == &quot;pandas&quot;`. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">parser == </span><span class="s5">&quot;liac-arff&quot;</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">_liac_arff_parser(</span>
+            <span class="s1">gzip_file</span><span class="s2">,</span>
+            <span class="s1">output_type</span><span class="s2">,</span>
+            <span class="s1">openml_columns_info</span><span class="s2">,</span>
+            <span class="s1">feature_names_to_select</span><span class="s2">,</span>
+            <span class="s1">target_names_to_select</span><span class="s2">,</span>
+            <span class="s1">shape</span><span class="s2">,</span>
+        <span class="s1">)</span>
+    <span class="s2">elif </span><span class="s1">parser == </span><span class="s5">&quot;pandas&quot;</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">_pandas_arff_parser(</span>
+            <span class="s1">gzip_file</span><span class="s2">,</span>
+            <span class="s1">output_type</span><span class="s2">,</span>
+            <span class="s1">openml_columns_info</span><span class="s2">,</span>
+            <span class="s1">feature_names_to_select</span><span class="s2">,</span>
+            <span class="s1">target_names_to_select</span><span class="s2">,</span>
+            <span class="s1">read_csv_kwargs</span><span class="s2">,</span>
+        <span class="s1">)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span>
+            <span class="s5">f&quot;Unknown parser: '</span><span class="s2">{</span><span class="s1">parser</span><span class="s2">}</span><span class="s5">'. Should be 'liac-arff' or 'pandas'.&quot;</span>
+        <span class="s1">)</span>
+</pre>
+</body>
+</html>

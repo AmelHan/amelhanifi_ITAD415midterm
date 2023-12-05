@@ -1,0 +1,645 @@
+<html>
+<head>
+<title>x13.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+x13.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Run x12/x13-arima specs in a subprocess from Python and curry results back 
+into python. 
+ 
+Notes 
+----- 
+Many of the functions are called x12. However, they are also intended to work 
+for x13. If this is not the case, it's a bug. 
+&quot;&quot;&quot;</span>
+<span class="s2">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s2">import </span><span class="s1">deprecate_kwarg</span>
+
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">subprocess</span>
+<span class="s2">import </span><span class="s1">tempfile</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">from </span><span class="s1">warnings </span><span class="s2">import </span><span class="s1">warn</span>
+
+<span class="s2">import </span><span class="s1">pandas </span><span class="s2">as </span><span class="s1">pd</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.tools.tools </span><span class="s2">import </span><span class="s1">Bunch</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.sm_exceptions </span><span class="s2">import </span><span class="s1">(X13NotFoundError</span><span class="s2">,</span>
+                                             <span class="s1">IOWarning</span><span class="s2">, </span><span class="s1">X13Error</span><span class="s2">,</span>
+                                             <span class="s1">X13Warning)</span>
+
+<span class="s1">__all__ = [</span><span class="s3">&quot;x13_arima_select_order&quot;</span><span class="s2">, </span><span class="s3">&quot;x13_arima_analysis&quot;</span><span class="s1">]</span>
+
+<span class="s1">_binary_names = (</span><span class="s3">'x13as.exe'</span><span class="s2">, </span><span class="s3">'x13as'</span><span class="s2">, </span><span class="s3">'x12a.exe'</span><span class="s2">, </span><span class="s3">'x12a'</span><span class="s2">,</span>
+                 <span class="s3">'x13as_ascii'</span><span class="s2">, </span><span class="s3">'x13as_html'</span><span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">_freq_to_period:</span>
+    <span class="s2">def </span><span class="s1">__getitem__(self</span><span class="s2">, </span><span class="s1">key):</span>
+        <span class="s2">if </span><span class="s1">key.startswith(</span><span class="s3">'M'</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s4">12</span>
+        <span class="s2">elif </span><span class="s1">key.startswith(</span><span class="s3">'Q'</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s4">4</span>
+        <span class="s2">elif </span><span class="s1">key.startswith(</span><span class="s3">'W'</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s4">52</span>
+
+
+<span class="s1">_freq_to_period = _freq_to_period()</span>
+
+<span class="s1">_period_to_freq = {</span><span class="s4">12</span><span class="s1">: </span><span class="s3">'M'</span><span class="s2">, </span><span class="s4">4</span><span class="s1">: </span><span class="s3">'Q'</span><span class="s1">}</span>
+<span class="s1">_log_to_x12 = {</span><span class="s2">True</span><span class="s1">: </span><span class="s3">'log'</span><span class="s2">, False</span><span class="s1">: </span><span class="s3">'none'</span><span class="s2">, None</span><span class="s1">: </span><span class="s3">'auto'</span><span class="s1">}</span>
+<span class="s1">_bool_to_yes_no = </span><span class="s2">lambda </span><span class="s1">x: </span><span class="s3">'yes' </span><span class="s2">if </span><span class="s1">x </span><span class="s2">else </span><span class="s3">'no'  </span><span class="s5"># noqa:E731</span>
+
+
+<span class="s2">def </span><span class="s1">_find_x12(x12path=</span><span class="s2">None, </span><span class="s1">prefer_x13=</span><span class="s2">True</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    If x12path is not given, then either x13as[.exe] or x12a[.exe] must 
+    be found on the PATH. Otherwise, the environmental variable X12PATH or 
+    X13PATH must be defined. If prefer_x13 is True, only X13PATH is searched 
+    for. If it is false, only X12PATH is searched for. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">global </span><span class="s1">_binary_names</span>
+    <span class="s2">if </span><span class="s1">x12path </span><span class="s2">is not None and </span><span class="s1">x12path.endswith(_binary_names):</span>
+        <span class="s5"># remove binary from path if path is not a directory</span>
+        <span class="s2">if not </span><span class="s1">os.path.isdir(x12path):</span>
+            <span class="s1">x12path = os.path.dirname(x12path)</span>
+
+    <span class="s2">if not </span><span class="s1">prefer_x13:  </span><span class="s5"># search for x12 first</span>
+        <span class="s1">_binary_names = _binary_names[::-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">x12path </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">x12path = os.getenv(</span><span class="s3">&quot;X12PATH&quot;</span><span class="s2">, </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s2">if not </span><span class="s1">x12path:</span>
+            <span class="s1">x12path = os.getenv(</span><span class="s3">&quot;X13PATH&quot;</span><span class="s2">, </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+    <span class="s2">elif </span><span class="s1">x12path </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">x12path = os.getenv(</span><span class="s3">&quot;X13PATH&quot;</span><span class="s2">, </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+        <span class="s2">if not </span><span class="s1">x12path:</span>
+            <span class="s1">x12path = os.getenv(</span><span class="s3">&quot;X12PATH&quot;</span><span class="s2">, </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+
+    <span class="s2">for </span><span class="s1">binary </span><span class="s2">in </span><span class="s1">_binary_names:</span>
+        <span class="s1">x12 = os.path.join(x12path</span><span class="s2">, </span><span class="s1">binary)</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s1">subprocess.check_call(x12</span><span class="s2">, </span><span class="s1">stdout=subprocess.PIPE</span><span class="s2">,</span>
+                                  <span class="s1">stderr=subprocess.PIPE)</span>
+            <span class="s2">return </span><span class="s1">x12</span>
+        <span class="s2">except </span><span class="s1">OSError:</span>
+            <span class="s2">pass</span>
+
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">return False</span>
+
+
+<span class="s2">def </span><span class="s1">_check_x12(x12path=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s1">x12path = _find_x12(x12path)</span>
+    <span class="s2">if not </span><span class="s1">x12path:</span>
+        <span class="s2">raise </span><span class="s1">X13NotFoundError(</span><span class="s3">&quot;x12a and x13as not found on path. Give the &quot;</span>
+                               <span class="s3">&quot;path, put them on PATH, or set the &quot;</span>
+                               <span class="s3">&quot;X12PATH or X13PATH environmental variable.&quot;</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">x12path</span>
+
+
+<span class="s2">def </span><span class="s1">_clean_order(order):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Takes something like (1 1 0)(0 1 1) and returns a arma order, sarma 
+    order tuple. Also accepts (1 1 0) and return arma order and (0, 0, 0) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">order = re.findall(</span><span class="s3">r&quot;\([0-9 ]*?\)&quot;</span><span class="s2">, </span><span class="s1">order)</span>
+
+    <span class="s2">def </span><span class="s1">clean(x):</span>
+        <span class="s2">return </span><span class="s1">tuple(map(int</span><span class="s2">, </span><span class="s1">re.sub(</span><span class="s3">&quot;[()]&quot;</span><span class="s2">, </span><span class="s3">&quot;&quot;</span><span class="s2">, </span><span class="s1">x).split(</span><span class="s3">&quot; &quot;</span><span class="s1">)))</span>
+
+    <span class="s2">if </span><span class="s1">len(order) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+        <span class="s1">order</span><span class="s2">, </span><span class="s1">sorder = map(clean</span><span class="s2">, </span><span class="s1">order)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">order = clean(order[</span><span class="s4">0</span><span class="s1">])</span>
+        <span class="s1">sorder = (</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span>
+
+    <span class="s2">return </span><span class="s1">order</span><span class="s2">, </span><span class="s1">sorder</span>
+
+
+<span class="s2">def </span><span class="s1">run_spec(x12path</span><span class="s2">, </span><span class="s1">specpath</span><span class="s2">, </span><span class="s1">outname=</span><span class="s2">None, </span><span class="s1">meta=</span><span class="s2">False, </span><span class="s1">datameta=</span><span class="s2">False</span><span class="s1">):</span>
+
+    <span class="s2">if </span><span class="s1">meta </span><span class="s2">and </span><span class="s1">datameta:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Cannot specify both meta and datameta.&quot;</span><span class="s1">)</span>
+    <span class="s2">if </span><span class="s1">meta:</span>
+        <span class="s1">args = [x12path</span><span class="s2">, </span><span class="s3">&quot;-m &quot; </span><span class="s1">+ specpath]</span>
+    <span class="s2">elif </span><span class="s1">datameta:</span>
+        <span class="s1">args = [x12path</span><span class="s2">, </span><span class="s3">&quot;-d &quot; </span><span class="s1">+ specpath]</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">args = [x12path</span><span class="s2">, </span><span class="s1">specpath]</span>
+
+    <span class="s2">if </span><span class="s1">outname:</span>
+        <span class="s1">args += [outname]</span>
+
+    <span class="s2">return </span><span class="s1">subprocess.Popen(args</span><span class="s2">, </span><span class="s1">stdout=subprocess.PIPE</span><span class="s2">,</span>
+                            <span class="s1">stderr=subprocess.STDOUT)</span>
+
+
+<span class="s2">def </span><span class="s1">_make_automdl_options(maxorder</span><span class="s2">, </span><span class="s1">maxdiff</span><span class="s2">, </span><span class="s1">diff):</span>
+    <span class="s1">options = </span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span>
+    <span class="s1">options += </span><span class="s3">&quot;maxorder = ({0} {1})</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.format(maxorder[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">maxorder[</span><span class="s4">1</span><span class="s1">])</span>
+    <span class="s2">if </span><span class="s1">maxdiff </span><span class="s2">is not None</span><span class="s1">:  </span><span class="s5"># maxdiff always takes precedence</span>
+        <span class="s1">options += </span><span class="s3">&quot;maxdiff = ({0} {1})</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.format(maxdiff[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">maxdiff[</span><span class="s4">1</span><span class="s1">])</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">options += </span><span class="s3">&quot;diff = ({0} {1})</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.format(diff[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">diff[</span><span class="s4">1</span><span class="s1">])</span>
+    <span class="s2">return </span><span class="s1">options</span>
+
+
+<span class="s2">def </span><span class="s1">_make_var_names(exog):</span>
+    <span class="s2">if </span><span class="s1">hasattr(exog</span><span class="s2">, </span><span class="s3">&quot;name&quot;</span><span class="s1">):</span>
+        <span class="s1">var_names = [exog.name]</span>
+    <span class="s2">elif </span><span class="s1">hasattr(exog</span><span class="s2">, </span><span class="s3">&quot;columns&quot;</span><span class="s1">):</span>
+        <span class="s1">var_names = exog.columns</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;exog is not a Series or DataFrame or is unnamed.&quot;</span><span class="s1">)</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">var_names = </span><span class="s3">&quot; &quot;</span><span class="s1">.join(var_names)</span>
+    <span class="s2">except </span><span class="s1">TypeError:  </span><span class="s5"># cannot have names that are numbers, pandas default</span>
+        <span class="s2">from </span><span class="s1">statsmodels.base.data </span><span class="s2">import </span><span class="s1">_make_exog_names</span>
+        <span class="s2">if </span><span class="s1">exog.ndim == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">var_names = </span><span class="s3">&quot;x1&quot;</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">var_names = </span><span class="s3">&quot; &quot;</span><span class="s1">.join(_make_exog_names(exog))</span>
+    <span class="s2">return </span><span class="s1">var_names</span>
+
+
+<span class="s2">def </span><span class="s1">_make_regression_options(trading</span><span class="s2">, </span><span class="s1">exog):</span>
+    <span class="s2">if not </span><span class="s1">trading </span><span class="s2">and </span><span class="s1">exog </span><span class="s2">is None</span><span class="s1">:  </span><span class="s5"># start regression spec</span>
+        <span class="s2">return </span><span class="s3">&quot;&quot;</span>
+
+    <span class="s1">reg_spec = </span><span class="s3">&quot;regression{</span><span class="s2">\n</span><span class="s3">&quot;</span>
+    <span class="s2">if </span><span class="s1">trading:</span>
+        <span class="s1">reg_spec += </span><span class="s3">&quot;    variables = (td)</span><span class="s2">\n</span><span class="s3">&quot;</span>
+    <span class="s2">if </span><span class="s1">exog </span><span class="s2">is not None</span><span class="s1">:</span>
+        <span class="s1">var_names = _make_var_names(exog)</span>
+        <span class="s1">reg_spec += </span><span class="s3">&quot;    user = ({0})</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.format(var_names)</span>
+        <span class="s1">reg_spec += </span><span class="s3">&quot;    data = ({0})</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.format(</span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.join(map(str</span><span class="s2">,</span>
+                                                <span class="s1">exog.values.ravel().tolist())))</span>
+
+    <span class="s1">reg_spec += </span><span class="s3">&quot;}</span><span class="s2">\n</span><span class="s3">&quot;  </span><span class="s5"># close out regression spec</span>
+    <span class="s2">return </span><span class="s1">reg_spec</span>
+
+
+<span class="s2">def </span><span class="s1">_make_forecast_options(forecast_periods):</span>
+    <span class="s2">if </span><span class="s1">forecast_periods </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s3">&quot;&quot;</span>
+    <span class="s1">forecast_spec = </span><span class="s3">&quot;forecast{</span><span class="s2">\n</span><span class="s3">&quot;</span>
+    <span class="s1">forecast_spec += </span><span class="s3">&quot;maxlead = ({0})</span><span class="s2">\n</span><span class="s3">}}</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.format(forecast_periods)</span>
+    <span class="s2">return </span><span class="s1">forecast_spec</span>
+
+
+<span class="s2">def </span><span class="s1">_check_errors(errors):</span>
+    <span class="s1">errors = errors[errors.find(</span><span class="s3">&quot;spc:&quot;</span><span class="s1">)+</span><span class="s4">4</span><span class="s1">:].strip()</span>
+    <span class="s2">if </span><span class="s1">errors </span><span class="s2">and </span><span class="s3">'ERROR' </span><span class="s2">in </span><span class="s1">errors:</span>
+        <span class="s2">raise </span><span class="s1">X13Error(errors)</span>
+    <span class="s2">elif </span><span class="s1">errors </span><span class="s2">and </span><span class="s3">'WARNING' </span><span class="s2">in </span><span class="s1">errors:</span>
+        <span class="s1">warn(errors</span><span class="s2">, </span><span class="s1">X13Warning)</span>
+
+
+<span class="s2">def </span><span class="s1">_convert_out_to_series(x</span><span class="s2">, </span><span class="s1">dates</span><span class="s2">, </span><span class="s1">name):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Convert x to a DataFrame where x is a string in the format given by 
+    x-13arima-seats output. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">from </span><span class="s1">io </span><span class="s2">import </span><span class="s1">StringIO</span>
+    <span class="s2">from </span><span class="s1">pandas </span><span class="s2">import </span><span class="s1">read_csv</span>
+    <span class="s1">out = read_csv(StringIO(x)</span><span class="s2">, </span><span class="s1">skiprows=</span><span class="s4">2</span><span class="s2">,</span>
+                   <span class="s1">header=</span><span class="s2">None, </span><span class="s1">sep=</span><span class="s3">'</span><span class="s2">\t</span><span class="s3">'</span><span class="s2">, </span><span class="s1">engine=</span><span class="s3">'python'</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">out.set_index(dates).rename(columns={</span><span class="s4">1</span><span class="s1">: name})[name]</span>
+
+
+<span class="s2">def </span><span class="s1">_open_and_read(fname):</span>
+    <span class="s5"># opens a file, reads it, and make sure it's closed</span>
+    <span class="s2">with </span><span class="s1">open(fname</span><span class="s2">, </span><span class="s3">'r'</span><span class="s2">, </span><span class="s1">encoding=</span><span class="s3">&quot;utf-8&quot;</span><span class="s1">) </span><span class="s2">as </span><span class="s1">fin:</span>
+        <span class="s1">fout = fin.read()</span>
+    <span class="s2">return </span><span class="s1">fout</span>
+
+
+<span class="s2">class </span><span class="s1">Spec:</span>
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">spec_name(self):</span>
+        <span class="s2">return </span><span class="s1">self.__class__.__name__.replace(</span><span class="s3">&quot;Spec&quot;</span><span class="s2">, </span><span class="s3">&quot;&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">create_spec(self</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">spec = </span><span class="s3">&quot;&quot;&quot;{name} {{ 
+        {options} 
+        }} 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">spec.format(name=self.spec_name</span><span class="s2">,</span>
+                           <span class="s1">options=self.options)</span>
+
+    <span class="s2">def </span><span class="s1">set_options(self</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s1">options = </span><span class="s3">&quot;&quot;</span>
+        <span class="s2">for </span><span class="s1">key</span><span class="s2">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">kwargs.items():</span>
+            <span class="s1">options += </span><span class="s3">&quot;{0}={1}</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.format(key</span><span class="s2">, </span><span class="s1">value)</span>
+            <span class="s1">self.__dict__.update({key: value})</span>
+        <span class="s1">self.options = options</span>
+
+
+<span class="s2">class </span><span class="s1">SeriesSpec(Spec):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Parameters 
+    ---------- 
+    data 
+    appendbcst : bool 
+    appendfcst : bool 
+    comptype 
+    compwt 
+    decimals 
+    modelspan 
+    name 
+    period 
+    precision 
+    to_print 
+    to_save 
+    span 
+    start 
+    title 
+    type 
+ 
+    Notes 
+    ----- 
+    Rarely used arguments 
+ 
+    divpower 
+    missingcode 
+    missingval 
+    saveprecision 
+    trimzero 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">name=</span><span class="s3">'Unnamed Series'</span><span class="s2">, </span><span class="s1">appendbcst=</span><span class="s2">False,</span>
+                 <span class="s1">appendfcst=</span><span class="s2">False,</span>
+                 <span class="s1">comptype=</span><span class="s2">None, </span><span class="s1">compwt=</span><span class="s4">1</span><span class="s2">, </span><span class="s1">decimals=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">modelspan=()</span><span class="s2">,</span>
+                 <span class="s1">period=</span><span class="s4">12</span><span class="s2">, </span><span class="s1">precision=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">to_print=[]</span><span class="s2">, </span><span class="s1">to_save=[]</span><span class="s2">, </span><span class="s1">span=()</span><span class="s2">,</span>
+                 <span class="s1">start=(</span><span class="s4">1</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">title=</span><span class="s3">''</span><span class="s2">, </span><span class="s1">series_type=</span><span class="s2">None, </span><span class="s1">divpower=</span><span class="s2">None,</span>
+                 <span class="s1">missingcode=-</span><span class="s4">99999</span><span class="s2">, </span><span class="s1">missingval=</span><span class="s4">1000000000</span><span class="s1">):</span>
+
+        <span class="s1">appendbcst</span><span class="s2">, </span><span class="s1">appendfcst = map(_bool_to_yes_no</span><span class="s2">, </span><span class="s1">[appendbcst</span><span class="s2">,</span>
+                                                       <span class="s1">appendfcst</span><span class="s2">,</span>
+                                                       <span class="s1">])</span>
+
+        <span class="s1">series_name = </span><span class="s3">&quot;</span><span class="s2">\&quot;</span><span class="s3">{0}</span><span class="s2">\&quot;</span><span class="s3">&quot;</span><span class="s1">.format(name[:</span><span class="s4">64</span><span class="s1">])  </span><span class="s5"># trim to 64 characters</span>
+        <span class="s1">title = </span><span class="s3">&quot;</span><span class="s2">\&quot;</span><span class="s3">{0}</span><span class="s2">\&quot;</span><span class="s3">&quot;</span><span class="s1">.format(title[:</span><span class="s4">79</span><span class="s1">])  </span><span class="s5"># trim to 79 characters</span>
+        <span class="s1">self.set_options(data=data</span><span class="s2">, </span><span class="s1">appendbcst=appendbcst</span><span class="s2">,</span>
+                         <span class="s1">appendfcst=appendfcst</span><span class="s2">, </span><span class="s1">period=period</span><span class="s2">, </span><span class="s1">start=start</span><span class="s2">,</span>
+                         <span class="s1">title=title</span><span class="s2">, </span><span class="s1">name=series_name</span><span class="s2">,</span>
+                         <span class="s1">)</span>
+
+
+<span class="s2">def </span><span class="s1">pandas_to_series_spec(x):</span>
+    <span class="s5"># from statsmodels.tools.data import _check_period_index</span>
+    <span class="s5"># check_period_index(x)</span>
+    <span class="s2">if </span><span class="s1">hasattr(x</span><span class="s2">, </span><span class="s3">'columns'</span><span class="s1">):  </span><span class="s5"># convert to series</span>
+        <span class="s2">if </span><span class="s1">len(x.columns) &gt; </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Does not handle DataFrame with more than one &quot;</span>
+                             <span class="s3">&quot;column&quot;</span><span class="s1">)</span>
+        <span class="s1">x = x[x.columns[</span><span class="s4">0</span><span class="s1">]]</span>
+
+    <span class="s1">data = </span><span class="s3">&quot;({0})&quot;</span><span class="s1">.format(</span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.join(map(str</span><span class="s2">, </span><span class="s1">x.values.tolist())))</span>
+
+    <span class="s5"># get periodicity</span>
+    <span class="s5"># get start / first data</span>
+    <span class="s5"># give it a title</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">period = _freq_to_period[x.index.freqstr]</span>
+    <span class="s2">except </span><span class="s1">(AttributeError</span><span class="s2">, </span><span class="s1">ValueError):</span>
+        <span class="s2">from </span><span class="s1">pandas.tseries.api </span><span class="s2">import </span><span class="s1">infer_freq</span>
+        <span class="s1">period = _freq_to_period[infer_freq(x.index)]</span>
+    <span class="s1">start_date = x.index[</span><span class="s4">0</span><span class="s1">]</span>
+    <span class="s2">if </span><span class="s1">period == </span><span class="s4">12</span><span class="s1">:</span>
+        <span class="s1">year</span><span class="s2">, </span><span class="s1">stperiod = start_date.year</span><span class="s2">, </span><span class="s1">start_date.month</span>
+    <span class="s2">elif </span><span class="s1">period == </span><span class="s4">4</span><span class="s1">:</span>
+        <span class="s1">year</span><span class="s2">, </span><span class="s1">stperiod = start_date.year</span><span class="s2">, </span><span class="s1">start_date.quarter</span>
+    <span class="s2">else</span><span class="s1">:  </span><span class="s5"># pragma: no cover</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Only monthly and quarterly periods are supported.&quot;</span>
+                         <span class="s3">&quot; Please report or send a pull request if you want &quot;</span>
+                         <span class="s3">&quot;this extended.&quot;</span><span class="s1">)</span>
+
+    <span class="s2">if </span><span class="s1">hasattr(x</span><span class="s2">, </span><span class="s3">'name'</span><span class="s1">):</span>
+        <span class="s1">name = x.name </span><span class="s2">or </span><span class="s3">&quot;Unnamed Series&quot;</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">name = </span><span class="s3">'Unnamed Series'</span>
+    <span class="s1">series_spec = SeriesSpec(data=data</span><span class="s2">, </span><span class="s1">name=name</span><span class="s2">, </span><span class="s1">period=period</span><span class="s2">,</span>
+                             <span class="s1">title=name</span><span class="s2">, </span><span class="s1">start=</span><span class="s3">&quot;{0}.{1}&quot;</span><span class="s1">.format(year</span><span class="s2">,</span>
+                                                                <span class="s1">stperiod))</span>
+    <span class="s2">return </span><span class="s1">series_spec</span>
+
+
+<span class="s1">@deprecate_kwarg(</span><span class="s3">'forecast_years'</span><span class="s2">, </span><span class="s3">'forecast_periods'</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">x13_arima_analysis(endog</span><span class="s2">, </span><span class="s1">maxorder=(</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">maxdiff=(</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">diff=</span><span class="s2">None,</span>
+                       <span class="s1">exog=</span><span class="s2">None, </span><span class="s1">log=</span><span class="s2">None, </span><span class="s1">outlier=</span><span class="s2">True, </span><span class="s1">trading=</span><span class="s2">False,</span>
+                       <span class="s1">forecast_periods=</span><span class="s2">None, </span><span class="s1">retspec=</span><span class="s2">False,</span>
+                       <span class="s1">speconly=</span><span class="s2">False, </span><span class="s1">start=</span><span class="s2">None, </span><span class="s1">freq=</span><span class="s2">None,</span>
+                       <span class="s1">print_stdout=</span><span class="s2">False, </span><span class="s1">x12path=</span><span class="s2">None, </span><span class="s1">prefer_x13=</span><span class="s2">True,</span>
+                       <span class="s1">tempdir=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Perform x13-arima analysis for monthly or quarterly data. 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like, pandas.Series 
+        The series to model. It is best to use a pandas object with a 
+        DatetimeIndex or PeriodIndex. However, you can pass an array-like 
+        object. If your object does not have a dates index then ``start`` and 
+        ``freq`` are not optional. 
+    maxorder : tuple 
+        The maximum order of the regular and seasonal ARMA polynomials to 
+        examine during the model identification. The order for the regular 
+        polynomial must be greater than zero and no larger than 4. The 
+        order for the seasonal polynomial may be 1 or 2. 
+    maxdiff : tuple 
+        The maximum orders for regular and seasonal differencing in the 
+        automatic differencing procedure. Acceptable inputs for regular 
+        differencing are 1 and 2. The maximum order for seasonal differencing 
+        is 1. If ``diff`` is specified then ``maxdiff`` should be None. 
+        Otherwise, ``diff`` will be ignored. See also ``diff``. 
+    diff : tuple 
+        Fixes the orders of differencing for the regular and seasonal 
+        differencing. Regular differencing may be 0, 1, or 2. Seasonal 
+        differencing may be 0 or 1. ``maxdiff`` must be None, otherwise 
+        ``diff`` is ignored. 
+    exog : array_like 
+        Exogenous variables. 
+    log : bool or None 
+        If None, it is automatically determined whether to log the series or 
+        not. If False, logs are not taken. If True, logs are taken. 
+    outlier : bool 
+        Whether or not outliers are tested for and corrected, if detected. 
+    trading : bool 
+        Whether or not trading day effects are tested for. 
+    forecast_periods : int 
+        Number of forecasts produced. The default is None. 
+    retspec : bool 
+        Whether to return the created specification file. Can be useful for 
+        debugging. 
+    speconly : bool 
+        Whether to create the specification file and then return it without 
+        performing the analysis. Can be useful for debugging. 
+    start : str, datetime 
+        Must be given if ``endog`` does not have date information in its index. 
+        Anything accepted by pandas.DatetimeIndex for the start value. 
+    freq : str 
+        Must be givein if ``endog`` does not have date information in its 
+        index. Anything accepted by pandas.DatetimeIndex for the freq value. 
+    print_stdout : bool 
+        The stdout from X12/X13 is suppressed. To print it out, set this 
+        to True. Default is False. 
+    x12path : str or None 
+        The path to x12 or x13 binary. If None, the program will attempt 
+        to find x13as or x12a on the PATH or by looking at X13PATH or 
+        X12PATH depending on the value of prefer_x13. 
+    prefer_x13 : bool 
+        If True, will look for x13as first and will fallback to the X13PATH 
+        environmental variable. If False, will look for x12a first and will 
+        fallback to the X12PATH environmental variable. If x12path points 
+        to the path for the X12/X13 binary, it does nothing. 
+    tempdir : str 
+        The path to where temporary files are created by the function. 
+        If None, files are created in the default temporary file location. 
+ 
+    Returns 
+    ------- 
+    Bunch 
+        A bunch object containing the listed attributes. 
+ 
+        - results : str 
+          The full output from the X12/X13 run. 
+        - seasadj : pandas.Series 
+          The final seasonally adjusted ``endog``. 
+        - trend : pandas.Series 
+          The trend-cycle component of ``endog``. 
+        - irregular : pandas.Series 
+          The final irregular component of ``endog``. 
+        - stdout : str 
+          The captured stdout produced by x12/x13. 
+        - spec : str, optional 
+          Returned if ``retspec`` is True. The only thing returned if 
+          ``speconly`` is True. 
+ 
+    Notes 
+    ----- 
+    This works by creating a specification file, writing it to a temporary 
+    directory, invoking X12/X13 in a subprocess, and reading the output 
+    directory, invoking exog12/X13 in a subprocess, and reading the output 
+    back in. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">x12path = _check_x12(x12path)</span>
+
+    <span class="s2">if not </span><span class="s1">isinstance(endog</span><span class="s2">, </span><span class="s1">(pd.DataFrame</span><span class="s2">, </span><span class="s1">pd.Series)):</span>
+        <span class="s2">if </span><span class="s1">start </span><span class="s2">is None or </span><span class="s1">freq </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;start and freq cannot be none if endog is not &quot;</span>
+                             <span class="s3">&quot;a pandas object&quot;</span><span class="s1">)</span>
+        <span class="s1">endog = pd.Series(endog</span><span class="s2">, </span><span class="s1">index=pd.DatetimeIndex(start=start</span><span class="s2">,</span>
+                                                        <span class="s1">periods=len(endog)</span><span class="s2">,</span>
+                                                        <span class="s1">freq=freq))</span>
+    <span class="s1">spec_obj = pandas_to_series_spec(endog)</span>
+    <span class="s1">spec = spec_obj.create_spec()</span>
+    <span class="s1">spec += </span><span class="s3">&quot;transform{{function={0}}}</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.format(_log_to_x12[log])</span>
+    <span class="s2">if </span><span class="s1">outlier:</span>
+        <span class="s1">spec += </span><span class="s3">&quot;outlier{}</span><span class="s2">\n</span><span class="s3">&quot;</span>
+    <span class="s1">options = _make_automdl_options(maxorder</span><span class="s2">, </span><span class="s1">maxdiff</span><span class="s2">, </span><span class="s1">diff)</span>
+    <span class="s1">spec += </span><span class="s3">&quot;automdl{{{0}}}</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.format(options)</span>
+    <span class="s1">spec += _make_regression_options(trading</span><span class="s2">, </span><span class="s1">exog)</span>
+    <span class="s1">spec += _make_forecast_options(forecast_periods)</span>
+    <span class="s1">spec += </span><span class="s3">&quot;x11{ save=(d11 d12 d13) }&quot;</span>
+    <span class="s2">if </span><span class="s1">speconly:</span>
+        <span class="s2">return </span><span class="s1">spec</span>
+    <span class="s5"># write it to a tempfile</span>
+    <span class="s5"># TODO: make this more robust - give the user some control?</span>
+    <span class="s1">ftempin = tempfile.NamedTemporaryFile(delete=</span><span class="s2">False,</span>
+                                          <span class="s1">suffix=</span><span class="s3">'.spc'</span><span class="s2">,</span>
+                                          <span class="s1">dir=tempdir)</span>
+    <span class="s1">ftempout = tempfile.NamedTemporaryFile(delete=</span><span class="s2">False, </span><span class="s1">dir=tempdir)</span>
+    <span class="s2">try</span><span class="s1">:</span>
+        <span class="s1">ftempin.write(spec.encode(</span><span class="s3">'utf8'</span><span class="s1">))</span>
+        <span class="s1">ftempin.close()</span>
+        <span class="s1">ftempout.close()</span>
+        <span class="s5"># call x12 arima</span>
+        <span class="s1">p = run_spec(x12path</span><span class="s2">, </span><span class="s1">ftempin.name[:-</span><span class="s4">4</span><span class="s1">]</span><span class="s2">, </span><span class="s1">ftempout.name)</span>
+        <span class="s1">p.wait()</span>
+        <span class="s1">stdout = p.stdout.read()</span>
+        <span class="s2">if </span><span class="s1">print_stdout:</span>
+            <span class="s1">print(p.stdout.read())</span>
+        <span class="s5"># check for errors</span>
+        <span class="s1">errors = _open_and_read(ftempout.name + </span><span class="s3">'.err'</span><span class="s1">)</span>
+        <span class="s1">_check_errors(errors)</span>
+
+        <span class="s5"># read in results</span>
+        <span class="s1">results = _open_and_read(ftempout.name + </span><span class="s3">'.out'</span><span class="s1">)</span>
+        <span class="s1">seasadj = _open_and_read(ftempout.name + </span><span class="s3">'.d11'</span><span class="s1">)</span>
+        <span class="s1">trend = _open_and_read(ftempout.name + </span><span class="s3">'.d12'</span><span class="s1">)</span>
+        <span class="s1">irregular = _open_and_read(ftempout.name + </span><span class="s3">'.d13'</span><span class="s1">)</span>
+    <span class="s2">finally</span><span class="s1">:</span>
+        <span class="s2">try</span><span class="s1">:  </span><span class="s5"># sometimes this gives a permission denied error?</span>
+            <span class="s5">#   not sure why. no process should have these open</span>
+            <span class="s1">os.remove(ftempin.name)</span>
+            <span class="s1">os.remove(ftempout.name)</span>
+        <span class="s2">except </span><span class="s1">OSError:</span>
+            <span class="s2">if </span><span class="s1">os.path.exists(ftempin.name):</span>
+                <span class="s1">warn(</span><span class="s3">&quot;Failed to delete resource {0}&quot;</span><span class="s1">.format(ftempin.name)</span><span class="s2">,</span>
+                     <span class="s1">IOWarning)</span>
+            <span class="s2">if </span><span class="s1">os.path.exists(ftempout.name):</span>
+                <span class="s1">warn(</span><span class="s3">&quot;Failed to delete resource {0}&quot;</span><span class="s1">.format(ftempout.name)</span><span class="s2">,</span>
+                     <span class="s1">IOWarning)</span>
+
+    <span class="s1">seasadj = _convert_out_to_series(seasadj</span><span class="s2">, </span><span class="s1">endog.index</span><span class="s2">, </span><span class="s3">'seasadj'</span><span class="s1">)</span>
+    <span class="s1">trend = _convert_out_to_series(trend</span><span class="s2">, </span><span class="s1">endog.index</span><span class="s2">, </span><span class="s3">'trend'</span><span class="s1">)</span>
+    <span class="s1">irregular = _convert_out_to_series(irregular</span><span class="s2">, </span><span class="s1">endog.index</span><span class="s2">, </span><span class="s3">'irregular'</span><span class="s1">)</span>
+
+    <span class="s5"># NOTE: there is not likely anything in stdout that's not in results</span>
+    <span class="s5">#       so may be safe to just suppress and remove it</span>
+    <span class="s2">if not </span><span class="s1">retspec:</span>
+        <span class="s1">res = X13ArimaAnalysisResult(observed=endog</span><span class="s2">, </span><span class="s1">results=results</span><span class="s2">,</span>
+                                     <span class="s1">seasadj=seasadj</span><span class="s2">, </span><span class="s1">trend=trend</span><span class="s2">,</span>
+                                     <span class="s1">irregular=irregular</span><span class="s2">, </span><span class="s1">stdout=stdout)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">res = X13ArimaAnalysisResult(observed=endog</span><span class="s2">, </span><span class="s1">results=results</span><span class="s2">,</span>
+                                     <span class="s1">seasadj=seasadj</span><span class="s2">, </span><span class="s1">trend=trend</span><span class="s2">,</span>
+                                     <span class="s1">irregular=irregular</span><span class="s2">, </span><span class="s1">stdout=stdout</span><span class="s2">,</span>
+                                     <span class="s1">spec=spec)</span>
+    <span class="s2">return </span><span class="s1">res</span>
+
+
+<span class="s1">@deprecate_kwarg(</span><span class="s3">'forecast_years'</span><span class="s2">, </span><span class="s3">'forecast_periods'</span><span class="s1">)</span>
+<span class="s2">def </span><span class="s1">x13_arima_select_order(endog</span><span class="s2">, </span><span class="s1">maxorder=(</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">maxdiff=(</span><span class="s4">2</span><span class="s2">, </span><span class="s4">1</span><span class="s1">)</span><span class="s2">, </span><span class="s1">diff=</span><span class="s2">None,</span>
+                           <span class="s1">exog=</span><span class="s2">None, </span><span class="s1">log=</span><span class="s2">None, </span><span class="s1">outlier=</span><span class="s2">True, </span><span class="s1">trading=</span><span class="s2">False,</span>
+                           <span class="s1">forecast_periods=</span><span class="s2">None,</span>
+                           <span class="s1">start=</span><span class="s2">None, </span><span class="s1">freq=</span><span class="s2">None, </span><span class="s1">print_stdout=</span><span class="s2">False,</span>
+                           <span class="s1">x12path=</span><span class="s2">None, </span><span class="s1">prefer_x13=</span><span class="s2">True, </span><span class="s1">tempdir=</span><span class="s2">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Perform automatic seasonal ARIMA order identification using x12/x13 ARIMA. 
+ 
+    Parameters 
+    ---------- 
+    endog : array_like, pandas.Series 
+        The series to model. It is best to use a pandas object with a 
+        DatetimeIndex or PeriodIndex. However, you can pass an array-like 
+        object. If your object does not have a dates index then ``start`` and 
+        ``freq`` are not optional. 
+    maxorder : tuple 
+        The maximum order of the regular and seasonal ARMA polynomials to 
+        examine during the model identification. The order for the regular 
+        polynomial must be greater than zero and no larger than 4. The 
+        order for the seasonal polynomial may be 1 or 2. 
+    maxdiff : tuple 
+        The maximum orders for regular and seasonal differencing in the 
+        automatic differencing procedure. Acceptable inputs for regular 
+        differencing are 1 and 2. The maximum order for seasonal differencing 
+        is 1. If ``diff`` is specified then ``maxdiff`` should be None. 
+        Otherwise, ``diff`` will be ignored. See also ``diff``. 
+    diff : tuple 
+        Fixes the orders of differencing for the regular and seasonal 
+        differencing. Regular differencing may be 0, 1, or 2. Seasonal 
+        differencing may be 0 or 1. ``maxdiff`` must be None, otherwise 
+        ``diff`` is ignored. 
+    exog : array_like 
+        Exogenous variables. 
+    log : bool or None 
+        If None, it is automatically determined whether to log the series or 
+        not. If False, logs are not taken. If True, logs are taken. 
+    outlier : bool 
+        Whether or not outliers are tested for and corrected, if detected. 
+    trading : bool 
+        Whether or not trading day effects are tested for. 
+    forecast_periods : int 
+        Number of forecasts produced. The default is None. 
+    start : str, datetime 
+        Must be given if ``endog`` does not have date information in its index. 
+        Anything accepted by pandas.DatetimeIndex for the start value. 
+    freq : str 
+        Must be givein if ``endog`` does not have date information in its 
+        index. Anything accepted by pandas.DatetimeIndex for the freq value. 
+    print_stdout : bool 
+        The stdout from X12/X13 is suppressed. To print it out, set this 
+        to True. Default is False. 
+    x12path : str or None 
+        The path to x12 or x13 binary. If None, the program will attempt 
+        to find x13as or x12a on the PATH or by looking at X13PATH or X12PATH 
+        depending on the value of prefer_x13. 
+    prefer_x13 : bool 
+        If True, will look for x13as first and will fallback to the X13PATH 
+        environmental variable. If False, will look for x12a first and will 
+        fallback to the X12PATH environmental variable. If x12path points 
+        to the path for the X12/X13 binary, it does nothing. 
+    tempdir : str 
+        The path to where temporary files are created by the function. 
+        If None, files are created in the default temporary file location. 
+ 
+    Returns 
+    ------- 
+    Bunch 
+        A bunch object containing the listed attributes. 
+ 
+        - order : tuple 
+          The regular order. 
+        - sorder : tuple 
+          The seasonal order. 
+        - include_mean : bool 
+          Whether to include a mean or not. 
+        - results : str 
+          The full results from the X12/X13 analysis. 
+        - stdout : str 
+          The captured stdout from the X12/X13 analysis. 
+ 
+    Notes 
+    ----- 
+    This works by creating a specification file, writing it to a temporary 
+    directory, invoking X12/X13 in a subprocess, and reading the output back 
+    in. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">results = x13_arima_analysis(endog</span><span class="s2">, </span><span class="s1">x12path=x12path</span><span class="s2">, </span><span class="s1">exog=exog</span><span class="s2">, </span><span class="s1">log=log</span><span class="s2">,</span>
+                                 <span class="s1">outlier=outlier</span><span class="s2">, </span><span class="s1">trading=trading</span><span class="s2">,</span>
+                                 <span class="s1">forecast_periods=forecast_periods</span><span class="s2">,</span>
+                                 <span class="s1">maxorder=maxorder</span><span class="s2">, </span><span class="s1">maxdiff=maxdiff</span><span class="s2">, </span><span class="s1">diff=diff</span><span class="s2">,</span>
+                                 <span class="s1">start=start</span><span class="s2">, </span><span class="s1">freq=freq</span><span class="s2">, </span><span class="s1">prefer_x13=prefer_x13</span><span class="s2">,</span>
+                                 <span class="s1">tempdir=tempdir)</span>
+    <span class="s1">model = re.search(</span><span class="s3">&quot;(?&lt;=Final automatic model choice : ).*&quot;</span><span class="s2">,</span>
+                      <span class="s1">results.results)</span>
+    <span class="s1">order = model.group()</span>
+    <span class="s2">if </span><span class="s1">re.search(</span><span class="s3">&quot;Mean is not significant&quot;</span><span class="s2">, </span><span class="s1">results.results):</span>
+        <span class="s1">include_mean = </span><span class="s2">False</span>
+    <span class="s2">elif </span><span class="s1">re.search(</span><span class="s3">&quot;Constant&quot;</span><span class="s2">, </span><span class="s1">results.results):</span>
+        <span class="s1">include_mean = </span><span class="s2">True</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">include_mean = </span><span class="s2">False</span>
+    <span class="s1">order</span><span class="s2">, </span><span class="s1">sorder = _clean_order(order)</span>
+    <span class="s1">res = Bunch(order=order</span><span class="s2">, </span><span class="s1">sorder=sorder</span><span class="s2">, </span><span class="s1">include_mean=include_mean</span><span class="s2">,</span>
+                <span class="s1">results=results.results</span><span class="s2">, </span><span class="s1">stdout=results.stdout)</span>
+    <span class="s2">return </span><span class="s1">res</span>
+
+
+<span class="s2">class </span><span class="s1">X13ArimaAnalysisResult:</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">for </span><span class="s1">key</span><span class="s2">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">kwargs.items():</span>
+            <span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">key</span><span class="s2">, </span><span class="s1">value)</span>
+
+    <span class="s2">def </span><span class="s1">plot(self):</span>
+        <span class="s2">from </span><span class="s1">statsmodels.graphics.utils </span><span class="s2">import </span><span class="s1">_import_mpl</span>
+        <span class="s1">plt = _import_mpl()</span>
+        <span class="s1">fig</span><span class="s2">, </span><span class="s1">axes = plt.subplots(</span><span class="s4">4</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">sharex=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">self.observed.plot(ax=axes[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">legend=</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s1">axes[</span><span class="s4">0</span><span class="s1">].set_ylabel(</span><span class="s3">'Observed'</span><span class="s1">)</span>
+        <span class="s1">self.seasadj.plot(ax=axes[</span><span class="s4">1</span><span class="s1">]</span><span class="s2">, </span><span class="s1">legend=</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s1">axes[</span><span class="s4">1</span><span class="s1">].set_ylabel(</span><span class="s3">'Seas. Adjusted'</span><span class="s1">)</span>
+        <span class="s1">self.trend.plot(ax=axes[</span><span class="s4">2</span><span class="s1">]</span><span class="s2">, </span><span class="s1">legend=</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s1">axes[</span><span class="s4">2</span><span class="s1">].set_ylabel(</span><span class="s3">'Trend'</span><span class="s1">)</span>
+        <span class="s1">self.irregular.plot(ax=axes[</span><span class="s4">3</span><span class="s1">]</span><span class="s2">, </span><span class="s1">legend=</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s1">axes[</span><span class="s4">3</span><span class="s1">].set_ylabel(</span><span class="s3">'Irregular'</span><span class="s1">)</span>
+
+        <span class="s1">fig.tight_layout()</span>
+        <span class="s2">return </span><span class="s1">fig</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,1556 @@
+<html>
+<head>
+<title>outliers_influence.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #808080;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #629755; font-style: italic;}
+.s3 { color: #cc7832;}
+.s4 { color: #6a8759;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+outliers_influence.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># -*- coding: utf-8 -*-</span>
+<span class="s2">&quot;&quot;&quot;Influence and Outlier Measures 
+ 
+Created on Sun Jan 29 11:16:09 2012 
+ 
+Author: Josef Perktold 
+License: BSD-3 
+&quot;&quot;&quot;</span>
+
+<span class="s3">import </span><span class="s1">warnings</span>
+
+<span class="s3">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s3">import </span><span class="s1">Appender</span>
+<span class="s3">from </span><span class="s1">statsmodels.compat.python </span><span class="s3">import </span><span class="s1">lzip</span>
+
+<span class="s3">from </span><span class="s1">collections </span><span class="s3">import </span><span class="s1">defaultdict</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+
+<span class="s3">from </span><span class="s1">statsmodels.graphics._regressionplots_doc </span><span class="s3">import </span><span class="s1">_plot_influence_doc</span>
+<span class="s3">from </span><span class="s1">statsmodels.regression.linear_model </span><span class="s3">import </span><span class="s1">OLS</span>
+<span class="s3">from </span><span class="s1">statsmodels.stats.multitest </span><span class="s3">import </span><span class="s1">multipletests</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.decorators </span><span class="s3">import </span><span class="s1">cache_readonly</span>
+<span class="s3">from </span><span class="s1">statsmodels.tools.tools </span><span class="s3">import </span><span class="s1">maybe_unwrap_results</span>
+
+<span class="s0"># outliers test convenience wrapper</span>
+
+<span class="s3">def </span><span class="s1">outlier_test(model_results</span><span class="s3">, </span><span class="s1">method=</span><span class="s4">'bonf'</span><span class="s3">, </span><span class="s1">alpha=</span><span class="s5">.05</span><span class="s3">, </span><span class="s1">labels=</span><span class="s3">None,</span>
+                 <span class="s1">order=</span><span class="s3">False, </span><span class="s1">cutoff=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Outlier Tests for RegressionResults instances. 
+ 
+    Parameters 
+    ---------- 
+    model_results : RegressionResults 
+        Linear model results 
+    method : str 
+        - `bonferroni` : one-step correction 
+        - `sidak` : one-step correction 
+        - `holm-sidak` : 
+        - `holm` : 
+        - `simes-hochberg` : 
+        - `hommel` : 
+        - `fdr_bh` : Benjamini/Hochberg 
+        - `fdr_by` : Benjamini/Yekutieli 
+        See `statsmodels.stats.multitest.multipletests` for details. 
+    alpha : float 
+        familywise error rate 
+    labels : None or array_like 
+        If `labels` is not None, then it will be used as index to the 
+        returned pandas DataFrame. See also Returns below 
+    order : bool 
+        Whether or not to order the results by the absolute value of the 
+        studentized residuals. If labels are provided they will also be sorted. 
+    cutoff : None or float in [0, 1] 
+        If cutoff is not None, then the return only includes observations with 
+        multiple testing corrected p-values strictly below the cutoff. The 
+        returned array or dataframe can be empty if there are no outlier 
+        candidates at the specified cutoff. 
+ 
+    Returns 
+    ------- 
+    table : ndarray or DataFrame 
+        Returns either an ndarray or a DataFrame if labels is not None. 
+        Will attempt to get labels from model_results if available. The 
+        columns are the Studentized residuals, the unadjusted p-value, 
+        and the corrected p-value according to method. 
+ 
+    Notes 
+    ----- 
+    The unadjusted p-value is stats.t.sf(abs(resid), df) where 
+    df = df_resid - 1. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">stats  </span><span class="s0"># lazy import</span>
+    <span class="s3">if </span><span class="s1">labels </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">labels = getattr(model_results.model.data</span><span class="s3">, </span><span class="s4">'row_labels'</span><span class="s3">, None</span><span class="s1">)</span>
+    <span class="s1">infl = getattr(model_results</span><span class="s3">, </span><span class="s4">'get_influence'</span><span class="s3">, None</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">infl </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">results = maybe_unwrap_results(model_results)</span>
+        <span class="s3">raise </span><span class="s1">AttributeError(</span><span class="s4">&quot;model_results object %s does not have a &quot;</span>
+                             <span class="s4">&quot;get_influence &quot;</span>
+                             <span class="s4">&quot;method.&quot; </span><span class="s1">% results.__class__.__name__)</span>
+    <span class="s1">resid = infl().resid_studentized_external</span>
+    <span class="s3">if </span><span class="s1">order:</span>
+        <span class="s1">idx = np.abs(resid).argsort()[::-</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">resid = resid[idx]</span>
+        <span class="s3">if </span><span class="s1">labels </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">labels = np.asarray(labels)[idx]</span>
+    <span class="s1">df = model_results.df_resid - </span><span class="s5">1</span>
+    <span class="s1">unadj_p = stats.t.sf(np.abs(resid)</span><span class="s3">, </span><span class="s1">df) * </span><span class="s5">2</span>
+    <span class="s1">adj_p = multipletests(unadj_p</span><span class="s3">, </span><span class="s1">alpha=alpha</span><span class="s3">, </span><span class="s1">method=method)</span>
+
+    <span class="s1">data = np.c_[resid</span><span class="s3">, </span><span class="s1">unadj_p</span><span class="s3">, </span><span class="s1">adj_p[</span><span class="s5">1</span><span class="s1">]]</span>
+    <span class="s3">if </span><span class="s1">cutoff </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s1">mask = data[:</span><span class="s3">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">] &lt; cutoff</span>
+        <span class="s1">data = data[mask]</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">mask = slice(</span><span class="s3">None</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s1">labels </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s3">from </span><span class="s1">pandas </span><span class="s3">import </span><span class="s1">DataFrame</span>
+        <span class="s3">return </span><span class="s1">DataFrame(data</span><span class="s3">,</span>
+                         <span class="s1">columns=[</span><span class="s4">'student_resid'</span><span class="s3">, </span><span class="s4">'unadj_p'</span><span class="s3">, </span><span class="s1">method + </span><span class="s4">&quot;(p)&quot;</span><span class="s1">]</span><span class="s3">,</span>
+                         <span class="s1">index=np.asarray(labels)[mask])</span>
+    <span class="s3">return </span><span class="s1">data</span>
+
+
+<span class="s0"># influence measures</span>
+
+<span class="s3">def </span><span class="s1">reset_ramsey(res</span><span class="s3">, </span><span class="s1">degree=</span><span class="s5">5</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot;Ramsey's RESET specification test for linear models 
+ 
+    This is a general specification test, for additional non-linear effects 
+    in a model. 
+ 
+    Parameters 
+    ---------- 
+    degree : int 
+        Maximum power to include in the RESET test.  Powers 0 and 1 are 
+        excluded, so that degree tests powers 2, ..., degree of the fitted 
+        values. 
+ 
+    Notes 
+    ----- 
+    The test fits an auxiliary OLS regression where the design matrix, exog, 
+    is augmented by powers 2 to degree of the fitted values. Then it performs 
+    an F-test whether these additional terms are significant. 
+ 
+    If the p-value of the f-test is below a threshold, e.g. 0.1, then this 
+    indicates that there might be additional non-linear effects in the model 
+    and that the linear model is mis-specified. 
+ 
+    References 
+    ---------- 
+    https://en.wikipedia.org/wiki/Ramsey_RESET_test 
+    &quot;&quot;&quot;</span>
+    <span class="s1">order = degree + </span><span class="s5">1</span>
+    <span class="s1">k_vars = res.model.exog.shape[</span><span class="s5">1</span><span class="s1">]</span>
+    <span class="s0"># vander without constant and x, and drop constant</span>
+    <span class="s1">norm_values = np.asarray(res.fittedvalues)</span>
+    <span class="s1">norm_values = norm_values / np.sqrt((norm_values ** </span><span class="s5">2</span><span class="s1">).mean())</span>
+    <span class="s1">y_fitted_vander = np.vander(norm_values</span><span class="s3">, </span><span class="s1">order)[:</span><span class="s3">, </span><span class="s1">:-</span><span class="s5">2</span><span class="s1">]</span>
+    <span class="s1">exog = np.column_stack((res.model.exog</span><span class="s3">, </span><span class="s1">y_fitted_vander))</span>
+    <span class="s1">exog /= np.sqrt((exog ** </span><span class="s5">2</span><span class="s1">).mean(</span><span class="s5">0</span><span class="s1">))</span>
+    <span class="s1">endog = res.model.endog / (res.model.endog ** </span><span class="s5">2</span><span class="s1">).mean()</span>
+    <span class="s1">res_aux = OLS(endog</span><span class="s3">, </span><span class="s1">exog).fit()</span>
+    <span class="s0"># r_matrix = np.eye(degree, exog.shape[1], k_vars)</span>
+    <span class="s1">r_matrix = np.eye(degree - </span><span class="s5">1</span><span class="s3">, </span><span class="s1">exog.shape[</span><span class="s5">1</span><span class="s1">]</span><span class="s3">, </span><span class="s1">k_vars)</span>
+    <span class="s0"># df1 = degree - 1</span>
+    <span class="s0"># df2 = exog.shape[0] - degree - res.df_model  (without constant)</span>
+    <span class="s3">return </span><span class="s1">res_aux.f_test(r_matrix)  </span><span class="s0"># , r_matrix, res_aux</span>
+
+
+<span class="s3">def </span><span class="s1">variance_inflation_factor(exog</span><span class="s3">, </span><span class="s1">exog_idx):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Variance inflation factor, VIF, for one exogenous variable 
+ 
+    The variance inflation factor is a measure for the increase of the 
+    variance of the parameter estimates if an additional variable, given by 
+    exog_idx is added to the linear regression. It is a measure for 
+    multicollinearity of the design matrix, exog. 
+ 
+    One recommendation is that if VIF is greater than 5, then the explanatory 
+    variable given by exog_idx is highly collinear with the other explanatory 
+    variables, and the parameter estimates will have large standard errors 
+    because of this. 
+ 
+    Parameters 
+    ---------- 
+    exog : {ndarray, DataFrame} 
+        design matrix with all explanatory variables, as for example used in 
+        regression 
+    exog_idx : int 
+        index of the exogenous variable in the columns of exog 
+ 
+    Returns 
+    ------- 
+    float 
+        variance inflation factor 
+ 
+    Notes 
+    ----- 
+    This function does not save the auxiliary regression. 
+ 
+    See Also 
+    -------- 
+    xxx : class for regression diagnostics  TODO: does not exist yet 
+ 
+    References 
+    ---------- 
+    https://en.wikipedia.org/wiki/Variance_inflation_factor 
+    &quot;&quot;&quot;</span>
+    <span class="s1">k_vars = exog.shape[</span><span class="s5">1</span><span class="s1">]</span>
+    <span class="s1">exog = np.asarray(exog)</span>
+    <span class="s1">x_i = exog[:</span><span class="s3">, </span><span class="s1">exog_idx]</span>
+    <span class="s1">mask = np.arange(k_vars) != exog_idx</span>
+    <span class="s1">x_noti = exog[:</span><span class="s3">, </span><span class="s1">mask]</span>
+    <span class="s1">r_squared_i = OLS(x_i</span><span class="s3">, </span><span class="s1">x_noti).fit().rsquared</span>
+    <span class="s1">vif = </span><span class="s5">1. </span><span class="s1">/ (</span><span class="s5">1. </span><span class="s1">- r_squared_i)</span>
+    <span class="s3">return </span><span class="s1">vif</span>
+
+
+<span class="s3">class </span><span class="s1">_BaseInfluenceMixin:</span>
+    <span class="s2">&quot;&quot;&quot;common methods between OLSInfluence and MLE/GLMInfluence 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">@Appender(_plot_influence_doc.format(**{</span><span class="s4">'extra_params_doc'</span><span class="s1">: </span><span class="s4">&quot;&quot;</span><span class="s1">}))</span>
+    <span class="s3">def </span><span class="s1">plot_influence(self</span><span class="s3">, </span><span class="s1">external=</span><span class="s3">None, </span><span class="s1">alpha=</span><span class="s5">.05</span><span class="s3">, </span><span class="s1">criterion=</span><span class="s4">&quot;cooks&quot;</span><span class="s3">,</span>
+                       <span class="s1">size=</span><span class="s5">48</span><span class="s3">, </span><span class="s1">plot_alpha=</span><span class="s5">.75</span><span class="s3">, </span><span class="s1">ax=</span><span class="s3">None, </span><span class="s1">**kwargs):</span>
+
+        <span class="s3">if </span><span class="s1">external </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">external = hasattr(self</span><span class="s3">, </span><span class="s4">'_cache'</span><span class="s1">) </span><span class="s3">and </span><span class="s4">'res_looo' </span><span class="s3">in </span><span class="s1">self._cache</span>
+        <span class="s3">from </span><span class="s1">statsmodels.graphics.regressionplots </span><span class="s3">import </span><span class="s1">_influence_plot</span>
+        <span class="s3">if </span><span class="s1">self.hat_matrix_diag </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">res = _influence_plot(self.results</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, </span><span class="s1">external=external</span><span class="s3">,</span>
+                                  <span class="s1">alpha=alpha</span><span class="s3">,</span>
+                                  <span class="s1">criterion=criterion</span><span class="s3">, </span><span class="s1">size=size</span><span class="s3">,</span>
+                                  <span class="s1">plot_alpha=plot_alpha</span><span class="s3">, </span><span class="s1">ax=ax</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">warnings.warn(</span><span class="s4">&quot;Plot uses pearson residuals and exog hat matrix.&quot;</span><span class="s1">)</span>
+            <span class="s1">res = _influence_plot(self.results</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, </span><span class="s1">external=external</span><span class="s3">,</span>
+                                  <span class="s1">alpha=alpha</span><span class="s3">,</span>
+                                  <span class="s1">criterion=criterion</span><span class="s3">, </span><span class="s1">size=size</span><span class="s3">,</span>
+                                  <span class="s1">leverage=self.hat_matrix_exog_diag</span><span class="s3">,</span>
+                                  <span class="s1">resid=self.resid</span><span class="s3">,</span>
+                                  <span class="s1">plot_alpha=plot_alpha</span><span class="s3">, </span><span class="s1">ax=ax</span><span class="s3">, </span><span class="s1">**kwargs)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s3">def </span><span class="s1">_plot_index(self</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">ylabel</span><span class="s3">, </span><span class="s1">threshold=</span><span class="s3">None, </span><span class="s1">title=</span><span class="s3">None, </span><span class="s1">ax=</span><span class="s3">None,</span>
+                    <span class="s1">**kwds):</span>
+        <span class="s3">from </span><span class="s1">statsmodels.graphics </span><span class="s3">import </span><span class="s1">utils</span>
+        <span class="s1">fig</span><span class="s3">, </span><span class="s1">ax = utils.create_mpl_ax(ax)</span>
+        <span class="s3">if </span><span class="s1">title </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">title = </span><span class="s4">&quot;Index Plot&quot;</span>
+        <span class="s1">nobs = len(self.endog)</span>
+        <span class="s1">index = np.arange(nobs)</span>
+        <span class="s1">ax.scatter(index</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">**kwds)</span>
+
+        <span class="s3">if </span><span class="s1">threshold == </span><span class="s4">'all'</span><span class="s1">:</span>
+            <span class="s1">large_points = np.ones(nobs</span><span class="s3">, </span><span class="s1">np.bool_)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">large_points = np.abs(y) &gt; threshold</span>
+        <span class="s1">psize = </span><span class="s5">3 </span><span class="s1">* np.ones(nobs)</span>
+        <span class="s0"># add point labels</span>
+        <span class="s1">labels = self.results.model.data.row_labels</span>
+        <span class="s3">if </span><span class="s1">labels </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">labels = np.arange(nobs)</span>
+        <span class="s1">ax = utils.annotate_axes(np.where(large_points)[</span><span class="s5">0</span><span class="s1">]</span><span class="s3">, </span><span class="s1">labels</span><span class="s3">,</span>
+                                 <span class="s1">lzip(index</span><span class="s3">, </span><span class="s1">y)</span><span class="s3">,</span>
+                                 <span class="s1">lzip(-psize</span><span class="s3">, </span><span class="s1">psize)</span><span class="s3">, </span><span class="s4">&quot;large&quot;</span><span class="s3">,</span>
+                                 <span class="s1">ax)</span>
+
+        <span class="s1">font = {</span><span class="s4">&quot;fontsize&quot;</span><span class="s1">: </span><span class="s5">16</span><span class="s3">, </span><span class="s4">&quot;color&quot;</span><span class="s1">: </span><span class="s4">&quot;black&quot;</span><span class="s1">}</span>
+        <span class="s1">ax.set_ylabel(ylabel</span><span class="s3">, </span><span class="s1">**font)</span>
+        <span class="s1">ax.set_xlabel(</span><span class="s4">&quot;Observation&quot;</span><span class="s3">, </span><span class="s1">**font)</span>
+        <span class="s1">ax.set_title(title</span><span class="s3">, </span><span class="s1">**font)</span>
+        <span class="s3">return </span><span class="s1">fig</span>
+
+    <span class="s3">def </span><span class="s1">plot_index(self</span><span class="s3">, </span><span class="s1">y_var=</span><span class="s4">'cooks'</span><span class="s3">, </span><span class="s1">threshold=</span><span class="s3">None, </span><span class="s1">title=</span><span class="s3">None, </span><span class="s1">ax=</span><span class="s3">None,</span>
+                   <span class="s1">idx=</span><span class="s3">None, </span><span class="s1">**kwds):</span>
+        <span class="s2">&quot;&quot;&quot;index plot for influence attributes 
+ 
+        Parameters 
+        ---------- 
+        y_var : str 
+            Name of attribute or shortcut for predefined attributes that will 
+            be plotted on the y-axis. 
+        threshold : None or float 
+            Threshold for adding annotation with observation labels. 
+            Observations for which the absolute value of the y_var is larger 
+            than the threshold will be annotated. Set to a negative number to 
+            label all observations or to a large number to have no annotation. 
+        title : str 
+            If provided, the title will replace the default &quot;Index Plot&quot; title. 
+        ax : matplolib axis instance 
+            The plot will be added to the `ax` if provided, otherwise a new 
+            figure is created. 
+        idx : {None, int} 
+            Some attributes require an additional index to select the y-var. 
+            In dfbetas this refers to the column indes. 
+        kwds : optional keywords 
+            Keywords will be used in the call to matplotlib scatter function. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">criterion = y_var  </span><span class="s0"># alias</span>
+        <span class="s3">if </span><span class="s1">threshold </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s0"># TODO: criterion specific defaults</span>
+            <span class="s1">threshold = </span><span class="s4">'all'</span>
+
+        <span class="s3">if </span><span class="s1">criterion == </span><span class="s4">'dfbeta'</span><span class="s1">:</span>
+            <span class="s1">y = self.dfbetas[:</span><span class="s3">, </span><span class="s1">idx]</span>
+            <span class="s1">ylabel = </span><span class="s4">'DFBETA for ' </span><span class="s1">+ self.results.model.exog_names[idx]</span>
+        <span class="s3">elif </span><span class="s1">criterion.startswith(</span><span class="s4">'cook'</span><span class="s1">):</span>
+            <span class="s1">y = self.cooks_distance[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s1">ylabel = </span><span class="s4">&quot;Cook's distance&quot;</span>
+        <span class="s3">elif </span><span class="s1">criterion.startswith(</span><span class="s4">'hat'</span><span class="s1">) </span><span class="s3">or </span><span class="s1">criterion.startswith(</span><span class="s4">'lever'</span><span class="s1">):</span>
+            <span class="s1">y = self.hat_matrix_diag</span>
+            <span class="s1">ylabel = </span><span class="s4">&quot;Leverage (diagonal of hat matrix)&quot;</span>
+        <span class="s3">elif </span><span class="s1">criterion.startswith(</span><span class="s4">'cook'</span><span class="s1">):</span>
+            <span class="s1">y = self.cooks_distance[</span><span class="s5">0</span><span class="s1">]</span>
+            <span class="s1">ylabel = </span><span class="s4">&quot;Cook's distance&quot;</span>
+        <span class="s3">elif </span><span class="s1">criterion.startswith(</span><span class="s4">'resid_stu'</span><span class="s1">):</span>
+            <span class="s1">y = self.resid_studentized</span>
+            <span class="s1">ylabel = </span><span class="s4">&quot;Internally Studentized Residuals&quot;</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s0"># assume we have the name of an attribute</span>
+            <span class="s1">y = getattr(self</span><span class="s3">, </span><span class="s1">y_var)</span>
+            <span class="s3">if </span><span class="s1">idx </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">y = y[idx]</span>
+            <span class="s1">ylabel = y_var</span>
+
+        <span class="s1">fig = self._plot_index(y</span><span class="s3">, </span><span class="s1">ylabel</span><span class="s3">, </span><span class="s1">threshold=threshold</span><span class="s3">, </span><span class="s1">title=title</span><span class="s3">,</span>
+                               <span class="s1">ax=ax</span><span class="s3">, </span><span class="s1">**kwds)</span>
+        <span class="s3">return </span><span class="s1">fig</span>
+
+
+<span class="s3">class </span><span class="s1">MLEInfluence(_BaseInfluenceMixin):</span>
+    <span class="s2">&quot;&quot;&quot;Global Influence and outlier measures (experimental) 
+ 
+    Parameters 
+    ---------- 
+    results : instance of results class 
+        This only works for model and results classes that have the necessary 
+        helper methods. 
+    other arguments : 
+        Those are only available to override default behavior and are used 
+        instead of the corresponding attribute of the results class. 
+        By default resid_pearson is used as resid. 
+ 
+    Attributes 
+    ---------- 
+    hat_matrix_diag (hii) : This is the generalized leverage computed as the 
+        local derivative of fittedvalues (predicted mean) with respect to the 
+        observed response for each observation. 
+        Not available for ZeroInflated models because of nondifferentiability. 
+    d_params : Change in parameters computed with one Newton step using the 
+        full Hessian corrected by division by (1 - hii). 
+        If hat_matrix_diag is not available, then the division by (1 - hii) is 
+        not included. 
+    dbetas : change in parameters divided by the standard error of parameters 
+        from the full model results, ``bse``. 
+    cooks_distance : quadratic form for change in parameters weighted by 
+        ``cov_params`` from the full model divided by the number of variables. 
+        It includes p-values based on the F-distribution which are only 
+        approximate outside of linear Gaussian models. 
+    resid_studentized : In the general MLE case resid_studentized are 
+        computed from the score residuals scaled by hessian factor and 
+        leverage. This does not use ``cov_params``. 
+    d_fittedvalues : local change of expected mean given the change in the 
+        parameters as computed in ``d_params``. 
+    d_fittedvalues_scaled : same as d_fittedvalues but scaled by the standard 
+        errors of a predicted mean of the response. 
+    params_one : is the one step parameter estimate computed as ``params`` 
+        from the full sample minus ``d_params``. 
+ 
+    Notes 
+    ----- 
+    MLEInfluence uses generic definitions based on maximum likelihood models. 
+ 
+    MLEInfluence produces the same results as GLMInfluence for canonical 
+    links (verified for GLM Binomial, Poisson and Gaussian). There will be 
+    some differences for non-canonical links or if a robust cov_type is used. 
+    For example, the generalized leverage differs from the definition of the 
+    GLM hat matrix in the case of Probit, which corresponds to family 
+    Binomial with a non-canonical link. 
+ 
+    The extension to non-standard models, e.g. multi-link model like 
+    BetaModel and the ZeroInflated models is still experimental and might still 
+    change. 
+    Additonally, ZeroInflated and some threshold models have a 
+    nondifferentiability in the generalized leverage. How this case is treated 
+    might also change. 
+ 
+    Warning: This does currently not work for constrained or penalized models, 
+    e.g. models estimated with fit_constrained or fit_regularized. 
+ 
+    This has not yet been tested for correctness when offset or exposure 
+    are used, although they should be supported by the code. 
+ 
+    status: experimental, 
+    This class will need changes to support different kinds of models, e.g. 
+    extra parameters in discrete.NegativeBinomial or two-part models like 
+    ZeroInflatedPoisson. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">results</span><span class="s3">, </span><span class="s1">resid=</span><span class="s3">None, </span><span class="s1">endog=</span><span class="s3">None, </span><span class="s1">exog=</span><span class="s3">None,</span>
+                 <span class="s1">hat_matrix_diag=</span><span class="s3">None, </span><span class="s1">cov_params=</span><span class="s3">None, </span><span class="s1">scale=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s0"># this __init__ attaches attributes that we don't really need</span>
+        <span class="s1">self.results = results = maybe_unwrap_results(results)</span>
+        <span class="s0"># TODO: check for extra params in e.g. NegBin</span>
+        <span class="s1">self.nobs</span><span class="s3">, </span><span class="s1">self.k_vars = results.model.exog.shape</span>
+        <span class="s1">self.k_params = np.size(results.params)</span>
+        <span class="s1">self.endog = endog </span><span class="s3">if </span><span class="s1">endog </span><span class="s3">is not None else </span><span class="s1">results.model.endog</span>
+        <span class="s1">self.exog = exog </span><span class="s3">if </span><span class="s1">exog </span><span class="s3">is not None else </span><span class="s1">results.model.exog</span>
+        <span class="s1">self.scale = scale </span><span class="s3">if </span><span class="s1">scale </span><span class="s3">is not None else </span><span class="s1">results.scale</span>
+        <span class="s3">if </span><span class="s1">resid </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self.resid = resid</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">self.resid = getattr(results</span><span class="s3">, </span><span class="s4">&quot;resid_pearson&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+            <span class="s3">if </span><span class="s1">self.resid </span><span class="s3">is not None</span><span class="s1">: </span><span class="s0"># and scale != 1:</span>
+                <span class="s0"># GLM and similar does not divide resid_pearson by scale</span>
+                <span class="s1">self.resid = self.resid / np.sqrt(self.scale)</span>
+
+        <span class="s1">self.cov_params = (cov_params </span><span class="s3">if </span><span class="s1">cov_params </span><span class="s3">is not None</span>
+                           <span class="s3">else </span><span class="s1">results.cov_params())</span>
+        <span class="s1">self.model_class = results.model.__class__</span>
+
+        <span class="s1">self.hessian = self.results.model.hessian(self.results.params)</span>
+        <span class="s1">self.score_obs = self.results.model.score_obs(self.results.params)</span>
+        <span class="s3">if </span><span class="s1">hat_matrix_diag </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">self._hat_matrix_diag = hat_matrix_diag</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">hat_matrix_diag(self):</span>
+        <span class="s2">&quot;&quot;&quot;Diagonal of the generalized leverage 
+ 
+        This is the analogue of the hat matrix diagonal for general MLE. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'_hat_matrix_diag'</span><span class="s1">):</span>
+            <span class="s3">return </span><span class="s1">self._hat_matrix_diag</span>
+
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">dsdy = self.results.model._deriv_score_obs_dendog(</span>
+                <span class="s1">self.results.params)</span>
+        <span class="s3">except </span><span class="s1">NotImplementedError:</span>
+            <span class="s1">dsdy = </span><span class="s3">None</span>
+
+        <span class="s3">if </span><span class="s1">dsdy </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">warnings.warn(</span><span class="s4">&quot;hat matrix is not available, missing derivatives&quot;</span><span class="s3">,</span>
+                          <span class="s1">UserWarning)</span>
+            <span class="s3">return None</span>
+
+        <span class="s1">dmu_dp = self.results.model._deriv_mean_dparams(self.results.params)</span>
+
+        <span class="s0"># dmu_dp = 1 /</span>
+        <span class="s0">#      self.results.model.family.link.deriv(self.results.fittedvalues)</span>
+        <span class="s1">h = (dmu_dp * np.linalg.solve(-self.hessian</span><span class="s3">, </span><span class="s1">dsdy.T).T).sum(</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">h</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">hat_matrix_exog_diag(self):</span>
+        <span class="s2">&quot;&quot;&quot;Diagonal of the hat_matrix using only exog as in OLS 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">get_exogs = getattr(self.results.model</span><span class="s3">, </span><span class="s4">&quot;_get_exogs&quot;</span><span class="s3">, None</span><span class="s1">)</span>
+        <span class="s3">if </span><span class="s1">get_exogs </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">exog = np.column_stack(get_exogs())</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">exog = self.exog</span>
+        <span class="s3">return </span><span class="s1">(exog * np.linalg.pinv(exog).T).sum(</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">d_params(self):</span>
+        <span class="s2">&quot;&quot;&quot;Approximate change in parameter estimates when dropping observation. 
+ 
+        This uses one-step approximation of the parameter change to deleting 
+        one observation. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">so_noti = self.score_obs.sum(</span><span class="s5">0</span><span class="s1">) - self.score_obs</span>
+        <span class="s1">beta_i = np.linalg.solve(self.hessian</span><span class="s3">, </span><span class="s1">so_noti.T).T</span>
+        <span class="s3">if </span><span class="s1">self.hat_matrix_diag </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">beta_i /= (</span><span class="s5">1 </span><span class="s1">- self.hat_matrix_diag)[:</span><span class="s3">, None</span><span class="s1">]</span>
+
+        <span class="s3">return </span><span class="s1">beta_i</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">dfbetas(self):</span>
+        <span class="s2">&quot;&quot;&quot;Scaled change in parameter estimates. 
+ 
+        The one-step change of parameters in d_params is rescaled by dividing 
+        by the standard error of the parameter estimate given by results.bse. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">beta_i = self.d_params / self.results.bse</span>
+        <span class="s3">return </span><span class="s1">beta_i</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">params_one(self):</span>
+        <span class="s2">&quot;&quot;&quot;Parameter estimate based on one-step approximation. 
+ 
+        This the one step parameter estimate computed as 
+        ``params`` from the full sample minus ``d_params``. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self.results.params - self.d_params</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">cooks_distance(self):</span>
+        <span class="s2">&quot;&quot;&quot;Cook's distance and p-values. 
+ 
+        Based on one step approximation d_params and on results.cov_params 
+        Cook's distance divides by the number of explanatory variables. 
+ 
+        p-values are based on the F-distribution which are only approximate 
+        outside of linear Gaussian models. 
+ 
+        Warning: The definition of p-values might change if we switch to using 
+        chi-square distribution instead of F-distribution, or if we make it 
+        dependent on the fit keyword use_t. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">cooks_d2 = (self.d_params * np.linalg.solve(self.cov_params</span><span class="s3">,</span>
+                                                    <span class="s1">self.d_params.T).T).sum(</span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s1">cooks_d2 /= self.k_params</span>
+        <span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">stats</span>
+
+        <span class="s0"># alpha = 0.1</span>
+        <span class="s0"># print stats.f.isf(1-alpha, n_params, res.df_modelwc)</span>
+        <span class="s0"># TODO use chi2   # use_f option</span>
+        <span class="s1">pvals = stats.f.sf(cooks_d2</span><span class="s3">, </span><span class="s1">self.k_params</span><span class="s3">, </span><span class="s1">self.results.df_resid)</span>
+
+        <span class="s3">return </span><span class="s1">cooks_d2</span><span class="s3">, </span><span class="s1">pvals</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">resid_studentized(self):</span>
+        <span class="s2">&quot;&quot;&quot;studentized default residuals. 
+ 
+        This uses the residual in `resid` attribute, which is by default 
+        resid_pearson and studentizes is using the generalized leverage. 
+ 
+        self.resid / np.sqrt(1 - self.hat_matrix_diag) 
+ 
+        Studentized residuals are not available if hat_matrix_diag is None. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self.resid / np.sqrt(</span><span class="s5">1 </span><span class="s1">- self.hat_matrix_diag)</span>
+
+    <span class="s3">def </span><span class="s1">resid_score_factor(self):</span>
+        <span class="s2">&quot;&quot;&quot;Score residual divided by sqrt of hessian factor. 
+ 
+        experimental, agrees with GLMInfluence for Binomial and Gaussian. 
+        This corresponds to considering the linear predictors as parameters 
+        of the model. 
+ 
+        Note: Nhis might have nan values if second derivative, hessian_factor, 
+        is positive, i.e. loglikelihood is not globally concave w.r.t. linear 
+        predictor. (This occured in an example for GeneralizedPoisson) 
+        &quot;&quot;&quot;</span>
+        <span class="s3">from </span><span class="s1">statsmodels.genmod.generalized_linear_model </span><span class="s3">import </span><span class="s1">GLM</span>
+        <span class="s1">sf = self.results.model.score_factor(self.results.params)</span>
+        <span class="s1">hf = self.results.model.hessian_factor(self.results.params)</span>
+        <span class="s3">if </span><span class="s1">isinstance(sf</span><span class="s3">, </span><span class="s1">tuple):</span>
+            <span class="s1">sf = sf[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s3">if </span><span class="s1">isinstance(hf</span><span class="s3">, </span><span class="s1">tuple):</span>
+            <span class="s1">hf = hf[</span><span class="s5">0</span><span class="s1">]</span>
+        <span class="s3">if not </span><span class="s1">isinstance(self.results.model</span><span class="s3">, </span><span class="s1">GLM):</span>
+            <span class="s0"># hessian_factor in GLM has wrong sign, is already positive</span>
+            <span class="s1">hf = -hf</span>
+
+        <span class="s3">return </span><span class="s1">sf / np.sqrt(hf) / np.sqrt(</span><span class="s5">1 </span><span class="s1">- self.hat_matrix_diag)</span>
+
+    <span class="s3">def </span><span class="s1">resid_score(self</span><span class="s3">, </span><span class="s1">joint=</span><span class="s3">True, </span><span class="s1">index=</span><span class="s3">None, </span><span class="s1">studentize=</span><span class="s3">False</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;Score observations scaled by inverse hessian. 
+ 
+        Score residual in resid_score are defined in analogy to a score test 
+        statistic for each observation. 
+ 
+        Parameters 
+        ---------- 
+        joint : bool 
+            If joint is true, then a quadratic form similar to score_test is 
+            returned for each observation. 
+            If joint is false, then standardized score_obs are returned. The 
+            returned array is two-dimensional 
+        index : ndarray (optional) 
+            Optional index to select a subset of score_obs columns. 
+            By default, all columns of score_obs will be used. 
+        studentize : bool 
+            If studentize is true, the the scaled residuals are also 
+            studentized using the generalized leverage. 
+ 
+        Returns 
+        ------- 
+        array :  1-D or 2-D residuals 
+ 
+        Notes 
+        ----- 
+        Status: experimental 
+ 
+        Because of the one srep approacimation of d_params, score residuals 
+        are identical to cooks_distance, except for 
+ 
+        - cooks_distance is normalized by the number of parameters 
+        - cooks_distance uses cov_params, resid_score is based on Hessian. 
+          This will make them differ in the case of robust cov_params. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># currently no caching</span>
+        <span class="s1">score_obs = self.results.model.score_obs(self.results.params)</span>
+        <span class="s1">hess = self.results.model.hessian(self.results.params)</span>
+        <span class="s3">if </span><span class="s1">index </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">score_obs = score_obs[:</span><span class="s3">, </span><span class="s1">index]</span>
+            <span class="s1">hess = hess[index[:</span><span class="s3">, None</span><span class="s1">]</span><span class="s3">, </span><span class="s1">index]</span>
+
+        <span class="s3">if </span><span class="s1">joint:</span>
+            <span class="s1">resid = (score_obs.T * np.linalg.solve(-hess</span><span class="s3">, </span><span class="s1">score_obs.T)).sum(</span><span class="s5">0</span><span class="s1">)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">resid = score_obs / np.sqrt(np.diag(-hess))</span>
+
+        <span class="s3">if </span><span class="s1">studentize:</span>
+            <span class="s3">if </span><span class="s1">joint:</span>
+                <span class="s1">resid /= np.sqrt(</span><span class="s5">1 </span><span class="s1">- self.hat_matrix_diag)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s0"># 2-dim resid</span>
+                <span class="s1">resid /= np.sqrt(</span><span class="s5">1 </span><span class="s1">- self.hat_matrix_diag[:</span><span class="s3">, None</span><span class="s1">])</span>
+
+        <span class="s3">return </span><span class="s1">resid</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">_get_prediction(self):</span>
+        <span class="s0"># TODO: do we cache this or does it need to be a method</span>
+        <span class="s0"># we only need unchanging parts, alpha for confint could change</span>
+        <span class="s3">with </span><span class="s1">warnings.catch_warnings():</span>
+            <span class="s1">msg = </span><span class="s4">'linear keyword is deprecated, use which=&quot;linear&quot;'</span>
+            <span class="s1">warnings.filterwarnings(</span><span class="s4">&quot;ignore&quot;</span><span class="s3">, </span><span class="s1">message=msg</span><span class="s3">,</span>
+                                    <span class="s1">category=FutureWarning)</span>
+            <span class="s1">pred = self.results.get_prediction()</span>
+        <span class="s3">return </span><span class="s1">pred</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">d_fittedvalues(self):</span>
+        <span class="s2">&quot;&quot;&quot;Change in expected response, fittedvalues. 
+ 
+        Local change of expected mean given the change in the parameters as 
+        computed in d_params. 
+ 
+        Notes 
+        ----- 
+        This uses the one-step approximation of the parameter change to 
+        deleting one observation ``d_params``. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># results.params might be a pandas.Series</span>
+        <span class="s1">params = np.asarray(self.results.params)</span>
+        <span class="s1">deriv = self.results.model._deriv_mean_dparams(params)</span>
+        <span class="s3">return </span><span class="s1">(deriv * self.d_params).sum(</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">d_fittedvalues_scaled(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Change in fittedvalues scaled by standard errors. 
+ 
+        This uses one-step approximation of the parameter change to deleting 
+        one observation ``d_params``, and divides by the standard errors 
+        for the predicted mean provided by results.get_prediction. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># Note: this and the previous methods are for the response</span>
+        <span class="s0"># and not for a weighted response, i.e. not the self.exog, self.endog</span>
+        <span class="s0"># this will be relevant for WLS comparing fitted endog versus wendog</span>
+        <span class="s3">return </span><span class="s1">self.d_fittedvalues / self._get_prediction.se</span>
+
+    <span class="s3">def </span><span class="s1">summary_frame(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Creates a DataFrame with influence results. 
+ 
+        Returns 
+        ------- 
+        frame : pandas DataFrame 
+            A DataFrame with selected results for each observation. 
+            The index will be the same as provided to the model. 
+ 
+        Notes 
+        ----- 
+        The resultant DataFrame contains six variables in addition to the 
+        ``dfbetas``. These are: 
+ 
+        * cooks_d : Cook's Distance defined in ``cooks_distance`` 
+        * standard_resid : Standardized residuals defined in 
+          `resid_studentizedl` 
+        * hat_diag : The diagonal of the projection, or hat, matrix defined in 
+          `hat_matrix_diag`. Not included if None. 
+        * dffits_internal : DFFITS statistics using internally Studentized 
+          residuals defined in `d_fittedvalues_scaled` 
+        &quot;&quot;&quot;</span>
+        <span class="s3">from </span><span class="s1">pandas </span><span class="s3">import </span><span class="s1">DataFrame</span>
+
+        <span class="s0"># row and column labels</span>
+        <span class="s1">data = self.results.model.data</span>
+        <span class="s1">row_labels = data.row_labels</span>
+        <span class="s1">beta_labels = [</span><span class="s4">'dfb_' </span><span class="s1">+ i </span><span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">data.xnames]</span>
+
+        <span class="s0"># grab the results</span>
+        <span class="s3">if </span><span class="s1">self.hat_matrix_diag </span><span class="s3">is not None</span><span class="s1">:</span>
+            <span class="s1">summary_data = DataFrame(dict(</span>
+                <span class="s1">cooks_d=self.cooks_distance[</span><span class="s5">0</span><span class="s1">]</span><span class="s3">,</span>
+                <span class="s1">standard_resid=self.resid_studentized</span><span class="s3">,</span>
+                <span class="s1">hat_diag=self.hat_matrix_diag</span><span class="s3">,</span>
+                <span class="s1">dffits_internal=self.d_fittedvalues_scaled)</span><span class="s3">,</span>
+                <span class="s1">index=row_labels)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">summary_data = DataFrame(dict(</span>
+                <span class="s1">cooks_d=self.cooks_distance[</span><span class="s5">0</span><span class="s1">]</span><span class="s3">,</span>
+                <span class="s0"># standard_resid=self.resid_studentized,</span>
+                <span class="s0"># hat_diag=self.hat_matrix_diag,</span>
+                <span class="s1">dffits_internal=self.d_fittedvalues_scaled)</span><span class="s3">,</span>
+                <span class="s1">index=row_labels)</span>
+
+        <span class="s0"># NOTE: if we do not give columns, order of above will be arbitrary</span>
+        <span class="s1">dfbeta = DataFrame(self.dfbetas</span><span class="s3">, </span><span class="s1">columns=beta_labels</span><span class="s3">,</span>
+                           <span class="s1">index=row_labels)</span>
+
+        <span class="s3">return </span><span class="s1">dfbeta.join(summary_data)</span>
+
+
+<span class="s3">class </span><span class="s1">OLSInfluence(_BaseInfluenceMixin):</span>
+    <span class="s2">&quot;&quot;&quot;class to calculate outlier and influence measures for OLS result 
+ 
+    Parameters 
+    ---------- 
+    results : RegressionResults 
+        currently assumes the results are from an OLS regression 
+ 
+    Notes 
+    ----- 
+    One part of the results can be calculated without any auxiliary regression 
+    (some of which have the `_internal` postfix in the name. Other statistics 
+    require leave-one-observation-out (LOOO) auxiliary regression, and will be 
+    slower (mainly results with `_external` postfix in the name). 
+    The auxiliary LOOO regression only the required results are stored. 
+ 
+    Using the LOO measures is currently only recommended if the data set 
+    is not too large. One possible approach for LOOO measures would be to 
+    identify possible problem observations with the _internal measures, and 
+    then run the leave-one-observation-out only with observations that are 
+    possible outliers. (However, this is not yet available in an automated way.) 
+ 
+    This should be extended to general least squares. 
+ 
+    The leave-one-variable-out (LOVO) auxiliary regression are currently not 
+    used. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__(self</span><span class="s3">, </span><span class="s1">results):</span>
+        <span class="s0"># check which model is allowed</span>
+        <span class="s1">self.results = maybe_unwrap_results(results)</span>
+        <span class="s1">self.nobs</span><span class="s3">, </span><span class="s1">self.k_vars = results.model.exog.shape</span>
+        <span class="s1">self.endog = results.model.endog</span>
+        <span class="s1">self.exog = results.model.exog</span>
+        <span class="s1">self.resid = results.resid</span>
+        <span class="s1">self.model_class = results.model.__class__</span>
+
+        <span class="s0"># self.sigma_est = np.sqrt(results.mse_resid)</span>
+        <span class="s1">self.scale = results.mse_resid</span>
+
+        <span class="s1">self.aux_regression_exog = {}</span>
+        <span class="s1">self.aux_regression_endog = {}</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">hat_matrix_diag(self):</span>
+        <span class="s2">&quot;&quot;&quot;Diagonal of the hat_matrix for OLS 
+ 
+        Notes 
+        ----- 
+        temporarily calculated here, this should go to model class 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">(self.exog * self.results.model.pinv_wexog.T).sum(</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">resid_press(self):</span>
+        <span class="s2">&quot;&quot;&quot;PRESS residuals 
+        &quot;&quot;&quot;</span>
+        <span class="s1">hii = self.hat_matrix_diag</span>
+        <span class="s3">return </span><span class="s1">self.resid / (</span><span class="s5">1 </span><span class="s1">- hii)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">influence(self):</span>
+        <span class="s2">&quot;&quot;&quot;Influence measure 
+ 
+        matches the influence measure that gretl reports 
+        u * h / (1 - h) 
+        where u are the residuals and h is the diagonal of the hat_matrix 
+        &quot;&quot;&quot;</span>
+        <span class="s1">hii = self.hat_matrix_diag</span>
+        <span class="s3">return </span><span class="s1">self.resid * hii / (</span><span class="s5">1 </span><span class="s1">- hii)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">hat_diag_factor(self):</span>
+        <span class="s2">&quot;&quot;&quot;Factor of diagonal of hat_matrix used in influence 
+ 
+        this might be useful for internal reuse 
+        h / (1 - h) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">hii = self.hat_matrix_diag</span>
+        <span class="s3">return </span><span class="s1">hii / (</span><span class="s5">1 </span><span class="s1">- hii)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">ess_press(self):</span>
+        <span class="s2">&quot;&quot;&quot;Error sum of squares of PRESS residuals 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">np.dot(self.resid_press</span><span class="s3">, </span><span class="s1">self.resid_press)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">resid_studentized(self):</span>
+        <span class="s2">&quot;&quot;&quot;Studentized residuals using variance from OLS 
+ 
+        alias for resid_studentized_internal for compatibility with 
+        MLEInfluence this uses sigma from original estimate and does 
+        not require leave one out loop 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self.resid_studentized_internal</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">resid_studentized_internal(self):</span>
+        <span class="s2">&quot;&quot;&quot;Studentized residuals using variance from OLS 
+ 
+        this uses sigma from original estimate 
+        does not require leave one out loop 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self.get_resid_studentized_external(sigma=</span><span class="s3">None</span><span class="s1">)</span>
+        <span class="s0"># return self.results.resid / self.sigma_est</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">resid_studentized_external(self):</span>
+        <span class="s2">&quot;&quot;&quot;Studentized residuals using LOOO variance 
+ 
+        this uses sigma from leave-one-out estimates 
+ 
+        requires leave one out loop for observations 
+        &quot;&quot;&quot;</span>
+        <span class="s1">sigma_looo = np.sqrt(self.sigma2_not_obsi)</span>
+        <span class="s3">return </span><span class="s1">self.get_resid_studentized_external(sigma=sigma_looo)</span>
+
+    <span class="s3">def </span><span class="s1">get_resid_studentized_external(self</span><span class="s3">, </span><span class="s1">sigma=</span><span class="s3">None</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;calculate studentized residuals 
+ 
+        Parameters 
+        ---------- 
+        sigma : None or float 
+            estimate of the standard deviation of the residuals. If None, then 
+            the estimate from the regression results is used. 
+ 
+        Returns 
+        ------- 
+        stzd_resid : ndarray 
+            studentized residuals 
+ 
+        Notes 
+        ----- 
+        studentized residuals are defined as :: 
+ 
+           resid / sigma / np.sqrt(1 - hii) 
+ 
+        where resid are the residuals from the regression, sigma is an 
+        estimate of the standard deviation of the residuals, and hii is the 
+        diagonal of the hat_matrix. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">hii = self.hat_matrix_diag</span>
+        <span class="s3">if </span><span class="s1">sigma </span><span class="s3">is None</span><span class="s1">:</span>
+            <span class="s1">sigma2_est = self.scale</span>
+            <span class="s0"># can be replace by different estimators of sigma</span>
+            <span class="s1">sigma = np.sqrt(sigma2_est)</span>
+
+        <span class="s3">return </span><span class="s1">self.resid / sigma / np.sqrt(</span><span class="s5">1 </span><span class="s1">- hii)</span>
+
+    <span class="s0"># same computation as GLMInfluence</span>
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">cooks_distance(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Cooks distance 
+ 
+        Uses original results, no nobs loop 
+ 
+        References 
+        ---------- 
+        .. [*] Eubank, R. L. (1999). Nonparametric regression and spline 
+            smoothing. CRC press. 
+        .. [*] Cook's distance. (n.d.). In Wikipedia. July 2019, from 
+            https://en.wikipedia.org/wiki/Cook%27s_distance 
+        &quot;&quot;&quot;</span>
+        <span class="s1">hii = self.hat_matrix_diag</span>
+        <span class="s0"># Eubank p.93, 94</span>
+        <span class="s1">cooks_d2 = self.resid_studentized ** </span><span class="s5">2 </span><span class="s1">/ self.k_vars</span>
+        <span class="s1">cooks_d2 *= hii / (</span><span class="s5">1 </span><span class="s1">- hii)</span>
+
+        <span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">stats</span>
+
+        <span class="s0"># alpha = 0.1</span>
+        <span class="s0"># print stats.f.isf(1-alpha, n_params, res.df_modelwc)</span>
+        <span class="s1">pvals = stats.f.sf(cooks_d2</span><span class="s3">, </span><span class="s1">self.k_vars</span><span class="s3">, </span><span class="s1">self.results.df_resid)</span>
+
+        <span class="s3">return </span><span class="s1">cooks_d2</span><span class="s3">, </span><span class="s1">pvals</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">dffits_internal(self):</span>
+        <span class="s2">&quot;&quot;&quot;dffits measure for influence of an observation 
+ 
+        based on resid_studentized_internal 
+        uses original results, no nobs loop 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># TODO: do I want to use different sigma estimate in</span>
+        <span class="s0">#      resid_studentized_external</span>
+        <span class="s0"># -&gt; move definition of sigma_error to the __init__</span>
+        <span class="s1">hii = self.hat_matrix_diag</span>
+        <span class="s1">dffits_ = self.resid_studentized_internal * np.sqrt(hii / (</span><span class="s5">1 </span><span class="s1">- hii))</span>
+        <span class="s1">dffits_threshold = </span><span class="s5">2 </span><span class="s1">* np.sqrt(self.k_vars * </span><span class="s5">1. </span><span class="s1">/ self.nobs)</span>
+        <span class="s3">return </span><span class="s1">dffits_</span><span class="s3">, </span><span class="s1">dffits_threshold</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">dffits(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        dffits measure for influence of an observation 
+ 
+        based on resid_studentized_external, 
+        uses results from leave-one-observation-out loop 
+ 
+        It is recommended that observations with dffits large than a 
+        threshold of 2 sqrt{k / n} where k is the number of parameters, should 
+        be investigated. 
+ 
+        Returns 
+        ------- 
+        dffits : float 
+        dffits_threshold : float 
+ 
+        References 
+        ---------- 
+        `Wikipedia &lt;https://en.wikipedia.org/wiki/DFFITS&gt;`_ 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># TODO: do I want to use different sigma estimate in</span>
+        <span class="s0">#      resid_studentized_external</span>
+        <span class="s0"># -&gt; move definition of sigma_error to the __init__</span>
+        <span class="s1">hii = self.hat_matrix_diag</span>
+        <span class="s1">dffits_ = self.resid_studentized_external * np.sqrt(hii / (</span><span class="s5">1 </span><span class="s1">- hii))</span>
+        <span class="s1">dffits_threshold = </span><span class="s5">2 </span><span class="s1">* np.sqrt(self.k_vars * </span><span class="s5">1. </span><span class="s1">/ self.nobs)</span>
+        <span class="s3">return </span><span class="s1">dffits_</span><span class="s3">, </span><span class="s1">dffits_threshold</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">dfbetas(self):</span>
+        <span class="s2">&quot;&quot;&quot;dfbetas 
+ 
+        uses results from leave-one-observation-out loop 
+        &quot;&quot;&quot;</span>
+        <span class="s1">dfbetas = self.results.params - self.params_not_obsi  </span><span class="s0"># [None,:]</span>
+        <span class="s1">dfbetas /= np.sqrt(self.sigma2_not_obsi[:</span><span class="s3">, None</span><span class="s1">])</span>
+        <span class="s1">dfbetas /= np.sqrt(np.diag(self.results.normalized_cov_params))</span>
+        <span class="s3">return </span><span class="s1">dfbetas</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">dfbeta(self):</span>
+        <span class="s2">&quot;&quot;&quot;dfbetas 
+ 
+        uses results from leave-one-observation-out loop 
+        &quot;&quot;&quot;</span>
+        <span class="s1">dfbeta = self.results.params - self.params_not_obsi</span>
+        <span class="s3">return </span><span class="s1">dfbeta</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">sigma2_not_obsi(self):</span>
+        <span class="s2">&quot;&quot;&quot;error variance for all LOOO regressions 
+ 
+        This is 'mse_resid' from each auxiliary regression. 
+ 
+        uses results from leave-one-observation-out loop 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">np.asarray(self._res_looo[</span><span class="s4">'mse_resid'</span><span class="s1">])</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">params_not_obsi(self):</span>
+        <span class="s2">&quot;&quot;&quot;parameter estimates for all LOOO regressions 
+ 
+        uses results from leave-one-observation-out loop 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">np.asarray(self._res_looo[</span><span class="s4">'params'</span><span class="s1">])</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">det_cov_params_not_obsi(self):</span>
+        <span class="s2">&quot;&quot;&quot;determinant of cov_params of all LOOO regressions 
+ 
+        uses results from leave-one-observation-out loop 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">np.asarray(self._res_looo[</span><span class="s4">'det_cov_params'</span><span class="s1">])</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">cov_ratio(self):</span>
+        <span class="s2">&quot;&quot;&quot;covariance ratio between LOOO and original 
+ 
+        This uses determinant of the estimate of the parameter covariance 
+        from leave-one-out estimates. 
+        requires leave one out loop for observations 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># do not use inplace division / because then we change original</span>
+        <span class="s1">cov_ratio = (self.det_cov_params_not_obsi</span>
+                     <span class="s1">/ np.linalg.det(self.results.cov_params()))</span>
+        <span class="s3">return </span><span class="s1">cov_ratio</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">resid_var(self):</span>
+        <span class="s2">&quot;&quot;&quot;estimate of variance of the residuals 
+ 
+        :: 
+ 
+           sigma2 = sigma2_OLS * (1 - hii) 
+ 
+        where hii is the diagonal of the hat matrix 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># TODO:check if correct outside of ols</span>
+        <span class="s3">return </span><span class="s1">self.scale * (</span><span class="s5">1 </span><span class="s1">- self.hat_matrix_diag)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">resid_std(self):</span>
+        <span class="s2">&quot;&quot;&quot;estimate of standard deviation of the residuals 
+ 
+        See Also 
+        -------- 
+        resid_var 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">np.sqrt(self.resid_var)</span>
+
+    <span class="s3">def </span><span class="s1">_ols_xnoti(self</span><span class="s3">, </span><span class="s1">drop_idx</span><span class="s3">, </span><span class="s1">endog_idx=</span><span class="s4">'endog'</span><span class="s3">, </span><span class="s1">store=</span><span class="s3">True</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;regression results from LOVO auxiliary regression with cache 
+ 
+ 
+        The result instances are stored, which could use a large amount of 
+        memory if the datasets are large. There are too many combinations to 
+        store them all, except for small problems. 
+ 
+        Parameters 
+        ---------- 
+        drop_idx : int 
+            index of exog that is dropped from the regression 
+        endog_idx : 'endog' or int 
+            If 'endog', then the endogenous variable of the result instance 
+            is regressed on the exogenous variables, excluding the one at 
+            drop_idx. If endog_idx is an integer, then the exog with that 
+            index is regressed with OLS on all other exogenous variables. 
+            (The latter is the auxiliary regression for the variance inflation 
+            factor.) 
+ 
+        this needs more thought, memory versus speed 
+        not yet used in any other parts, not sufficiently tested 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># reverse the structure, access store, if fail calculate ?</span>
+        <span class="s0"># this creates keys in store even if store = false ! bug</span>
+        <span class="s3">if </span><span class="s1">endog_idx == </span><span class="s4">'endog'</span><span class="s1">:</span>
+            <span class="s1">stored = self.aux_regression_endog</span>
+            <span class="s3">if </span><span class="s1">hasattr(stored</span><span class="s3">, </span><span class="s1">drop_idx):</span>
+                <span class="s3">return </span><span class="s1">stored[drop_idx]</span>
+            <span class="s1">x_i = self.results.model.endog</span>
+
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s0"># nested dictionary</span>
+            <span class="s3">try</span><span class="s1">:</span>
+                <span class="s1">self.aux_regression_exog[endog_idx][drop_idx]</span>
+            <span class="s3">except </span><span class="s1">KeyError:</span>
+                <span class="s3">pass</span>
+
+            <span class="s1">stored = self.aux_regression_exog[endog_idx]</span>
+            <span class="s1">stored = {}</span>
+
+            <span class="s1">x_i = self.exog[:</span><span class="s3">, </span><span class="s1">endog_idx]</span>
+
+        <span class="s1">k_vars = self.exog.shape[</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">mask = np.arange(k_vars) != drop_idx</span>
+        <span class="s1">x_noti = self.exog[:</span><span class="s3">, </span><span class="s1">mask]</span>
+        <span class="s1">res = OLS(x_i</span><span class="s3">, </span><span class="s1">x_noti).fit()</span>
+        <span class="s3">if </span><span class="s1">store:</span>
+            <span class="s1">stored[drop_idx] = res</span>
+
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s3">def </span><span class="s1">_get_drop_vari(self</span><span class="s3">, </span><span class="s1">attributes):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        regress endog on exog without one of the variables 
+ 
+        This uses a k_vars loop, only attributes of the OLS instance are 
+        stored. 
+ 
+        Parameters 
+        ---------- 
+        attributes : list[str] 
+           These are the names of the attributes of the auxiliary OLS results 
+           instance that are stored and returned. 
+ 
+        not yet used 
+        &quot;&quot;&quot;</span>
+        <span class="s3">from </span><span class="s1">statsmodels.sandbox.tools.cross_val </span><span class="s3">import </span><span class="s1">LeaveOneOut</span>
+
+        <span class="s1">endog = self.results.model.endog</span>
+        <span class="s1">exog = self.exog</span>
+
+        <span class="s1">cv_iter = LeaveOneOut(self.k_vars)</span>
+        <span class="s1">res_loo = defaultdict(list)</span>
+        <span class="s3">for </span><span class="s1">inidx</span><span class="s3">, </span><span class="s1">outidx </span><span class="s3">in </span><span class="s1">cv_iter:</span>
+            <span class="s3">for </span><span class="s1">att </span><span class="s3">in </span><span class="s1">attributes:</span>
+                <span class="s1">res_i = self.model_class(endog</span><span class="s3">, </span><span class="s1">exog[:</span><span class="s3">, </span><span class="s1">inidx]).fit()</span>
+                <span class="s1">res_loo[att].append(getattr(res_i</span><span class="s3">, </span><span class="s1">att))</span>
+
+        <span class="s3">return </span><span class="s1">res_loo</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">_res_looo(self):</span>
+        <span class="s2">&quot;&quot;&quot;collect required results from the LOOO loop 
+ 
+        all results will be attached. 
+        currently only 'params', 'mse_resid', 'det_cov_params' are stored 
+ 
+        regresses endog on exog dropping one observation at a time 
+ 
+        this uses a nobs loop, only attributes of the OLS instance are stored. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">from </span><span class="s1">statsmodels.sandbox.tools.cross_val </span><span class="s3">import </span><span class="s1">LeaveOneOut</span>
+
+        <span class="s3">def </span><span class="s1">get_det_cov_params(res):</span>
+            <span class="s3">return </span><span class="s1">np.linalg.det(res.cov_params())</span>
+
+        <span class="s1">endog = self.results.model.endog</span>
+        <span class="s1">exog = self.results.model.exog</span>
+
+        <span class="s1">params = np.zeros(exog.shape</span><span class="s3">, </span><span class="s1">dtype=float)</span>
+        <span class="s1">mse_resid = np.zeros(endog.shape</span><span class="s3">, </span><span class="s1">dtype=float)</span>
+        <span class="s1">det_cov_params = np.zeros(endog.shape</span><span class="s3">, </span><span class="s1">dtype=float)</span>
+
+        <span class="s1">cv_iter = LeaveOneOut(self.nobs)</span>
+        <span class="s3">for </span><span class="s1">inidx</span><span class="s3">, </span><span class="s1">outidx </span><span class="s3">in </span><span class="s1">cv_iter:</span>
+            <span class="s1">res_i = self.model_class(endog[inidx]</span><span class="s3">, </span><span class="s1">exog[inidx]).fit()</span>
+            <span class="s1">params[outidx] = res_i.params</span>
+            <span class="s1">mse_resid[outidx] = res_i.mse_resid</span>
+            <span class="s1">det_cov_params[outidx] = get_det_cov_params(res_i)</span>
+
+        <span class="s3">return </span><span class="s1">dict(params=params</span><span class="s3">, </span><span class="s1">mse_resid=mse_resid</span><span class="s3">,</span>
+                    <span class="s1">det_cov_params=det_cov_params)</span>
+
+    <span class="s3">def </span><span class="s1">summary_frame(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Creates a DataFrame with all available influence results. 
+ 
+        Returns 
+        ------- 
+        frame : DataFrame 
+            A DataFrame with all results. 
+ 
+        Notes 
+        ----- 
+        The resultant DataFrame contains six variables in addition to the 
+        DFBETAS. These are: 
+ 
+        * cooks_d : Cook's Distance defined in `Influence.cooks_distance` 
+        * standard_resid : Standardized residuals defined in 
+          `Influence.resid_studentized_internal` 
+        * hat_diag : The diagonal of the projection, or hat, matrix defined in 
+          `Influence.hat_matrix_diag` 
+        * dffits_internal : DFFITS statistics using internally Studentized 
+          residuals defined in `Influence.dffits_internal` 
+        * dffits : DFFITS statistics using externally Studentized residuals 
+          defined in `Influence.dffits` 
+        * student_resid : Externally Studentized residuals defined in 
+          `Influence.resid_studentized_external` 
+        &quot;&quot;&quot;</span>
+        <span class="s3">from </span><span class="s1">pandas </span><span class="s3">import </span><span class="s1">DataFrame</span>
+
+        <span class="s0"># row and column labels</span>
+        <span class="s1">data = self.results.model.data</span>
+        <span class="s1">row_labels = data.row_labels</span>
+        <span class="s1">beta_labels = [</span><span class="s4">'dfb_' </span><span class="s1">+ i </span><span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">data.xnames]</span>
+
+        <span class="s0"># grab the results</span>
+        <span class="s1">summary_data = DataFrame(dict(</span>
+            <span class="s1">cooks_d=self.cooks_distance[</span><span class="s5">0</span><span class="s1">]</span><span class="s3">,</span>
+            <span class="s1">standard_resid=self.resid_studentized_internal</span><span class="s3">,</span>
+            <span class="s1">hat_diag=self.hat_matrix_diag</span><span class="s3">,</span>
+            <span class="s1">dffits_internal=self.dffits_internal[</span><span class="s5">0</span><span class="s1">]</span><span class="s3">,</span>
+            <span class="s1">student_resid=self.resid_studentized_external</span><span class="s3">,</span>
+            <span class="s1">dffits=self.dffits[</span><span class="s5">0</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s1">)</span><span class="s3">,</span>
+            <span class="s1">index=row_labels)</span>
+        <span class="s0"># NOTE: if we do not give columns, order of above will be arbitrary</span>
+        <span class="s1">dfbeta = DataFrame(self.dfbetas</span><span class="s3">, </span><span class="s1">columns=beta_labels</span><span class="s3">,</span>
+                           <span class="s1">index=row_labels)</span>
+
+        <span class="s3">return </span><span class="s1">dfbeta.join(summary_data)</span>
+
+    <span class="s3">def </span><span class="s1">summary_table(self</span><span class="s3">, </span><span class="s1">float_fmt=</span><span class="s4">&quot;%6.3f&quot;</span><span class="s1">):</span>
+        <span class="s2">&quot;&quot;&quot;create a summary table with all influence and outlier measures 
+ 
+        This does currently not distinguish between statistics that can be 
+        calculated from the original regression results and for which a 
+        leave-one-observation-out loop is needed 
+ 
+        Returns 
+        ------- 
+        res : SimpleTable 
+           SimpleTable instance with the results, can be printed 
+ 
+        Notes 
+        ----- 
+        This also attaches table_data to the instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># print self.dfbetas</span>
+
+        <span class="s0">#        table_raw = [ np.arange(self.nobs),</span>
+        <span class="s0">#                      self.endog,</span>
+        <span class="s0">#                      self.fittedvalues,</span>
+        <span class="s0">#                      self.cooks_distance(),</span>
+        <span class="s0">#                      self.resid_studentized_internal,</span>
+        <span class="s0">#                      self.hat_matrix_diag,</span>
+        <span class="s0">#                      self.dffits_internal,</span>
+        <span class="s0">#                      self.resid_studentized_external,</span>
+        <span class="s0">#                      self.dffits,</span>
+        <span class="s0">#                      self.dfbetas</span>
+        <span class="s0">#                      ]</span>
+        <span class="s1">table_raw = [(</span><span class="s4">'obs'</span><span class="s3">, </span><span class="s1">np.arange(self.nobs))</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s4">'endog'</span><span class="s3">, </span><span class="s1">self.endog)</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s4">'fitted</span><span class="s3">\n</span><span class="s4">value'</span><span class="s3">, </span><span class="s1">self.results.fittedvalues)</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s4">&quot;Cook's</span><span class="s3">\n</span><span class="s4">d&quot;</span><span class="s3">, </span><span class="s1">self.cooks_distance[</span><span class="s5">0</span><span class="s1">])</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s4">&quot;student.</span><span class="s3">\n</span><span class="s4">residual&quot;</span><span class="s3">, </span><span class="s1">self.resid_studentized_internal)</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s4">'hat diag'</span><span class="s3">, </span><span class="s1">self.hat_matrix_diag)</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s4">'dffits </span><span class="s3">\n</span><span class="s4">internal'</span><span class="s3">, </span><span class="s1">self.dffits_internal[</span><span class="s5">0</span><span class="s1">])</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s4">&quot;ext.stud.</span><span class="s3">\n</span><span class="s4">residual&quot;</span><span class="s3">, </span><span class="s1">self.resid_studentized_external)</span><span class="s3">,</span>
+                     <span class="s1">(</span><span class="s4">'dffits'</span><span class="s3">, </span><span class="s1">self.dffits[</span><span class="s5">0</span><span class="s1">])</span>
+                     <span class="s1">]</span>
+        <span class="s1">colnames</span><span class="s3">, </span><span class="s1">data = lzip(*table_raw)  </span><span class="s0"># unzip</span>
+        <span class="s1">data = np.column_stack(data)</span>
+        <span class="s1">self.table_data = data</span>
+        <span class="s3">from </span><span class="s1">copy </span><span class="s3">import </span><span class="s1">deepcopy</span>
+
+        <span class="s3">from </span><span class="s1">statsmodels.iolib.table </span><span class="s3">import </span><span class="s1">SimpleTable</span><span class="s3">, </span><span class="s1">default_html_fmt</span>
+        <span class="s3">from </span><span class="s1">statsmodels.iolib.tableformatting </span><span class="s3">import </span><span class="s1">fmt_base</span>
+        <span class="s1">fmt = deepcopy(fmt_base)</span>
+        <span class="s1">fmt_html = deepcopy(default_html_fmt)</span>
+        <span class="s1">fmt[</span><span class="s4">'data_fmts'</span><span class="s1">] = [</span><span class="s4">&quot;%4d&quot;</span><span class="s1">] + [float_fmt] * (data.shape[</span><span class="s5">1</span><span class="s1">] - </span><span class="s5">1</span><span class="s1">)</span>
+        <span class="s0"># fmt_html['data_fmts'] = fmt['data_fmts']</span>
+        <span class="s3">return </span><span class="s1">SimpleTable(data</span><span class="s3">, </span><span class="s1">headers=colnames</span><span class="s3">, </span><span class="s1">txt_fmt=fmt</span><span class="s3">,</span>
+                           <span class="s1">html_fmt=fmt_html)</span>
+
+
+<span class="s3">def </span><span class="s1">summary_table(res</span><span class="s3">, </span><span class="s1">alpha=</span><span class="s5">0.05</span><span class="s1">):</span>
+    <span class="s2">&quot;&quot;&quot; 
+    Generate summary table of outlier and influence similar to SAS 
+ 
+    Parameters 
+    ---------- 
+    alpha : float 
+       significance level for confidence interval 
+ 
+    Returns 
+    ------- 
+    st : SimpleTable 
+       table with results that can be printed 
+    data : ndarray 
+       calculated measures and statistics for the table 
+    ss2 : list[str] 
+       column_names for table (Note: rows of table are observations) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">stats</span>
+
+    <span class="s3">from </span><span class="s1">statsmodels.sandbox.regression.predstd </span><span class="s3">import </span><span class="s1">wls_prediction_std</span>
+
+    <span class="s1">infl = OLSInfluence(res)</span>
+
+    <span class="s0"># standard error for predicted mean</span>
+    <span class="s0"># Note: using hat_matrix only works for fitted values</span>
+    <span class="s1">predict_mean_se = np.sqrt(infl.hat_matrix_diag * res.mse_resid)</span>
+
+    <span class="s1">tppf = stats.t.isf(alpha / </span><span class="s5">2.</span><span class="s3">, </span><span class="s1">res.df_resid)</span>
+    <span class="s1">predict_mean_ci = np.column_stack([</span>
+        <span class="s1">res.fittedvalues - tppf * predict_mean_se</span><span class="s3">,</span>
+        <span class="s1">res.fittedvalues + tppf * predict_mean_se])</span>
+
+    <span class="s0"># standard error for predicted observation</span>
+    <span class="s1">tmp = wls_prediction_std(res</span><span class="s3">, </span><span class="s1">alpha=alpha)</span>
+    <span class="s1">predict_se</span><span class="s3">, </span><span class="s1">predict_ci_low</span><span class="s3">, </span><span class="s1">predict_ci_upp = tmp</span>
+
+    <span class="s1">predict_ci = np.column_stack((predict_ci_low</span><span class="s3">, </span><span class="s1">predict_ci_upp))</span>
+
+    <span class="s0"># standard deviation of residual</span>
+    <span class="s1">resid_se = np.sqrt(res.mse_resid * (</span><span class="s5">1 </span><span class="s1">- infl.hat_matrix_diag))</span>
+
+    <span class="s1">table_sm = np.column_stack([</span>
+        <span class="s1">np.arange(res.nobs) + </span><span class="s5">1</span><span class="s3">,</span>
+        <span class="s1">res.model.endog</span><span class="s3">,</span>
+        <span class="s1">res.fittedvalues</span><span class="s3">,</span>
+        <span class="s1">predict_mean_se</span><span class="s3">,</span>
+        <span class="s1">predict_mean_ci[:</span><span class="s3">, </span><span class="s5">0</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s1">predict_mean_ci[:</span><span class="s3">, </span><span class="s5">1</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s1">predict_ci[:</span><span class="s3">, </span><span class="s5">0</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s1">predict_ci[:</span><span class="s3">, </span><span class="s5">1</span><span class="s1">]</span><span class="s3">,</span>
+        <span class="s1">res.resid</span><span class="s3">,</span>
+        <span class="s1">resid_se</span><span class="s3">,</span>
+        <span class="s1">infl.resid_studentized_internal</span><span class="s3">,</span>
+        <span class="s1">infl.cooks_distance[</span><span class="s5">0</span><span class="s1">]</span>
+    <span class="s1">])</span>
+
+    <span class="s0"># colnames, data = lzip(*table_raw) #unzip</span>
+    <span class="s1">data = table_sm</span>
+    <span class="s1">ss2 = [</span><span class="s4">'Obs'</span><span class="s3">, </span><span class="s4">'Dep Var</span><span class="s3">\n</span><span class="s4">Population'</span><span class="s3">, </span><span class="s4">'Predicted</span><span class="s3">\n</span><span class="s4">Value'</span><span class="s3">,</span>
+           <span class="s4">'Std Error</span><span class="s3">\n</span><span class="s4">Mean Predict'</span><span class="s3">, </span><span class="s4">'Mean ci</span><span class="s3">\n</span><span class="s4">95% low'</span><span class="s3">, </span><span class="s4">'Mean ci</span><span class="s3">\n</span><span class="s4">95% upp'</span><span class="s3">,</span>
+           <span class="s4">'Predict ci</span><span class="s3">\n</span><span class="s4">95% low'</span><span class="s3">, </span><span class="s4">'Predict ci</span><span class="s3">\n</span><span class="s4">95% upp'</span><span class="s3">, </span><span class="s4">'Residual'</span><span class="s3">,</span>
+           <span class="s4">'Std Error</span><span class="s3">\n</span><span class="s4">Residual'</span><span class="s3">, </span><span class="s4">'Student</span><span class="s3">\n</span><span class="s4">Residual'</span><span class="s3">, </span><span class="s4">&quot;Cook's</span><span class="s3">\n</span><span class="s4">D&quot;</span><span class="s1">]</span>
+    <span class="s1">colnames = ss2</span>
+    <span class="s0"># self.table_data = data</span>
+    <span class="s0"># data = np.column_stack(data)</span>
+    <span class="s3">from </span><span class="s1">copy </span><span class="s3">import </span><span class="s1">deepcopy</span>
+
+    <span class="s3">from </span><span class="s1">statsmodels.iolib.table </span><span class="s3">import </span><span class="s1">SimpleTable</span><span class="s3">, </span><span class="s1">default_html_fmt</span>
+    <span class="s3">from </span><span class="s1">statsmodels.iolib.tableformatting </span><span class="s3">import </span><span class="s1">fmt_base</span>
+    <span class="s1">fmt = deepcopy(fmt_base)</span>
+    <span class="s1">fmt_html = deepcopy(default_html_fmt)</span>
+    <span class="s1">fmt[</span><span class="s4">'data_fmts'</span><span class="s1">] = [</span><span class="s4">&quot;%4d&quot;</span><span class="s1">] + [</span><span class="s4">&quot;%6.3f&quot;</span><span class="s1">] * (data.shape[</span><span class="s5">1</span><span class="s1">] - </span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s0"># fmt_html['data_fmts'] = fmt['data_fmts']</span>
+    <span class="s1">st = SimpleTable(data</span><span class="s3">, </span><span class="s1">headers=colnames</span><span class="s3">, </span><span class="s1">txt_fmt=fmt</span><span class="s3">,</span>
+                     <span class="s1">html_fmt=fmt_html)</span>
+
+    <span class="s3">return </span><span class="s1">st</span><span class="s3">, </span><span class="s1">data</span><span class="s3">, </span><span class="s1">ss2</span>
+
+
+<span class="s3">class </span><span class="s1">GLMInfluence(MLEInfluence):</span>
+    <span class="s2">&quot;&quot;&quot;Influence and outlier measures (experimental) 
+ 
+    This uses partly formulas specific to GLM, specifically cooks_distance 
+    is based on the hessian, i.e. observed or expected information matrix and 
+    not on cov_params, in contrast to MLEInfluence. 
+    Standardization for changes in parameters, in fittedvalues and in 
+    the linear predictor are based on cov_params. 
+ 
+    Parameters 
+    ---------- 
+    results : instance of results class 
+        This only works for model and results classes that have the necessary 
+        helper methods. 
+    other arguments are only to override default behavior and are used instead 
+    of the corresponding attribute of the results class. 
+    By default resid_pearson is used as resid. 
+ 
+    Attributes 
+    ---------- 
+    dbetas 
+        change in parameters divided by the standard error of parameters from 
+        the full model results, ``bse``. 
+    d_fittedvalues_scaled 
+        same as d_fittedvalues but scaled by the standard errors of a 
+        predicted mean of the response. 
+    d_linpred 
+        local change in linear prediction. 
+    d_linpred_scale 
+        local change in linear prediction scaled by the standard errors for 
+        the prediction based on cov_params. 
+ 
+    Notes 
+    ----- 
+    This has not yet been tested for correctness when offset or exposure 
+    are used, although they should be supported by the code. 
+ 
+    Some GLM specific measures like d_deviance are still missing. 
+ 
+    Computing an explicit leave-one-observation-out (LOOO) loop is included 
+    but no influence measures are currently computed from it. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">hat_matrix_diag(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Diagonal of the hat_matrix for GLM 
+ 
+        Notes 
+        ----- 
+        This returns the diagonal of the hat matrix that was provided as 
+        argument to GLMInfluence or computes it using the results method 
+        `get_hat_matrix`. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">hasattr(self</span><span class="s3">, </span><span class="s4">'_hat_matrix_diag'</span><span class="s1">):</span>
+            <span class="s3">return </span><span class="s1">self._hat_matrix_diag</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">self.results.get_hat_matrix()</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">d_params(self):</span>
+        <span class="s2">&quot;&quot;&quot;Change in parameter estimates 
+ 
+        Notes 
+        ----- 
+        This uses one-step approximation of the parameter change to deleting 
+        one observation. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">beta_i = np.linalg.pinv(self.exog) * self.resid_studentized</span>
+        <span class="s1">beta_i /= np.sqrt(</span><span class="s5">1 </span><span class="s1">- self.hat_matrix_diag)</span>
+        <span class="s3">return </span><span class="s1">beta_i.T</span>
+
+    <span class="s0"># same computation as OLS</span>
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">resid_studentized(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Internally studentized pearson residuals 
+ 
+        Notes 
+        ----- 
+        residuals / sqrt( scale * (1 - hii)) 
+ 
+        where residuals are those provided to GLMInfluence which are 
+        pearson residuals by default, and 
+        hii is the diagonal of the hat matrix. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># redundant with scaled resid_pearson, keep for docstring for now</span>
+        <span class="s3">return </span><span class="s1">super().resid_studentized</span>
+
+    <span class="s0"># same computation as OLS</span>
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">cooks_distance(self):</span>
+        <span class="s2">&quot;&quot;&quot;Cook's distance 
+ 
+        Notes 
+        ----- 
+        Based on one step approximation using resid_studentized and 
+        hat_matrix_diag for the computation. 
+ 
+        Cook's distance divides by the number of explanatory variables. 
+ 
+        Computed using formulas for GLM and does not use results.cov_params. 
+        It includes p-values based on the F-distribution which are only 
+        approximate outside of linear Gaussian models. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">hii = self.hat_matrix_diag</span>
+        <span class="s0"># Eubank p.93, 94</span>
+        <span class="s1">cooks_d2 = self.resid_studentized ** </span><span class="s5">2 </span><span class="s1">/ self.k_vars</span>
+        <span class="s1">cooks_d2 *= hii / (</span><span class="s5">1 </span><span class="s1">- hii)</span>
+
+        <span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">stats</span>
+
+        <span class="s0"># alpha = 0.1</span>
+        <span class="s0"># print stats.f.isf(1-alpha, n_params, res.df_modelwc)</span>
+        <span class="s1">pvals = stats.f.sf(cooks_d2</span><span class="s3">, </span><span class="s1">self.k_vars</span><span class="s3">, </span><span class="s1">self.results.df_resid)</span>
+
+        <span class="s3">return </span><span class="s1">cooks_d2</span><span class="s3">, </span><span class="s1">pvals</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">d_linpred(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Change in linear prediction 
+ 
+        This uses one-step approximation of the parameter change to deleting 
+        one observation ``d_params``. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># TODO: This will need adjustment for extra params in Poisson</span>
+        <span class="s0"># use original model exog not transformed influence exog</span>
+        <span class="s1">exog = self.results.model.exog</span>
+        <span class="s3">return </span><span class="s1">(exog * self.d_params).sum(</span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">d_linpred_scaled(self):</span>
+        <span class="s2">&quot;&quot;&quot; 
+        Change in linpred scaled by standard errors 
+ 
+        This uses one-step approximation of the parameter change to deleting 
+        one observation ``d_params``, and divides by the standard errors 
+        for linpred provided by results.get_prediction. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># Note: this and the previous methods are for the response</span>
+        <span class="s0"># and not for a weighted response, i.e. not the self.exog, self.endog</span>
+        <span class="s0"># this will be relevant for WLS comparing fitted endog versus wendog</span>
+        <span class="s3">return </span><span class="s1">self.d_linpred / self._get_prediction.linpred.se</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">_fittedvalues_one(self):</span>
+        <span class="s2">&quot;&quot;&quot;experimental code 
+        &quot;&quot;&quot;</span>
+        <span class="s1">warnings.warn(</span><span class="s4">'this ignores offset and exposure'</span><span class="s3">, </span><span class="s1">UserWarning)</span>
+        <span class="s0"># TODO: we need to handle offset, exposure and weights</span>
+        <span class="s0"># use original model exog not transformed influence exog</span>
+        <span class="s1">exog = self.results.model.exog</span>
+        <span class="s1">fitted = np.array([self.results.model.predict(pi</span><span class="s3">, </span><span class="s1">exog[i])</span>
+                           <span class="s3">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">pi </span><span class="s3">in </span><span class="s1">enumerate(self.params_one)])</span>
+        <span class="s3">return </span><span class="s1">fitted.squeeze()</span>
+
+    <span class="s1">@property</span>
+    <span class="s3">def </span><span class="s1">_diff_fittedvalues_one(self):</span>
+        <span class="s2">&quot;&quot;&quot;experimental code 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># in discrete we cannot reuse results.fittedvalues</span>
+        <span class="s3">return </span><span class="s1">self.results.predict() - self._fittedvalues_one</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s3">def </span><span class="s1">_res_looo(self):</span>
+        <span class="s2">&quot;&quot;&quot;collect required results from the LOOO loop 
+ 
+        all results will be attached. 
+        currently only 'params', 'mse_resid', 'det_cov_params' are stored 
+ 
+        Reestimates the model with endog and exog dropping one observation 
+        at a time 
+ 
+        This uses a nobs loop, only attributes of the results instance are 
+        stored. 
+ 
+        Warning: This will need refactoring and API changes to be able to 
+        add options. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">from </span><span class="s1">statsmodels.sandbox.tools.cross_val </span><span class="s3">import </span><span class="s1">LeaveOneOut</span>
+        <span class="s1">get_det_cov_params = </span><span class="s3">lambda </span><span class="s1">res: np.linalg.det(res.cov_params())</span>
+
+        <span class="s1">endog = self.results.model.endog</span>
+        <span class="s1">exog = self.results.model.exog</span>
+
+        <span class="s1">init_kwds = self.results.model._get_init_kwds()</span>
+        <span class="s0"># We need to drop obs also from extra arrays</span>
+        <span class="s1">freq_weights = init_kwds.pop(</span><span class="s4">'freq_weights'</span><span class="s1">)</span>
+        <span class="s1">var_weights = init_kwds.pop(</span><span class="s4">'var_weights'</span><span class="s1">)</span>
+        <span class="s1">offset = offset_ = init_kwds.pop(</span><span class="s4">'offset'</span><span class="s1">)</span>
+        <span class="s1">exposure = exposure_ = init_kwds.pop(</span><span class="s4">'exposure'</span><span class="s1">)</span>
+        <span class="s1">n_trials = init_kwds.pop(</span><span class="s4">'n_trials'</span><span class="s3">, None</span><span class="s1">)</span>
+        <span class="s0"># family Binomial creates `n` i.e. `n_trials`</span>
+        <span class="s0"># we need to reset it</span>
+        <span class="s0"># TODO: figure out how to do this properly</span>
+        <span class="s3">if </span><span class="s1">hasattr(init_kwds[</span><span class="s4">'family'</span><span class="s1">]</span><span class="s3">, </span><span class="s4">'initialize'</span><span class="s1">):</span>
+            <span class="s0"># assume we have Binomial</span>
+            <span class="s1">is_binomial = </span><span class="s3">True</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s1">is_binomial = </span><span class="s3">False</span>
+
+        <span class="s1">params = np.zeros(exog.shape</span><span class="s3">, </span><span class="s1">dtype=float)</span>
+        <span class="s1">scale = np.zeros(endog.shape</span><span class="s3">, </span><span class="s1">dtype=float)</span>
+        <span class="s1">det_cov_params = np.zeros(endog.shape</span><span class="s3">, </span><span class="s1">dtype=float)</span>
+
+        <span class="s1">cv_iter = LeaveOneOut(self.nobs)</span>
+        <span class="s3">for </span><span class="s1">inidx</span><span class="s3">, </span><span class="s1">outidx </span><span class="s3">in </span><span class="s1">cv_iter:</span>
+            <span class="s3">if </span><span class="s1">offset </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">offset_ = offset[inidx]</span>
+            <span class="s3">if </span><span class="s1">exposure </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">exposure_ = exposure[inidx]</span>
+            <span class="s3">if </span><span class="s1">n_trials </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">init_kwds[</span><span class="s4">'n_trials'</span><span class="s1">] = n_trials[inidx]</span>
+
+            <span class="s1">mod_i = self.model_class(endog[inidx]</span><span class="s3">, </span><span class="s1">exog[inidx]</span><span class="s3">,</span>
+                                     <span class="s1">offset=offset_</span><span class="s3">,</span>
+                                     <span class="s1">exposure=exposure_</span><span class="s3">,</span>
+                                     <span class="s1">freq_weights=freq_weights[inidx]</span><span class="s3">,</span>
+                                     <span class="s1">var_weights=var_weights[inidx]</span><span class="s3">,</span>
+                                     <span class="s1">**init_kwds)</span>
+            <span class="s3">if </span><span class="s1">is_binomial:</span>
+                <span class="s1">mod_i.family.n = init_kwds[</span><span class="s4">'n_trials'</span><span class="s1">]</span>
+            <span class="s1">res_i = mod_i.fit(start_params=self.results.params</span><span class="s3">,</span>
+                              <span class="s1">method=</span><span class="s4">'newton'</span><span class="s1">)</span>
+            <span class="s1">params[outidx] = res_i.params.copy()</span>
+            <span class="s1">scale[outidx] = res_i.scale</span>
+            <span class="s1">det_cov_params[outidx] = get_det_cov_params(res_i)</span>
+
+        <span class="s3">return </span><span class="s1">dict(params=params</span><span class="s3">, </span><span class="s1">scale=scale</span><span class="s3">, </span><span class="s1">mse_resid=scale</span><span class="s3">,</span>
+                    <span class="s0"># alias for now</span>
+                    <span class="s1">det_cov_params=det_cov_params)</span>
+</pre>
+</body>
+</html>

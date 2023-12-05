@@ -1,0 +1,358 @@
+<html>
+<head>
+<title>json.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+.s6 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+json.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">__future__ </span><span class="s0">import </span><span class="s1">annotations</span>
+
+<span class="s0">import </span><span class="s1">io</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">from </span><span class="s1">functools </span><span class="s0">import </span><span class="s1">partial</span>
+<span class="s0">from </span><span class="s1">itertools </span><span class="s0">import </span><span class="s1">zip_longest</span>
+
+<span class="s0">import </span><span class="s1">pandas </span><span class="s0">as </span><span class="s1">pd</span>
+<span class="s0">from </span><span class="s1">fsspec.core </span><span class="s0">import </span><span class="s1">open_files</span>
+
+<span class="s0">from </span><span class="s1">dask.base </span><span class="s0">import </span><span class="s1">compute </span><span class="s0">as </span><span class="s1">dask_compute</span>
+<span class="s0">from </span><span class="s1">dask.bytes </span><span class="s0">import </span><span class="s1">read_bytes</span>
+<span class="s0">from </span><span class="s1">dask.core </span><span class="s0">import </span><span class="s1">flatten</span>
+<span class="s0">from </span><span class="s1">dask.dataframe._compat </span><span class="s0">import </span><span class="s1">PANDAS_GE_200</span><span class="s0">, </span><span class="s1">PANDAS_VERSION</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.backends </span><span class="s0">import </span><span class="s1">dataframe_creation_dispatch</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.io.io </span><span class="s0">import </span><span class="s1">from_delayed</span>
+<span class="s0">from </span><span class="s1">dask.dataframe.utils </span><span class="s0">import </span><span class="s1">insert_meta_param_description</span><span class="s0">, </span><span class="s1">make_meta</span>
+<span class="s0">from </span><span class="s1">dask.delayed </span><span class="s0">import </span><span class="s1">delayed</span>
+
+
+<span class="s0">def </span><span class="s1">to_json(</span>
+    <span class="s1">df</span><span class="s0">,</span>
+    <span class="s1">url_path</span><span class="s0">,</span>
+    <span class="s1">orient=</span><span class="s2">&quot;records&quot;</span><span class="s0">,</span>
+    <span class="s1">lines=</span><span class="s0">None,</span>
+    <span class="s1">storage_options=</span><span class="s0">None,</span>
+    <span class="s1">compute=</span><span class="s0">True,</span>
+    <span class="s1">encoding=</span><span class="s2">&quot;utf-8&quot;</span><span class="s0">,</span>
+    <span class="s1">errors=</span><span class="s2">&quot;strict&quot;</span><span class="s0">,</span>
+    <span class="s1">compression=</span><span class="s0">None,</span>
+    <span class="s1">compute_kwargs=</span><span class="s0">None,</span>
+    <span class="s1">name_function=</span><span class="s0">None,</span>
+    <span class="s1">**kwargs</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Write dataframe into JSON text files 
+ 
+    This utilises ``pandas.DataFrame.to_json()``, and most parameters are 
+    passed through - see its docstring. 
+ 
+    Differences: orient is 'records' by default, with lines=True; this 
+    produces the kind of JSON output that is most common in big-data 
+    applications, and which can be chunked when reading (see ``read_json()``). 
+ 
+    Parameters 
+    ---------- 
+    df: dask.DataFrame 
+        Data to save 
+    url_path: str, list of str 
+        Location to write to. If a string, and there are more than one 
+        partitions in df, should include a glob character to expand into a 
+        set of file names, or provide a ``name_function=`` parameter. 
+        Supports protocol specifications such as ``&quot;s3://&quot;``. 
+    encoding, errors: 
+        The text encoding to implement, e.g., &quot;utf-8&quot; and how to respond 
+        to errors in the conversion (see ``str.encode()``). 
+    orient, lines, kwargs 
+        passed to pandas; if not specified, lines=True when orient='records', 
+        False otherwise. 
+    storage_options: dict 
+        Passed to backend file-system implementation 
+    compute: bool 
+        If true, immediately executes. If False, returns a set of delayed 
+        objects, which can be computed at a later time. 
+    compute_kwargs : dict, optional 
+        Options to be passed in to the compute method 
+    compression : string or None 
+        String like 'gzip' or 'xz'. 
+    name_function : callable, default None 
+        Function accepting an integer (partition index) and producing a 
+        string to replace the asterisk in the given filename globstring. 
+        Should preserve the lexicographic order of partitions. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">lines </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">lines = orient == </span><span class="s2">&quot;records&quot;</span>
+    <span class="s0">if </span><span class="s1">orient != </span><span class="s2">&quot;records&quot; </span><span class="s0">and </span><span class="s1">lines:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s2">&quot;Line-delimited JSON is only available with&quot; 'orient=&quot;records&quot;.'</span>
+        <span class="s1">)</span>
+    <span class="s1">kwargs[</span><span class="s2">&quot;orient&quot;</span><span class="s1">] = orient</span>
+    <span class="s1">kwargs[</span><span class="s2">&quot;lines&quot;</span><span class="s1">] = lines </span><span class="s0">and </span><span class="s1">orient == </span><span class="s2">&quot;records&quot;</span>
+    <span class="s1">outfiles = open_files(</span>
+        <span class="s1">url_path</span><span class="s0">,</span>
+        <span class="s2">&quot;wt&quot;</span><span class="s0">,</span>
+        <span class="s1">encoding=encoding</span><span class="s0">,</span>
+        <span class="s1">errors=errors</span><span class="s0">,</span>
+        <span class="s1">name_function=name_function</span><span class="s0">,</span>
+        <span class="s1">num=df.npartitions</span><span class="s0">,</span>
+        <span class="s1">compression=compression</span><span class="s0">,</span>
+        <span class="s1">**(storage_options </span><span class="s0">or </span><span class="s1">{})</span><span class="s0">,</span>
+    <span class="s1">)</span>
+    <span class="s1">parts = [</span>
+        <span class="s1">delayed(write_json_partition)(d</span><span class="s0">, </span><span class="s1">outfile</span><span class="s0">, </span><span class="s1">kwargs)</span>
+        <span class="s0">for </span><span class="s1">outfile</span><span class="s0">, </span><span class="s1">d </span><span class="s0">in </span><span class="s1">zip(outfiles</span><span class="s0">, </span><span class="s1">df.to_delayed())</span>
+    <span class="s1">]</span>
+    <span class="s0">if </span><span class="s1">compute:</span>
+        <span class="s0">if </span><span class="s1">compute_kwargs </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">compute_kwargs = dict()</span>
+        <span class="s0">return </span><span class="s1">list(dask_compute(*parts</span><span class="s0">, </span><span class="s1">**compute_kwargs))</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s0">return </span><span class="s1">parts</span>
+
+
+<span class="s0">def </span><span class="s1">write_json_partition(df</span><span class="s0">, </span><span class="s1">openfile</span><span class="s0">, </span><span class="s1">kwargs):</span>
+    <span class="s0">with </span><span class="s1">openfile </span><span class="s0">as </span><span class="s1">f:</span>
+        <span class="s1">df.to_json(f</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s0">return </span><span class="s1">os.path.normpath(openfile.path)</span>
+
+
+<span class="s1">@dataframe_creation_dispatch.register_inplace(</span><span class="s2">&quot;pandas&quot;</span><span class="s1">)</span>
+<span class="s1">@insert_meta_param_description</span>
+<span class="s0">def </span><span class="s1">read_json(</span>
+    <span class="s1">url_path</span><span class="s0">,</span>
+    <span class="s1">orient=</span><span class="s2">&quot;records&quot;</span><span class="s0">,</span>
+    <span class="s1">lines=</span><span class="s0">None,</span>
+    <span class="s1">storage_options=</span><span class="s0">None,</span>
+    <span class="s1">blocksize=</span><span class="s0">None,</span>
+    <span class="s1">sample=</span><span class="s4">2</span><span class="s1">**</span><span class="s4">20</span><span class="s0">,</span>
+    <span class="s1">encoding=</span><span class="s2">&quot;utf-8&quot;</span><span class="s0">,</span>
+    <span class="s1">errors=</span><span class="s2">&quot;strict&quot;</span><span class="s0">,</span>
+    <span class="s1">compression=</span><span class="s2">&quot;infer&quot;</span><span class="s0">,</span>
+    <span class="s1">meta=</span><span class="s0">None,</span>
+    <span class="s1">engine=pd.read_json</span><span class="s0">,</span>
+    <span class="s1">include_path_column=</span><span class="s0">False,</span>
+    <span class="s1">path_converter=</span><span class="s0">None,</span>
+    <span class="s1">**kwargs</span><span class="s0">,</span>
+<span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;Create a dataframe from a set of JSON files 
+ 
+    This utilises ``pandas.read_json()``, and most parameters are 
+    passed through - see its docstring. 
+ 
+    Differences: orient is 'records' by default, with lines=True; this 
+    is appropriate for line-delimited &quot;JSON-lines&quot; data, the kind of JSON output 
+    that is most common in big-data scenarios, and which can be chunked when 
+    reading (see ``read_json()``). All other options require blocksize=None, 
+    i.e., one partition per input file. 
+ 
+    Parameters 
+    ---------- 
+    url_path: str, list of str 
+        Location to read from. If a string, can include a glob character to 
+        find a set of file names. 
+        Supports protocol specifications such as ``&quot;s3://&quot;``. 
+    encoding, errors: 
+        The text encoding to implement, e.g., &quot;utf-8&quot; and how to respond 
+        to errors in the conversion (see ``str.encode()``). 
+    orient, lines, kwargs 
+        passed to pandas; if not specified, lines=True when orient='records', 
+        False otherwise. 
+    storage_options: dict 
+        Passed to backend file-system implementation 
+    blocksize: None or int 
+        If None, files are not blocked, and you get one partition per input 
+        file. If int, which can only be used for line-delimited JSON files, 
+        each partition will be approximately this size in bytes, to the nearest 
+        newline character. 
+    sample: int 
+        Number of bytes to pre-load, to provide an empty dataframe structure 
+        to any blocks without data. Only relevant when using blocksize. 
+    encoding, errors: 
+        Text conversion, ``see bytes.decode()`` 
+    compression : string or None 
+        String like 'gzip' or 'xz'. 
+    engine : callable or str, default ``pd.read_json`` 
+        The underlying function that dask will use to read JSON files. By 
+        default, this will be the pandas JSON reader (``pd.read_json``). 
+        If a string is specified, this value will be passed under the ``engine`` 
+        key-word argument to ``pd.read_json`` (only supported for pandas&gt;=2.0). 
+    include_path_column : bool or str, optional 
+        Include a column with the file path where each row in the dataframe 
+        originated. If ``True``, a new column is added to the dataframe called 
+        ``path``. If ``str``, sets new column name. Default is ``False``. 
+    path_converter : function or None, optional 
+        A function that takes one argument and returns a string. Used to convert 
+        paths in the ``path`` column, for instance, to strip a common prefix from 
+        all the paths. 
+    $META 
+ 
+    Returns 
+    ------- 
+    dask.DataFrame 
+ 
+    Examples 
+    -------- 
+    Load single file 
+ 
+    &gt;&gt;&gt; dd.read_json('myfile.1.json')  # doctest: +SKIP 
+ 
+    Load multiple files 
+ 
+    &gt;&gt;&gt; dd.read_json('myfile.*.json')  # doctest: +SKIP 
+ 
+    &gt;&gt;&gt; dd.read_json(['myfile.1.json', 'myfile.2.json'])  # doctest: +SKIP 
+ 
+    Load large line-delimited JSON files using partitions of approx 
+    256MB size 
+ 
+    &gt;&gt; dd.read_json('data/file*.csv', blocksize=2**28) 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">lines </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">lines = orient == </span><span class="s2">&quot;records&quot;</span>
+    <span class="s0">if </span><span class="s1">orient != </span><span class="s2">&quot;records&quot; </span><span class="s0">and </span><span class="s1">lines:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s2">&quot;Line-delimited JSON is only available with&quot; 'orient=&quot;records&quot;.'</span>
+        <span class="s1">)</span>
+    <span class="s0">if </span><span class="s1">blocksize </span><span class="s0">and </span><span class="s1">(orient != </span><span class="s2">&quot;records&quot; </span><span class="s0">or not </span><span class="s1">lines):</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s2">&quot;JSON file chunking only allowed for JSON-lines&quot;</span>
+            <span class="s2">&quot;input (orient='records', lines=True).&quot;</span>
+        <span class="s1">)</span>
+    <span class="s1">storage_options = storage_options </span><span class="s0">or </span><span class="s1">{}</span>
+    <span class="s0">if </span><span class="s1">include_path_column </span><span class="s0">is True</span><span class="s1">:</span>
+        <span class="s1">include_path_column = </span><span class="s2">&quot;path&quot;</span>
+
+    <span class="s0">if </span><span class="s1">path_converter </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s1">path_converter = </span><span class="s0">lambda </span><span class="s1">x: x</span>
+
+    <span class="s5"># Handle engine string (Pandas&gt;=2.0)</span>
+    <span class="s0">if </span><span class="s1">isinstance(engine</span><span class="s0">, </span><span class="s1">str):</span>
+        <span class="s0">if not </span><span class="s1">PANDAS_GE_200:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span>
+                <span class="s2">f&quot;Pandas&gt;=2.0 is required to pass a string to the &quot;</span>
+                <span class="s2">f&quot;`engine` argument of `read_json` &quot;</span>
+                <span class="s2">f&quot;(pandas=</span><span class="s0">{</span><span class="s1">str(PANDAS_VERSION)</span><span class="s0">} </span><span class="s2">is currently installed).&quot;</span>
+            <span class="s1">)</span>
+        <span class="s1">engine = partial(pd.read_json</span><span class="s0">, </span><span class="s1">engine=engine)</span>
+
+    <span class="s0">if </span><span class="s1">blocksize:</span>
+        <span class="s1">b_out = read_bytes(</span>
+            <span class="s1">url_path</span><span class="s0">,</span>
+            <span class="s6">b&quot;</span><span class="s0">\n</span><span class="s6">&quot;</span><span class="s0">,</span>
+            <span class="s1">blocksize=blocksize</span><span class="s0">,</span>
+            <span class="s1">sample=sample</span><span class="s0">,</span>
+            <span class="s1">compression=compression</span><span class="s0">,</span>
+            <span class="s1">include_path=include_path_column</span><span class="s0">,</span>
+            <span class="s1">**storage_options</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s0">if </span><span class="s1">include_path_column:</span>
+            <span class="s1">first</span><span class="s0">, </span><span class="s1">chunks</span><span class="s0">, </span><span class="s1">paths = b_out</span>
+            <span class="s1">first_path = path_converter(paths[</span><span class="s4">0</span><span class="s1">])</span>
+            <span class="s1">path_dtype = pd.CategoricalDtype(path_converter(p) </span><span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">paths)</span>
+            <span class="s1">flat_paths = flatten(</span>
+                <span class="s1">[path_converter(p)] * len(chunk) </span><span class="s0">for </span><span class="s1">p</span><span class="s0">, </span><span class="s1">chunk </span><span class="s0">in </span><span class="s1">zip(paths</span><span class="s0">, </span><span class="s1">chunks)</span>
+            <span class="s1">)</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">first</span><span class="s0">, </span><span class="s1">chunks = b_out</span>
+            <span class="s1">first_path = </span><span class="s0">None</span>
+            <span class="s1">flat_paths = (</span><span class="s0">None,</span><span class="s1">)</span>
+            <span class="s1">path_dtype = </span><span class="s0">None</span>
+
+        <span class="s1">flat_chunks = flatten(chunks)</span>
+        <span class="s0">if </span><span class="s1">meta </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">meta = read_json_chunk(</span>
+                <span class="s1">first</span><span class="s0">,</span>
+                <span class="s1">encoding</span><span class="s0">,</span>
+                <span class="s1">errors</span><span class="s0">,</span>
+                <span class="s1">engine</span><span class="s0">,</span>
+                <span class="s1">include_path_column</span><span class="s0">,</span>
+                <span class="s1">first_path</span><span class="s0">,</span>
+                <span class="s1">path_dtype</span><span class="s0">,</span>
+                <span class="s1">kwargs</span><span class="s0">,</span>
+            <span class="s1">)</span>
+        <span class="s1">meta = make_meta(meta)</span>
+        <span class="s1">parts = [</span>
+            <span class="s1">delayed(read_json_chunk)(</span>
+                <span class="s1">chunk</span><span class="s0">,</span>
+                <span class="s1">encoding</span><span class="s0">,</span>
+                <span class="s1">errors</span><span class="s0">,</span>
+                <span class="s1">engine</span><span class="s0">,</span>
+                <span class="s1">include_path_column</span><span class="s0">,</span>
+                <span class="s1">path</span><span class="s0">,</span>
+                <span class="s1">path_dtype</span><span class="s0">,</span>
+                <span class="s1">kwargs</span><span class="s0">,</span>
+                <span class="s1">meta=meta</span><span class="s0">,</span>
+            <span class="s1">)</span>
+            <span class="s0">for </span><span class="s1">chunk</span><span class="s0">, </span><span class="s1">path </span><span class="s0">in </span><span class="s1">zip_longest(flat_chunks</span><span class="s0">, </span><span class="s1">flat_paths)</span>
+        <span class="s1">]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">files = open_files(</span>
+            <span class="s1">url_path</span><span class="s0">,</span>
+            <span class="s2">&quot;rt&quot;</span><span class="s0">,</span>
+            <span class="s1">encoding=encoding</span><span class="s0">,</span>
+            <span class="s1">errors=errors</span><span class="s0">,</span>
+            <span class="s1">compression=compression</span><span class="s0">,</span>
+            <span class="s1">**storage_options</span><span class="s0">,</span>
+        <span class="s1">)</span>
+        <span class="s1">path_dtype = pd.CategoricalDtype(path_converter(f.path) </span><span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">files)</span>
+        <span class="s1">parts = [</span>
+            <span class="s1">delayed(read_json_file)(</span>
+                <span class="s1">f</span><span class="s0">,</span>
+                <span class="s1">orient</span><span class="s0">,</span>
+                <span class="s1">lines</span><span class="s0">,</span>
+                <span class="s1">engine</span><span class="s0">,</span>
+                <span class="s1">include_path_column</span><span class="s0">,</span>
+                <span class="s1">path_converter(f.path)</span><span class="s0">,</span>
+                <span class="s1">path_dtype</span><span class="s0">,</span>
+                <span class="s1">kwargs</span><span class="s0">,</span>
+            <span class="s1">)</span>
+            <span class="s0">for </span><span class="s1">f </span><span class="s0">in </span><span class="s1">files</span>
+        <span class="s1">]</span>
+
+    <span class="s0">return </span><span class="s1">from_delayed(parts</span><span class="s0">, </span><span class="s1">meta=meta)</span>
+
+
+<span class="s0">def </span><span class="s1">read_json_chunk(</span>
+    <span class="s1">chunk</span><span class="s0">, </span><span class="s1">encoding</span><span class="s0">, </span><span class="s1">errors</span><span class="s0">, </span><span class="s1">engine</span><span class="s0">, </span><span class="s1">column_name</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">path_dtype</span><span class="s0">, </span><span class="s1">kwargs</span><span class="s0">, </span><span class="s1">meta=</span><span class="s0">None</span>
+<span class="s1">):</span>
+    <span class="s1">s = io.StringIO(chunk.decode(encoding</span><span class="s0">, </span><span class="s1">errors))</span>
+    <span class="s1">s.seek(</span><span class="s4">0</span><span class="s1">)</span>
+    <span class="s1">df = engine(s</span><span class="s0">, </span><span class="s1">orient=</span><span class="s2">&quot;records&quot;</span><span class="s0">, </span><span class="s1">lines=</span><span class="s0">True, </span><span class="s1">**kwargs)</span>
+    <span class="s0">if </span><span class="s1">meta </span><span class="s0">is not None and </span><span class="s1">df.empty:</span>
+        <span class="s0">return </span><span class="s1">meta</span>
+
+    <span class="s0">if </span><span class="s1">column_name:</span>
+        <span class="s1">df = add_path_column(df</span><span class="s0">, </span><span class="s1">column_name</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">path_dtype)</span>
+
+    <span class="s0">return </span><span class="s1">df</span>
+
+
+<span class="s0">def </span><span class="s1">read_json_file(f</span><span class="s0">, </span><span class="s1">orient</span><span class="s0">, </span><span class="s1">lines</span><span class="s0">, </span><span class="s1">engine</span><span class="s0">, </span><span class="s1">column_name</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">path_dtype</span><span class="s0">, </span><span class="s1">kwargs):</span>
+    <span class="s0">with </span><span class="s1">f </span><span class="s0">as </span><span class="s1">open_file:</span>
+        <span class="s1">df = engine(open_file</span><span class="s0">, </span><span class="s1">orient=orient</span><span class="s0">, </span><span class="s1">lines=lines</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+    <span class="s0">if </span><span class="s1">column_name:</span>
+        <span class="s1">df = add_path_column(df</span><span class="s0">, </span><span class="s1">column_name</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">path_dtype)</span>
+    <span class="s0">return </span><span class="s1">df</span>
+
+
+<span class="s0">def </span><span class="s1">add_path_column(df</span><span class="s0">, </span><span class="s1">column_name</span><span class="s0">, </span><span class="s1">path</span><span class="s0">, </span><span class="s1">dtype):</span>
+    <span class="s0">if </span><span class="s1">column_name </span><span class="s0">in </span><span class="s1">df.columns:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span>
+            <span class="s2">f&quot;Files already contain the column name: '</span><span class="s0">{</span><span class="s1">column_name</span><span class="s0">}</span><span class="s2">', so the path &quot;</span>
+            <span class="s2">&quot;column cannot use this name. Please set `include_path_column` to a &quot;</span>
+            <span class="s2">&quot;unique name.&quot;</span>
+        <span class="s1">)</span>
+    <span class="s0">return </span><span class="s1">df.assign(**{column_name: pd.Series([path] * len(df)</span><span class="s0">, </span><span class="s1">dtype=dtype)})</span>
+</pre>
+</body>
+</html>

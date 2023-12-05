@@ -1,0 +1,232 @@
+<html>
+<head>
+<title>_matfuncs_sqrtm.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_matfuncs_sqrtm.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Matrix square root for general matrices and for upper triangular matrices. 
+ 
+This module exists to avoid cyclic imports. 
+ 
+&quot;&quot;&quot;</span>
+<span class="s1">__all__ = [</span><span class="s2">'sqrtm'</span><span class="s1">]</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+
+<span class="s3">from </span><span class="s1">scipy._lib._util </span><span class="s3">import </span><span class="s1">_asarray_validated</span>
+
+<span class="s4"># Local imports</span>
+<span class="s3">from </span><span class="s1">._misc </span><span class="s3">import </span><span class="s1">norm</span>
+<span class="s3">from </span><span class="s1">.lapack </span><span class="s3">import </span><span class="s1">ztrsyl</span><span class="s3">, </span><span class="s1">dtrsyl</span>
+<span class="s3">from </span><span class="s1">._decomp_schur </span><span class="s3">import </span><span class="s1">schur</span><span class="s3">, </span><span class="s1">rsf2csf</span>
+
+
+
+<span class="s3">class </span><span class="s1">SqrtmError(np.linalg.LinAlgError):</span>
+    <span class="s3">pass</span>
+
+
+<span class="s3">from </span><span class="s1">._matfuncs_sqrtm_triu </span><span class="s3">import </span><span class="s1">within_block_loop  </span><span class="s4"># noqa: E402</span>
+
+
+<span class="s3">def </span><span class="s1">_sqrtm_triu(T</span><span class="s3">, </span><span class="s1">blocksize=</span><span class="s5">64</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Matrix square root of an upper triangular matrix. 
+ 
+    This is a helper function for `sqrtm` and `logm`. 
+ 
+    Parameters 
+    ---------- 
+    T : (N, N) array_like upper triangular 
+        Matrix whose square root to evaluate 
+    blocksize : int, optional 
+        If the blocksize is not degenerate with respect to the 
+        size of the input array, then use a blocked algorithm. (Default: 64) 
+ 
+    Returns 
+    ------- 
+    sqrtm : (N, N) ndarray 
+        Value of the sqrt function at `T` 
+ 
+    References 
+    ---------- 
+    .. [1] Edvin Deadman, Nicholas J. Higham, Rui Ralha (2013) 
+           &quot;Blocked Schur Algorithms for Computing the Matrix Square Root, 
+           Lecture Notes in Computer Science, 7782. pp. 171-182. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">T_diag = np.diag(T)</span>
+    <span class="s1">keep_it_real = np.isrealobj(T) </span><span class="s3">and </span><span class="s1">np.min(T_diag) &gt;= </span><span class="s5">0</span>
+
+    <span class="s4"># Cast to complex as necessary + ensure double precision</span>
+    <span class="s3">if not </span><span class="s1">keep_it_real:</span>
+        <span class="s1">T = np.asarray(T</span><span class="s3">, </span><span class="s1">dtype=np.complex128</span><span class="s3">, </span><span class="s1">order=</span><span class="s2">&quot;C&quot;</span><span class="s1">)</span>
+        <span class="s1">T_diag = np.asarray(T_diag</span><span class="s3">, </span><span class="s1">dtype=np.complex128)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">T = np.asarray(T</span><span class="s3">, </span><span class="s1">dtype=np.float64</span><span class="s3">, </span><span class="s1">order=</span><span class="s2">&quot;C&quot;</span><span class="s1">)</span>
+        <span class="s1">T_diag = np.asarray(T_diag</span><span class="s3">, </span><span class="s1">dtype=np.float64)</span>
+
+    <span class="s1">R = np.diag(np.sqrt(T_diag))</span>
+
+    <span class="s4"># Compute the number of blocks to use; use at least one block.</span>
+    <span class="s1">n</span><span class="s3">, </span><span class="s1">n = T.shape</span>
+    <span class="s1">nblocks = max(n // blocksize</span><span class="s3">, </span><span class="s5">1</span><span class="s1">)</span>
+
+    <span class="s4"># Compute the smaller of the two sizes of blocks that</span>
+    <span class="s4"># we will actually use, and compute the number of large blocks.</span>
+    <span class="s1">bsmall</span><span class="s3">, </span><span class="s1">nlarge = divmod(n</span><span class="s3">, </span><span class="s1">nblocks)</span>
+    <span class="s1">blarge = bsmall + </span><span class="s5">1</span>
+    <span class="s1">nsmall = nblocks - nlarge</span>
+    <span class="s3">if </span><span class="s1">nsmall * bsmall + nlarge * blarge != n:</span>
+        <span class="s3">raise </span><span class="s1">Exception(</span><span class="s2">'internal inconsistency'</span><span class="s1">)</span>
+
+    <span class="s4"># Define the index range covered by each block.</span>
+    <span class="s1">start_stop_pairs = []</span>
+    <span class="s1">start = </span><span class="s5">0</span>
+    <span class="s3">for </span><span class="s1">count</span><span class="s3">, </span><span class="s1">size </span><span class="s3">in </span><span class="s1">((nsmall</span><span class="s3">, </span><span class="s1">bsmall)</span><span class="s3">, </span><span class="s1">(nlarge</span><span class="s3">, </span><span class="s1">blarge)):</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(count):</span>
+            <span class="s1">start_stop_pairs.append((start</span><span class="s3">, </span><span class="s1">start + size))</span>
+            <span class="s1">start += size</span>
+
+    <span class="s4"># Within-block interactions (Cythonized)</span>
+    <span class="s3">try</span><span class="s1">:</span>
+        <span class="s1">within_block_loop(R</span><span class="s3">, </span><span class="s1">T</span><span class="s3">, </span><span class="s1">start_stop_pairs</span><span class="s3">, </span><span class="s1">nblocks)</span>
+    <span class="s3">except </span><span class="s1">RuntimeError </span><span class="s3">as </span><span class="s1">e:</span>
+        <span class="s3">raise </span><span class="s1">SqrtmError(*e.args) </span><span class="s3">from </span><span class="s1">e</span>
+
+    <span class="s4"># Between-block interactions (Cython would give no significant speedup)</span>
+    <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range(nblocks):</span>
+        <span class="s1">jstart</span><span class="s3">, </span><span class="s1">jstop = start_stop_pairs[j]</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range(j-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">-</span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">istart</span><span class="s3">, </span><span class="s1">istop = start_stop_pairs[i]</span>
+            <span class="s1">S = T[istart:istop</span><span class="s3">, </span><span class="s1">jstart:jstop]</span>
+            <span class="s3">if </span><span class="s1">j - i &gt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s1">S = S - R[istart:istop</span><span class="s3">, </span><span class="s1">istop:jstart].dot(R[istop:jstart</span><span class="s3">,</span>
+                                                            <span class="s1">jstart:jstop])</span>
+
+            <span class="s4"># Invoke LAPACK.</span>
+            <span class="s4"># For more details, see the solve_sylvester implemention</span>
+            <span class="s4"># and the fortran dtrsyl and ztrsyl docs.</span>
+            <span class="s1">Rii = R[istart:istop</span><span class="s3">, </span><span class="s1">istart:istop]</span>
+            <span class="s1">Rjj = R[jstart:jstop</span><span class="s3">, </span><span class="s1">jstart:jstop]</span>
+            <span class="s3">if </span><span class="s1">keep_it_real:</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">, </span><span class="s1">info = dtrsyl(Rii</span><span class="s3">, </span><span class="s1">Rjj</span><span class="s3">, </span><span class="s1">S)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">, </span><span class="s1">info = ztrsyl(Rii</span><span class="s3">, </span><span class="s1">Rjj</span><span class="s3">, </span><span class="s1">S)</span>
+            <span class="s1">R[istart:istop</span><span class="s3">, </span><span class="s1">jstart:jstop] = x * scale</span>
+
+    <span class="s4"># Return the matrix square root.</span>
+    <span class="s3">return </span><span class="s1">R</span>
+
+
+<span class="s3">def </span><span class="s1">sqrtm(A</span><span class="s3">, </span><span class="s1">disp=</span><span class="s3">True, </span><span class="s1">blocksize=</span><span class="s5">64</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Matrix square root. 
+ 
+    Parameters 
+    ---------- 
+    A : (N, N) array_like 
+        Matrix whose square root to evaluate 
+    disp : bool, optional 
+        Print warning if error in the result is estimated large 
+        instead of returning estimated error. (Default: True) 
+    blocksize : integer, optional 
+        If the blocksize is not degenerate with respect to the 
+        size of the input array, then use a blocked algorithm. (Default: 64) 
+ 
+    Returns 
+    ------- 
+    sqrtm : (N, N) ndarray 
+        Value of the sqrt function at `A`. The dtype is float or complex. 
+        The precision (data size) is determined based on the precision of 
+        input `A`. When the dtype is float, the precision is the same as `A`. 
+        When the dtype is complex, the precision is double that of `A`. The 
+        precision might be clipped by each dtype precision range. 
+ 
+    errest : float 
+        (if disp == False) 
+ 
+        Frobenius norm of the estimated error, ||err||_F / ||A||_F 
+ 
+    References 
+    ---------- 
+    .. [1] Edvin Deadman, Nicholas J. Higham, Rui Ralha (2013) 
+           &quot;Blocked Schur Algorithms for Computing the Matrix Square Root, 
+           Lecture Notes in Computer Science, 7782. pp. 171-182. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.linalg import sqrtm 
+    &gt;&gt;&gt; a = np.array([[1.0, 3.0], [1.0, 4.0]]) 
+    &gt;&gt;&gt; r = sqrtm(a) 
+    &gt;&gt;&gt; r 
+    array([[ 0.75592895,  1.13389342], 
+           [ 0.37796447,  1.88982237]]) 
+    &gt;&gt;&gt; r.dot(r) 
+    array([[ 1.,  3.], 
+           [ 1.,  4.]]) 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">byte_size = np.asarray(A).dtype.itemsize</span>
+    <span class="s1">A = _asarray_validated(A</span><span class="s3">, </span><span class="s1">check_finite=</span><span class="s3">True, </span><span class="s1">as_inexact=</span><span class="s3">True</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">len(A.shape) != </span><span class="s5">2</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Non-matrix input to matrix function.&quot;</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">blocksize &lt; </span><span class="s5">1</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;The blocksize should be at least 1.&quot;</span><span class="s1">)</span>
+    <span class="s1">keep_it_real = np.isrealobj(A)</span>
+    <span class="s3">if </span><span class="s1">keep_it_real:</span>
+        <span class="s1">T</span><span class="s3">, </span><span class="s1">Z = schur(A)</span>
+        <span class="s3">if not </span><span class="s1">np.allclose(T</span><span class="s3">, </span><span class="s1">np.triu(T)):</span>
+            <span class="s1">T</span><span class="s3">, </span><span class="s1">Z = rsf2csf(T</span><span class="s3">, </span><span class="s1">Z)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">T</span><span class="s3">, </span><span class="s1">Z = schur(A</span><span class="s3">, </span><span class="s1">output=</span><span class="s2">'complex'</span><span class="s1">)</span>
+    <span class="s1">failflag = </span><span class="s3">False</span>
+    <span class="s3">try</span><span class="s1">:</span>
+        <span class="s1">R = _sqrtm_triu(T</span><span class="s3">, </span><span class="s1">blocksize=blocksize)</span>
+        <span class="s1">ZH = np.conjugate(Z).T</span>
+        <span class="s1">X = Z.dot(R).dot(ZH)</span>
+        <span class="s3">if not </span><span class="s1">np.iscomplexobj(X):</span>
+            <span class="s4"># float byte size range: f2 ~ f16</span>
+            <span class="s1">X = X.astype(</span><span class="s2">f&quot;f</span><span class="s3">{</span><span class="s1">np.clip(byte_size</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s5">16</span><span class="s1">)</span><span class="s3">}</span><span class="s2">&quot;</span><span class="s3">, </span><span class="s1">copy=</span><span class="s3">False</span><span class="s1">)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s4"># complex byte size range: c8 ~ c32.</span>
+            <span class="s4"># c32(complex256) might not be supported in some environments.</span>
+            <span class="s3">if </span><span class="s1">hasattr(np</span><span class="s3">, </span><span class="s2">'complex256'</span><span class="s1">):</span>
+                <span class="s1">X = X.astype(</span><span class="s2">f&quot;c</span><span class="s3">{</span><span class="s1">np.clip(byte_size*</span><span class="s5">2</span><span class="s3">, </span><span class="s5">8</span><span class="s3">, </span><span class="s5">32</span><span class="s1">)</span><span class="s3">}</span><span class="s2">&quot;</span><span class="s3">, </span><span class="s1">copy=</span><span class="s3">False</span><span class="s1">)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">X = X.astype(</span><span class="s2">f&quot;c</span><span class="s3">{</span><span class="s1">np.clip(byte_size*</span><span class="s5">2</span><span class="s3">, </span><span class="s5">8</span><span class="s3">, </span><span class="s5">16</span><span class="s1">)</span><span class="s3">}</span><span class="s2">&quot;</span><span class="s3">, </span><span class="s1">copy=</span><span class="s3">False</span><span class="s1">)</span>
+    <span class="s3">except </span><span class="s1">SqrtmError:</span>
+        <span class="s1">failflag = </span><span class="s3">True</span>
+        <span class="s1">X = np.empty_like(A)</span>
+        <span class="s1">X.fill(np.nan)</span>
+
+    <span class="s3">if </span><span class="s1">disp:</span>
+        <span class="s3">if </span><span class="s1">failflag:</span>
+            <span class="s1">print(</span><span class="s2">&quot;Failed to find a square root.&quot;</span><span class="s1">)</span>
+        <span class="s3">return </span><span class="s1">X</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">try</span><span class="s1">:</span>
+            <span class="s1">arg2 = norm(X.dot(X) - A</span><span class="s3">, </span><span class="s2">'fro'</span><span class="s1">)**</span><span class="s5">2 </span><span class="s1">/ norm(A</span><span class="s3">, </span><span class="s2">'fro'</span><span class="s1">)</span>
+        <span class="s3">except </span><span class="s1">ValueError:</span>
+            <span class="s4"># NaNs in matrix</span>
+            <span class="s1">arg2 = np.inf</span>
+
+        <span class="s3">return </span><span class="s1">X</span><span class="s3">, </span><span class="s1">arg2</span>
+</pre>
+</body>
+</html>

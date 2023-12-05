@@ -1,0 +1,1017 @@
+<html>
+<head>
+<title>_gb_losses.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #808080;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_gb_losses.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Losses and corresponding default initial estimators for gradient boosting 
+decision trees. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">abc </span><span class="s2">import </span><span class="s1">ABCMeta</span><span class="s2">, </span><span class="s1">abstractmethod</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">scipy.special </span><span class="s2">import </span><span class="s1">expit</span><span class="s2">, </span><span class="s1">logsumexp</span>
+
+<span class="s2">from </span><span class="s1">..dummy </span><span class="s2">import </span><span class="s1">DummyClassifier</span><span class="s2">, </span><span class="s1">DummyRegressor</span>
+<span class="s2">from </span><span class="s1">..tree._tree </span><span class="s2">import </span><span class="s1">TREE_LEAF</span>
+<span class="s2">from </span><span class="s1">..utils.stats </span><span class="s2">import </span><span class="s1">_weighted_percentile</span>
+
+
+<span class="s2">class </span><span class="s1">LossFunction(metaclass=ABCMeta):</span>
+    <span class="s0">&quot;&quot;&quot;Abstract base class for various loss functions. 
+ 
+    Parameters 
+    ---------- 
+    n_classes : int 
+        Number of classes. 
+ 
+    Attributes 
+    ---------- 
+    K : int 
+        The number of regression trees to be induced; 
+        1 for regression and binary classification; 
+        ``n_classes`` for multi-class classification. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">is_multi_class = </span><span class="s2">False</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">n_classes):</span>
+        <span class="s1">self.K = n_classes</span>
+
+    <span class="s1">@abstractmethod</span>
+    <span class="s2">def </span><span class="s1">init_estimator(self):</span>
+        <span class="s0">&quot;&quot;&quot;Default ``init`` estimator for loss function.&quot;&quot;&quot;</span>
+
+    <span class="s1">@abstractmethod</span>
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">sample_weight=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the loss. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            True labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves). 
+ 
+        sample_weight : ndarray of shape (n_samples,), default=None 
+            Sample weights. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s1">@abstractmethod</span>
+    <span class="s2">def </span><span class="s1">negative_gradient(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">**kargs):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the negative gradient. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            The target labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble at iteration ``i - 1``. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">update_terminal_regions(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">tree</span><span class="s2">,</span>
+        <span class="s1">X</span><span class="s2">,</span>
+        <span class="s1">y</span><span class="s2">,</span>
+        <span class="s1">residual</span><span class="s2">,</span>
+        <span class="s1">raw_predictions</span><span class="s2">,</span>
+        <span class="s1">sample_weight</span><span class="s2">,</span>
+        <span class="s1">sample_mask</span><span class="s2">,</span>
+        <span class="s1">learning_rate=</span><span class="s3">0.1</span><span class="s2">,</span>
+        <span class="s1">k=</span><span class="s3">0</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Update the terminal regions (=leaves) of the given tree and 
+        updates the current predictions of the model. Traverses tree 
+        and invokes template method `_update_terminal_region`. 
+ 
+        Parameters 
+        ---------- 
+        tree : tree.Tree 
+            The tree object. 
+        X : ndarray of shape (n_samples, n_features) 
+            The data array. 
+        y : ndarray of shape (n_samples,) 
+            The target labels. 
+        residual : ndarray of shape (n_samples,) 
+            The residuals (usually the negative gradient). 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble at iteration ``i - 1``. 
+        sample_weight : ndarray of shape (n_samples,) 
+            The weight of each sample. 
+        sample_mask : ndarray of shape (n_samples,) 
+            The sample mask to be used. 
+        learning_rate : float, default=0.1 
+            Learning rate shrinks the contribution of each tree by 
+             ``learning_rate``. 
+        k : int, default=0 
+            The index of the estimator being updated. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># compute leaf for each sample in ``X``.</span>
+        <span class="s1">terminal_regions = tree.apply(X)</span>
+
+        <span class="s4"># mask all which are not in sample mask.</span>
+        <span class="s1">masked_terminal_regions = terminal_regions.copy()</span>
+        <span class="s1">masked_terminal_regions[~sample_mask] = -</span><span class="s3">1</span>
+
+        <span class="s4"># update each leaf (= perform line search)</span>
+        <span class="s2">for </span><span class="s1">leaf </span><span class="s2">in </span><span class="s1">np.where(tree.children_left == TREE_LEAF)[</span><span class="s3">0</span><span class="s1">]:</span>
+            <span class="s1">self._update_terminal_region(</span>
+                <span class="s1">tree</span><span class="s2">,</span>
+                <span class="s1">masked_terminal_regions</span><span class="s2">,</span>
+                <span class="s1">leaf</span><span class="s2">,</span>
+                <span class="s1">X</span><span class="s2">,</span>
+                <span class="s1">y</span><span class="s2">,</span>
+                <span class="s1">residual</span><span class="s2">,</span>
+                <span class="s1">raw_predictions[:</span><span class="s2">, </span><span class="s1">k]</span><span class="s2">,</span>
+                <span class="s1">sample_weight</span><span class="s2">,</span>
+            <span class="s1">)</span>
+
+        <span class="s4"># update predictions (both in-bag and out-of-bag)</span>
+        <span class="s1">raw_predictions[:</span><span class="s2">, </span><span class="s1">k] += learning_rate * tree.value[:</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">].take(</span>
+            <span class="s1">terminal_regions</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@abstractmethod</span>
+    <span class="s2">def </span><span class="s1">_update_terminal_region(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">tree</span><span class="s2">,</span>
+        <span class="s1">terminal_regions</span><span class="s2">,</span>
+        <span class="s1">leaf</span><span class="s2">,</span>
+        <span class="s1">X</span><span class="s2">,</span>
+        <span class="s1">y</span><span class="s2">,</span>
+        <span class="s1">residual</span><span class="s2">,</span>
+        <span class="s1">raw_predictions</span><span class="s2">,</span>
+        <span class="s1">sample_weight</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Template method for updating terminal regions (i.e., leaves).&quot;&quot;&quot;</span>
+
+    <span class="s1">@abstractmethod</span>
+    <span class="s2">def </span><span class="s1">get_init_raw_predictions(self</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">estimator):</span>
+        <span class="s0">&quot;&quot;&quot;Return the initial raw predictions. 
+ 
+        Parameters 
+        ---------- 
+        X : ndarray of shape (n_samples, n_features) 
+            The data array. 
+        estimator : object 
+            The estimator to use to compute the predictions. 
+ 
+        Returns 
+        ------- 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The initial raw predictions. K is equal to 1 for binary 
+            classification and regression, and equal to the number of classes 
+            for multiclass classification. ``raw_predictions`` is casted 
+            into float64. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">RegressionLossFunction(LossFunction</span><span class="s2">, </span><span class="s1">metaclass=ABCMeta):</span>
+    <span class="s0">&quot;&quot;&quot;Base class for regression loss functions.&quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self):</span>
+        <span class="s1">super().__init__(n_classes=</span><span class="s3">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">check_init_estimator(self</span><span class="s2">, </span><span class="s1">estimator):</span>
+        <span class="s0">&quot;&quot;&quot;Make sure estimator has the required fit and predict methods. 
+ 
+        Parameters 
+        ---------- 
+        estimator : object 
+            The init estimator to check. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">(hasattr(estimator</span><span class="s2">, </span><span class="s5">&quot;fit&quot;</span><span class="s1">) </span><span class="s2">and </span><span class="s1">hasattr(estimator</span><span class="s2">, </span><span class="s5">&quot;predict&quot;</span><span class="s1">)):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;The init parameter must be a valid estimator and &quot;</span>
+                <span class="s5">&quot;support both fit and predict.&quot;</span>
+            <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">get_init_raw_predictions(self</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">estimator):</span>
+        <span class="s1">predictions = estimator.predict(X)</span>
+        <span class="s2">return </span><span class="s1">predictions.reshape(-</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s1">).astype(np.float64)</span>
+
+
+<span class="s2">class </span><span class="s1">LeastSquaresError(RegressionLossFunction):</span>
+    <span class="s0">&quot;&quot;&quot;Loss function for least squares (LS) estimation. 
+    Terminal regions do not need to be updated for least squares. 
+ 
+    Parameters 
+    ---------- 
+    n_classes : int 
+        Number of classes. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">init_estimator(self):</span>
+        <span class="s2">return </span><span class="s1">DummyRegressor(strategy=</span><span class="s5">&quot;mean&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">sample_weight=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the least squares loss. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            True labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves). 
+ 
+        sample_weight : ndarray of shape (n_samples,), default=None 
+            Sample weights. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">np.mean((y - raw_predictions.ravel()) ** </span><span class="s3">2</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(</span>
+                <span class="s3">1</span>
+                <span class="s1">/ sample_weight.sum()</span>
+                <span class="s1">* np.sum(sample_weight * ((y - raw_predictions.ravel()) ** </span><span class="s3">2</span><span class="s1">))</span>
+            <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">negative_gradient(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">**kargs):</span>
+        <span class="s0">&quot;&quot;&quot;Compute half of the negative gradient. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            The target labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples,) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble at iteration ``i - 1``. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">y - raw_predictions.ravel()</span>
+
+    <span class="s2">def </span><span class="s1">update_terminal_regions(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">tree</span><span class="s2">,</span>
+        <span class="s1">X</span><span class="s2">,</span>
+        <span class="s1">y</span><span class="s2">,</span>
+        <span class="s1">residual</span><span class="s2">,</span>
+        <span class="s1">raw_predictions</span><span class="s2">,</span>
+        <span class="s1">sample_weight</span><span class="s2">,</span>
+        <span class="s1">sample_mask</span><span class="s2">,</span>
+        <span class="s1">learning_rate=</span><span class="s3">0.1</span><span class="s2">,</span>
+        <span class="s1">k=</span><span class="s3">0</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Least squares does not need to update terminal regions. 
+ 
+        But it has to update the predictions. 
+ 
+        Parameters 
+        ---------- 
+        tree : tree.Tree 
+            The tree object. 
+        X : ndarray of shape (n_samples, n_features) 
+            The data array. 
+        y : ndarray of shape (n_samples,) 
+            The target labels. 
+        residual : ndarray of shape (n_samples,) 
+            The residuals (usually the negative gradient). 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble at iteration ``i - 1``. 
+        sample_weight : ndarray of shape (n,) 
+            The weight of each sample. 
+        sample_mask : ndarray of shape (n,) 
+            The sample mask to be used. 
+        learning_rate : float, default=0.1 
+            Learning rate shrinks the contribution of each tree by 
+             ``learning_rate``. 
+        k : int, default=0 
+            The index of the estimator being updated. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># update predictions</span>
+        <span class="s1">raw_predictions[:</span><span class="s2">, </span><span class="s1">k] += learning_rate * tree.predict(X).ravel()</span>
+
+    <span class="s2">def </span><span class="s1">_update_terminal_region(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">tree</span><span class="s2">,</span>
+        <span class="s1">terminal_regions</span><span class="s2">,</span>
+        <span class="s1">leaf</span><span class="s2">,</span>
+        <span class="s1">X</span><span class="s2">,</span>
+        <span class="s1">y</span><span class="s2">,</span>
+        <span class="s1">residual</span><span class="s2">,</span>
+        <span class="s1">raw_predictions</span><span class="s2">,</span>
+        <span class="s1">sample_weight</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">LeastAbsoluteError(RegressionLossFunction):</span>
+    <span class="s0">&quot;&quot;&quot;Loss function for least absolute deviation (LAD) regression. 
+ 
+    Parameters 
+    ---------- 
+    n_classes : int 
+        Number of classes 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">init_estimator(self):</span>
+        <span class="s2">return </span><span class="s1">DummyRegressor(strategy=</span><span class="s5">&quot;quantile&quot;</span><span class="s2">, </span><span class="s1">quantile=</span><span class="s3">0.5</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">sample_weight=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the least absolute error. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            True labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves). 
+ 
+        sample_weight : ndarray of shape (n_samples,), default=None 
+            Sample weights. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">np.abs(y - raw_predictions.ravel()).mean()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(</span>
+                <span class="s3">1</span>
+                <span class="s1">/ sample_weight.sum()</span>
+                <span class="s1">* np.sum(sample_weight * np.abs(y - raw_predictions.ravel()))</span>
+            <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">negative_gradient(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">**kargs):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the negative gradient. 
+ 
+        1.0 if y - raw_predictions &gt; 0.0 else -1.0 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            The target labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble at iteration ``i - 1``. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">raw_predictions = raw_predictions.ravel()</span>
+        <span class="s2">return </span><span class="s3">2 </span><span class="s1">* (y - raw_predictions &gt; </span><span class="s3">0</span><span class="s1">) - </span><span class="s3">1</span>
+
+    <span class="s2">def </span><span class="s1">_update_terminal_region(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">tree</span><span class="s2">,</span>
+        <span class="s1">terminal_regions</span><span class="s2">,</span>
+        <span class="s1">leaf</span><span class="s2">,</span>
+        <span class="s1">X</span><span class="s2">,</span>
+        <span class="s1">y</span><span class="s2">,</span>
+        <span class="s1">residual</span><span class="s2">,</span>
+        <span class="s1">raw_predictions</span><span class="s2">,</span>
+        <span class="s1">sample_weight</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;LAD updates terminal regions to median estimates.&quot;&quot;&quot;</span>
+        <span class="s1">terminal_region = np.where(terminal_regions == leaf)[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">sample_weight = sample_weight.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+        <span class="s1">diff = y.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">) - raw_predictions.take(</span>
+            <span class="s1">terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span>
+        <span class="s1">)</span>
+        <span class="s1">tree.value[leaf</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = _weighted_percentile(</span>
+            <span class="s1">diff</span><span class="s2">, </span><span class="s1">sample_weight</span><span class="s2">, </span><span class="s1">percentile=</span><span class="s3">50</span>
+        <span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">HuberLossFunction(RegressionLossFunction):</span>
+    <span class="s0">&quot;&quot;&quot;Huber loss function for robust regression. 
+ 
+    M-Regression proposed in Friedman 2001. 
+ 
+    Parameters 
+    ---------- 
+    alpha : float, default=0.9 
+        Percentile at which to extract score. 
+ 
+    References 
+    ---------- 
+    J. Friedman, Greedy Function Approximation: A Gradient Boosting 
+    Machine, The Annals of Statistics, Vol. 29, No. 5, 2001. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s3">0.9</span><span class="s1">):</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s1">self.alpha = alpha</span>
+        <span class="s1">self.gamma = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">init_estimator(self):</span>
+        <span class="s2">return </span><span class="s1">DummyRegressor(strategy=</span><span class="s5">&quot;quantile&quot;</span><span class="s2">, </span><span class="s1">quantile=</span><span class="s3">0.5</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">sample_weight=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the Huber loss. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            True labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble. 
+ 
+        sample_weight : ndarray of shape (n_samples,), default=None 
+            Sample weights. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">raw_predictions = raw_predictions.ravel()</span>
+        <span class="s1">diff = y - raw_predictions</span>
+        <span class="s1">gamma = self.gamma</span>
+        <span class="s2">if </span><span class="s1">gamma </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">gamma = np.percentile(np.abs(diff)</span><span class="s2">, </span><span class="s1">self.alpha * </span><span class="s3">100</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">gamma = _weighted_percentile(</span>
+                    <span class="s1">np.abs(diff)</span><span class="s2">, </span><span class="s1">sample_weight</span><span class="s2">, </span><span class="s1">self.alpha * </span><span class="s3">100</span>
+                <span class="s1">)</span>
+
+        <span class="s1">gamma_mask = np.abs(diff) &lt;= gamma</span>
+        <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">sq_loss = np.sum(</span><span class="s3">0.5 </span><span class="s1">* diff[gamma_mask] ** </span><span class="s3">2</span><span class="s1">)</span>
+            <span class="s1">lin_loss = np.sum(gamma * (np.abs(diff[~gamma_mask]) - gamma / </span><span class="s3">2</span><span class="s1">))</span>
+            <span class="s1">loss = (sq_loss + lin_loss) / y.shape[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">sq_loss = np.sum(</span><span class="s3">0.5 </span><span class="s1">* sample_weight[gamma_mask] * diff[gamma_mask] ** </span><span class="s3">2</span><span class="s1">)</span>
+            <span class="s1">lin_loss = np.sum(</span>
+                <span class="s1">gamma</span>
+                <span class="s1">* sample_weight[~gamma_mask]</span>
+                <span class="s1">* (np.abs(diff[~gamma_mask]) - gamma / </span><span class="s3">2</span><span class="s1">)</span>
+            <span class="s1">)</span>
+            <span class="s1">loss = (sq_loss + lin_loss) / sample_weight.sum()</span>
+        <span class="s2">return </span><span class="s1">loss</span>
+
+    <span class="s2">def </span><span class="s1">negative_gradient(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">sample_weight=</span><span class="s2">None, </span><span class="s1">**kargs):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the negative gradient. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            The target labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble at iteration ``i - 1``. 
+ 
+        sample_weight : ndarray of shape (n_samples,), default=None 
+            Sample weights. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">raw_predictions = raw_predictions.ravel()</span>
+        <span class="s1">diff = y - raw_predictions</span>
+        <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">gamma = np.percentile(np.abs(diff)</span><span class="s2">, </span><span class="s1">self.alpha * </span><span class="s3">100</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">gamma = _weighted_percentile(np.abs(diff)</span><span class="s2">, </span><span class="s1">sample_weight</span><span class="s2">, </span><span class="s1">self.alpha * </span><span class="s3">100</span><span class="s1">)</span>
+        <span class="s1">gamma_mask = np.abs(diff) &lt;= gamma</span>
+        <span class="s1">residual = np.zeros((y.shape[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">,</span><span class="s1">)</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">residual[gamma_mask] = diff[gamma_mask]</span>
+        <span class="s1">residual[~gamma_mask] = gamma * np.sign(diff[~gamma_mask])</span>
+        <span class="s1">self.gamma = gamma</span>
+        <span class="s2">return </span><span class="s1">residual</span>
+
+    <span class="s2">def </span><span class="s1">_update_terminal_region(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">tree</span><span class="s2">,</span>
+        <span class="s1">terminal_regions</span><span class="s2">,</span>
+        <span class="s1">leaf</span><span class="s2">,</span>
+        <span class="s1">X</span><span class="s2">,</span>
+        <span class="s1">y</span><span class="s2">,</span>
+        <span class="s1">residual</span><span class="s2">,</span>
+        <span class="s1">raw_predictions</span><span class="s2">,</span>
+        <span class="s1">sample_weight</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s1">terminal_region = np.where(terminal_regions == leaf)[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">sample_weight = sample_weight.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+        <span class="s1">gamma = self.gamma</span>
+        <span class="s1">diff = y.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">) - raw_predictions.take(</span>
+            <span class="s1">terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span>
+        <span class="s1">)</span>
+        <span class="s1">median = _weighted_percentile(diff</span><span class="s2">, </span><span class="s1">sample_weight</span><span class="s2">, </span><span class="s1">percentile=</span><span class="s3">50</span><span class="s1">)</span>
+        <span class="s1">diff_minus_median = diff - median</span>
+        <span class="s1">tree.value[leaf</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = median + np.mean(</span>
+            <span class="s1">np.sign(diff_minus_median) * np.minimum(np.abs(diff_minus_median)</span><span class="s2">, </span><span class="s1">gamma)</span>
+        <span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">QuantileLossFunction(RegressionLossFunction):</span>
+    <span class="s0">&quot;&quot;&quot;Loss function for quantile regression. 
+ 
+    Quantile regression allows to estimate the percentiles 
+    of the conditional distribution of the target. 
+ 
+    Parameters 
+    ---------- 
+    alpha : float, default=0.9 
+        The percentile. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s3">0.9</span><span class="s1">):</span>
+        <span class="s1">super().__init__()</span>
+        <span class="s1">self.alpha = alpha</span>
+        <span class="s1">self.percentile = alpha * </span><span class="s3">100</span>
+
+    <span class="s2">def </span><span class="s1">init_estimator(self):</span>
+        <span class="s2">return </span><span class="s1">DummyRegressor(strategy=</span><span class="s5">&quot;quantile&quot;</span><span class="s2">, </span><span class="s1">quantile=self.alpha)</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">sample_weight=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the Quantile loss. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            True labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble. 
+ 
+        sample_weight : ndarray of shape (n_samples,), default=None 
+            Sample weights. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">raw_predictions = raw_predictions.ravel()</span>
+        <span class="s1">diff = y - raw_predictions</span>
+        <span class="s1">alpha = self.alpha</span>
+
+        <span class="s1">mask = y &gt; raw_predictions</span>
+        <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">loss = (</span>
+                <span class="s1">alpha * diff[mask].sum() - (</span><span class="s3">1 </span><span class="s1">- alpha) * diff[~mask].sum()</span>
+            <span class="s1">) / y.shape[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">loss = (</span>
+                <span class="s1">alpha * np.sum(sample_weight[mask] * diff[mask])</span>
+                <span class="s1">- (</span><span class="s3">1 </span><span class="s1">- alpha) * np.sum(sample_weight[~mask] * diff[~mask])</span>
+            <span class="s1">) / sample_weight.sum()</span>
+        <span class="s2">return </span><span class="s1">loss</span>
+
+    <span class="s2">def </span><span class="s1">negative_gradient(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">**kargs):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the negative gradient. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            The target labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble at iteration ``i - 1``. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">alpha = self.alpha</span>
+        <span class="s1">raw_predictions = raw_predictions.ravel()</span>
+        <span class="s1">mask = y &gt; raw_predictions</span>
+        <span class="s2">return </span><span class="s1">(alpha * mask) - ((</span><span class="s3">1 </span><span class="s1">- alpha) * ~mask)</span>
+
+    <span class="s2">def </span><span class="s1">_update_terminal_region(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">tree</span><span class="s2">,</span>
+        <span class="s1">terminal_regions</span><span class="s2">,</span>
+        <span class="s1">leaf</span><span class="s2">,</span>
+        <span class="s1">X</span><span class="s2">,</span>
+        <span class="s1">y</span><span class="s2">,</span>
+        <span class="s1">residual</span><span class="s2">,</span>
+        <span class="s1">raw_predictions</span><span class="s2">,</span>
+        <span class="s1">sample_weight</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s1">terminal_region = np.where(terminal_regions == leaf)[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">diff = y.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">) - raw_predictions.take(</span>
+            <span class="s1">terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span>
+        <span class="s1">)</span>
+        <span class="s1">sample_weight = sample_weight.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+
+        <span class="s1">val = _weighted_percentile(diff</span><span class="s2">, </span><span class="s1">sample_weight</span><span class="s2">, </span><span class="s1">self.percentile)</span>
+        <span class="s1">tree.value[leaf</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = val</span>
+
+
+<span class="s2">class </span><span class="s1">ClassificationLossFunction(LossFunction</span><span class="s2">, </span><span class="s1">metaclass=ABCMeta):</span>
+    <span class="s0">&quot;&quot;&quot;Base class for classification loss functions.&quot;&quot;&quot;</span>
+
+    <span class="s1">@abstractmethod</span>
+    <span class="s2">def </span><span class="s1">_raw_prediction_to_proba(self</span><span class="s2">, </span><span class="s1">raw_predictions):</span>
+        <span class="s0">&quot;&quot;&quot;Template method to convert raw predictions into probabilities. 
+ 
+        Parameters 
+        ---------- 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble. 
+ 
+        Returns 
+        ------- 
+        probas : ndarray of shape (n_samples, K) 
+            The predicted probabilities. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s1">@abstractmethod</span>
+    <span class="s2">def </span><span class="s1">_raw_prediction_to_decision(self</span><span class="s2">, </span><span class="s1">raw_predictions):</span>
+        <span class="s0">&quot;&quot;&quot;Template method to convert raw predictions to decisions. 
+ 
+        Parameters 
+        ---------- 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble. 
+ 
+        Returns 
+        ------- 
+        encoded_predictions : ndarray of shape (n_samples, K) 
+            The predicted encoded labels. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">check_init_estimator(self</span><span class="s2">, </span><span class="s1">estimator):</span>
+        <span class="s0">&quot;&quot;&quot;Make sure estimator has fit and predict_proba methods. 
+ 
+        Parameters 
+        ---------- 
+        estimator : object 
+            The init estimator to check. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">(hasattr(estimator</span><span class="s2">, </span><span class="s5">&quot;fit&quot;</span><span class="s1">) </span><span class="s2">and </span><span class="s1">hasattr(estimator</span><span class="s2">, </span><span class="s5">&quot;predict_proba&quot;</span><span class="s1">)):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;The init parameter must be a valid estimator &quot;</span>
+                <span class="s5">&quot;and support both fit and predict_proba.&quot;</span>
+            <span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">BinomialDeviance(ClassificationLossFunction):</span>
+    <span class="s0">&quot;&quot;&quot;Binomial deviance loss function for binary classification. 
+ 
+    Binary classification is a special case; here, we only need to 
+    fit one tree instead of ``n_classes`` trees. 
+ 
+    Parameters 
+    ---------- 
+    n_classes : int 
+        Number of classes. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">n_classes):</span>
+        <span class="s2">if </span><span class="s1">n_classes != </span><span class="s3">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;{0:s} requires 2 classes; got {1:d} class(es)&quot;</span><span class="s1">.format(</span>
+                    <span class="s1">self.__class__.__name__</span><span class="s2">, </span><span class="s1">n_classes</span>
+                <span class="s1">)</span>
+            <span class="s1">)</span>
+        <span class="s4"># we only need to fit one tree for binary clf.</span>
+        <span class="s1">super().__init__(n_classes=</span><span class="s3">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">init_estimator(self):</span>
+        <span class="s4"># return the most common class, taking into account the samples</span>
+        <span class="s4"># weights</span>
+        <span class="s2">return </span><span class="s1">DummyClassifier(strategy=</span><span class="s5">&quot;prior&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">sample_weight=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the deviance (= 2 * negative log-likelihood). 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            True labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble. 
+ 
+        sample_weight : ndarray of shape (n_samples,), default=None 
+            Sample weights. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># logaddexp(0, v) == log(1.0 + exp(v))</span>
+        <span class="s1">raw_predictions = raw_predictions.ravel()</span>
+        <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">-</span><span class="s3">2 </span><span class="s1">* np.mean(</span>
+                <span class="s1">(y * raw_predictions) - np.logaddexp(</span><span class="s3">0</span><span class="s2">, </span><span class="s1">raw_predictions)</span>
+            <span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(</span>
+                <span class="s1">-</span><span class="s3">2</span>
+                <span class="s1">/ sample_weight.sum()</span>
+                <span class="s1">* np.sum(</span>
+                    <span class="s1">sample_weight</span>
+                    <span class="s1">* ((y * raw_predictions) - np.logaddexp(</span><span class="s3">0</span><span class="s2">, </span><span class="s1">raw_predictions))</span>
+                <span class="s1">)</span>
+            <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">negative_gradient(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">**kargs):</span>
+        <span class="s0">&quot;&quot;&quot;Compute half of the negative gradient. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            True labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble at iteration ``i - 1``. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">y - expit(raw_predictions.ravel())</span>
+
+    <span class="s2">def </span><span class="s1">_update_terminal_region(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">tree</span><span class="s2">,</span>
+        <span class="s1">terminal_regions</span><span class="s2">,</span>
+        <span class="s1">leaf</span><span class="s2">,</span>
+        <span class="s1">X</span><span class="s2">,</span>
+        <span class="s1">y</span><span class="s2">,</span>
+        <span class="s1">residual</span><span class="s2">,</span>
+        <span class="s1">raw_predictions</span><span class="s2">,</span>
+        <span class="s1">sample_weight</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Make a single Newton-Raphson step. 
+ 
+        our node estimate is given by: 
+ 
+            sum(w * (y - prob)) / sum(w * prob * (1 - prob)) 
+ 
+        we take advantage that: y - prob = residual 
+        &quot;&quot;&quot;</span>
+        <span class="s1">terminal_region = np.where(terminal_regions == leaf)[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">residual = residual.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+        <span class="s1">y = y.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+        <span class="s1">sample_weight = sample_weight.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+
+        <span class="s1">numerator = np.sum(sample_weight * residual)</span>
+        <span class="s1">denominator = np.sum(sample_weight * (y - residual) * (</span><span class="s3">1 </span><span class="s1">- y + residual))</span>
+
+        <span class="s4"># prevents overflow and division by zero</span>
+        <span class="s2">if </span><span class="s1">abs(denominator) &lt; </span><span class="s3">1e-150</span><span class="s1">:</span>
+            <span class="s1">tree.value[leaf</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = </span><span class="s3">0.0</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">tree.value[leaf</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = numerator / denominator</span>
+
+    <span class="s2">def </span><span class="s1">_raw_prediction_to_proba(self</span><span class="s2">, </span><span class="s1">raw_predictions):</span>
+        <span class="s1">proba = np.ones((raw_predictions.shape[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s3">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">proba[:</span><span class="s2">, </span><span class="s3">1</span><span class="s1">] = expit(raw_predictions.ravel())</span>
+        <span class="s1">proba[:</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] -= proba[:</span><span class="s2">, </span><span class="s3">1</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">proba</span>
+
+    <span class="s2">def </span><span class="s1">_raw_prediction_to_decision(self</span><span class="s2">, </span><span class="s1">raw_predictions):</span>
+        <span class="s1">proba = self._raw_prediction_to_proba(raw_predictions)</span>
+        <span class="s2">return </span><span class="s1">np.argmax(proba</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">get_init_raw_predictions(self</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">estimator):</span>
+        <span class="s1">probas = estimator.predict_proba(X)</span>
+        <span class="s1">proba_pos_class = probas[:</span><span class="s2">, </span><span class="s3">1</span><span class="s1">]</span>
+        <span class="s1">eps = np.finfo(np.float32).eps</span>
+        <span class="s1">proba_pos_class = np.clip(proba_pos_class</span><span class="s2">, </span><span class="s1">eps</span><span class="s2">, </span><span class="s3">1 </span><span class="s1">- eps)</span>
+        <span class="s4"># log(x / (1 - x)) is the inverse of the sigmoid (expit) function</span>
+        <span class="s1">raw_predictions = np.log(proba_pos_class / (</span><span class="s3">1 </span><span class="s1">- proba_pos_class))</span>
+        <span class="s2">return </span><span class="s1">raw_predictions.reshape(-</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s1">).astype(np.float64)</span>
+
+
+<span class="s2">class </span><span class="s1">MultinomialDeviance(ClassificationLossFunction):</span>
+    <span class="s0">&quot;&quot;&quot;Multinomial deviance loss function for multi-class classification. 
+ 
+    For multi-class classification we need to fit ``n_classes`` trees at 
+    each stage. 
+ 
+    Parameters 
+    ---------- 
+    n_classes : int 
+        Number of classes. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">is_multi_class = </span><span class="s2">True</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">n_classes):</span>
+        <span class="s2">if </span><span class="s1">n_classes &lt; </span><span class="s3">3</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;{0:s} requires more than 2 classes.&quot;</span><span class="s1">.format(self.__class__.__name__)</span>
+            <span class="s1">)</span>
+        <span class="s1">super().__init__(n_classes)</span>
+
+    <span class="s2">def </span><span class="s1">init_estimator(self):</span>
+        <span class="s2">return </span><span class="s1">DummyClassifier(strategy=</span><span class="s5">&quot;prior&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">sample_weight=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the Multinomial deviance. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            True labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble. 
+ 
+        sample_weight : ndarray of shape (n_samples,), default=None 
+            Sample weights. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># create one-hot label encoding</span>
+        <span class="s1">Y = np.zeros((y.shape[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.K)</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range(self.K):</span>
+            <span class="s1">Y[:</span><span class="s2">, </span><span class="s1">k] = y == k</span>
+
+        <span class="s2">return </span><span class="s1">np.average(</span>
+            <span class="s1">-</span><span class="s3">1 </span><span class="s1">* (Y * raw_predictions).sum(axis=</span><span class="s3">1</span><span class="s1">) + logsumexp(raw_predictions</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">1</span><span class="s1">)</span><span class="s2">,</span>
+            <span class="s1">weights=sample_weight</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">negative_gradient(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">k=</span><span class="s3">0</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">&quot;&quot;&quot;Compute negative gradient for the ``k``-th class. 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            The target labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble at iteration ``i - 1``. 
+ 
+        k : int, default=0 
+            The index of the class. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">y - np.nan_to_num(</span>
+            <span class="s1">np.exp(raw_predictions[:</span><span class="s2">, </span><span class="s1">k] - logsumexp(raw_predictions</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">1</span><span class="s1">))</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_update_terminal_region(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">tree</span><span class="s2">,</span>
+        <span class="s1">terminal_regions</span><span class="s2">,</span>
+        <span class="s1">leaf</span><span class="s2">,</span>
+        <span class="s1">X</span><span class="s2">,</span>
+        <span class="s1">y</span><span class="s2">,</span>
+        <span class="s1">residual</span><span class="s2">,</span>
+        <span class="s1">raw_predictions</span><span class="s2">,</span>
+        <span class="s1">sample_weight</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Make a single Newton-Raphson step.&quot;&quot;&quot;</span>
+        <span class="s1">terminal_region = np.where(terminal_regions == leaf)[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">residual = residual.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+        <span class="s1">y = y.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+        <span class="s1">sample_weight = sample_weight.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+
+        <span class="s1">numerator = np.sum(sample_weight * residual)</span>
+        <span class="s1">numerator *= (self.K - </span><span class="s3">1</span><span class="s1">) / self.K</span>
+
+        <span class="s1">denominator = np.sum(sample_weight * (y - residual) * (</span><span class="s3">1 </span><span class="s1">- y + residual))</span>
+
+        <span class="s4"># prevents overflow and division by zero</span>
+        <span class="s2">if </span><span class="s1">abs(denominator) &lt; </span><span class="s3">1e-150</span><span class="s1">:</span>
+            <span class="s1">tree.value[leaf</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = </span><span class="s3">0.0</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">tree.value[leaf</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = numerator / denominator</span>
+
+    <span class="s2">def </span><span class="s1">_raw_prediction_to_proba(self</span><span class="s2">, </span><span class="s1">raw_predictions):</span>
+        <span class="s2">return </span><span class="s1">np.nan_to_num(</span>
+            <span class="s1">np.exp(</span>
+                <span class="s1">raw_predictions - (logsumexp(raw_predictions</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">1</span><span class="s1">)[:</span><span class="s2">, </span><span class="s1">np.newaxis])</span>
+            <span class="s1">)</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_raw_prediction_to_decision(self</span><span class="s2">, </span><span class="s1">raw_predictions):</span>
+        <span class="s1">proba = self._raw_prediction_to_proba(raw_predictions)</span>
+        <span class="s2">return </span><span class="s1">np.argmax(proba</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">get_init_raw_predictions(self</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">estimator):</span>
+        <span class="s1">probas = estimator.predict_proba(X)</span>
+        <span class="s1">eps = np.finfo(np.float32).eps</span>
+        <span class="s1">probas = np.clip(probas</span><span class="s2">, </span><span class="s1">eps</span><span class="s2">, </span><span class="s3">1 </span><span class="s1">- eps)</span>
+        <span class="s1">raw_predictions = np.log(probas).astype(np.float64)</span>
+        <span class="s2">return </span><span class="s1">raw_predictions</span>
+
+
+<span class="s2">class </span><span class="s1">ExponentialLoss(ClassificationLossFunction):</span>
+    <span class="s0">&quot;&quot;&quot;Exponential loss function for binary classification. 
+ 
+    Same loss as AdaBoost. 
+ 
+    Parameters 
+    ---------- 
+    n_classes : int 
+        Number of classes. 
+ 
+    References 
+    ---------- 
+    Greg Ridgeway, Generalized Boosted Models: A guide to the gbm package, 2007 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">n_classes):</span>
+        <span class="s2">if </span><span class="s1">n_classes != </span><span class="s3">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s5">&quot;{0:s} requires 2 classes; got {1:d} class(es)&quot;</span><span class="s1">.format(</span>
+                    <span class="s1">self.__class__.__name__</span><span class="s2">, </span><span class="s1">n_classes</span>
+                <span class="s1">)</span>
+            <span class="s1">)</span>
+        <span class="s4"># we only need to fit one tree for binary clf.</span>
+        <span class="s1">super().__init__(n_classes=</span><span class="s3">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">init_estimator(self):</span>
+        <span class="s2">return </span><span class="s1">DummyClassifier(strategy=</span><span class="s5">&quot;prior&quot;</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">__call__(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">sample_weight=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the exponential loss 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            True labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble. 
+ 
+        sample_weight : ndarray of shape (n_samples,), default=None 
+            Sample weights. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">raw_predictions = raw_predictions.ravel()</span>
+        <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">np.mean(np.exp(-(</span><span class="s3">2.0 </span><span class="s1">* y - </span><span class="s3">1.0</span><span class="s1">) * raw_predictions))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">(</span>
+                <span class="s3">1.0</span>
+                <span class="s1">/ sample_weight.sum()</span>
+                <span class="s1">* np.sum(sample_weight * np.exp(-(</span><span class="s3">2 </span><span class="s1">* y - </span><span class="s3">1</span><span class="s1">) * raw_predictions))</span>
+            <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">negative_gradient(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">raw_predictions</span><span class="s2">, </span><span class="s1">**kargs):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the residual (= negative gradient). 
+ 
+        Parameters 
+        ---------- 
+        y : ndarray of shape (n_samples,) 
+            True labels. 
+ 
+        raw_predictions : ndarray of shape (n_samples, K) 
+            The raw predictions (i.e. values from the tree leaves) of the 
+            tree ensemble at iteration ``i - 1``. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">y_ = </span><span class="s3">2.0 </span><span class="s1">* y - </span><span class="s3">1.0</span>
+        <span class="s2">return </span><span class="s1">y_ * np.exp(-y_ * raw_predictions.ravel())</span>
+
+    <span class="s2">def </span><span class="s1">_update_terminal_region(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">tree</span><span class="s2">,</span>
+        <span class="s1">terminal_regions</span><span class="s2">,</span>
+        <span class="s1">leaf</span><span class="s2">,</span>
+        <span class="s1">X</span><span class="s2">,</span>
+        <span class="s1">y</span><span class="s2">,</span>
+        <span class="s1">residual</span><span class="s2">,</span>
+        <span class="s1">raw_predictions</span><span class="s2">,</span>
+        <span class="s1">sample_weight</span><span class="s2">,</span>
+    <span class="s1">):</span>
+        <span class="s1">terminal_region = np.where(terminal_regions == leaf)[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">raw_predictions = raw_predictions.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+        <span class="s1">y = y.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+        <span class="s1">sample_weight = sample_weight.take(terminal_region</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+
+        <span class="s1">y_ = </span><span class="s3">2.0 </span><span class="s1">* y - </span><span class="s3">1.0</span>
+
+        <span class="s1">numerator = np.sum(y_ * sample_weight * np.exp(-y_ * raw_predictions))</span>
+        <span class="s1">denominator = np.sum(sample_weight * np.exp(-y_ * raw_predictions))</span>
+
+        <span class="s4"># prevents overflow and division by zero</span>
+        <span class="s2">if </span><span class="s1">abs(denominator) &lt; </span><span class="s3">1e-150</span><span class="s1">:</span>
+            <span class="s1">tree.value[leaf</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = </span><span class="s3">0.0</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">tree.value[leaf</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = numerator / denominator</span>
+
+    <span class="s2">def </span><span class="s1">_raw_prediction_to_proba(self</span><span class="s2">, </span><span class="s1">raw_predictions):</span>
+        <span class="s1">proba = np.ones((raw_predictions.shape[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s3">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">dtype=np.float64)</span>
+        <span class="s1">proba[:</span><span class="s2">, </span><span class="s3">1</span><span class="s1">] = expit(</span><span class="s3">2.0 </span><span class="s1">* raw_predictions.ravel())</span>
+        <span class="s1">proba[:</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] -= proba[:</span><span class="s2">, </span><span class="s3">1</span><span class="s1">]</span>
+        <span class="s2">return </span><span class="s1">proba</span>
+
+    <span class="s2">def </span><span class="s1">_raw_prediction_to_decision(self</span><span class="s2">, </span><span class="s1">raw_predictions):</span>
+        <span class="s2">return </span><span class="s1">(raw_predictions.ravel() &gt;= </span><span class="s3">0</span><span class="s1">).astype(int)</span>
+
+    <span class="s2">def </span><span class="s1">get_init_raw_predictions(self</span><span class="s2">, </span><span class="s1">X</span><span class="s2">, </span><span class="s1">estimator):</span>
+        <span class="s1">probas = estimator.predict_proba(X)</span>
+        <span class="s1">proba_pos_class = probas[:</span><span class="s2">, </span><span class="s3">1</span><span class="s1">]</span>
+        <span class="s1">eps = np.finfo(np.float32).eps</span>
+        <span class="s1">proba_pos_class = np.clip(proba_pos_class</span><span class="s2">, </span><span class="s1">eps</span><span class="s2">, </span><span class="s3">1 </span><span class="s1">- eps)</span>
+        <span class="s4"># according to The Elements of Statistical Learning sec. 10.5, the</span>
+        <span class="s4"># minimizer of the exponential loss is .5 * log odds ratio. So this is</span>
+        <span class="s4"># the equivalent to .5 * binomial_deviance.get_init_raw_predictions()</span>
+        <span class="s1">raw_predictions = </span><span class="s3">0.5 </span><span class="s1">* np.log(proba_pos_class / (</span><span class="s3">1 </span><span class="s1">- proba_pos_class))</span>
+        <span class="s2">return </span><span class="s1">raw_predictions.reshape(-</span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s1">).astype(np.float64)</span>
+
+
+<span class="s1">LOSS_FUNCTIONS = {</span>
+    <span class="s5">&quot;squared_error&quot;</span><span class="s1">: LeastSquaresError</span><span class="s2">,</span>
+    <span class="s5">&quot;absolute_error&quot;</span><span class="s1">: LeastAbsoluteError</span><span class="s2">,</span>
+    <span class="s5">&quot;huber&quot;</span><span class="s1">: HuberLossFunction</span><span class="s2">,</span>
+    <span class="s5">&quot;quantile&quot;</span><span class="s1">: QuantileLossFunction</span><span class="s2">,</span>
+    <span class="s5">&quot;log_loss&quot;</span><span class="s1">: </span><span class="s2">None,  </span><span class="s4"># for both, multinomial and binomial</span>
+    <span class="s5">&quot;exponential&quot;</span><span class="s1">: ExponentialLoss</span><span class="s2">,</span>
+<span class="s1">}</span>
+</pre>
+</body>
+</html>

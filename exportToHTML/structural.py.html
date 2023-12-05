@@ -1,0 +1,1833 @@
+<html>
+<head>
+<title>structural.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+structural.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Univariate structural time series models 
+ 
+TODO: tests: &quot;** On entry to DLASCL, parameter number  4 had an illegal value&quot; 
+ 
+Author: Chad Fulton 
+License: Simplified-BSD 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">warnings </span><span class="s2">import </span><span class="s1">warn</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s2">import </span><span class="s1">Appender</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.tools </span><span class="s2">import </span><span class="s1">Bunch</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.sm_exceptions </span><span class="s2">import </span><span class="s1">OutputWarning</span><span class="s2">, </span><span class="s1">SpecificationWarning</span>
+<span class="s2">import </span><span class="s1">statsmodels.base.wrapper </span><span class="s2">as </span><span class="s1">wrap</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.tsa.filters.hp_filter </span><span class="s2">import </span><span class="s1">hpfilter</span>
+<span class="s2">from </span><span class="s1">statsmodels.tsa.tsatools </span><span class="s2">import </span><span class="s1">lagmat</span>
+
+<span class="s2">from </span><span class="s1">.mlemodel </span><span class="s2">import </span><span class="s1">MLEModel</span><span class="s2">, </span><span class="s1">MLEResults</span><span class="s2">, </span><span class="s1">MLEResultsWrapper</span>
+<span class="s2">from </span><span class="s1">.initialization </span><span class="s2">import </span><span class="s1">Initialization</span>
+<span class="s2">from </span><span class="s1">.tools </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">companion_matrix</span><span class="s2">, </span><span class="s1">constrain_stationary_univariate</span><span class="s2">,</span>
+    <span class="s1">unconstrain_stationary_univariate</span><span class="s2">, </span><span class="s1">prepare_exog)</span>
+
+<span class="s1">_mask_map = {</span>
+    <span class="s3">1</span><span class="s1">: </span><span class="s4">'irregular'</span><span class="s2">,</span>
+    <span class="s3">2</span><span class="s1">: </span><span class="s4">'fixed intercept'</span><span class="s2">,</span>
+    <span class="s3">3</span><span class="s1">: </span><span class="s4">'deterministic constant'</span><span class="s2">,</span>
+    <span class="s3">6</span><span class="s1">: </span><span class="s4">'random walk'</span><span class="s2">,</span>
+    <span class="s3">7</span><span class="s1">: </span><span class="s4">'local level'</span><span class="s2">,</span>
+    <span class="s3">8</span><span class="s1">: </span><span class="s4">'fixed slope'</span><span class="s2">,</span>
+    <span class="s3">11</span><span class="s1">: </span><span class="s4">'deterministic trend'</span><span class="s2">,</span>
+    <span class="s3">14</span><span class="s1">: </span><span class="s4">'random walk with drift'</span><span class="s2">,</span>
+    <span class="s3">15</span><span class="s1">: </span><span class="s4">'local linear deterministic trend'</span><span class="s2">,</span>
+    <span class="s3">31</span><span class="s1">: </span><span class="s4">'local linear trend'</span><span class="s2">,</span>
+    <span class="s3">27</span><span class="s1">: </span><span class="s4">'smooth trend'</span><span class="s2">,</span>
+    <span class="s3">26</span><span class="s1">: </span><span class="s4">'random trend'</span>
+<span class="s1">}</span>
+
+
+<span class="s2">class </span><span class="s1">UnobservedComponents(MLEModel):</span>
+    <span class="s4">r&quot;&quot;&quot; 
+    Univariate unobserved components time series model 
+ 
+    These are also known as structural time series models, and decompose a 
+    (univariate) time series into trend, seasonal, cyclical, and irregular 
+    components. 
+ 
+    Parameters 
+    ---------- 
+ 
+    endog : array_like 
+        The observed time-series process :math:`y` 
+    level : {bool, str}, optional 
+        Whether or not to include a level component. Default is False. Can also 
+        be a string specification of the level / trend component; see Notes 
+        for available model specification strings. 
+    trend : bool, optional 
+        Whether or not to include a trend component. Default is False. If True, 
+        `level` must also be True. 
+    seasonal : {int, None}, optional 
+        The period of the seasonal component, if any. Default is None. 
+    freq_seasonal : {list[dict], None}, optional. 
+        Whether (and how) to model seasonal component(s) with trig. functions. 
+        If specified, there is one dictionary for each frequency-domain 
+        seasonal component.  Each dictionary must have the key, value pair for 
+        'period' -- integer and may have a key, value pair for 
+        'harmonics' -- integer. If 'harmonics' is not specified in any of the 
+        dictionaries, it defaults to the floor of period/2. 
+    cycle : bool, optional 
+        Whether or not to include a cycle component. Default is False. 
+    autoregressive : {int, None}, optional 
+        The order of the autoregressive component. Default is None. 
+    exog : {array_like, None}, optional 
+        Exogenous variables. 
+    irregular : bool, optional 
+        Whether or not to include an irregular component. Default is False. 
+    stochastic_level : bool, optional 
+        Whether or not any level component is stochastic. Default is False. 
+    stochastic_trend : bool, optional 
+        Whether or not any trend component is stochastic. Default is False. 
+    stochastic_seasonal : bool, optional 
+        Whether or not any seasonal component is stochastic. Default is True. 
+    stochastic_freq_seasonal : list[bool], optional 
+        Whether or not each seasonal component(s) is (are) stochastic.  Default 
+        is True for each component.  The list should be of the same length as 
+        freq_seasonal. 
+    stochastic_cycle : bool, optional 
+        Whether or not any cycle component is stochastic. Default is False. 
+    damped_cycle : bool, optional 
+        Whether or not the cycle component is damped. Default is False. 
+    cycle_period_bounds : tuple, optional 
+        A tuple with lower and upper allowed bounds for the period of the 
+        cycle. If not provided, the following default bounds are used: 
+        (1) if no date / time information is provided, the frequency is 
+        constrained to be between zero and :math:`\pi`, so the period is 
+        constrained to be in [0.5, infinity]. 
+        (2) If the date / time information is provided, the default bounds 
+        allow the cyclical component to be between 1.5 and 12 years; depending 
+        on the frequency of the endogenous variable, this will imply different 
+        specific bounds. 
+    mle_regression : bool, optional 
+        Whether or not to estimate regression coefficients by maximum likelihood 
+        as one of hyperparameters. Default is True. 
+        If False, the regression coefficients are estimated by recursive OLS, 
+        included in the state vector. 
+    use_exact_diffuse : bool, optional 
+        Whether or not to use exact diffuse initialization for non-stationary 
+        states. Default is False (in which case approximate diffuse 
+        initialization is used). 
+ 
+    See Also 
+    -------- 
+    statsmodels.tsa.statespace.structural.UnobservedComponentsResults 
+    statsmodels.tsa.statespace.mlemodel.MLEModel 
+ 
+    Notes 
+    ----- 
+ 
+    These models take the general form (see [1]_ Chapter 3.2 for all details) 
+ 
+    .. math:: 
+ 
+        y_t = \mu_t + \gamma_t + c_t + \varepsilon_t 
+ 
+    where :math:`y_t` refers to the observation vector at time :math:`t`, 
+    :math:`\mu_t` refers to the trend component, :math:`\gamma_t` refers to the 
+    seasonal component, :math:`c_t` refers to the cycle, and 
+    :math:`\varepsilon_t` is the irregular. The modeling details of these 
+    components are given below. 
+ 
+    **Trend** 
+ 
+    The trend component is a dynamic extension of a regression model that 
+    includes an intercept and linear time-trend. It can be written: 
+ 
+    .. math:: 
+ 
+        \mu_t = \mu_{t-1} + \beta_{t-1} + \eta_{t-1} \\ 
+        \beta_t = \beta_{t-1} + \zeta_{t-1} 
+ 
+    where the level is a generalization of the intercept term that can 
+    dynamically vary across time, and the trend is a generalization of the 
+    time-trend such that the slope can dynamically vary across time. 
+ 
+    Here :math:`\eta_t \sim N(0, \sigma_\eta^2)` and 
+    :math:`\zeta_t \sim N(0, \sigma_\zeta^2)`. 
+ 
+    For both elements (level and trend), we can consider models in which: 
+ 
+    - The element is included vs excluded (if the trend is included, there must 
+      also be a level included). 
+    - The element is deterministic vs stochastic (i.e. whether or not the 
+      variance on the error term is confined to be zero or not) 
+ 
+    The only additional parameters to be estimated via MLE are the variances of 
+    any included stochastic components. 
+ 
+    The level/trend components can be specified using the boolean keyword 
+    arguments `level`, `stochastic_level`, `trend`, etc., or all at once as a 
+    string argument to `level`. The following table shows the available 
+    model specifications: 
+ 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Model name                       | Full string syntax                   | Abbreviated syntax | Model                                            | 
+    +==================================+======================================+====================+==================================================+ 
+    | No trend                         | `'irregular'`                        | `'ntrend'`         | .. math:: y_t = \varepsilon_t                    | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Fixed intercept                  | `'fixed intercept'`                  |                    | .. math:: y_t = \mu                              | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Deterministic constant           | `'deterministic constant'`           | `'dconstant'`      | .. math:: y_t = \mu + \varepsilon_t              | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Local level                      | `'local level'`                      | `'llevel'`         | .. math:: y_t &amp;= \mu_t + \varepsilon_t \\        | 
+    |                                  |                                      |                    |     \mu_t &amp;= \mu_{t-1} + \eta_t                  | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Random walk                      | `'random walk'`                      | `'rwalk'`          | .. math:: y_t &amp;= \mu_t \\                        | 
+    |                                  |                                      |                    |     \mu_t &amp;= \mu_{t-1} + \eta_t                  | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Fixed slope                      | `'fixed slope'`                      |                    | .. math:: y_t &amp;= \mu_t \\                        | 
+    |                                  |                                      |                    |     \mu_t &amp;= \mu_{t-1} + \beta                   | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Deterministic trend              | `'deterministic trend'`              | `'dtrend'`         | .. math:: y_t &amp;= \mu_t + \varepsilon_t \\        | 
+    |                                  |                                      |                    |     \mu_t &amp;= \mu_{t-1} + \beta                   | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Local linear deterministic trend | `'local linear deterministic trend'` | `'lldtrend'`       | .. math:: y_t &amp;= \mu_t + \varepsilon_t \\        | 
+    |                                  |                                      |                    |     \mu_t &amp;= \mu_{t-1} + \beta + \eta_t          | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Random walk with drift           | `'random walk with drift'`           | `'rwdrift'`        | .. math:: y_t &amp;= \mu_t \\                        | 
+    |                                  |                                      |                    |     \mu_t &amp;= \mu_{t-1} + \beta + \eta_t          | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Local linear trend               | `'local linear trend'`               | `'lltrend'`        | .. math:: y_t &amp;= \mu_t + \varepsilon_t \\        | 
+    |                                  |                                      |                    |     \mu_t &amp;= \mu_{t-1} + \beta_{t-1} + \eta_t \\ | 
+    |                                  |                                      |                    |     \beta_t &amp;= \beta_{t-1} + \zeta_t             | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Smooth trend                     | `'smooth trend'`                     | `'strend'`         | .. math:: y_t &amp;= \mu_t + \varepsilon_t \\        | 
+    |                                  |                                      |                    |     \mu_t &amp;= \mu_{t-1} + \beta_{t-1} \\          | 
+    |                                  |                                      |                    |     \beta_t &amp;= \beta_{t-1} + \zeta_t             | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+    | Random trend                     | `'random trend'`                     | `'rtrend'`         | .. math:: y_t &amp;= \mu_t \\                        | 
+    |                                  |                                      |                    |     \mu_t &amp;= \mu_{t-1} + \beta_{t-1} \\          | 
+    |                                  |                                      |                    |     \beta_t &amp;= \beta_{t-1} + \zeta_t             | 
+    +----------------------------------+--------------------------------------+--------------------+--------------------------------------------------+ 
+ 
+    Following the fitting of the model, the unobserved level and trend 
+    component time series are available in the results class in the 
+    `level` and `trend` attributes, respectively. 
+ 
+    **Seasonal (Time-domain)** 
+ 
+    The seasonal component is modeled as: 
+ 
+    .. math:: 
+ 
+        \gamma_t = - \sum_{j=1}^{s-1} \gamma_{t+1-j} + \omega_t \\ 
+        \omega_t \sim N(0, \sigma_\omega^2) 
+ 
+    The periodicity (number of seasons) is s, and the defining character is 
+    that (without the error term), the seasonal components sum to zero across 
+    one complete cycle. The inclusion of an error term allows the seasonal 
+    effects to vary over time (if this is not desired, :math:`\sigma_\omega^2` 
+    can be set to zero using the `stochastic_seasonal=False` keyword argument). 
+ 
+    This component results in one parameter to be selected via maximum 
+    likelihood: :math:`\sigma_\omega^2`, and one parameter to be chosen, the 
+    number of seasons `s`. 
+ 
+    Following the fitting of the model, the unobserved seasonal component 
+    time series is available in the results class in the `seasonal` 
+    attribute. 
+ 
+    **Frequency-domain Seasonal** 
+ 
+    Each frequency-domain seasonal component is modeled as: 
+ 
+    .. math:: 
+ 
+        \gamma_t &amp; =  \sum_{j=1}^h \gamma_{j, t} \\ 
+        \gamma_{j, t+1} &amp; = \gamma_{j, t}\cos(\lambda_j) 
+                        + \gamma^{*}_{j, t}\sin(\lambda_j) + \omega_{j,t} \\ 
+        \gamma^{*}_{j, t+1} &amp; = -\gamma^{(1)}_{j, t}\sin(\lambda_j) 
+                            + \gamma^{*}_{j, t}\cos(\lambda_j) 
+                            + \omega^{*}_{j, t}, \\ 
+        \omega^{*}_{j, t}, \omega_{j, t} &amp; \sim N(0, \sigma_{\omega^2}) \\ 
+        \lambda_j &amp; = \frac{2 \pi j}{s} 
+ 
+    where j ranges from 1 to h. 
+ 
+    The periodicity (number of &quot;seasons&quot; in a &quot;year&quot;) is s and the number of 
+    harmonics is h.  Note that h is configurable to be less than s/2, but 
+    s/2 harmonics is sufficient to fully model all seasonal variations of 
+    periodicity s.  Like the time domain seasonal term (cf. Seasonal section, 
+    above), the inclusion of the error terms allows for the seasonal effects to 
+    vary over time.  The argument stochastic_freq_seasonal can be used to set 
+    one or more of the seasonal components of this type to be non-random, 
+    meaning they will not vary over time. 
+ 
+    This component results in one parameter to be fitted using maximum 
+    likelihood: :math:`\sigma_{\omega^2}`, and up to two parameters to be 
+    chosen, the number of seasons s and optionally the number of harmonics 
+    h, with :math:`1 \leq h \leq \lfloor s/2 \rfloor`. 
+ 
+    After fitting the model, each unobserved seasonal component modeled in the 
+    frequency domain is available in the results class in the `freq_seasonal` 
+    attribute. 
+ 
+    **Cycle** 
+ 
+    The cyclical component is intended to capture cyclical effects at time 
+    frames much longer than captured by the seasonal component. For example, 
+    in economics the cyclical term is often intended to capture the business 
+    cycle, and is then expected to have a period between &quot;1.5 and 12 years&quot; 
+    (see Durbin and Koopman). 
+ 
+    .. math:: 
+ 
+        c_{t+1} &amp; = \rho_c (\tilde c_t \cos \lambda_c t 
+                + \tilde c_t^* \sin \lambda_c) + 
+                \tilde \omega_t \\ 
+        c_{t+1}^* &amp; = \rho_c (- \tilde c_t \sin \lambda_c  t + 
+                \tilde c_t^* \cos \lambda_c) + 
+                \tilde \omega_t^* \\ 
+ 
+    where :math:`\omega_t, \tilde \omega_t iid N(0, \sigma_{\tilde \omega}^2)` 
+ 
+    The parameter :math:`\lambda_c` (the frequency of the cycle) is an 
+    additional parameter to be estimated by MLE. 
+ 
+    If the cyclical effect is stochastic (`stochastic_cycle=True`), then there 
+    is another parameter to estimate (the variance of the error term - note 
+    that both of the error terms here share the same variance, but are assumed 
+    to have independent draws). 
+ 
+    If the cycle is damped (`damped_cycle=True`), then there is a third 
+    parameter to estimate, :math:`\rho_c`. 
+ 
+    In order to achieve cycles with the appropriate frequencies, bounds are 
+    imposed on the parameter :math:`\lambda_c` in estimation. These can be 
+    controlled via the keyword argument `cycle_period_bounds`, which, if 
+    specified, must be a tuple of bounds on the **period** `(lower, upper)`. 
+    The bounds on the frequency are then calculated from those bounds. 
+ 
+    The default bounds, if none are provided, are selected in the following 
+    way: 
+ 
+    1. If no date / time information is provided, the frequency is 
+       constrained to be between zero and :math:`\pi`, so the period is 
+       constrained to be in :math:`[0.5, \infty]`. 
+    2. If the date / time information is provided, the default bounds 
+       allow the cyclical component to be between 1.5 and 12 years; depending 
+       on the frequency of the endogenous variable, this will imply different 
+       specific bounds. 
+ 
+    Following the fitting of the model, the unobserved cyclical component 
+    time series is available in the results class in the `cycle` 
+    attribute. 
+ 
+    **Irregular** 
+ 
+    The irregular components are independent and identically distributed (iid): 
+ 
+    .. math:: 
+ 
+        \varepsilon_t \sim N(0, \sigma_\varepsilon^2) 
+ 
+    **Autoregressive Irregular** 
+ 
+    An autoregressive component (often used as a replacement for the white 
+    noise irregular term) can be specified as: 
+ 
+    .. math:: 
+ 
+        \varepsilon_t = \rho(L) \varepsilon_{t-1} + \epsilon_t \\ 
+        \epsilon_t \sim N(0, \sigma_\epsilon^2) 
+ 
+    In this case, the AR order is specified via the `autoregressive` keyword, 
+    and the autoregressive coefficients are estimated. 
+ 
+    Following the fitting of the model, the unobserved autoregressive component 
+    time series is available in the results class in the `autoregressive` 
+    attribute. 
+ 
+    **Regression effects** 
+ 
+    Exogenous regressors can be pass to the `exog` argument. The regression 
+    coefficients will be estimated by maximum likelihood unless 
+    `mle_regression=False`, in which case the regression coefficients will be 
+    included in the state vector where they are essentially estimated via 
+    recursive OLS. 
+ 
+    If the regression_coefficients are included in the state vector, the 
+    recursive estimates are available in the results class in the 
+    `regression_coefficients` attribute. 
+ 
+    References 
+    ---------- 
+    .. [1] Durbin, James, and Siem Jan Koopman. 2012. 
+       Time Series Analysis by State Space Methods: Second Edition. 
+       Oxford University Press. 
+    &quot;&quot;&quot;  </span><span class="s5"># noqa:E501</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">level=</span><span class="s2">False, </span><span class="s1">trend=</span><span class="s2">False, </span><span class="s1">seasonal=</span><span class="s2">None,</span>
+                 <span class="s1">freq_seasonal=</span><span class="s2">None, </span><span class="s1">cycle=</span><span class="s2">False, </span><span class="s1">autoregressive=</span><span class="s2">None,</span>
+                 <span class="s1">exog=</span><span class="s2">None, </span><span class="s1">irregular=</span><span class="s2">False,</span>
+                 <span class="s1">stochastic_level=</span><span class="s2">False,</span>
+                 <span class="s1">stochastic_trend=</span><span class="s2">False,</span>
+                 <span class="s1">stochastic_seasonal=</span><span class="s2">True,</span>
+                 <span class="s1">stochastic_freq_seasonal=</span><span class="s2">None,</span>
+                 <span class="s1">stochastic_cycle=</span><span class="s2">False,</span>
+                 <span class="s1">damped_cycle=</span><span class="s2">False, </span><span class="s1">cycle_period_bounds=</span><span class="s2">None,</span>
+                 <span class="s1">mle_regression=</span><span class="s2">True, </span><span class="s1">use_exact_diffuse=</span><span class="s2">False,</span>
+                 <span class="s1">**kwargs):</span>
+
+        <span class="s5"># Model options</span>
+        <span class="s1">self.level = level</span>
+        <span class="s1">self.trend = trend</span>
+        <span class="s1">self.seasonal_periods = seasonal </span><span class="s2">if </span><span class="s1">seasonal </span><span class="s2">is not None else </span><span class="s3">0</span>
+        <span class="s1">self.seasonal = self.seasonal_periods &gt; </span><span class="s3">0</span>
+        <span class="s2">if </span><span class="s1">freq_seasonal:</span>
+            <span class="s1">self.freq_seasonal_periods = [d[</span><span class="s4">'period'</span><span class="s1">] </span><span class="s2">for </span><span class="s1">d </span><span class="s2">in </span><span class="s1">freq_seasonal]</span>
+            <span class="s1">self.freq_seasonal_harmonics = [d.get(</span>
+                <span class="s4">'harmonics'</span><span class="s2">, </span><span class="s1">int(np.floor(d[</span><span class="s4">'period'</span><span class="s1">] / </span><span class="s3">2</span><span class="s1">))) </span><span class="s2">for</span>
+                <span class="s1">d </span><span class="s2">in </span><span class="s1">freq_seasonal]</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.freq_seasonal_periods = []</span>
+            <span class="s1">self.freq_seasonal_harmonics = []</span>
+        <span class="s1">self.freq_seasonal = any(x &gt; </span><span class="s3">0 </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self.freq_seasonal_periods)</span>
+        <span class="s1">self.cycle = cycle</span>
+        <span class="s1">self.ar_order = autoregressive </span><span class="s2">if </span><span class="s1">autoregressive </span><span class="s2">is not None else </span><span class="s3">0</span>
+        <span class="s1">self.autoregressive = self.ar_order &gt; </span><span class="s3">0</span>
+        <span class="s1">self.irregular = irregular</span>
+
+        <span class="s1">self.stochastic_level = stochastic_level</span>
+        <span class="s1">self.stochastic_trend = stochastic_trend</span>
+        <span class="s1">self.stochastic_seasonal = stochastic_seasonal</span>
+        <span class="s2">if </span><span class="s1">stochastic_freq_seasonal </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self.stochastic_freq_seasonal = [</span><span class="s2">True</span><span class="s1">] * len(</span>
+                <span class="s1">self.freq_seasonal_periods)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">len(stochastic_freq_seasonal) != len(freq_seasonal):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span>
+                    <span class="s4">&quot;Length of stochastic_freq_seasonal must equal length&quot;</span>
+                    <span class="s4">&quot; of freq_seasonal: {!r} vs {!r}&quot;</span><span class="s1">.format(</span>
+                        <span class="s1">len(stochastic_freq_seasonal)</span><span class="s2">, </span><span class="s1">len(freq_seasonal)))</span>
+            <span class="s1">self.stochastic_freq_seasonal = stochastic_freq_seasonal</span>
+        <span class="s1">self.stochastic_cycle = stochastic_cycle</span>
+
+        <span class="s1">self.damped_cycle = damped_cycle</span>
+        <span class="s1">self.mle_regression = mle_regression</span>
+        <span class="s1">self.use_exact_diffuse = use_exact_diffuse</span>
+
+        <span class="s5"># Check for string trend/level specification</span>
+        <span class="s1">self.trend_specification = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">isinstance(self.level</span><span class="s2">, </span><span class="s1">str):</span>
+            <span class="s1">self.trend_specification = level</span>
+            <span class="s1">self.level = </span><span class="s2">False</span>
+
+            <span class="s5"># Check if any of the trend/level components have been set, and</span>
+            <span class="s5"># reset everything to False</span>
+            <span class="s1">trend_attributes = [</span><span class="s4">'irregular'</span><span class="s2">, </span><span class="s4">'level'</span><span class="s2">, </span><span class="s4">'trend'</span><span class="s2">,</span>
+                                <span class="s4">'stochastic_level'</span><span class="s2">, </span><span class="s4">'stochastic_trend'</span><span class="s1">]</span>
+            <span class="s2">for </span><span class="s1">attribute </span><span class="s2">in </span><span class="s1">trend_attributes:</span>
+                <span class="s2">if not </span><span class="s1">getattr(self</span><span class="s2">, </span><span class="s1">attribute) </span><span class="s2">is False</span><span class="s1">:</span>
+                    <span class="s1">warn(</span><span class="s4">&quot;Value of `%s` may be overridden when the trend&quot;</span>
+                         <span class="s4">&quot; component is specified using a model string.&quot;</span>
+                         <span class="s1">% attribute</span><span class="s2">, </span><span class="s1">SpecificationWarning)</span>
+                    <span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">attribute</span><span class="s2">, False</span><span class="s1">)</span>
+
+            <span class="s5"># Now set the correct specification</span>
+            <span class="s1">spec = self.trend_specification</span>
+            <span class="s2">if </span><span class="s1">spec == </span><span class="s4">'irregular' </span><span class="s2">or </span><span class="s1">spec == </span><span class="s4">'ntrend'</span><span class="s1">:</span>
+                <span class="s1">self.irregular = </span><span class="s2">True</span>
+                <span class="s1">self.trend_specification = </span><span class="s4">'irregular'</span>
+            <span class="s2">elif </span><span class="s1">spec == </span><span class="s4">'fixed intercept'</span><span class="s1">:</span>
+                <span class="s1">self.level = </span><span class="s2">True</span>
+            <span class="s2">elif </span><span class="s1">spec == </span><span class="s4">'deterministic constant' </span><span class="s2">or </span><span class="s1">spec == </span><span class="s4">'dconstant'</span><span class="s1">:</span>
+                <span class="s1">self.irregular = </span><span class="s2">True</span>
+                <span class="s1">self.level = </span><span class="s2">True</span>
+                <span class="s1">self.trend_specification = </span><span class="s4">'deterministic constant'</span>
+            <span class="s2">elif </span><span class="s1">spec == </span><span class="s4">'local level' </span><span class="s2">or </span><span class="s1">spec == </span><span class="s4">'llevel'</span><span class="s1">:</span>
+                <span class="s1">self.irregular = </span><span class="s2">True</span>
+                <span class="s1">self.level = </span><span class="s2">True</span>
+                <span class="s1">self.stochastic_level = </span><span class="s2">True</span>
+                <span class="s1">self.trend_specification = </span><span class="s4">'local level'</span>
+            <span class="s2">elif </span><span class="s1">spec == </span><span class="s4">'random walk' </span><span class="s2">or </span><span class="s1">spec == </span><span class="s4">'rwalk'</span><span class="s1">:</span>
+                <span class="s1">self.level = </span><span class="s2">True</span>
+                <span class="s1">self.stochastic_level = </span><span class="s2">True</span>
+                <span class="s1">self.trend_specification = </span><span class="s4">'random walk'</span>
+            <span class="s2">elif </span><span class="s1">spec == </span><span class="s4">'fixed slope'</span><span class="s1">:</span>
+                <span class="s1">self.level = </span><span class="s2">True</span>
+                <span class="s1">self.trend = </span><span class="s2">True</span>
+            <span class="s2">elif </span><span class="s1">spec == </span><span class="s4">'deterministic trend' </span><span class="s2">or </span><span class="s1">spec == </span><span class="s4">'dtrend'</span><span class="s1">:</span>
+                <span class="s1">self.irregular = </span><span class="s2">True</span>
+                <span class="s1">self.level = </span><span class="s2">True</span>
+                <span class="s1">self.trend = </span><span class="s2">True</span>
+                <span class="s1">self.trend_specification = </span><span class="s4">'deterministic trend'</span>
+            <span class="s2">elif </span><span class="s1">(spec == </span><span class="s4">'local linear deterministic trend' </span><span class="s2">or</span>
+                    <span class="s1">spec == </span><span class="s4">'lldtrend'</span><span class="s1">):</span>
+                <span class="s1">self.irregular = </span><span class="s2">True</span>
+                <span class="s1">self.level = </span><span class="s2">True</span>
+                <span class="s1">self.stochastic_level = </span><span class="s2">True</span>
+                <span class="s1">self.trend = </span><span class="s2">True</span>
+                <span class="s1">self.trend_specification = </span><span class="s4">'local linear deterministic trend'</span>
+            <span class="s2">elif </span><span class="s1">spec == </span><span class="s4">'random walk with drift' </span><span class="s2">or </span><span class="s1">spec == </span><span class="s4">'rwdrift'</span><span class="s1">:</span>
+                <span class="s1">self.level = </span><span class="s2">True</span>
+                <span class="s1">self.stochastic_level = </span><span class="s2">True</span>
+                <span class="s1">self.trend = </span><span class="s2">True</span>
+                <span class="s1">self.trend_specification = </span><span class="s4">'random walk with drift'</span>
+            <span class="s2">elif </span><span class="s1">spec == </span><span class="s4">'local linear trend' </span><span class="s2">or </span><span class="s1">spec == </span><span class="s4">'lltrend'</span><span class="s1">:</span>
+                <span class="s1">self.irregular = </span><span class="s2">True</span>
+                <span class="s1">self.level = </span><span class="s2">True</span>
+                <span class="s1">self.stochastic_level = </span><span class="s2">True</span>
+                <span class="s1">self.trend = </span><span class="s2">True</span>
+                <span class="s1">self.stochastic_trend = </span><span class="s2">True</span>
+                <span class="s1">self.trend_specification = </span><span class="s4">'local linear trend'</span>
+            <span class="s2">elif </span><span class="s1">spec == </span><span class="s4">'smooth trend' </span><span class="s2">or </span><span class="s1">spec == </span><span class="s4">'strend'</span><span class="s1">:</span>
+                <span class="s1">self.irregular = </span><span class="s2">True</span>
+                <span class="s1">self.level = </span><span class="s2">True</span>
+                <span class="s1">self.trend = </span><span class="s2">True</span>
+                <span class="s1">self.stochastic_trend = </span><span class="s2">True</span>
+                <span class="s1">self.trend_specification = </span><span class="s4">'smooth trend'</span>
+            <span class="s2">elif </span><span class="s1">spec == </span><span class="s4">'random trend' </span><span class="s2">or </span><span class="s1">spec == </span><span class="s4">'rtrend'</span><span class="s1">:</span>
+                <span class="s1">self.level = </span><span class="s2">True</span>
+                <span class="s1">self.trend = </span><span class="s2">True</span>
+                <span class="s1">self.stochastic_trend = </span><span class="s2">True</span>
+                <span class="s1">self.trend_specification = </span><span class="s4">'random trend'</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">&quot;Invalid level/trend specification: '%s'&quot;</span>
+                                 <span class="s1">% spec)</span>
+
+        <span class="s5"># Check for a model that makes sense</span>
+        <span class="s2">if </span><span class="s1">trend </span><span class="s2">and not </span><span class="s1">level:</span>
+            <span class="s1">warn(</span><span class="s4">&quot;Trend component specified without level component;&quot;</span>
+                 <span class="s4">&quot; deterministic level component added.&quot;</span><span class="s2">, </span><span class="s1">SpecificationWarning)</span>
+            <span class="s1">self.level = </span><span class="s2">True</span>
+            <span class="s1">self.stochastic_level = </span><span class="s2">False</span>
+
+        <span class="s2">if not </span><span class="s1">(self.irregular </span><span class="s2">or</span>
+                <span class="s1">(self.level </span><span class="s2">and </span><span class="s1">self.stochastic_level) </span><span class="s2">or</span>
+                <span class="s1">(self.trend </span><span class="s2">and </span><span class="s1">self.stochastic_trend) </span><span class="s2">or</span>
+                <span class="s1">(self.seasonal </span><span class="s2">and </span><span class="s1">self.stochastic_seasonal) </span><span class="s2">or</span>
+                <span class="s1">(self.freq_seasonal </span><span class="s2">and </span><span class="s1">any(</span>
+                    <span class="s1">self.stochastic_freq_seasonal)) </span><span class="s2">or</span>
+                <span class="s1">(self.cycle </span><span class="s2">and </span><span class="s1">self.stochastic_cycle) </span><span class="s2">or</span>
+                <span class="s1">self.autoregressive):</span>
+            <span class="s1">warn(</span><span class="s4">&quot;Specified model does not contain a stochastic element;&quot;</span>
+                 <span class="s4">&quot; irregular component added.&quot;</span><span class="s2">, </span><span class="s1">SpecificationWarning)</span>
+            <span class="s1">self.irregular = </span><span class="s2">True</span>
+
+        <span class="s2">if </span><span class="s1">self.seasonal </span><span class="s2">and </span><span class="s1">self.seasonal_periods &lt; </span><span class="s3">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'Seasonal component must have a seasonal period'</span>
+                             <span class="s4">' of at least 2.'</span><span class="s1">)</span>
+
+        <span class="s2">if </span><span class="s1">self.freq_seasonal:</span>
+            <span class="s2">for </span><span class="s1">p </span><span class="s2">in </span><span class="s1">self.freq_seasonal_periods:</span>
+                <span class="s2">if </span><span class="s1">p &lt; </span><span class="s3">2</span><span class="s1">:</span>
+                    <span class="s2">raise </span><span class="s1">ValueError(</span>
+                        <span class="s4">'Frequency Domain seasonal component must have a '</span>
+                        <span class="s4">'seasonal period of at least 2.'</span><span class="s1">)</span>
+
+        <span class="s5"># Create a bitmask holding the level/trend specification</span>
+        <span class="s1">self.trend_mask = (</span>
+            <span class="s1">self.irregular * </span><span class="s3">0x01 </span><span class="s1">|</span>
+            <span class="s1">self.level * </span><span class="s3">0x02 </span><span class="s1">|</span>
+            <span class="s1">self.level * self.stochastic_level * </span><span class="s3">0x04 </span><span class="s1">|</span>
+            <span class="s1">self.trend * </span><span class="s3">0x08 </span><span class="s1">|</span>
+            <span class="s1">self.trend * self.stochastic_trend * </span><span class="s3">0x10</span>
+        <span class="s1">)</span>
+
+        <span class="s5"># Create the trend specification, if it was not given</span>
+        <span class="s2">if </span><span class="s1">self.trend_specification </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s5"># trend specification may be none, e.g. if the model is only</span>
+            <span class="s5"># a stochastic cycle, etc.</span>
+            <span class="s1">self.trend_specification = _mask_map.get(self.trend_mask</span><span class="s2">, None</span><span class="s1">)</span>
+
+        <span class="s5"># Exogenous component</span>
+        <span class="s1">(self.k_exog</span><span class="s2">, </span><span class="s1">exog) = prepare_exog(exog)</span>
+
+        <span class="s1">self.regression = self.k_exog &gt; </span><span class="s3">0</span>
+
+        <span class="s5"># Model parameters</span>
+        <span class="s1">self._k_seasonal_states = (self.seasonal_periods - </span><span class="s3">1</span><span class="s1">) * self.seasonal</span>
+        <span class="s1">self._k_freq_seas_states = (</span>
+            <span class="s1">sum(</span><span class="s3">2 </span><span class="s1">* h </span><span class="s2">for </span><span class="s1">h </span><span class="s2">in </span><span class="s1">self.freq_seasonal_harmonics)</span>
+            <span class="s1">* self.freq_seasonal)</span>
+        <span class="s1">self._k_cycle_states = self.cycle * </span><span class="s3">2</span>
+        <span class="s1">k_states = (</span>
+            <span class="s1">self.level + self.trend +</span>
+            <span class="s1">self._k_seasonal_states +</span>
+            <span class="s1">self._k_freq_seas_states +</span>
+            <span class="s1">self._k_cycle_states +</span>
+            <span class="s1">self.ar_order +</span>
+            <span class="s1">(</span><span class="s2">not </span><span class="s1">self.mle_regression) * self.k_exog</span>
+        <span class="s1">)</span>
+        <span class="s1">k_posdef = (</span>
+            <span class="s1">self.stochastic_level * self.level +</span>
+            <span class="s1">self.stochastic_trend * self.trend +</span>
+            <span class="s1">self.stochastic_seasonal * self.seasonal +</span>
+            <span class="s1">((sum(</span><span class="s3">2 </span><span class="s1">* h </span><span class="s2">if </span><span class="s1">self.stochastic_freq_seasonal[ix] </span><span class="s2">else </span><span class="s3">0 </span><span class="s2">for</span>
+                  <span class="s1">ix</span><span class="s2">, </span><span class="s1">h </span><span class="s2">in </span><span class="s1">enumerate(self.freq_seasonal_harmonics))) *</span>
+             <span class="s1">self.freq_seasonal) +</span>
+            <span class="s1">self.stochastic_cycle * (self._k_cycle_states) +</span>
+            <span class="s1">self.autoregressive</span>
+        <span class="s1">)</span>
+
+        <span class="s5"># Handle non-default loglikelihood burn</span>
+        <span class="s1">self._loglikelihood_burn = kwargs.get(</span><span class="s4">'loglikelihood_burn'</span><span class="s2">, None</span><span class="s1">)</span>
+
+        <span class="s5"># We can still estimate the model with just the irregular component,</span>
+        <span class="s5"># just need to have one state that does nothing.</span>
+        <span class="s1">self._unused_state = </span><span class="s2">False</span>
+        <span class="s2">if </span><span class="s1">k_states == </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s2">if not </span><span class="s1">self.irregular:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'Model has no components specified.'</span><span class="s1">)</span>
+            <span class="s1">k_states = </span><span class="s3">1</span>
+            <span class="s1">self._unused_state = </span><span class="s2">True</span>
+        <span class="s2">if </span><span class="s1">k_posdef == </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s1">k_posdef = </span><span class="s3">1</span>
+
+        <span class="s5"># Setup the representation</span>
+        <span class="s1">super(UnobservedComponents</span><span class="s2">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">endog</span><span class="s2">, </span><span class="s1">k_states</span><span class="s2">, </span><span class="s1">k_posdef=k_posdef</span><span class="s2">, </span><span class="s1">exog=exog</span><span class="s2">, </span><span class="s1">**kwargs</span>
+        <span class="s1">)</span>
+        <span class="s1">self.setup()</span>
+
+        <span class="s5"># Set as time-varying model if we have exog</span>
+        <span class="s2">if </span><span class="s1">self.k_exog &gt; </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s1">self.ssm._time_invariant = </span><span class="s2">False</span>
+
+        <span class="s5"># Need to reset the MLE names (since when they were first set, `setup`</span>
+        <span class="s5"># had not been run (and could not have been at that point))</span>
+        <span class="s1">self.data.param_names = self.param_names</span>
+
+        <span class="s5"># Get bounds for the frequency of the cycle, if we know the frequency</span>
+        <span class="s5"># of the data.</span>
+        <span class="s2">if </span><span class="s1">cycle_period_bounds </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">freq = self.data.freq[</span><span class="s3">0</span><span class="s1">] </span><span class="s2">if </span><span class="s1">self.data.freq </span><span class="s2">is not None else </span><span class="s4">''</span>
+            <span class="s2">if </span><span class="s1">freq == </span><span class="s4">'A'</span><span class="s1">:</span>
+                <span class="s1">cycle_period_bounds = (</span><span class="s3">1.5</span><span class="s2">, </span><span class="s3">12</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">freq == </span><span class="s4">'Q'</span><span class="s1">:</span>
+                <span class="s1">cycle_period_bounds = (</span><span class="s3">1.5</span><span class="s1">*</span><span class="s3">4</span><span class="s2">, </span><span class="s3">12</span><span class="s1">*</span><span class="s3">4</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">freq == </span><span class="s4">'M'</span><span class="s1">:</span>
+                <span class="s1">cycle_period_bounds = (</span><span class="s3">1.5</span><span class="s1">*</span><span class="s3">12</span><span class="s2">, </span><span class="s3">12</span><span class="s1">*</span><span class="s3">12</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s5"># If we have no information on data frequency, require the</span>
+                <span class="s5"># cycle frequency to be between 0 and pi</span>
+                <span class="s1">cycle_period_bounds = (</span><span class="s3">2</span><span class="s2">, </span><span class="s1">np.inf)</span>
+
+        <span class="s1">self.cycle_frequency_bound = (</span>
+            <span class="s3">2</span><span class="s1">*np.pi / cycle_period_bounds[</span><span class="s3">1</span><span class="s1">]</span><span class="s2">, </span><span class="s3">2</span><span class="s1">*np.pi / cycle_period_bounds[</span><span class="s3">0</span><span class="s1">]</span>
+        <span class="s1">)</span>
+
+        <span class="s5"># Update _init_keys attached by super</span>
+        <span class="s1">self._init_keys += [</span><span class="s4">'level'</span><span class="s2">, </span><span class="s4">'trend'</span><span class="s2">, </span><span class="s4">'seasonal'</span><span class="s2">, </span><span class="s4">'freq_seasonal'</span><span class="s2">,</span>
+                            <span class="s4">'cycle'</span><span class="s2">, </span><span class="s4">'autoregressive'</span><span class="s2">, </span><span class="s4">'irregular'</span><span class="s2">,</span>
+                            <span class="s4">'stochastic_level'</span><span class="s2">, </span><span class="s4">'stochastic_trend'</span><span class="s2">,</span>
+                            <span class="s4">'stochastic_seasonal'</span><span class="s2">, </span><span class="s4">'stochastic_freq_seasonal'</span><span class="s2">,</span>
+                            <span class="s4">'stochastic_cycle'</span><span class="s2">,</span>
+                            <span class="s4">'damped_cycle'</span><span class="s2">, </span><span class="s4">'cycle_period_bounds'</span><span class="s2">,</span>
+                            <span class="s4">'mle_regression'</span><span class="s1">] + list(kwargs.keys())</span>
+
+        <span class="s5"># Initialize the state</span>
+        <span class="s1">self.initialize_default()</span>
+
+    <span class="s2">def </span><span class="s1">_get_init_kwds(self):</span>
+        <span class="s5"># Get keywords based on model attributes</span>
+        <span class="s1">kwds = super(UnobservedComponents</span><span class="s2">, </span><span class="s1">self)._get_init_kwds()</span>
+
+        <span class="s5"># Modifications</span>
+        <span class="s2">if </span><span class="s1">self.trend_specification </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">kwds[</span><span class="s4">'level'</span><span class="s1">] = self.trend_specification</span>
+
+            <span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">[</span><span class="s4">'irregular'</span><span class="s2">, </span><span class="s4">'trend'</span><span class="s2">, </span><span class="s4">'stochastic_level'</span><span class="s2">,</span>
+                         <span class="s4">'stochastic_trend'</span><span class="s1">]:</span>
+                <span class="s1">kwds[attr] = </span><span class="s2">False</span>
+
+        <span class="s1">kwds[</span><span class="s4">'seasonal'</span><span class="s1">] = self.seasonal_periods</span>
+        <span class="s1">kwds[</span><span class="s4">'freq_seasonal'</span><span class="s1">] = [</span>
+            <span class="s1">{</span><span class="s4">'period'</span><span class="s1">: p</span><span class="s2">,</span>
+             <span class="s4">'harmonics'</span><span class="s1">: self.freq_seasonal_harmonics[ix]} </span><span class="s2">for</span>
+            <span class="s1">ix</span><span class="s2">, </span><span class="s1">p </span><span class="s2">in </span><span class="s1">enumerate(self.freq_seasonal_periods)]</span>
+        <span class="s1">kwds[</span><span class="s4">'autoregressive'</span><span class="s1">] = self.ar_order</span>
+
+        <span class="s2">return </span><span class="s1">kwds</span>
+
+    <span class="s2">def </span><span class="s1">setup(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Setup the structural time series representation 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># Initialize the ordered sets of parameters</span>
+        <span class="s1">self.parameters = {}</span>
+        <span class="s1">self.parameters_obs_intercept = {}</span>
+        <span class="s1">self.parameters_obs_cov = {}</span>
+        <span class="s1">self.parameters_transition = {}</span>
+        <span class="s1">self.parameters_state_cov = {}</span>
+
+        <span class="s5"># Initialize the fixed components of the state space matrices,</span>
+        <span class="s1">i = </span><span class="s3">0  </span><span class="s5"># state offset</span>
+        <span class="s1">j = </span><span class="s3">0  </span><span class="s5"># state covariance offset</span>
+
+        <span class="s2">if </span><span class="s1">self.irregular:</span>
+            <span class="s1">self.parameters_obs_cov[</span><span class="s4">'irregular_var'</span><span class="s1">] = </span><span class="s3">1</span>
+        <span class="s2">if </span><span class="s1">self.level:</span>
+            <span class="s1">self.ssm[</span><span class="s4">'design'</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s1">i] = </span><span class="s3">1.</span>
+            <span class="s1">self.ssm[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">i] = </span><span class="s3">1.</span>
+            <span class="s2">if </span><span class="s1">self.trend:</span>
+                <span class="s1">self.ssm[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">i+</span><span class="s3">1</span><span class="s1">] = </span><span class="s3">1.</span>
+            <span class="s2">if </span><span class="s1">self.stochastic_level:</span>
+                <span class="s1">self.ssm[</span><span class="s4">'selection'</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">j] = </span><span class="s3">1.</span>
+                <span class="s1">self.parameters_state_cov[</span><span class="s4">'level_var'</span><span class="s1">] = </span><span class="s3">1</span>
+                <span class="s1">j += </span><span class="s3">1</span>
+            <span class="s1">i += </span><span class="s3">1</span>
+        <span class="s2">if </span><span class="s1">self.trend:</span>
+            <span class="s1">self.ssm[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">i] = </span><span class="s3">1.</span>
+            <span class="s2">if </span><span class="s1">self.stochastic_trend:</span>
+                <span class="s1">self.ssm[</span><span class="s4">'selection'</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">j] = </span><span class="s3">1.</span>
+                <span class="s1">self.parameters_state_cov[</span><span class="s4">'trend_var'</span><span class="s1">] = </span><span class="s3">1</span>
+                <span class="s1">j += </span><span class="s3">1</span>
+            <span class="s1">i += </span><span class="s3">1</span>
+        <span class="s2">if </span><span class="s1">self.seasonal:</span>
+            <span class="s1">n = self.seasonal_periods - </span><span class="s3">1</span>
+            <span class="s1">self.ssm[</span><span class="s4">'design'</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s1">i] = </span><span class="s3">1.</span>
+            <span class="s1">self.ssm[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">i:i + n</span><span class="s2">, </span><span class="s1">i:i + n] = (</span>
+                <span class="s1">companion_matrix(np.r_[</span><span class="s3">1</span><span class="s2">, </span><span class="s1">[</span><span class="s3">1</span><span class="s1">] * n]).transpose()</span>
+            <span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">self.stochastic_seasonal:</span>
+                <span class="s1">self.ssm[</span><span class="s4">'selection'</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">j] = </span><span class="s3">1.</span>
+                <span class="s1">self.parameters_state_cov[</span><span class="s4">'seasonal_var'</span><span class="s1">] = </span><span class="s3">1</span>
+                <span class="s1">j += </span><span class="s3">1</span>
+            <span class="s1">i += n</span>
+        <span class="s2">if </span><span class="s1">self.freq_seasonal:</span>
+            <span class="s2">for </span><span class="s1">ix</span><span class="s2">, </span><span class="s1">h </span><span class="s2">in </span><span class="s1">enumerate(self.freq_seasonal_harmonics):</span>
+                <span class="s5"># These are the \gamma_jt and \gamma^*_jt terms in D&amp;K (3.8)</span>
+                <span class="s1">n = </span><span class="s3">2 </span><span class="s1">* h</span>
+                <span class="s1">p = self.freq_seasonal_periods[ix]</span>
+                <span class="s1">lambda_p = </span><span class="s3">2 </span><span class="s1">* np.pi / float(p)</span>
+
+                <span class="s1">t = </span><span class="s3">0  </span><span class="s5"># frequency transition matrix offset</span>
+                <span class="s2">for </span><span class="s1">block </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">h + </span><span class="s3">1</span><span class="s1">):</span>
+                    <span class="s5"># ibid. eqn (3.7)</span>
+                    <span class="s1">self.ssm[</span><span class="s4">'design'</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s1">i+t] = </span><span class="s3">1.</span>
+
+                    <span class="s5"># ibid. eqn (3.8)</span>
+                    <span class="s1">cos_lambda_block = np.cos(lambda_p * block)</span>
+                    <span class="s1">sin_lambda_block = np.sin(lambda_p * block)</span>
+                    <span class="s1">trans = np.array([[cos_lambda_block</span><span class="s2">, </span><span class="s1">sin_lambda_block]</span><span class="s2">,</span>
+                                      <span class="s1">[-sin_lambda_block</span><span class="s2">, </span><span class="s1">cos_lambda_block]])</span>
+                    <span class="s1">trans_s = np.s_[i + t:i + t + </span><span class="s3">2</span><span class="s1">]</span>
+                    <span class="s1">self.ssm[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">trans_s</span><span class="s2">, </span><span class="s1">trans_s] = trans</span>
+                    <span class="s1">t += </span><span class="s3">2</span>
+
+                <span class="s2">if </span><span class="s1">self.stochastic_freq_seasonal[ix]:</span>
+                    <span class="s1">self.ssm[</span><span class="s4">'selection'</span><span class="s2">, </span><span class="s1">i:i + n</span><span class="s2">, </span><span class="s1">j:j + n] = np.eye(n)</span>
+                    <span class="s1">cov_key = </span><span class="s4">'freq_seasonal_var_{!r}'</span><span class="s1">.format(ix)</span>
+                    <span class="s1">self.parameters_state_cov[cov_key] = </span><span class="s3">1</span>
+                    <span class="s1">j += n</span>
+                <span class="s1">i += n</span>
+        <span class="s2">if </span><span class="s1">self.cycle:</span>
+            <span class="s1">self.ssm[</span><span class="s4">'design'</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s1">i] = </span><span class="s3">1.</span>
+            <span class="s1">self.parameters_transition[</span><span class="s4">'cycle_freq'</span><span class="s1">] = </span><span class="s3">1</span>
+            <span class="s2">if </span><span class="s1">self.damped_cycle:</span>
+                <span class="s1">self.parameters_transition[</span><span class="s4">'cycle_damp'</span><span class="s1">] = </span><span class="s3">1</span>
+            <span class="s2">if </span><span class="s1">self.stochastic_cycle:</span>
+                <span class="s1">self.ssm[</span><span class="s4">'selection'</span><span class="s2">, </span><span class="s1">i:i+</span><span class="s3">2</span><span class="s2">, </span><span class="s1">j:j+</span><span class="s3">2</span><span class="s1">] = np.eye(</span><span class="s3">2</span><span class="s1">)</span>
+                <span class="s1">self.parameters_state_cov[</span><span class="s4">'cycle_var'</span><span class="s1">] = </span><span class="s3">1</span>
+                <span class="s1">j += </span><span class="s3">2</span>
+            <span class="s1">self._idx_cycle_transition = np.s_[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">i:i+</span><span class="s3">2</span><span class="s2">, </span><span class="s1">i:i+</span><span class="s3">2</span><span class="s1">]</span>
+            <span class="s1">i += </span><span class="s3">2</span>
+        <span class="s2">if </span><span class="s1">self.autoregressive:</span>
+            <span class="s1">self.ssm[</span><span class="s4">'design'</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s1">i] = </span><span class="s3">1.</span>
+            <span class="s1">self.parameters_transition[</span><span class="s4">'ar_coeff'</span><span class="s1">] = self.ar_order</span>
+            <span class="s1">self.parameters_state_cov[</span><span class="s4">'ar_var'</span><span class="s1">] = </span><span class="s3">1</span>
+            <span class="s1">self.ssm[</span><span class="s4">'selection'</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">j] = </span><span class="s3">1</span>
+            <span class="s1">self.ssm[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">i:i+self.ar_order</span><span class="s2">, </span><span class="s1">i:i+self.ar_order] = (</span>
+                <span class="s1">companion_matrix(self.ar_order).T</span>
+            <span class="s1">)</span>
+            <span class="s1">self._idx_ar_transition = (</span>
+                <span class="s1">np.s_[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">i</span><span class="s2">, </span><span class="s1">i:i+self.ar_order]</span>
+            <span class="s1">)</span>
+            <span class="s1">j += </span><span class="s3">1</span>
+            <span class="s1">i += self.ar_order</span>
+        <span class="s2">if </span><span class="s1">self.regression:</span>
+            <span class="s2">if </span><span class="s1">self.mle_regression:</span>
+                <span class="s1">self.parameters_obs_intercept[</span><span class="s4">'reg_coeff'</span><span class="s1">] = self.k_exog</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">design = np.repeat(self.ssm[</span><span class="s4">'design'</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">self.nobs</span><span class="s2">,</span>
+                                   <span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+                <span class="s1">self.ssm[</span><span class="s4">'design'</span><span class="s1">] = design.transpose()[np.newaxis</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:]</span>
+                <span class="s1">self.ssm[</span><span class="s4">'design'</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s1">i:i+self.k_exog</span><span class="s2">, </span><span class="s1">:] = (</span>
+                    <span class="s1">self.exog.transpose())</span>
+                <span class="s1">self.ssm[</span><span class="s4">'transition'</span><span class="s2">, </span><span class="s1">i:i+self.k_exog</span><span class="s2">, </span><span class="s1">i:i+self.k_exog] = (</span>
+                    <span class="s1">np.eye(self.k_exog)</span>
+                <span class="s1">)</span>
+
+                <span class="s1">i += self.k_exog</span>
+
+        <span class="s5"># Update to get the actual parameter set</span>
+        <span class="s1">self.parameters.update(self.parameters_obs_cov)</span>
+        <span class="s1">self.parameters.update(self.parameters_state_cov)</span>
+        <span class="s1">self.parameters.update(self.parameters_transition)  </span><span class="s5"># ordered last</span>
+        <span class="s1">self.parameters.update(self.parameters_obs_intercept)</span>
+
+        <span class="s1">self.k_obs_intercept = sum(self.parameters_obs_intercept.values())</span>
+        <span class="s1">self.k_obs_cov = sum(self.parameters_obs_cov.values())</span>
+        <span class="s1">self.k_transition = sum(self.parameters_transition.values())</span>
+        <span class="s1">self.k_state_cov = sum(self.parameters_state_cov.values())</span>
+        <span class="s1">self.k_params = sum(self.parameters.values())</span>
+
+        <span class="s5"># Other indices</span>
+        <span class="s1">idx = np.diag_indices(self.ssm.k_posdef)</span>
+        <span class="s1">self._idx_state_cov = (</span><span class="s4">'state_cov'</span><span class="s2">, </span><span class="s1">idx[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">idx[</span><span class="s3">1</span><span class="s1">])</span>
+
+        <span class="s5"># Some of the variances may be tied together (repeated parameter usage)</span>
+        <span class="s5"># Use list() for compatibility with python 3.5</span>
+        <span class="s1">param_keys = list(self.parameters_state_cov.keys())</span>
+        <span class="s1">self._var_repetitions = np.ones(self.k_state_cov</span><span class="s2">, </span><span class="s1">dtype=int)</span>
+        <span class="s2">if </span><span class="s1">self.freq_seasonal:</span>
+            <span class="s2">for </span><span class="s1">ix</span><span class="s2">, </span><span class="s1">is_stochastic </span><span class="s2">in </span><span class="s1">enumerate(self.stochastic_freq_seasonal):</span>
+                <span class="s2">if </span><span class="s1">is_stochastic:</span>
+                    <span class="s1">num_harmonics = self.freq_seasonal_harmonics[ix]</span>
+                    <span class="s1">repeat_times = </span><span class="s3">2 </span><span class="s1">* num_harmonics</span>
+                    <span class="s1">cov_key = </span><span class="s4">'freq_seasonal_var_{!r}'</span><span class="s1">.format(ix)</span>
+                    <span class="s1">cov_ix = param_keys.index(cov_key)</span>
+                    <span class="s1">self._var_repetitions[cov_ix] = repeat_times</span>
+
+        <span class="s2">if </span><span class="s1">self.stochastic_cycle </span><span class="s2">and </span><span class="s1">self.cycle:</span>
+            <span class="s1">cov_ix = param_keys.index(</span><span class="s4">'cycle_var'</span><span class="s1">)</span>
+            <span class="s1">self._var_repetitions[cov_ix] = </span><span class="s3">2</span>
+        <span class="s1">self._repeat_any_var = any(self._var_repetitions &gt; </span><span class="s3">1</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">initialize_default(self</span><span class="s2">, </span><span class="s1">approximate_diffuse_variance=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">approximate_diffuse_variance </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">approximate_diffuse_variance = self.ssm.initial_variance</span>
+        <span class="s2">if </span><span class="s1">self.use_exact_diffuse:</span>
+            <span class="s1">diffuse_type = </span><span class="s4">'diffuse'</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">diffuse_type = </span><span class="s4">'approximate_diffuse'</span>
+
+            <span class="s5"># Set the loglikelihood burn parameter, if not given in constructor</span>
+            <span class="s2">if </span><span class="s1">self._loglikelihood_burn </span><span class="s2">is None</span><span class="s1">:</span>
+                <span class="s1">k_diffuse_states = (</span>
+                    <span class="s1">self.k_states - int(self._unused_state) - self.ar_order)</span>
+                <span class="s1">self.loglikelihood_burn = k_diffuse_states</span>
+
+        <span class="s1">init = Initialization(</span>
+            <span class="s1">self.k_states</span><span class="s2">,</span>
+            <span class="s1">approximate_diffuse_variance=approximate_diffuse_variance)</span>
+
+        <span class="s2">if </span><span class="s1">self._unused_state:</span>
+            <span class="s5"># If this flag is set, it means we have a model with just an</span>
+            <span class="s5"># irregular component and nothing else. The state is then</span>
+            <span class="s5"># irrelevant and we can't put it as diffuse, since then the filter</span>
+            <span class="s5"># will never leave the diffuse state.</span>
+            <span class="s1">init.set(</span><span class="s3">0</span><span class="s2">, </span><span class="s4">'known'</span><span class="s2">, </span><span class="s1">constant=[</span><span class="s3">0</span><span class="s1">])</span>
+        <span class="s2">elif </span><span class="s1">self.autoregressive:</span>
+            <span class="s1">offset = (self.level + self.trend +</span>
+                      <span class="s1">self._k_seasonal_states +</span>
+                      <span class="s1">self._k_freq_seas_states +</span>
+                      <span class="s1">self._k_cycle_states)</span>
+            <span class="s1">length = self.ar_order</span>
+            <span class="s1">init.set((</span><span class="s3">0</span><span class="s2">, </span><span class="s1">offset)</span><span class="s2">, </span><span class="s1">diffuse_type)</span>
+            <span class="s1">init.set((offset</span><span class="s2">, </span><span class="s1">offset + length)</span><span class="s2">, </span><span class="s4">'stationary'</span><span class="s1">)</span>
+            <span class="s1">init.set((offset + length</span><span class="s2">, </span><span class="s1">self.k_states)</span><span class="s2">, </span><span class="s1">diffuse_type)</span>
+        <span class="s5"># If we do not have an autoregressive component, then everything has</span>
+        <span class="s5"># a diffuse initialization</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">init.set(</span><span class="s2">None, </span><span class="s1">diffuse_type)</span>
+
+        <span class="s1">self.ssm.initialization = init</span>
+
+    <span class="s2">def </span><span class="s1">clone(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s2">return </span><span class="s1">self._clone_from_init_kwds(endog</span><span class="s2">, </span><span class="s1">exog=exog</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">_res_classes(self):</span>
+        <span class="s2">return </span><span class="s1">{</span><span class="s4">'fit'</span><span class="s1">: (UnobservedComponentsResults</span><span class="s2">,</span>
+                        <span class="s1">UnobservedComponentsResultsWrapper)}</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">start_params(self):</span>
+        <span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">'parameters'</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s1">[]</span>
+
+        <span class="s5"># Eliminate missing data to estimate starting parameters</span>
+        <span class="s1">endog = self.endog</span>
+        <span class="s1">exog = self.exog</span>
+        <span class="s2">if </span><span class="s1">np.any(np.isnan(endog)):</span>
+            <span class="s1">mask = ~np.isnan(endog).squeeze()</span>
+            <span class="s1">endog = endog[mask]</span>
+            <span class="s2">if </span><span class="s1">exog </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">exog = exog[mask]</span>
+
+        <span class="s5"># Level / trend variances</span>
+        <span class="s5"># (Use the HP filter to get initial estimates of variances)</span>
+        <span class="s1">_start_params = {}</span>
+        <span class="s2">if </span><span class="s1">self.level:</span>
+            <span class="s1">resid</span><span class="s2">, </span><span class="s1">trend1 = hpfilter(endog)</span>
+
+            <span class="s2">if </span><span class="s1">self.stochastic_trend:</span>
+                <span class="s1">cycle2</span><span class="s2">, </span><span class="s1">trend2 = hpfilter(trend1)</span>
+                <span class="s1">_start_params[</span><span class="s4">'trend_var'</span><span class="s1">] = np.std(trend2)**</span><span class="s3">2</span>
+                <span class="s2">if </span><span class="s1">self.stochastic_level:</span>
+                    <span class="s1">_start_params[</span><span class="s4">'level_var'</span><span class="s1">] = np.std(cycle2)**</span><span class="s3">2</span>
+            <span class="s2">elif </span><span class="s1">self.stochastic_level:</span>
+                <span class="s1">_start_params[</span><span class="s4">'level_var'</span><span class="s1">] = np.std(trend1)**</span><span class="s3">2</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">resid = self.ssm.endog[</span><span class="s3">0</span><span class="s1">]</span>
+
+        <span class="s5"># Regression</span>
+        <span class="s2">if </span><span class="s1">self.regression </span><span class="s2">and </span><span class="s1">self.mle_regression:</span>
+            <span class="s1">_start_params[</span><span class="s4">'reg_coeff'</span><span class="s1">] = (</span>
+                <span class="s1">np.linalg.pinv(exog).dot(resid).tolist()</span>
+            <span class="s1">)</span>
+            <span class="s1">resid = np.squeeze(</span>
+                <span class="s1">resid - np.dot(exog</span><span class="s2">, </span><span class="s1">_start_params[</span><span class="s4">'reg_coeff'</span><span class="s1">])</span>
+            <span class="s1">)</span>
+
+        <span class="s5"># Autoregressive</span>
+        <span class="s2">if </span><span class="s1">self.autoregressive:</span>
+            <span class="s1">Y = resid[self.ar_order:]</span>
+            <span class="s1">X = lagmat(resid</span><span class="s2">, </span><span class="s1">self.ar_order</span><span class="s2">, </span><span class="s1">trim=</span><span class="s4">'both'</span><span class="s1">)</span>
+            <span class="s1">_start_params[</span><span class="s4">'ar_coeff'</span><span class="s1">] = np.linalg.pinv(X).dot(Y).tolist()</span>
+            <span class="s1">resid = np.squeeze(Y - np.dot(X</span><span class="s2">, </span><span class="s1">_start_params[</span><span class="s4">'ar_coeff'</span><span class="s1">]))</span>
+            <span class="s1">_start_params[</span><span class="s4">'ar_var'</span><span class="s1">] = np.var(resid)</span>
+
+        <span class="s5"># The variance of the residual term can be used for all variances,</span>
+        <span class="s5"># just to get something in the right order of magnitude.</span>
+        <span class="s1">var_resid = np.var(resid)</span>
+
+        <span class="s5"># Seasonal</span>
+        <span class="s2">if </span><span class="s1">self.stochastic_seasonal:</span>
+            <span class="s1">_start_params[</span><span class="s4">'seasonal_var'</span><span class="s1">] = var_resid</span>
+
+        <span class="s5"># Frequency domain seasonal</span>
+        <span class="s2">for </span><span class="s1">ix</span><span class="s2">, </span><span class="s1">is_stochastic </span><span class="s2">in </span><span class="s1">enumerate(self.stochastic_freq_seasonal):</span>
+            <span class="s1">cov_key = </span><span class="s4">'freq_seasonal_var_{!r}'</span><span class="s1">.format(ix)</span>
+            <span class="s1">_start_params[cov_key] = var_resid</span>
+
+        <span class="s5"># Cyclical</span>
+        <span class="s2">if </span><span class="s1">self.cycle:</span>
+            <span class="s1">_start_params[</span><span class="s4">'cycle_var'</span><span class="s1">] = var_resid</span>
+            <span class="s5"># Clip this to make sure it is positive and strictly stationary</span>
+            <span class="s5"># (i.e. do not want negative or 1)</span>
+            <span class="s1">_start_params[</span><span class="s4">'cycle_damp'</span><span class="s1">] = np.clip(</span>
+                <span class="s1">np.linalg.pinv(resid[:-</span><span class="s3">1</span><span class="s2">, None</span><span class="s1">]).dot(resid[</span><span class="s3">1</span><span class="s1">:])[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0.99</span>
+            <span class="s1">)</span>
+
+            <span class="s5"># Set initial period estimate to 3 year, if we know the frequency</span>
+            <span class="s5"># of the data observations</span>
+            <span class="s1">freq = self.data.freq[</span><span class="s3">0</span><span class="s1">] </span><span class="s2">if </span><span class="s1">self.data.freq </span><span class="s2">is not None else </span><span class="s4">''</span>
+            <span class="s2">if </span><span class="s1">freq == </span><span class="s4">'A'</span><span class="s1">:</span>
+                <span class="s1">_start_params[</span><span class="s4">'cycle_freq'</span><span class="s1">] = </span><span class="s3">2 </span><span class="s1">* np.pi / </span><span class="s3">3</span>
+            <span class="s2">elif </span><span class="s1">freq == </span><span class="s4">'Q'</span><span class="s1">:</span>
+                <span class="s1">_start_params[</span><span class="s4">'cycle_freq'</span><span class="s1">] = </span><span class="s3">2 </span><span class="s1">* np.pi / </span><span class="s3">12</span>
+            <span class="s2">elif </span><span class="s1">freq == </span><span class="s4">'M'</span><span class="s1">:</span>
+                <span class="s1">_start_params[</span><span class="s4">'cycle_freq'</span><span class="s1">] = </span><span class="s3">2 </span><span class="s1">* np.pi / </span><span class="s3">36</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">if not </span><span class="s1">np.any(np.isinf(self.cycle_frequency_bound)):</span>
+                    <span class="s1">_start_params[</span><span class="s4">'cycle_freq'</span><span class="s1">] = (</span>
+                        <span class="s1">np.mean(self.cycle_frequency_bound))</span>
+                <span class="s2">elif </span><span class="s1">np.isinf(self.cycle_frequency_bound[</span><span class="s3">1</span><span class="s1">]):</span>
+                    <span class="s1">_start_params[</span><span class="s4">'cycle_freq'</span><span class="s1">] = self.cycle_frequency_bound[</span><span class="s3">0</span><span class="s1">]</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">_start_params[</span><span class="s4">'cycle_freq'</span><span class="s1">] = self.cycle_frequency_bound[</span><span class="s3">1</span><span class="s1">]</span>
+
+        <span class="s5"># Irregular</span>
+        <span class="s2">if </span><span class="s1">self.irregular:</span>
+            <span class="s1">_start_params[</span><span class="s4">'irregular_var'</span><span class="s1">] = var_resid</span>
+
+        <span class="s5"># Create the starting parameter list</span>
+        <span class="s1">start_params = []</span>
+        <span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">self.parameters.keys():</span>
+            <span class="s2">if </span><span class="s1">np.isscalar(_start_params[key]):</span>
+                <span class="s1">start_params.append(_start_params[key])</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">start_params += _start_params[key]</span>
+        <span class="s2">return </span><span class="s1">start_params</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">param_names(self):</span>
+        <span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s4">'parameters'</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s1">[]</span>
+        <span class="s1">param_names = []</span>
+        <span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">self.parameters.keys():</span>
+            <span class="s2">if </span><span class="s1">key == </span><span class="s4">'irregular_var'</span><span class="s1">:</span>
+                <span class="s1">param_names.append(</span><span class="s4">'sigma2.irregular'</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">key == </span><span class="s4">'level_var'</span><span class="s1">:</span>
+                <span class="s1">param_names.append(</span><span class="s4">'sigma2.level'</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">key == </span><span class="s4">'trend_var'</span><span class="s1">:</span>
+                <span class="s1">param_names.append(</span><span class="s4">'sigma2.trend'</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">key == </span><span class="s4">'seasonal_var'</span><span class="s1">:</span>
+                <span class="s1">param_names.append(</span><span class="s4">'sigma2.seasonal'</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">key.startswith(</span><span class="s4">'freq_seasonal_var_'</span><span class="s1">):</span>
+                <span class="s5"># There are potentially multiple frequency domain</span>
+                <span class="s5"># seasonal terms</span>
+                <span class="s1">idx_fseas_comp = int(key[-</span><span class="s3">1</span><span class="s1">])</span>
+                <span class="s1">periodicity = self.freq_seasonal_periods[idx_fseas_comp]</span>
+                <span class="s1">harmonics = self.freq_seasonal_harmonics[idx_fseas_comp]</span>
+                <span class="s1">freq_seasonal_name = </span><span class="s4">&quot;{p}({h})&quot;</span><span class="s1">.format(</span>
+                    <span class="s1">p=repr(periodicity)</span><span class="s2">,</span>
+                    <span class="s1">h=repr(harmonics))</span>
+                <span class="s1">param_names.append(</span>
+                    <span class="s4">'sigma2.' </span><span class="s1">+ </span><span class="s4">'freq_seasonal_' </span><span class="s1">+ freq_seasonal_name)</span>
+            <span class="s2">elif </span><span class="s1">key == </span><span class="s4">'cycle_var'</span><span class="s1">:</span>
+                <span class="s1">param_names.append(</span><span class="s4">'sigma2.cycle'</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">key == </span><span class="s4">'cycle_freq'</span><span class="s1">:</span>
+                <span class="s1">param_names.append(</span><span class="s4">'frequency.cycle'</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">key == </span><span class="s4">'cycle_damp'</span><span class="s1">:</span>
+                <span class="s1">param_names.append(</span><span class="s4">'damping.cycle'</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">key == </span><span class="s4">'ar_coeff'</span><span class="s1">:</span>
+                <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(self.ar_order):</span>
+                    <span class="s1">param_names.append(</span><span class="s4">'ar.L%d' </span><span class="s1">% (i+</span><span class="s3">1</span><span class="s1">))</span>
+            <span class="s2">elif </span><span class="s1">key == </span><span class="s4">'ar_var'</span><span class="s1">:</span>
+                <span class="s1">param_names.append(</span><span class="s4">'sigma2.ar'</span><span class="s1">)</span>
+            <span class="s2">elif </span><span class="s1">key == </span><span class="s4">'reg_coeff'</span><span class="s1">:</span>
+                <span class="s1">param_names += [</span>
+                    <span class="s4">'beta.%s' </span><span class="s1">% self.exog_names[i]</span>
+                    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(self.k_exog)</span>
+                <span class="s1">]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">param_names.append(key)</span>
+        <span class="s2">return </span><span class="s1">param_names</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">state_names(self):</span>
+        <span class="s1">names = []</span>
+        <span class="s2">if </span><span class="s1">self.level:</span>
+            <span class="s1">names.append(</span><span class="s4">'level'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">self.trend:</span>
+            <span class="s1">names.append(</span><span class="s4">'trend'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">self.seasonal:</span>
+            <span class="s1">names.append(</span><span class="s4">'seasonal'</span><span class="s1">)</span>
+            <span class="s1">names += [</span><span class="s4">'seasonal.L%d' </span><span class="s1">% i</span>
+                      <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">self._k_seasonal_states)]</span>
+        <span class="s2">if </span><span class="s1">self.freq_seasonal:</span>
+            <span class="s1">names += [</span><span class="s4">'freq_seasonal.%d' </span><span class="s1">% i</span>
+                      <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(self._k_freq_seas_states)]</span>
+        <span class="s2">if </span><span class="s1">self.cycle:</span>
+            <span class="s1">names += [</span><span class="s4">'cycle'</span><span class="s2">, </span><span class="s4">'cycle.auxilliary'</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">self.ar_order &gt; </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s1">names += [</span><span class="s4">'ar.L%d' </span><span class="s1">% i</span>
+                      <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">self.ar_order + </span><span class="s3">1</span><span class="s1">)]</span>
+        <span class="s2">if </span><span class="s1">self.k_exog &gt; </span><span class="s3">0 </span><span class="s2">and not </span><span class="s1">self.mle_regression:</span>
+            <span class="s1">names += [</span><span class="s4">'beta.%s' </span><span class="s1">% self.exog_names[i]</span>
+                      <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(self.k_exog)]</span>
+        <span class="s2">if </span><span class="s1">self._unused_state:</span>
+            <span class="s1">names += [</span><span class="s4">'dummy'</span><span class="s1">]</span>
+
+        <span class="s2">return </span><span class="s1">names</span>
+
+    <span class="s2">def </span><span class="s1">transform_params(self</span><span class="s2">, </span><span class="s1">unconstrained):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Transform unconstrained parameters used by the optimizer to constrained 
+        parameters used in likelihood evaluation 
+        &quot;&quot;&quot;</span>
+        <span class="s1">unconstrained = np.array(unconstrained</span><span class="s2">, </span><span class="s1">ndmin=</span><span class="s3">1</span><span class="s1">)</span>
+        <span class="s1">constrained = np.zeros(unconstrained.shape</span><span class="s2">, </span><span class="s1">dtype=unconstrained.dtype)</span>
+
+        <span class="s5"># Positive parameters: obs_cov, state_cov</span>
+        <span class="s1">offset = self.k_obs_cov + self.k_state_cov</span>
+        <span class="s1">constrained[:offset] = unconstrained[:offset]**</span><span class="s3">2</span>
+
+        <span class="s5"># Cycle parameters</span>
+        <span class="s2">if </span><span class="s1">self.cycle:</span>
+            <span class="s5"># Cycle frequency must be between between our bounds</span>
+            <span class="s1">low</span><span class="s2">, </span><span class="s1">high = self.cycle_frequency_bound</span>
+            <span class="s1">constrained[offset] = (</span>
+                <span class="s3">1 </span><span class="s1">/ (</span><span class="s3">1 </span><span class="s1">+ np.exp(-unconstrained[offset]))</span>
+            <span class="s1">) * (high - low) + low</span>
+            <span class="s1">offset += </span><span class="s3">1</span>
+
+            <span class="s5"># Cycle damping (if present) must be between 0 and 1</span>
+            <span class="s2">if </span><span class="s1">self.damped_cycle:</span>
+                <span class="s1">constrained[offset] = (</span>
+                    <span class="s3">1 </span><span class="s1">/ (</span><span class="s3">1 </span><span class="s1">+ np.exp(-unconstrained[offset]))</span>
+                <span class="s1">)</span>
+                <span class="s1">offset += </span><span class="s3">1</span>
+
+        <span class="s5"># Autoregressive coefficients must be stationary</span>
+        <span class="s2">if </span><span class="s1">self.autoregressive:</span>
+            <span class="s1">constrained[offset:offset + self.ar_order] = (</span>
+                <span class="s1">constrain_stationary_univariate(</span>
+                    <span class="s1">unconstrained[offset:offset + self.ar_order]</span>
+                <span class="s1">)</span>
+            <span class="s1">)</span>
+            <span class="s1">offset += self.ar_order</span>
+
+        <span class="s5"># Nothing to do with betas</span>
+        <span class="s1">constrained[offset:offset + self.k_exog] = (</span>
+            <span class="s1">unconstrained[offset:offset + self.k_exog]</span>
+        <span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">constrained</span>
+
+    <span class="s2">def </span><span class="s1">untransform_params(self</span><span class="s2">, </span><span class="s1">constrained):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Reverse the transformation 
+        &quot;&quot;&quot;</span>
+        <span class="s1">constrained = np.array(constrained</span><span class="s2">, </span><span class="s1">ndmin=</span><span class="s3">1</span><span class="s1">)</span>
+        <span class="s1">unconstrained = np.zeros(constrained.shape</span><span class="s2">, </span><span class="s1">dtype=constrained.dtype)</span>
+
+        <span class="s5"># Positive parameters: obs_cov, state_cov</span>
+        <span class="s1">offset = self.k_obs_cov + self.k_state_cov</span>
+        <span class="s1">unconstrained[:offset] = constrained[:offset]**</span><span class="s3">0.5</span>
+
+        <span class="s5"># Cycle parameters</span>
+        <span class="s2">if </span><span class="s1">self.cycle:</span>
+            <span class="s5"># Cycle frequency must be between between our bounds</span>
+            <span class="s1">low</span><span class="s2">, </span><span class="s1">high = self.cycle_frequency_bound</span>
+            <span class="s1">x = (constrained[offset] - low) / (high - low)</span>
+            <span class="s1">unconstrained[offset] = np.log(</span>
+                <span class="s1">x / (</span><span class="s3">1 </span><span class="s1">- x)</span>
+            <span class="s1">)</span>
+            <span class="s1">offset += </span><span class="s3">1</span>
+
+            <span class="s5"># Cycle damping (if present) must be between 0 and 1</span>
+            <span class="s2">if </span><span class="s1">self.damped_cycle:</span>
+                <span class="s1">unconstrained[offset] = np.log(</span>
+                    <span class="s1">constrained[offset] / (</span><span class="s3">1 </span><span class="s1">- constrained[offset])</span>
+                <span class="s1">)</span>
+                <span class="s1">offset += </span><span class="s3">1</span>
+
+        <span class="s5"># Autoregressive coefficients must be stationary</span>
+        <span class="s2">if </span><span class="s1">self.autoregressive:</span>
+            <span class="s1">unconstrained[offset:offset + self.ar_order] = (</span>
+                <span class="s1">unconstrain_stationary_univariate(</span>
+                    <span class="s1">constrained[offset:offset + self.ar_order]</span>
+                <span class="s1">)</span>
+            <span class="s1">)</span>
+            <span class="s1">offset += self.ar_order</span>
+
+        <span class="s5"># Nothing to do with betas</span>
+        <span class="s1">unconstrained[offset:offset + self.k_exog] = (</span>
+            <span class="s1">constrained[offset:offset + self.k_exog]</span>
+        <span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">unconstrained</span>
+
+    <span class="s2">def </span><span class="s1">_validate_can_fix_params(self</span><span class="s2">, </span><span class="s1">param_names):</span>
+        <span class="s1">super(UnobservedComponents</span><span class="s2">, </span><span class="s1">self)._validate_can_fix_params(param_names)</span>
+
+        <span class="s2">if </span><span class="s4">'ar_coeff' </span><span class="s2">in </span><span class="s1">self.parameters:</span>
+            <span class="s1">ar_names = [</span><span class="s4">'ar.L%d' </span><span class="s1">% (i+</span><span class="s3">1</span><span class="s1">) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(self.ar_order)]</span>
+            <span class="s1">fix_all_ar = param_names.issuperset(ar_names)</span>
+            <span class="s1">fix_any_ar = len(param_names.intersection(ar_names)) &gt; </span><span class="s3">0</span>
+            <span class="s2">if </span><span class="s1">fix_any_ar </span><span class="s2">and not </span><span class="s1">fix_all_ar:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'Cannot fix individual autoregressive.'</span>
+                                 <span class="s4">' parameters. Must either fix all'</span>
+                                 <span class="s4">' autoregressive parameters or none.'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">update(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">transformed=</span><span class="s2">True, </span><span class="s1">includes_fixed=</span><span class="s2">False,</span>
+               <span class="s1">complex_step=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s1">params = self.handle_params(params</span><span class="s2">, </span><span class="s1">transformed=transformed</span><span class="s2">,</span>
+                                    <span class="s1">includes_fixed=includes_fixed)</span>
+
+        <span class="s1">offset = </span><span class="s3">0</span>
+
+        <span class="s5"># Observation covariance</span>
+        <span class="s2">if </span><span class="s1">self.irregular:</span>
+            <span class="s1">self.ssm[</span><span class="s4">'obs_cov'</span><span class="s2">, </span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">] = params[offset]</span>
+            <span class="s1">offset += </span><span class="s3">1</span>
+
+        <span class="s5"># State covariance</span>
+        <span class="s2">if </span><span class="s1">self.k_state_cov &gt; </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s1">variances = params[offset:offset+self.k_state_cov]</span>
+            <span class="s2">if </span><span class="s1">self._repeat_any_var:</span>
+                <span class="s1">variances = np.repeat(variances</span><span class="s2">, </span><span class="s1">self._var_repetitions)</span>
+            <span class="s1">self.ssm[self._idx_state_cov] = variances</span>
+            <span class="s1">offset += self.k_state_cov</span>
+
+        <span class="s5"># Cycle transition</span>
+        <span class="s2">if </span><span class="s1">self.cycle:</span>
+            <span class="s1">cos_freq = np.cos(params[offset])</span>
+            <span class="s1">sin_freq = np.sin(params[offset])</span>
+            <span class="s1">cycle_transition = np.array(</span>
+                <span class="s1">[[cos_freq</span><span class="s2">, </span><span class="s1">sin_freq]</span><span class="s2">,</span>
+                 <span class="s1">[-sin_freq</span><span class="s2">, </span><span class="s1">cos_freq]]</span>
+            <span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">self.damped_cycle:</span>
+                <span class="s1">offset += </span><span class="s3">1</span>
+                <span class="s1">cycle_transition *= params[offset]</span>
+            <span class="s1">self.ssm[self._idx_cycle_transition] = cycle_transition</span>
+            <span class="s1">offset += </span><span class="s3">1</span>
+
+        <span class="s5"># AR transition</span>
+        <span class="s2">if </span><span class="s1">self.autoregressive:</span>
+            <span class="s1">self.ssm[self._idx_ar_transition] = (</span>
+                <span class="s1">params[offset:offset+self.ar_order]</span>
+            <span class="s1">)</span>
+            <span class="s1">offset += self.ar_order</span>
+
+        <span class="s5"># Beta observation intercept</span>
+        <span class="s2">if </span><span class="s1">self.regression:</span>
+            <span class="s2">if </span><span class="s1">self.mle_regression:</span>
+                <span class="s1">self.ssm[</span><span class="s4">'obs_intercept'</span><span class="s1">] = np.dot(</span>
+                    <span class="s1">self.exog</span><span class="s2">,</span>
+                    <span class="s1">params[offset:offset+self.k_exog]</span>
+                <span class="s1">)[</span><span class="s2">None, </span><span class="s1">:]</span>
+            <span class="s1">offset += self.k_exog</span>
+
+
+<span class="s2">class </span><span class="s1">UnobservedComponentsResults(MLEResults):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Class to hold results from fitting an unobserved components model. 
+ 
+    Parameters 
+    ---------- 
+    model : UnobservedComponents instance 
+        The fitted model instance 
+ 
+    Attributes 
+    ---------- 
+    specification : dictionary 
+        Dictionary including all attributes from the unobserved components 
+        model instance. 
+ 
+    See Also 
+    -------- 
+    statsmodels.tsa.statespace.kalman_filter.FilterResults 
+    statsmodels.tsa.statespace.mlemodel.MLEResults 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">model</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">filter_results</span><span class="s2">, </span><span class="s1">cov_type=</span><span class="s2">None,</span>
+                 <span class="s1">**kwargs):</span>
+        <span class="s1">super(UnobservedComponentsResults</span><span class="s2">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">model</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">filter_results</span><span class="s2">, </span><span class="s1">cov_type</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s1">self.df_resid = np.inf  </span><span class="s5"># attribute required for wald tests</span>
+
+        <span class="s5"># Save _init_kwds</span>
+        <span class="s1">self._init_kwds = self.model._get_init_kwds()</span>
+
+        <span class="s5"># Save number of states by type</span>
+        <span class="s1">self._k_states_by_type = {</span>
+            <span class="s4">'seasonal'</span><span class="s1">: self.model._k_seasonal_states</span><span class="s2">,</span>
+            <span class="s4">'freq_seasonal'</span><span class="s1">: self.model._k_freq_seas_states</span><span class="s2">,</span>
+            <span class="s4">'cycle'</span><span class="s1">: self.model._k_cycle_states}</span>
+
+        <span class="s5"># Save the model specification</span>
+        <span class="s1">self.specification = Bunch(**{</span>
+            <span class="s5"># Model options</span>
+            <span class="s4">'level'</span><span class="s1">: self.model.level</span><span class="s2">,</span>
+            <span class="s4">'trend'</span><span class="s1">: self.model.trend</span><span class="s2">,</span>
+            <span class="s4">'seasonal_periods'</span><span class="s1">: self.model.seasonal_periods</span><span class="s2">,</span>
+            <span class="s4">'seasonal'</span><span class="s1">: self.model.seasonal</span><span class="s2">,</span>
+            <span class="s4">'freq_seasonal'</span><span class="s1">: self.model.freq_seasonal</span><span class="s2">,</span>
+            <span class="s4">'freq_seasonal_periods'</span><span class="s1">: self.model.freq_seasonal_periods</span><span class="s2">,</span>
+            <span class="s4">'freq_seasonal_harmonics'</span><span class="s1">: self.model.freq_seasonal_harmonics</span><span class="s2">,</span>
+            <span class="s4">'cycle'</span><span class="s1">: self.model.cycle</span><span class="s2">,</span>
+            <span class="s4">'ar_order'</span><span class="s1">: self.model.ar_order</span><span class="s2">,</span>
+            <span class="s4">'autoregressive'</span><span class="s1">: self.model.autoregressive</span><span class="s2">,</span>
+            <span class="s4">'irregular'</span><span class="s1">: self.model.irregular</span><span class="s2">,</span>
+            <span class="s4">'stochastic_level'</span><span class="s1">: self.model.stochastic_level</span><span class="s2">,</span>
+            <span class="s4">'stochastic_trend'</span><span class="s1">: self.model.stochastic_trend</span><span class="s2">,</span>
+            <span class="s4">'stochastic_seasonal'</span><span class="s1">: self.model.stochastic_seasonal</span><span class="s2">,</span>
+            <span class="s4">'stochastic_freq_seasonal'</span><span class="s1">: self.model.stochastic_freq_seasonal</span><span class="s2">,</span>
+            <span class="s4">'stochastic_cycle'</span><span class="s1">: self.model.stochastic_cycle</span><span class="s2">,</span>
+
+            <span class="s4">'damped_cycle'</span><span class="s1">: self.model.damped_cycle</span><span class="s2">,</span>
+            <span class="s4">'regression'</span><span class="s1">: self.model.regression</span><span class="s2">,</span>
+            <span class="s4">'mle_regression'</span><span class="s1">: self.model.mle_regression</span><span class="s2">,</span>
+            <span class="s4">'k_exog'</span><span class="s1">: self.model.k_exog</span><span class="s2">,</span>
+
+            <span class="s5"># Check for string trend/level specification</span>
+            <span class="s4">'trend_specification'</span><span class="s1">: self.model.trend_specification</span>
+        <span class="s1">})</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">level(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimates of unobserved level component 
+ 
+        Returns 
+        ------- 
+        out: Bunch 
+            Has the following attributes: 
+ 
+            - `filtered`: a time series array with the filtered estimate of 
+                          the component 
+            - `filtered_cov`: a time series array with the filtered estimate of 
+                          the variance/covariance of the component 
+            - `smoothed`: a time series array with the smoothed estimate of 
+                          the component 
+            - `smoothed_cov`: a time series array with the smoothed estimate of 
+                          the variance/covariance of the component 
+            - `offset`: an integer giving the offset in the state vector where 
+                        this component begins 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># If present, level is always the first component of the state vector</span>
+        <span class="s1">out = </span><span class="s2">None</span>
+        <span class="s1">spec = self.specification</span>
+        <span class="s2">if </span><span class="s1">spec.level:</span>
+            <span class="s1">offset = </span><span class="s3">0</span>
+            <span class="s1">out = Bunch(filtered=self.filtered_state[offset]</span><span class="s2">,</span>
+                        <span class="s1">filtered_cov=self.filtered_state_cov[offset</span><span class="s2">, </span><span class="s1">offset]</span><span class="s2">,</span>
+                        <span class="s1">smoothed=</span><span class="s2">None, </span><span class="s1">smoothed_cov=</span><span class="s2">None,</span>
+                        <span class="s1">offset=offset)</span>
+            <span class="s2">if </span><span class="s1">self.smoothed_state </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">out.smoothed = self.smoothed_state[offset]</span>
+            <span class="s2">if </span><span class="s1">self.smoothed_state_cov </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">out.smoothed_cov = self.smoothed_state_cov[offset</span><span class="s2">, </span><span class="s1">offset]</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">trend(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimates of of unobserved trend component 
+ 
+        Returns 
+        ------- 
+        out: Bunch 
+            Has the following attributes: 
+ 
+            - `filtered`: a time series array with the filtered estimate of 
+                          the component 
+            - `filtered_cov`: a time series array with the filtered estimate of 
+                          the variance/covariance of the component 
+            - `smoothed`: a time series array with the smoothed estimate of 
+                          the component 
+            - `smoothed_cov`: a time series array with the smoothed estimate of 
+                          the variance/covariance of the component 
+            - `offset`: an integer giving the offset in the state vector where 
+                        this component begins 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># If present, trend is always the second component of the state vector</span>
+        <span class="s5"># (because level is always present if trend is present)</span>
+        <span class="s1">out = </span><span class="s2">None</span>
+        <span class="s1">spec = self.specification</span>
+        <span class="s2">if </span><span class="s1">spec.trend:</span>
+            <span class="s1">offset = int(spec.level)</span>
+            <span class="s1">out = Bunch(filtered=self.filtered_state[offset]</span><span class="s2">,</span>
+                        <span class="s1">filtered_cov=self.filtered_state_cov[offset</span><span class="s2">, </span><span class="s1">offset]</span><span class="s2">,</span>
+                        <span class="s1">smoothed=</span><span class="s2">None, </span><span class="s1">smoothed_cov=</span><span class="s2">None,</span>
+                        <span class="s1">offset=offset)</span>
+            <span class="s2">if </span><span class="s1">self.smoothed_state </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">out.smoothed = self.smoothed_state[offset]</span>
+            <span class="s2">if </span><span class="s1">self.smoothed_state_cov </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">out.smoothed_cov = self.smoothed_state_cov[offset</span><span class="s2">, </span><span class="s1">offset]</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">seasonal(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimates of unobserved seasonal component 
+ 
+        Returns 
+        ------- 
+        out: Bunch 
+            Has the following attributes: 
+ 
+            - `filtered`: a time series array with the filtered estimate of 
+                          the component 
+            - `filtered_cov`: a time series array with the filtered estimate of 
+                          the variance/covariance of the component 
+            - `smoothed`: a time series array with the smoothed estimate of 
+                          the component 
+            - `smoothed_cov`: a time series array with the smoothed estimate of 
+                          the variance/covariance of the component 
+            - `offset`: an integer giving the offset in the state vector where 
+                        this component begins 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># If present, seasonal always follows level/trend (if they are present)</span>
+        <span class="s5"># Note that we return only the first seasonal state, but there are</span>
+        <span class="s5"># in fact seasonal_periods-1 seasonal states, however latter states</span>
+        <span class="s5"># are just lagged versions of the first seasonal state.</span>
+        <span class="s1">out = </span><span class="s2">None</span>
+        <span class="s1">spec = self.specification</span>
+        <span class="s2">if </span><span class="s1">spec.seasonal:</span>
+            <span class="s1">offset = int(spec.trend + spec.level)</span>
+            <span class="s1">out = Bunch(filtered=self.filtered_state[offset]</span><span class="s2">,</span>
+                        <span class="s1">filtered_cov=self.filtered_state_cov[offset</span><span class="s2">, </span><span class="s1">offset]</span><span class="s2">,</span>
+                        <span class="s1">smoothed=</span><span class="s2">None, </span><span class="s1">smoothed_cov=</span><span class="s2">None,</span>
+                        <span class="s1">offset=offset)</span>
+            <span class="s2">if </span><span class="s1">self.smoothed_state </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">out.smoothed = self.smoothed_state[offset]</span>
+            <span class="s2">if </span><span class="s1">self.smoothed_state_cov </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">out.smoothed_cov = self.smoothed_state_cov[offset</span><span class="s2">, </span><span class="s1">offset]</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">freq_seasonal(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimates of unobserved frequency domain seasonal component(s) 
+ 
+        Returns 
+        ------- 
+        out: list of Bunch instances 
+            Each item has the following attributes: 
+ 
+            - `filtered`: a time series array with the filtered estimate of 
+                          the component 
+            - `filtered_cov`: a time series array with the filtered estimate of 
+                          the variance/covariance of the component 
+            - `smoothed`: a time series array with the smoothed estimate of 
+                          the component 
+            - `smoothed_cov`: a time series array with the smoothed estimate of 
+                          the variance/covariance of the component 
+            - `offset`: an integer giving the offset in the state vector where 
+                        this component begins 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># If present, freq_seasonal components always follows level/trend</span>
+        <span class="s5">#  and seasonal.</span>
+
+        <span class="s5"># There are 2 * (harmonics) seasonal states per freq_seasonal</span>
+        <span class="s5"># component.</span>
+        <span class="s5"># The sum of every other state enters the measurement equation.</span>
+        <span class="s5"># Additionally, there can be multiple components of this type.</span>
+        <span class="s5"># These facts make this property messier in implementation than the</span>
+        <span class="s5"># others.</span>
+        <span class="s5"># Fortunately, the states are conditionally mutually independent</span>
+        <span class="s5"># (conditional on previous timestep's states), so that the calculations</span>
+        <span class="s5"># of the variances are simple summations of individual variances and</span>
+        <span class="s5"># the calculation of the returned state is likewise a summation.</span>
+        <span class="s1">out = []</span>
+        <span class="s1">spec = self.specification</span>
+        <span class="s2">if </span><span class="s1">spec.freq_seasonal:</span>
+            <span class="s1">previous_states_offset = int(spec.trend + spec.level</span>
+                                         <span class="s1">+ self._k_states_by_type[</span><span class="s4">'seasonal'</span><span class="s1">])</span>
+            <span class="s1">previous_f_seas_offset = </span><span class="s3">0</span>
+            <span class="s2">for </span><span class="s1">ix</span><span class="s2">, </span><span class="s1">h </span><span class="s2">in </span><span class="s1">enumerate(spec.freq_seasonal_harmonics):</span>
+                <span class="s1">offset = previous_states_offset + previous_f_seas_offset</span>
+
+                <span class="s1">period = spec.freq_seasonal_periods[ix]</span>
+
+                <span class="s5"># Only the gamma_jt terms enter the measurement equation (cf.</span>
+                <span class="s5"># D&amp;K 2012 (3.7))</span>
+                <span class="s1">states_in_sum = np.arange(</span><span class="s3">0</span><span class="s2">, </span><span class="s3">2 </span><span class="s1">* h</span><span class="s2">, </span><span class="s3">2</span><span class="s1">)</span>
+
+                <span class="s1">filtered_state = np.sum(</span>
+                    <span class="s1">[self.filtered_state[offset + j] </span><span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">states_in_sum]</span><span class="s2">,</span>
+                    <span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+                <span class="s1">filtered_cov = np.sum(</span>
+                    <span class="s1">[self.filtered_state_cov[offset + j</span><span class="s2">, </span><span class="s1">offset + j] </span><span class="s2">for </span><span class="s1">j </span><span class="s2">in</span>
+                     <span class="s1">states_in_sum]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+
+                <span class="s1">item = Bunch(</span>
+                    <span class="s1">filtered=filtered_state</span><span class="s2">,</span>
+                    <span class="s1">filtered_cov=filtered_cov</span><span class="s2">,</span>
+                    <span class="s1">smoothed=</span><span class="s2">None, </span><span class="s1">smoothed_cov=</span><span class="s2">None,</span>
+                    <span class="s1">offset=offset</span><span class="s2">,</span>
+                    <span class="s1">pretty_name=</span><span class="s4">'seasonal {p}({h})'</span><span class="s1">.format(p=repr(period)</span><span class="s2">,</span>
+                                                           <span class="s1">h=repr(h)))</span>
+                <span class="s2">if </span><span class="s1">self.smoothed_state </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">item.smoothed = np.sum(</span>
+                        <span class="s1">[self.smoothed_state[offset+j] </span><span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">states_in_sum]</span><span class="s2">,</span>
+                        <span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+                <span class="s2">if </span><span class="s1">self.smoothed_state_cov </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">item.smoothed_cov = np.sum(</span>
+                        <span class="s1">[self.smoothed_state_cov[offset+j</span><span class="s2">, </span><span class="s1">offset+j]</span>
+                         <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">states_in_sum]</span><span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+                <span class="s1">out.append(item)</span>
+                <span class="s1">previous_f_seas_offset += </span><span class="s3">2 </span><span class="s1">* h</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">cycle(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimates of unobserved cycle component 
+ 
+        Returns 
+        ------- 
+        out: Bunch 
+            Has the following attributes: 
+ 
+            - `filtered`: a time series array with the filtered estimate of 
+                          the component 
+            - `filtered_cov`: a time series array with the filtered estimate of 
+                          the variance/covariance of the component 
+            - `smoothed`: a time series array with the smoothed estimate of 
+                          the component 
+            - `smoothed_cov`: a time series array with the smoothed estimate of 
+                          the variance/covariance of the component 
+            - `offset`: an integer giving the offset in the state vector where 
+                        this component begins 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># If present, cycle always follows level/trend, seasonal, and freq</span>
+        <span class="s5">#  seasonal.</span>
+        <span class="s5"># Note that we return only the first cyclical state, but there are</span>
+        <span class="s5"># in fact 2 cyclical states. The second cyclical state is not simply</span>
+        <span class="s5"># a lag of the first cyclical state, but the first cyclical state is</span>
+        <span class="s5"># the one that enters the measurement equation.</span>
+        <span class="s1">out = </span><span class="s2">None</span>
+        <span class="s1">spec = self.specification</span>
+        <span class="s2">if </span><span class="s1">spec.cycle:</span>
+            <span class="s1">offset = int(spec.trend + spec.level</span>
+                         <span class="s1">+ self._k_states_by_type[</span><span class="s4">'seasonal'</span><span class="s1">]</span>
+                         <span class="s1">+ self._k_states_by_type[</span><span class="s4">'freq_seasonal'</span><span class="s1">])</span>
+            <span class="s1">out = Bunch(filtered=self.filtered_state[offset]</span><span class="s2">,</span>
+                        <span class="s1">filtered_cov=self.filtered_state_cov[offset</span><span class="s2">, </span><span class="s1">offset]</span><span class="s2">,</span>
+                        <span class="s1">smoothed=</span><span class="s2">None, </span><span class="s1">smoothed_cov=</span><span class="s2">None,</span>
+                        <span class="s1">offset=offset)</span>
+            <span class="s2">if </span><span class="s1">self.smoothed_state </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">out.smoothed = self.smoothed_state[offset]</span>
+            <span class="s2">if </span><span class="s1">self.smoothed_state_cov </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">out.smoothed_cov = self.smoothed_state_cov[offset</span><span class="s2">, </span><span class="s1">offset]</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">autoregressive(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimates of unobserved autoregressive component 
+ 
+        Returns 
+        ------- 
+        out: Bunch 
+            Has the following attributes: 
+ 
+            - `filtered`: a time series array with the filtered estimate of 
+                          the component 
+            - `filtered_cov`: a time series array with the filtered estimate of 
+                          the variance/covariance of the component 
+            - `smoothed`: a time series array with the smoothed estimate of 
+                          the component 
+            - `smoothed_cov`: a time series array with the smoothed estimate of 
+                          the variance/covariance of the component 
+            - `offset`: an integer giving the offset in the state vector where 
+                        this component begins 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># If present, autoregressive always follows level/trend, seasonal,</span>
+        <span class="s5"># freq seasonal, and cyclical.</span>
+        <span class="s5"># If it is an AR(p) model, then there are p associated</span>
+        <span class="s5"># states, but the second - pth states are just lags of the first state.</span>
+        <span class="s1">out = </span><span class="s2">None</span>
+        <span class="s1">spec = self.specification</span>
+        <span class="s2">if </span><span class="s1">spec.autoregressive:</span>
+            <span class="s1">offset = int(spec.trend + spec.level</span>
+                         <span class="s1">+ self._k_states_by_type[</span><span class="s4">'seasonal'</span><span class="s1">]</span>
+                         <span class="s1">+ self._k_states_by_type[</span><span class="s4">'freq_seasonal'</span><span class="s1">]</span>
+                         <span class="s1">+ self._k_states_by_type[</span><span class="s4">'cycle'</span><span class="s1">])</span>
+            <span class="s1">out = Bunch(filtered=self.filtered_state[offset]</span><span class="s2">,</span>
+                        <span class="s1">filtered_cov=self.filtered_state_cov[offset</span><span class="s2">, </span><span class="s1">offset]</span><span class="s2">,</span>
+                        <span class="s1">smoothed=</span><span class="s2">None, </span><span class="s1">smoothed_cov=</span><span class="s2">None,</span>
+                        <span class="s1">offset=offset)</span>
+            <span class="s2">if </span><span class="s1">self.smoothed_state </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">out.smoothed = self.smoothed_state[offset]</span>
+            <span class="s2">if </span><span class="s1">self.smoothed_state_cov </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">out.smoothed_cov = self.smoothed_state_cov[offset</span><span class="s2">, </span><span class="s1">offset]</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">regression_coefficients(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimates of unobserved regression coefficients 
+ 
+        Returns 
+        ------- 
+        out: Bunch 
+            Has the following attributes: 
+ 
+            - `filtered`: a time series array with the filtered estimate of 
+                          the component 
+            - `filtered_cov`: a time series array with the filtered estimate of 
+                          the variance/covariance of the component 
+            - `smoothed`: a time series array with the smoothed estimate of 
+                          the component 
+            - `smoothed_cov`: a time series array with the smoothed estimate of 
+                          the variance/covariance of the component 
+            - `offset`: an integer giving the offset in the state vector where 
+                        this component begins 
+        &quot;&quot;&quot;</span>
+        <span class="s5"># If present, state-vector regression coefficients always are last</span>
+        <span class="s5"># (i.e. they follow level/trend, seasonal, freq seasonal, cyclical, and</span>
+        <span class="s5"># autoregressive states). There is one state associated with each</span>
+        <span class="s5"># regressor, and all are returned here.</span>
+        <span class="s1">out = </span><span class="s2">None</span>
+        <span class="s1">spec = self.specification</span>
+        <span class="s2">if </span><span class="s1">spec.regression:</span>
+            <span class="s2">if </span><span class="s1">spec.mle_regression:</span>
+                <span class="s2">import </span><span class="s1">warnings</span>
+                <span class="s1">warnings.warn(</span><span class="s4">'Regression coefficients estimated via maximum'</span>
+                              <span class="s4">' likelihood. Estimated coefficients are'</span>
+                              <span class="s4">' available in the parameters list, not as part'</span>
+                              <span class="s4">' of the state vector.'</span><span class="s2">, </span><span class="s1">OutputWarning)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">offset = int(spec.trend + spec.level</span>
+                             <span class="s1">+ self._k_states_by_type[</span><span class="s4">'seasonal'</span><span class="s1">]</span>
+                             <span class="s1">+ self._k_states_by_type[</span><span class="s4">'freq_seasonal'</span><span class="s1">]</span>
+                             <span class="s1">+ self._k_states_by_type[</span><span class="s4">'cycle'</span><span class="s1">]</span>
+                             <span class="s1">+ spec.ar_order)</span>
+                <span class="s1">start = offset</span>
+                <span class="s1">end = offset + spec.k_exog</span>
+                <span class="s1">out = Bunch(</span>
+                    <span class="s1">filtered=self.filtered_state[start:end]</span><span class="s2">,</span>
+                    <span class="s1">filtered_cov=self.filtered_state_cov[start:end</span><span class="s2">, </span><span class="s1">start:end]</span><span class="s2">,</span>
+                    <span class="s1">smoothed=</span><span class="s2">None, </span><span class="s1">smoothed_cov=</span><span class="s2">None,</span>
+                    <span class="s1">offset=offset</span>
+                <span class="s1">)</span>
+                <span class="s2">if </span><span class="s1">self.smoothed_state </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">out.smoothed = self.smoothed_state[start:end]</span>
+                <span class="s2">if </span><span class="s1">self.smoothed_state_cov </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">out.smoothed_cov = (</span>
+                        <span class="s1">self.smoothed_state_cov[start:end</span><span class="s2">, </span><span class="s1">start:end])</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s2">def </span><span class="s1">plot_components(self</span><span class="s2">, </span><span class="s1">which=</span><span class="s2">None, </span><span class="s1">alpha=</span><span class="s3">0.05</span><span class="s2">,</span>
+                        <span class="s1">observed=</span><span class="s2">True, </span><span class="s1">level=</span><span class="s2">True, </span><span class="s1">trend=</span><span class="s2">True,</span>
+                        <span class="s1">seasonal=</span><span class="s2">True, </span><span class="s1">freq_seasonal=</span><span class="s2">True,</span>
+                        <span class="s1">cycle=</span><span class="s2">True, </span><span class="s1">autoregressive=</span><span class="s2">True,</span>
+                        <span class="s1">legend_loc=</span><span class="s4">'upper right'</span><span class="s2">, </span><span class="s1">fig=</span><span class="s2">None, </span><span class="s1">figsize=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Plot the estimated components of the model. 
+ 
+        Parameters 
+        ---------- 
+        which : {'filtered', 'smoothed'}, or None, optional 
+            Type of state estimate to plot. Default is 'smoothed' if smoothed 
+            results are available otherwise 'filtered'. 
+        alpha : float, optional 
+            The confidence intervals for the components are (1 - alpha) % 
+        observed : bool, optional 
+            Whether or not to plot the observed series against 
+            one-step-ahead predictions. 
+            Default is True. 
+        level : bool, optional 
+            Whether or not to plot the level component, if applicable. 
+            Default is True. 
+        trend : bool, optional 
+            Whether or not to plot the trend component, if applicable. 
+            Default is True. 
+        seasonal : bool, optional 
+            Whether or not to plot the seasonal component, if applicable. 
+            Default is True. 
+        freq_seasonal : bool, optional 
+            Whether or not to plot the frequency domain seasonal component(s), 
+            if applicable. Default is True. 
+        cycle : bool, optional 
+            Whether or not to plot the cyclical component, if applicable. 
+            Default is True. 
+        autoregressive : bool, optional 
+            Whether or not to plot the autoregressive state, if applicable. 
+            Default is True. 
+        fig : Figure, optional 
+            If given, subplots are created in this figure instead of in a new 
+            figure. Note that the grid will be created in the provided 
+            figure using `fig.add_subplot()`. 
+        figsize : tuple, optional 
+            If a figure is created, this argument allows specifying a size. 
+            The tuple is (width, height). 
+ 
+        Notes 
+        ----- 
+        If all options are included in the model and selected, this produces 
+        a 6x1 plot grid with the following plots (ordered top-to-bottom): 
+ 
+        0. Observed series against predicted series 
+        1. Level 
+        2. Trend 
+        3. Seasonal 
+        4. Freq Seasonal 
+        5. Cycle 
+        6. Autoregressive 
+ 
+        Specific subplots will be removed if the component is not present in 
+        the estimated model or if the corresponding keyword argument is set to 
+        False. 
+ 
+        All plots contain (1 - `alpha`) %  confidence intervals. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">from </span><span class="s1">scipy.stats </span><span class="s2">import </span><span class="s1">norm</span>
+        <span class="s2">from </span><span class="s1">statsmodels.graphics.utils </span><span class="s2">import </span><span class="s1">_import_mpl</span><span class="s2">, </span><span class="s1">create_mpl_fig</span>
+        <span class="s1">plt = _import_mpl()</span>
+        <span class="s1">fig = create_mpl_fig(fig</span><span class="s2">, </span><span class="s1">figsize)</span>
+
+        <span class="s5"># Determine which results we have</span>
+        <span class="s2">if </span><span class="s1">which </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">which = </span><span class="s4">'filtered' </span><span class="s2">if </span><span class="s1">self.smoothed_state </span><span class="s2">is None else </span><span class="s4">'smoothed'</span>
+
+        <span class="s5"># Determine which plots we have</span>
+        <span class="s1">spec = self.specification</span>
+
+        <span class="s1">comp = [</span>
+            <span class="s1">(</span><span class="s4">'level'</span><span class="s2">, </span><span class="s1">level </span><span class="s2">and </span><span class="s1">spec.level)</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s4">'trend'</span><span class="s2">, </span><span class="s1">trend </span><span class="s2">and </span><span class="s1">spec.trend)</span><span class="s2">,</span>
+            <span class="s1">(</span><span class="s4">'seasonal'</span><span class="s2">, </span><span class="s1">seasonal </span><span class="s2">and </span><span class="s1">spec.seasonal)</span><span class="s2">,</span>
+        <span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">freq_seasonal </span><span class="s2">and </span><span class="s1">spec.freq_seasonal:</span>
+            <span class="s2">for </span><span class="s1">ix</span><span class="s2">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">enumerate(spec.freq_seasonal_periods):</span>
+                <span class="s1">key = </span><span class="s4">'freq_seasonal_{!r}'</span><span class="s1">.format(ix)</span>
+                <span class="s1">comp.append((key</span><span class="s2">, True</span><span class="s1">))</span>
+
+        <span class="s1">comp.extend(</span>
+            <span class="s1">[(</span><span class="s4">'cycle'</span><span class="s2">, </span><span class="s1">cycle </span><span class="s2">and </span><span class="s1">spec.cycle)</span><span class="s2">,</span>
+             <span class="s1">(</span><span class="s4">'autoregressive'</span><span class="s2">, </span><span class="s1">autoregressive </span><span class="s2">and </span><span class="s1">spec.autoregressive)])</span>
+
+        <span class="s1">components = dict(comp)</span>
+
+        <span class="s1">llb = self.filter_results.loglikelihood_burn</span>
+
+        <span class="s5"># Number of plots</span>
+        <span class="s1">k_plots = observed + np.sum(list(components.values()))</span>
+
+        <span class="s5"># Get dates, if applicable</span>
+        <span class="s2">if </span><span class="s1">hasattr(self.data</span><span class="s2">, </span><span class="s4">'dates'</span><span class="s1">) </span><span class="s2">and </span><span class="s1">self.data.dates </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">dates = self.data.dates._mpl_repr()</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">dates = np.arange(len(self.data.endog))</span>
+
+        <span class="s5"># Get the critical value for confidence intervals</span>
+        <span class="s1">critical_value = norm.ppf(</span><span class="s3">1 </span><span class="s1">- alpha / </span><span class="s3">2.</span><span class="s1">)</span>
+
+        <span class="s1">plot_idx = </span><span class="s3">1</span>
+
+        <span class="s5"># Observed, predicted, confidence intervals</span>
+        <span class="s2">if </span><span class="s1">observed:</span>
+            <span class="s1">ax = fig.add_subplot(k_plots</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s1">plot_idx)</span>
+            <span class="s1">plot_idx += </span><span class="s3">1</span>
+
+            <span class="s5"># Plot the observed dataset</span>
+            <span class="s1">ax.plot(dates[llb:]</span><span class="s2">, </span><span class="s1">self.model.endog[llb:]</span><span class="s2">, </span><span class="s1">color=</span><span class="s4">'k'</span><span class="s2">,</span>
+                    <span class="s1">label=</span><span class="s4">'Observed'</span><span class="s1">)</span>
+
+            <span class="s5"># Get the predicted values and confidence intervals</span>
+            <span class="s1">predict = self.filter_results.forecasts[</span><span class="s3">0</span><span class="s1">]</span>
+            <span class="s1">std_errors = np.sqrt(self.filter_results.forecasts_error_cov[</span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">])</span>
+            <span class="s1">ci_lower = predict - critical_value * std_errors</span>
+            <span class="s1">ci_upper = predict + critical_value * std_errors</span>
+
+            <span class="s5"># Plot</span>
+            <span class="s1">ax.plot(dates[llb:]</span><span class="s2">, </span><span class="s1">predict[llb:]</span><span class="s2">,</span>
+                    <span class="s1">label=</span><span class="s4">'One-step-ahead predictions'</span><span class="s1">)</span>
+            <span class="s1">ci_poly = ax.fill_between(</span>
+                <span class="s1">dates[llb:]</span><span class="s2">, </span><span class="s1">ci_lower[llb:]</span><span class="s2">, </span><span class="s1">ci_upper[llb:]</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s3">0.2</span>
+            <span class="s1">)</span>
+            <span class="s1">ci_label = </span><span class="s4">'$%.3g </span><span class="s2">\\</span><span class="s4">%%$ confidence interval' </span><span class="s1">% ((</span><span class="s3">1 </span><span class="s1">- alpha) * </span><span class="s3">100</span><span class="s1">)</span>
+
+            <span class="s5"># Proxy artist for fill_between legend entry</span>
+            <span class="s5"># See e.g. https://matplotlib.org/1.3.1/users/legend_guide.html</span>
+            <span class="s1">p = plt.Rectangle((</span><span class="s3">0</span><span class="s2">, </span><span class="s3">0</span><span class="s1">)</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s1">fc=ci_poly.get_facecolor()[</span><span class="s3">0</span><span class="s1">])</span>
+
+            <span class="s5"># Legend</span>
+            <span class="s1">handles</span><span class="s2">, </span><span class="s1">labels = ax.get_legend_handles_labels()</span>
+            <span class="s1">handles.append(p)</span>
+            <span class="s1">labels.append(ci_label)</span>
+            <span class="s1">ax.legend(handles</span><span class="s2">, </span><span class="s1">labels</span><span class="s2">, </span><span class="s1">loc=legend_loc)</span>
+
+            <span class="s1">ax.set_title(</span><span class="s4">'Predicted vs observed'</span><span class="s1">)</span>
+
+        <span class="s5"># Plot each component</span>
+        <span class="s2">for </span><span class="s1">component</span><span class="s2">, </span><span class="s1">is_plotted </span><span class="s2">in </span><span class="s1">components.items():</span>
+            <span class="s2">if not </span><span class="s1">is_plotted:</span>
+                <span class="s2">continue</span>
+
+            <span class="s1">ax = fig.add_subplot(k_plots</span><span class="s2">, </span><span class="s3">1</span><span class="s2">, </span><span class="s1">plot_idx)</span>
+            <span class="s1">plot_idx += </span><span class="s3">1</span>
+
+            <span class="s2">try</span><span class="s1">:</span>
+                <span class="s1">component_bunch = getattr(self</span><span class="s2">, </span><span class="s1">component)</span>
+                <span class="s1">title = component.title()</span>
+            <span class="s2">except </span><span class="s1">AttributeError:</span>
+                <span class="s5"># This might be a freq_seasonal component, of which there are</span>
+                <span class="s5">#  possibly multiple bagged up in property freq_seasonal</span>
+                <span class="s2">if </span><span class="s1">component.startswith(</span><span class="s4">'freq_seasonal_'</span><span class="s1">):</span>
+                    <span class="s1">ix = int(component.replace(</span><span class="s4">'freq_seasonal_'</span><span class="s2">, </span><span class="s4">''</span><span class="s1">))</span>
+                    <span class="s1">big_bunch = getattr(self</span><span class="s2">, </span><span class="s4">'freq_seasonal'</span><span class="s1">)</span>
+                    <span class="s1">component_bunch = big_bunch[ix]</span>
+                    <span class="s1">title = component_bunch.pretty_name</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">raise</span>
+
+            <span class="s5"># Check for a valid estimation type</span>
+            <span class="s2">if </span><span class="s1">which </span><span class="s2">not in </span><span class="s1">component_bunch:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s4">'Invalid type of state estimate.'</span><span class="s1">)</span>
+
+            <span class="s1">which_cov = </span><span class="s4">'%s_cov' </span><span class="s1">% which</span>
+
+            <span class="s5"># Get the predicted values</span>
+            <span class="s1">value = component_bunch[which]</span>
+
+            <span class="s5"># Plot</span>
+            <span class="s1">state_label = </span><span class="s4">'%s (%s)' </span><span class="s1">% (title</span><span class="s2">, </span><span class="s1">which)</span>
+            <span class="s1">ax.plot(dates[llb:]</span><span class="s2">, </span><span class="s1">value[llb:]</span><span class="s2">, </span><span class="s1">label=state_label)</span>
+
+            <span class="s5"># Get confidence intervals</span>
+            <span class="s2">if </span><span class="s1">which_cov </span><span class="s2">in </span><span class="s1">component_bunch:</span>
+                <span class="s1">std_errors = np.sqrt(component_bunch[</span><span class="s4">'%s_cov' </span><span class="s1">% which])</span>
+                <span class="s1">ci_lower = value - critical_value * std_errors</span>
+                <span class="s1">ci_upper = value + critical_value * std_errors</span>
+                <span class="s1">ci_poly = ax.fill_between(</span>
+                    <span class="s1">dates[llb:]</span><span class="s2">, </span><span class="s1">ci_lower[llb:]</span><span class="s2">, </span><span class="s1">ci_upper[llb:]</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s3">0.2</span>
+                <span class="s1">)</span>
+                <span class="s1">ci_label = (</span><span class="s4">'$%.3g </span><span class="s2">\\</span><span class="s4">%%$ confidence interval'</span>
+                            <span class="s1">% ((</span><span class="s3">1 </span><span class="s1">- alpha) * </span><span class="s3">100</span><span class="s1">))</span>
+
+            <span class="s5"># Legend</span>
+            <span class="s1">ax.legend(loc=legend_loc)</span>
+
+            <span class="s1">ax.set_title(</span><span class="s4">'%s component' </span><span class="s1">% title)</span>
+
+        <span class="s5"># Add a note if first observations excluded</span>
+        <span class="s2">if </span><span class="s1">llb &gt; </span><span class="s3">0</span><span class="s1">:</span>
+            <span class="s1">text = (</span><span class="s4">'Note: The first %d observations are not shown, due to'</span>
+                    <span class="s4">' approximate diffuse initialization.'</span><span class="s1">)</span>
+            <span class="s1">fig.text(</span><span class="s3">0.1</span><span class="s2">, </span><span class="s3">0.01</span><span class="s2">, </span><span class="s1">text % llb</span><span class="s2">, </span><span class="s1">fontsize=</span><span class="s4">'large'</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">fig</span>
+
+    <span class="s1">@Appender(MLEResults.summary.__doc__)</span>
+    <span class="s2">def </span><span class="s1">summary(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s3">.05</span><span class="s2">, </span><span class="s1">start=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s5"># Create the model name</span>
+
+        <span class="s1">model_name = [self.specification.trend_specification]</span>
+
+        <span class="s2">if </span><span class="s1">self.specification.seasonal:</span>
+            <span class="s1">seasonal_name = (</span><span class="s4">'seasonal(%d)'</span>
+                             <span class="s1">% self.specification.seasonal_periods)</span>
+            <span class="s2">if </span><span class="s1">self.specification.stochastic_seasonal:</span>
+                <span class="s1">seasonal_name = </span><span class="s4">'stochastic ' </span><span class="s1">+ seasonal_name</span>
+            <span class="s1">model_name.append(seasonal_name)</span>
+
+        <span class="s2">if </span><span class="s1">self.specification.freq_seasonal:</span>
+            <span class="s2">for </span><span class="s1">ix</span><span class="s2">, </span><span class="s1">is_stochastic </span><span class="s2">in </span><span class="s1">enumerate(</span>
+                    <span class="s1">self.specification.stochastic_freq_seasonal):</span>
+                <span class="s1">periodicity = self.specification.freq_seasonal_periods[ix]</span>
+                <span class="s1">harmonics = self.specification.freq_seasonal_harmonics[ix]</span>
+                <span class="s1">freq_seasonal_name = </span><span class="s4">&quot;freq_seasonal({p}({h}))&quot;</span><span class="s1">.format(</span>
+                    <span class="s1">p=repr(periodicity)</span><span class="s2">,</span>
+                    <span class="s1">h=repr(harmonics))</span>
+                <span class="s2">if </span><span class="s1">is_stochastic:</span>
+                    <span class="s1">freq_seasonal_name = </span><span class="s4">'stochastic ' </span><span class="s1">+ freq_seasonal_name</span>
+                <span class="s1">model_name.append(freq_seasonal_name)</span>
+
+        <span class="s2">if </span><span class="s1">self.specification.cycle:</span>
+            <span class="s1">cycle_name = </span><span class="s4">'cycle'</span>
+            <span class="s2">if </span><span class="s1">self.specification.stochastic_cycle:</span>
+                <span class="s1">cycle_name = </span><span class="s4">'stochastic ' </span><span class="s1">+ cycle_name</span>
+            <span class="s2">if </span><span class="s1">self.specification.damped_cycle:</span>
+                <span class="s1">cycle_name = </span><span class="s4">'damped ' </span><span class="s1">+ cycle_name</span>
+            <span class="s1">model_name.append(cycle_name)</span>
+
+        <span class="s2">if </span><span class="s1">self.specification.autoregressive:</span>
+            <span class="s1">autoregressive_name = </span><span class="s4">'AR(%d)' </span><span class="s1">% self.specification.ar_order</span>
+            <span class="s1">model_name.append(autoregressive_name)</span>
+
+        <span class="s2">return </span><span class="s1">super(UnobservedComponentsResults</span><span class="s2">, </span><span class="s1">self).summary(</span>
+            <span class="s1">alpha=alpha</span><span class="s2">, </span><span class="s1">start=start</span><span class="s2">, </span><span class="s1">title=</span><span class="s4">'Unobserved Components Results'</span><span class="s2">,</span>
+            <span class="s1">model_name=model_name</span>
+        <span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">UnobservedComponentsResultsWrapper(MLEResultsWrapper):</span>
+    <span class="s1">_attrs = {}</span>
+    <span class="s1">_wrap_attrs = wrap.union_dicts(MLEResultsWrapper._wrap_attrs</span><span class="s2">,</span>
+                                   <span class="s1">_attrs)</span>
+    <span class="s1">_methods = {}</span>
+    <span class="s1">_wrap_methods = wrap.union_dicts(MLEResultsWrapper._wrap_methods</span><span class="s2">,</span>
+                                     <span class="s1">_methods)</span>
+<span class="s1">wrap.populate_wrapper(UnobservedComponentsResultsWrapper</span><span class="s2">,  </span><span class="s5"># noqa:E305</span>
+                      <span class="s1">UnobservedComponentsResults)</span>
+</pre>
+</body>
+</html>

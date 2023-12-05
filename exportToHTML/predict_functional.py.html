@@ -1,0 +1,469 @@
+<html>
+<head>
+<title>predict_functional.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+predict_functional.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A predict-like function that constructs means and pointwise or 
+simultaneous confidence bands for the function f(x) = E[Y | X*=x, 
+X1=x1, ...], where X* is the focus variable and X1, X2, ... are 
+non-focus variables.  This is especially useful when conducting a 
+functional regression in which the role of x is modeled with b-splines 
+or other basis functions. 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">pandas </span><span class="s2">as </span><span class="s1">pd</span>
+<span class="s2">import </span><span class="s1">patsy</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.tools.sm_exceptions </span><span class="s2">import </span><span class="s1">ValueWarning</span>
+<span class="s2">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s2">import </span><span class="s1">Appender</span>
+
+<span class="s1">_predict_functional_doc =\</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Predictions and contrasts of a fitted model as a function of a given covariate. 
+ 
+    The value of the focus variable varies along a sequence of its 
+    quantiles, calculated from the data used to fit the model.  The 
+    other variables are held constant either at given values, or at 
+    values obtained by applying given summary functions to the data 
+    used to fit the model.  Optionally, a second specification of the 
+    non-focus variables is provided and the contrast between the two 
+    specifications is returned. 
+ 
+    Parameters 
+    ---------- 
+    result : statsmodels result object 
+        A results object for the fitted model. 
+    focus_var : str 
+        The name of the 'focus variable'. 
+    summaries : dict-like 
+        A map from names of non-focus variables to summary functions. 
+        Each summary function is applied to the data used to fit the 
+        model, to obtain a value at which the variable is held fixed. 
+    values : dict-like 
+        Values at which a given non-focus variable is held fixed. 
+    summaries2 : dict-like 
+        A second set of summary functions used to define a contrast. 
+    values2 : dict-like 
+        A second set of fixed values used to define a contrast. 
+    alpha : float 
+        `1 - alpha` is the coverage probability. 
+    ci_method : str 
+        The method for constructing the confidence band, one of 
+        'pointwise', 'scheffe', and 'simultaneous'. 
+    num_points : int 
+        The number of equally-spaced quantile points where the 
+        prediction is made. 
+    exog : array_like 
+        Explicitly provide points to cover with the confidence band. 
+    exog2 : array_like 
+        Explicitly provide points to contrast to `exog` in a functional 
+        confidence band. 
+    kwargs : 
+        Arguments passed to the `predict` method. 
+ 
+    Returns 
+    ------- 
+    pred : array_like 
+        The predicted mean values. 
+    cb : array_like 
+        An array with two columns, containing respectively the lower 
+        and upper limits of a confidence band. 
+    fvals : array_like 
+        The values of the focus variable at which the prediction is 
+        made. 
+ 
+    Notes 
+    ----- 
+    All variables in the model except for the focus variable should be 
+    included as a key in either `summaries` or `values` (unless `exog` 
+    is provided). 
+ 
+    If `summaries2` and `values2` are not provided, the returned value 
+    contains predicted conditional means for the outcome as the focus 
+    variable varies, with the other variables fixed as specified. 
+ 
+    If `summaries2` and/or `values2` is provided, two sets of 
+    predicted conditional means are calculated, and the returned value 
+    is the contrast between them. 
+ 
+    If `exog` is provided, then the rows should contain a sequence of 
+    values approximating a continuous path through the domain of the 
+    covariates.  For example, if Z(s) is the covariate expressed as a 
+    function of s, then the rows of exog may approximate Z(g(s)) for 
+    some continuous function g.  If `exog` is provided then neither of 
+    the summaries or values arguments should be provided.  If `exog2` 
+    is also provided, then the returned value is a contrast between 
+    the functionas defined by `exog` and `exog2`. 
+ 
+    Examples 
+    -------- 
+    Fit a model using a formula in which the predictors are age 
+    (modeled with splines), ethnicity (which is categorical), gender, 
+    and income.  Then we obtain the fitted mean values as a function 
+    of age for females with mean income and the most common 
+    ethnicity. 
+ 
+    &gt;&gt;&gt; model = sm.OLS.from_formula('y ~ bs(age, df=4) + C(ethnicity) + gender + income', data) 
+    &gt;&gt;&gt; result = model.fit() 
+    &gt;&gt;&gt; mode = lambda x : x.value_counts().argmax() 
+    &gt;&gt;&gt; summaries = {'income': np.mean, ethnicity=mode} 
+    &gt;&gt;&gt; values = {'gender': 'female'} 
+    &gt;&gt;&gt; pr, cb, x = predict_functional(result, 'age', summaries, values) 
+ 
+    Fit a model using arrays.  Plot the means as a function of x3, 
+    holding x1 fixed at its mean value in the data used to fit the 
+    model, and holding x2 fixed at 1. 
+ 
+    &gt;&gt;&gt; model = sm.OLS(y ,x) 
+    &gt;&gt;&gt; result = model.fit() 
+    &gt;&gt;&gt; summaries = {'x1': np.mean} 
+    &gt;&gt;&gt; values = {'x2': 1} 
+    &gt;&gt;&gt; pr, cb, x = predict_functional(result, 'x3', summaries, values) 
+ 
+    Fit a model usng a formula and construct a contrast comparing the 
+    female and male predicted mean functions. 
+ 
+    &gt;&gt;&gt; model = sm.OLS.from_formula('y ~ bs(age, df=4) + gender', data) 
+    &gt;&gt;&gt; result = model.fit() 
+    &gt;&gt;&gt; values = {'gender': 'female'} 
+    &gt;&gt;&gt; values2 = {'gender': 'male'} 
+    &gt;&gt;&gt; pr, cb, x = predict_functional(result, 'age', values=values, values2=values2) 
+    &quot;&quot;&quot;</span>
+
+
+<span class="s2">def </span><span class="s1">_make_exog_from_formula(result</span><span class="s2">, </span><span class="s1">focus_var</span><span class="s2">, </span><span class="s1">summaries</span><span class="s2">, </span><span class="s1">values</span><span class="s2">, </span><span class="s1">num_points):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Create dataframes for exploring a fitted model as a function of one variable. 
+ 
+    This works for models fit with a formula. 
+ 
+    Returns 
+    ------- 
+    dexog : data frame 
+        A data frame in which the focus variable varies and the other variables 
+        are fixed at specified or computed values. 
+    fexog : data frame 
+        The data frame `dexog` processed through the model formula. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">model = result.model</span>
+    <span class="s1">exog = model.data.frame</span>
+
+    <span class="s2">if </span><span class="s1">summaries </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">summaries = {}</span>
+    <span class="s2">if </span><span class="s1">values </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">values = {}</span>
+
+    <span class="s2">if </span><span class="s1">exog[focus_var].dtype </span><span class="s2">is </span><span class="s1">np.dtype(</span><span class="s3">'O'</span><span class="s1">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">'focus variable may not have object type'</span><span class="s1">)</span>
+
+    <span class="s1">colnames = list(summaries.keys()) + list(values.keys()) + [focus_var]</span>
+    <span class="s1">dtypes = [exog[x].dtype </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">colnames]</span>
+
+    <span class="s4"># Check for variables whose values are not set either through</span>
+    <span class="s4"># `values` or `summaries`.  Since the model data frame can contain</span>
+    <span class="s4"># extra variables not referenced in the formula RHS, this may not</span>
+    <span class="s4"># be a problem, so just warn.  There is no obvious way to extract</span>
+    <span class="s4"># from a formula all the variable names that it references.</span>
+    <span class="s1">varl = set(exog.columns.tolist()) - set([model.endog_names])</span>
+    <span class="s1">unmatched = varl - set(colnames)</span>
+    <span class="s1">unmatched = list(unmatched)</span>
+    <span class="s2">if </span><span class="s1">len(unmatched) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s1">warnings.warn(</span><span class="s3">&quot;%s in data frame but not in summaries or values.&quot;</span>
+                      <span class="s1">% </span><span class="s3">&quot;, &quot;</span><span class="s1">.join([</span><span class="s3">&quot;'%s'&quot; </span><span class="s1">% x </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">unmatched])</span><span class="s2">,</span>
+                      <span class="s1">ValueWarning)</span>
+
+    <span class="s4"># Initialize at zero so each column can be converted to any dtype.</span>
+    <span class="s1">ix = range(num_points)</span>
+    <span class="s1">fexog = pd.DataFrame(index=ix</span><span class="s2">, </span><span class="s1">columns=colnames)</span>
+    <span class="s2">for </span><span class="s1">d</span><span class="s2">, </span><span class="s1">x </span><span class="s2">in </span><span class="s1">zip(dtypes</span><span class="s2">, </span><span class="s1">colnames):</span>
+        <span class="s1">fexog[x] = pd.Series(index=ix</span><span class="s2">, </span><span class="s1">dtype=d)</span>
+
+    <span class="s4"># The values of the 'focus variable' are a sequence of percentiles</span>
+    <span class="s1">pctls = np.linspace(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">100</span><span class="s2">, </span><span class="s1">num_points).tolist()</span>
+    <span class="s1">fvals = np.percentile(exog[focus_var]</span><span class="s2">, </span><span class="s1">pctls)</span>
+    <span class="s1">fvals = np.asarray(fvals)</span>
+    <span class="s1">fexog.loc[:</span><span class="s2">, </span><span class="s1">focus_var] = fvals</span>
+
+    <span class="s4"># The values of the other variables may be given by summary functions...</span>
+    <span class="s2">for </span><span class="s1">ky </span><span class="s2">in </span><span class="s1">summaries.keys():</span>
+        <span class="s1">fexog.loc[:</span><span class="s2">, </span><span class="s1">ky] = summaries[ky](exog.loc[:</span><span class="s2">, </span><span class="s1">ky])</span>
+
+    <span class="s4"># or they may be provided as given values.</span>
+    <span class="s2">for </span><span class="s1">ky </span><span class="s2">in </span><span class="s1">values.keys():</span>
+        <span class="s1">fexog[ky] = values[ky]</span>
+
+    <span class="s1">dexog = patsy.dmatrix(model.data.design_info</span><span class="s2">, </span><span class="s1">fexog</span><span class="s2">,</span>
+                          <span class="s1">return_type=</span><span class="s3">'dataframe'</span><span class="s1">)</span>
+    <span class="s2">return </span><span class="s1">dexog</span><span class="s2">, </span><span class="s1">fexog</span><span class="s2">, </span><span class="s1">fvals</span>
+
+
+<span class="s2">def </span><span class="s1">_make_exog_from_arrays(result</span><span class="s2">, </span><span class="s1">focus_var</span><span class="s2">, </span><span class="s1">summaries</span><span class="s2">, </span><span class="s1">values</span><span class="s2">, </span><span class="s1">num_points):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Create dataframes for exploring a fitted model as a function of one variable. 
+ 
+    This works for models fit without a formula. 
+ 
+    Returns 
+    ------- 
+    exog : data frame 
+        A data frame in which the focus variable varies and the other variables 
+        are fixed at specified or computed values. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">model = result.model</span>
+    <span class="s1">model_exog = model.exog</span>
+    <span class="s1">exog_names = model.exog_names</span>
+
+    <span class="s2">if </span><span class="s1">summaries </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">summaries = {}</span>
+    <span class="s2">if </span><span class="s1">values </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">values = {}</span>
+
+    <span class="s1">exog = np.zeros((num_points</span><span class="s2">, </span><span class="s1">model_exog.shape[</span><span class="s5">1</span><span class="s1">]))</span>
+
+    <span class="s4"># Check for variables whose values are not set either through</span>
+    <span class="s4"># `values` or `summaries`.</span>
+    <span class="s1">colnames = list(values.keys()) + list(summaries.keys()) + [focus_var]</span>
+    <span class="s1">unmatched = set(exog_names) - set(colnames)</span>
+    <span class="s1">unmatched = list(unmatched)</span>
+    <span class="s2">if </span><span class="s1">len(unmatched) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s1">warnings.warn(</span><span class="s3">&quot;%s in model but not in `summaries` or `values`.&quot;</span>
+                      <span class="s1">% </span><span class="s3">&quot;, &quot;</span><span class="s1">.join([</span><span class="s3">&quot;'%s'&quot; </span><span class="s1">% x </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">unmatched])</span><span class="s2">,</span>
+                      <span class="s1">ValueWarning)</span>
+
+    <span class="s4"># The values of the 'focus variable' are a sequence of percentiles</span>
+    <span class="s1">pctls = np.linspace(</span><span class="s5">0</span><span class="s2">, </span><span class="s5">100</span><span class="s2">, </span><span class="s1">num_points).tolist()</span>
+    <span class="s1">ix = exog_names.index(focus_var)</span>
+    <span class="s1">fvals = np.percentile(model_exog[:</span><span class="s2">, </span><span class="s1">ix]</span><span class="s2">, </span><span class="s1">pctls)</span>
+    <span class="s1">exog[:</span><span class="s2">, </span><span class="s1">ix] = fvals</span>
+
+    <span class="s4"># The values of the other variables may be given by summary functions...</span>
+    <span class="s2">for </span><span class="s1">ky </span><span class="s2">in </span><span class="s1">summaries.keys():</span>
+        <span class="s1">ix = exog_names.index(ky)</span>
+        <span class="s1">exog[:</span><span class="s2">, </span><span class="s1">ix] = summaries[ky](model_exog[:</span><span class="s2">, </span><span class="s1">ix])</span>
+
+    <span class="s4"># or they may be provided as given values.</span>
+    <span class="s2">for </span><span class="s1">ky </span><span class="s2">in </span><span class="s1">values.keys():</span>
+        <span class="s1">ix = exog_names.index(ky)</span>
+        <span class="s1">exog[:</span><span class="s2">, </span><span class="s1">ix] = values[ky]</span>
+
+    <span class="s2">return </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">fvals</span>
+
+
+<span class="s2">def </span><span class="s1">_make_exog(result</span><span class="s2">, </span><span class="s1">focus_var</span><span class="s2">, </span><span class="s1">summaries</span><span class="s2">, </span><span class="s1">values</span><span class="s2">, </span><span class="s1">num_points):</span>
+
+    <span class="s4"># Branch depending on whether the model was fit with a formula.</span>
+    <span class="s2">if </span><span class="s1">hasattr(result.model.data</span><span class="s2">, </span><span class="s3">&quot;frame&quot;</span><span class="s1">):</span>
+        <span class="s1">dexog</span><span class="s2">, </span><span class="s1">fexog</span><span class="s2">, </span><span class="s1">fvals = _make_exog_from_formula(result</span><span class="s2">, </span><span class="s1">focus_var</span><span class="s2">,</span>
+                                       <span class="s1">summaries</span><span class="s2">, </span><span class="s1">values</span><span class="s2">, </span><span class="s1">num_points)</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">exog</span><span class="s2">, </span><span class="s1">fvals = _make_exog_from_arrays(result</span><span class="s2">, </span><span class="s1">focus_var</span><span class="s2">, </span><span class="s1">summaries</span><span class="s2">,</span>
+                                 <span class="s1">values</span><span class="s2">, </span><span class="s1">num_points)</span>
+        <span class="s1">dexog</span><span class="s2">, </span><span class="s1">fexog = exog</span><span class="s2">, </span><span class="s1">exog</span>
+
+    <span class="s2">return </span><span class="s1">dexog</span><span class="s2">, </span><span class="s1">fexog</span><span class="s2">, </span><span class="s1">fvals</span>
+
+
+<span class="s2">def </span><span class="s1">_check_args(values</span><span class="s2">, </span><span class="s1">summaries</span><span class="s2">, </span><span class="s1">values2</span><span class="s2">, </span><span class="s1">summaries2):</span>
+
+    <span class="s2">if </span><span class="s1">values </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">values = {}</span>
+    <span class="s2">if </span><span class="s1">values2 </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">values2 = {}</span>
+    <span class="s2">if </span><span class="s1">summaries </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">summaries = {}</span>
+    <span class="s2">if </span><span class="s1">summaries2 </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s1">summaries2 = {}</span>
+
+    <span class="s2">for </span><span class="s1">(s</span><span class="s2">,</span><span class="s1">v) </span><span class="s2">in </span><span class="s1">(summaries</span><span class="s2">, </span><span class="s1">values)</span><span class="s2">, </span><span class="s1">(summaries2</span><span class="s2">, </span><span class="s1">values2):</span>
+        <span class="s1">ky = set(v.keys()) &amp; set(s.keys())</span>
+        <span class="s1">ky = list(ky)</span>
+        <span class="s2">if </span><span class="s1">len(ky) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;One or more variable names are contained in both `summaries` and `values`:&quot; </span><span class="s1">+</span>
+                             <span class="s3">&quot;, &quot;</span><span class="s1">.join(ky))</span>
+
+    <span class="s2">return </span><span class="s1">values</span><span class="s2">, </span><span class="s1">summaries</span><span class="s2">, </span><span class="s1">values2</span><span class="s2">, </span><span class="s1">summaries2</span>
+
+
+<span class="s1">@Appender(_predict_functional_doc)</span>
+<span class="s2">def </span><span class="s1">predict_functional(result</span><span class="s2">, </span><span class="s1">focus_var</span><span class="s2">, </span><span class="s1">summaries=</span><span class="s2">None, </span><span class="s1">values=</span><span class="s2">None,</span>
+                       <span class="s1">summaries2=</span><span class="s2">None, </span><span class="s1">values2=</span><span class="s2">None, </span><span class="s1">alpha=</span><span class="s5">0.05</span><span class="s2">,</span>
+                       <span class="s1">ci_method=</span><span class="s3">&quot;pointwise&quot;</span><span class="s2">, </span><span class="s1">linear=</span><span class="s2">True, </span><span class="s1">num_points=</span><span class="s5">10</span><span class="s2">,</span>
+                       <span class="s1">exog=</span><span class="s2">None, </span><span class="s1">exog2=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+
+    <span class="s2">if </span><span class="s1">ci_method </span><span class="s2">not in </span><span class="s1">(</span><span class="s3">&quot;pointwise&quot;</span><span class="s2">, </span><span class="s3">&quot;scheffe&quot;</span><span class="s2">, </span><span class="s3">&quot;simultaneous&quot;</span><span class="s1">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">'confidence band method must be one of '</span>
+                         <span class="s3">'`pointwise`, `scheffe`, and `simultaneous`.'</span><span class="s1">)</span>
+
+    <span class="s1">contrast = (values2 </span><span class="s2">is not None</span><span class="s1">) </span><span class="s2">or </span><span class="s1">(summaries2 </span><span class="s2">is not None</span><span class="s1">)</span>
+
+    <span class="s2">if </span><span class="s1">contrast </span><span class="s2">and not </span><span class="s1">linear:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;`linear` must be True for computing contrasts&quot;</span><span class="s1">)</span>
+
+    <span class="s1">model = result.model</span>
+    <span class="s2">if </span><span class="s1">exog </span><span class="s2">is not None</span><span class="s1">:</span>
+
+        <span class="s2">if </span><span class="s1">any(x </span><span class="s2">is not None for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">[summaries</span><span class="s2">, </span><span class="s1">summaries2</span><span class="s2">, </span><span class="s1">values</span><span class="s2">, </span><span class="s1">values2]):</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;if `exog` is provided then do not &quot;</span>
+                             <span class="s3">&quot;provide `summaries` or `values`&quot;</span><span class="s1">)</span>
+
+        <span class="s1">fexog = exog</span>
+        <span class="s1">dexog = patsy.dmatrix(model.data.design_info</span><span class="s2">,</span>
+                              <span class="s1">fexog</span><span class="s2">, </span><span class="s1">return_type=</span><span class="s3">'dataframe'</span><span class="s1">)</span>
+        <span class="s1">fvals = exog[focus_var]</span>
+
+        <span class="s2">if </span><span class="s1">exog2 </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">fexog2 = exog</span>
+            <span class="s1">dexog2 = patsy.dmatrix(model.data.design_info</span><span class="s2">,</span>
+                                   <span class="s1">fexog2</span><span class="s2">, </span><span class="s1">return_type=</span><span class="s3">'dataframe'</span><span class="s1">)</span>
+            <span class="s1">fvals2 = fvals</span>
+
+    <span class="s2">else</span><span class="s1">:</span>
+
+        <span class="s1">values</span><span class="s2">, </span><span class="s1">summaries</span><span class="s2">, </span><span class="s1">values2</span><span class="s2">, </span><span class="s1">summaries2 = _check_args(values</span><span class="s2">,</span>
+                                                             <span class="s1">summaries</span><span class="s2">,</span>
+                                                             <span class="s1">values2</span><span class="s2">,</span>
+                                                             <span class="s1">summaries2)</span>
+
+        <span class="s1">dexog</span><span class="s2">, </span><span class="s1">fexog</span><span class="s2">, </span><span class="s1">fvals = _make_exog(result</span><span class="s2">, </span><span class="s1">focus_var</span><span class="s2">, </span><span class="s1">summaries</span><span class="s2">,</span>
+                                         <span class="s1">values</span><span class="s2">, </span><span class="s1">num_points)</span>
+
+        <span class="s2">if </span><span class="s1">len(summaries2) + len(values2) &gt; </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s1">dexog2</span><span class="s2">, </span><span class="s1">fexog2</span><span class="s2">, </span><span class="s1">fvals2 = _make_exog(result</span><span class="s2">, </span><span class="s1">focus_var</span><span class="s2">, </span><span class="s1">summaries2</span><span class="s2">,</span>
+                                                <span class="s1">values2</span><span class="s2">, </span><span class="s1">num_points)</span>
+
+    <span class="s2">from </span><span class="s1">statsmodels.genmod.generalized_linear_model </span><span class="s2">import </span><span class="s1">GLM</span>
+    <span class="s2">from </span><span class="s1">statsmodels.genmod.generalized_estimating_equations </span><span class="s2">import </span><span class="s1">GEE</span>
+    <span class="s2">if </span><span class="s1">isinstance(result.model</span><span class="s2">, </span><span class="s1">(GLM</span><span class="s2">, </span><span class="s1">GEE)):</span>
+        <span class="s1">kwargs_pred = kwargs.copy()</span>
+        <span class="s1">kwargs_pred.update({</span><span class="s3">&quot;which&quot;</span><span class="s1">: </span><span class="s3">&quot;linear&quot;</span><span class="s1">})</span>
+    <span class="s2">else</span><span class="s1">:</span>
+        <span class="s1">kwargs_pred = kwargs</span>
+
+    <span class="s1">pred = result.predict(exog=fexog</span><span class="s2">, </span><span class="s1">**kwargs_pred)</span>
+    <span class="s2">if </span><span class="s1">contrast:</span>
+        <span class="s1">pred2 = result.predict(exog=fexog2</span><span class="s2">, </span><span class="s1">**kwargs_pred)</span>
+        <span class="s1">pred = pred - pred2</span>
+        <span class="s1">dexog = dexog - dexog2</span>
+
+    <span class="s2">if </span><span class="s1">ci_method == </span><span class="s3">'pointwise'</span><span class="s1">:</span>
+
+        <span class="s1">t_test = result.t_test(dexog)</span>
+        <span class="s1">cb = t_test.conf_int(alpha=alpha)</span>
+
+    <span class="s2">elif </span><span class="s1">ci_method == </span><span class="s3">'scheffe'</span><span class="s1">:</span>
+
+        <span class="s1">t_test = result.t_test(dexog)</span>
+        <span class="s1">sd = t_test.sd</span>
+        <span class="s1">cb = np.zeros((num_points</span><span class="s2">, </span><span class="s5">2</span><span class="s1">))</span>
+
+        <span class="s4"># Scheffe's method</span>
+        <span class="s2">from </span><span class="s1">scipy.stats.distributions </span><span class="s2">import </span><span class="s1">f </span><span class="s2">as </span><span class="s1">fdist</span>
+        <span class="s1">df1 = result.model.exog.shape[</span><span class="s5">1</span><span class="s1">]</span>
+        <span class="s1">df2 = result.model.exog.shape[</span><span class="s5">0</span><span class="s1">] - df1</span>
+        <span class="s1">qf = fdist.cdf(</span><span class="s5">1 </span><span class="s1">- alpha</span><span class="s2">, </span><span class="s1">df1</span><span class="s2">, </span><span class="s1">df2)</span>
+        <span class="s1">fx = sd * np.sqrt(df1 * qf)</span>
+        <span class="s1">cb[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = pred - fx</span>
+        <span class="s1">cb[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = pred + fx</span>
+
+    <span class="s2">elif </span><span class="s1">ci_method == </span><span class="s3">'simultaneous'</span><span class="s1">:</span>
+
+        <span class="s1">sigma</span><span class="s2">, </span><span class="s1">c = _glm_basic_scr(result</span><span class="s2">, </span><span class="s1">dexog</span><span class="s2">, </span><span class="s1">alpha)</span>
+        <span class="s1">cb = np.zeros((dexog.shape[</span><span class="s5">0</span><span class="s1">]</span><span class="s2">, </span><span class="s5">2</span><span class="s1">))</span>
+        <span class="s1">cb[:</span><span class="s2">, </span><span class="s5">0</span><span class="s1">] = pred - c*sigma</span>
+        <span class="s1">cb[:</span><span class="s2">, </span><span class="s5">1</span><span class="s1">] = pred + c*sigma</span>
+
+    <span class="s2">if not </span><span class="s1">linear:</span>
+        <span class="s4"># May need to support other models with link-like functions.</span>
+        <span class="s1">link = result.family.link</span>
+        <span class="s1">pred = link.inverse(pred)</span>
+        <span class="s1">cb = link.inverse(cb)</span>
+
+    <span class="s2">return </span><span class="s1">pred</span><span class="s2">, </span><span class="s1">cb</span><span class="s2">, </span><span class="s1">fvals</span>
+
+
+<span class="s2">def </span><span class="s1">_glm_basic_scr(result</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">alpha):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    The basic SCR from (Sun et al. Annals of Statistics 2000). 
+ 
+    Computes simultaneous confidence regions (SCR). 
+ 
+    Parameters 
+    ---------- 
+    result : results instance 
+        The fitted GLM results instance 
+    exog : array_like 
+        The exog values spanning the interval 
+    alpha : float 
+        `1 - alpha` is the coverage probability. 
+ 
+    Returns 
+    ------- 
+    An array with two columns, containing the lower and upper 
+    confidence bounds, respectively. 
+ 
+    Notes 
+    ----- 
+    The rows of `exog` should be a sequence of covariate values 
+    obtained by taking one 'free variable' x and varying it over an 
+    interval.  The matrix `exog` is thus the basis functions and any 
+    other covariates evaluated as x varies. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">model = result.model</span>
+    <span class="s1">n = model.exog.shape[</span><span class="s5">0</span><span class="s1">]</span>
+
+    <span class="s4"># Get the Hessian without recomputing.</span>
+    <span class="s1">cov = result.cov_params()</span>
+    <span class="s1">hess = np.linalg.inv(cov)</span>
+
+    <span class="s4"># Proposition 3.1 of Sun et al.</span>
+    <span class="s1">A = hess / n</span>
+    <span class="s1">B = np.linalg.cholesky(A).T </span><span class="s4"># Upper Cholesky triangle</span>
+
+    <span class="s4"># The variance and SD of the linear predictor at each row of exog.</span>
+    <span class="s1">sigma2 = (np.dot(exog</span><span class="s2">, </span><span class="s1">cov) * exog).sum(</span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">sigma = np.asarray(np.sqrt(sigma2))</span>
+
+    <span class="s4"># Calculate kappa_0 (formula 42 from Sun et al)</span>
+    <span class="s1">bz = np.linalg.solve(B.T</span><span class="s2">, </span><span class="s1">exog.T).T</span>
+    <span class="s1">bz /= np.sqrt(n)</span>
+    <span class="s1">bz /= sigma[:</span><span class="s2">, None</span><span class="s1">]</span>
+    <span class="s1">bzd = np.diff(bz</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s1">axis=</span><span class="s5">0</span><span class="s1">)</span>
+    <span class="s1">bzdn = (bzd**</span><span class="s5">2</span><span class="s1">).sum(</span><span class="s5">1</span><span class="s1">)</span>
+    <span class="s1">kappa_0 = np.sqrt(bzdn).sum()</span>
+
+    <span class="s2">from </span><span class="s1">scipy.stats.distributions </span><span class="s2">import </span><span class="s1">norm</span>
+
+    <span class="s4"># The root of this function is the multiplier for the confidence</span>
+    <span class="s4"># band, see Sun et al. equation 35.</span>
+    <span class="s2">def </span><span class="s1">func(c):</span>
+        <span class="s2">return </span><span class="s1">kappa_0 * np.exp(-c**</span><span class="s5">2</span><span class="s1">/</span><span class="s5">2</span><span class="s1">) / np.pi + </span><span class="s5">2</span><span class="s1">*(</span><span class="s5">1 </span><span class="s1">- norm.cdf(c)) - alpha</span>
+
+    <span class="s2">from </span><span class="s1">scipy.optimize </span><span class="s2">import </span><span class="s1">brentq</span>
+
+    <span class="s1">c</span><span class="s2">, </span><span class="s1">rslt = brentq(func</span><span class="s2">, </span><span class="s5">1</span><span class="s2">, </span><span class="s5">10</span><span class="s2">, </span><span class="s1">full_output=</span><span class="s2">True</span><span class="s1">)</span>
+    <span class="s2">if not </span><span class="s1">rslt.converged:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;Root finding error in basic SCR&quot;</span><span class="s1">)</span>
+
+    <span class="s2">return </span><span class="s1">sigma</span><span class="s2">, </span><span class="s1">c</span>
+</pre>
+</body>
+</html>

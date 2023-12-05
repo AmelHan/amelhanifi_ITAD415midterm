@@ -1,0 +1,911 @@
+<html>
+<head>
+<title>iterative.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #cc7832;}
+.s4 { color: #808080;}
+.s5 { color: #6897bb;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+iterative.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Iterative methods for solving linear systems&quot;&quot;&quot;</span>
+
+<span class="s1">__all__ = [</span><span class="s2">'bicg'</span><span class="s3">,</span><span class="s2">'bicgstab'</span><span class="s3">,</span><span class="s2">'cg'</span><span class="s3">,</span><span class="s2">'cgs'</span><span class="s3">,</span><span class="s2">'gmres'</span><span class="s3">,</span><span class="s2">'qmr'</span><span class="s1">]</span>
+
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">from </span><span class="s1">textwrap </span><span class="s3">import </span><span class="s1">dedent</span>
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+
+<span class="s3">from </span><span class="s1">. </span><span class="s3">import </span><span class="s1">_iterative</span>
+
+<span class="s3">from </span><span class="s1">scipy.sparse.linalg._interface </span><span class="s3">import </span><span class="s1">LinearOperator</span>
+<span class="s3">from </span><span class="s1">.utils </span><span class="s3">import </span><span class="s1">make_system</span>
+<span class="s3">from </span><span class="s1">scipy._lib._util </span><span class="s3">import </span><span class="s1">_aligned_zeros</span>
+<span class="s3">from </span><span class="s1">scipy._lib._threadsafety </span><span class="s3">import </span><span class="s1">non_reentrant</span>
+
+<span class="s1">_type_conv = {</span><span class="s2">'f'</span><span class="s1">:</span><span class="s2">'s'</span><span class="s3">, </span><span class="s2">'d'</span><span class="s1">:</span><span class="s2">'d'</span><span class="s3">, </span><span class="s2">'F'</span><span class="s1">:</span><span class="s2">'c'</span><span class="s3">, </span><span class="s2">'D'</span><span class="s1">:</span><span class="s2">'z'</span><span class="s1">}</span>
+
+
+<span class="s4"># Part of the docstring common to all iterative solvers</span>
+<span class="s1">common_doc1 = \</span>
+<span class="s2">&quot;&quot;&quot; 
+Parameters 
+---------- 
+A : {sparse matrix, ndarray, LinearOperator}&quot;&quot;&quot;</span>
+
+<span class="s1">common_doc2 = \</span>
+<span class="s2">&quot;&quot;&quot;b : ndarray 
+    Right hand side of the linear system. Has shape (N,) or (N,1). 
+ 
+Returns 
+------- 
+x : ndarray 
+    The converged solution. 
+info : integer 
+    Provides convergence information: 
+        0  : successful exit 
+        &gt;0 : convergence to tolerance not achieved, number of iterations 
+        &lt;0 : illegal input or breakdown 
+ 
+Other Parameters 
+---------------- 
+x0 : ndarray 
+    Starting guess for the solution. 
+tol, atol : float, optional 
+    Tolerances for convergence, ``norm(residual) &lt;= max(tol*norm(b), atol)``. 
+    The default for ``atol`` is ``'legacy'``, which emulates 
+    a different legacy behavior. 
+ 
+    .. warning:: 
+ 
+       The default value for `atol` will be changed in a future release. 
+       For future compatibility, specify `atol` explicitly. 
+maxiter : integer 
+    Maximum number of iterations.  Iteration will stop after maxiter 
+    steps even if the specified tolerance has not been achieved. 
+M : {sparse matrix, ndarray, LinearOperator} 
+    Preconditioner for A.  The preconditioner should approximate the 
+    inverse of A.  Effective preconditioning dramatically improves the 
+    rate of convergence, which implies that fewer iterations are needed 
+    to reach a given error tolerance. 
+callback : function 
+    User-supplied function to call after each iteration.  It is called 
+    as callback(xk), where xk is the current solution vector. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s3">def </span><span class="s1">_stoptest(residual</span><span class="s3">, </span><span class="s1">atol):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Successful termination condition for the solvers. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">resid = np.linalg.norm(residual)</span>
+    <span class="s3">if </span><span class="s1">resid &lt;= atol:</span>
+        <span class="s3">return </span><span class="s1">resid</span><span class="s3">, </span><span class="s5">1</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">resid</span><span class="s3">, </span><span class="s5">0</span>
+
+
+<span class="s3">def </span><span class="s1">_get_atol(tol</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">bnrm2</span><span class="s3">, </span><span class="s1">get_residual</span><span class="s3">, </span><span class="s1">routine_name):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Parse arguments for absolute tolerance in termination condition. 
+ 
+    Parameters 
+    ---------- 
+    tol, atol : object 
+        The arguments passed into the solver routine by user. 
+    bnrm2 : float 
+        2-norm of the rhs vector. 
+    get_residual : callable 
+        Callable ``get_residual()`` that returns the initial value of 
+        the residual. 
+    routine_name : str 
+        Name of the routine. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">atol </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">warnings.warn(</span><span class="s2">&quot;scipy.sparse.linalg.{name} called without specifying `atol`. &quot;</span>
+                      <span class="s2">&quot;The default value will be changed in a future release. &quot;</span>
+                      <span class="s2">&quot;For compatibility, specify a value for `atol` explicitly, e.g., &quot;</span>
+                      <span class="s2">&quot;``{name}(..., atol=0)``, or to retain the old behavior &quot;</span>
+                      <span class="s2">&quot;``{name}(..., atol='legacy')``&quot;</span><span class="s1">.format(name=routine_name)</span><span class="s3">,</span>
+                      <span class="s1">category=DeprecationWarning</span><span class="s3">, </span><span class="s1">stacklevel=</span><span class="s5">4</span><span class="s1">)</span>
+        <span class="s1">atol = </span><span class="s2">'legacy'</span>
+
+    <span class="s1">tol = float(tol)</span>
+
+    <span class="s3">if </span><span class="s1">atol == </span><span class="s2">'legacy'</span><span class="s1">:</span>
+        <span class="s4"># emulate old legacy behavior</span>
+        <span class="s1">resid = get_residual()</span>
+        <span class="s3">if </span><span class="s1">resid &lt;= tol:</span>
+            <span class="s3">return </span><span class="s2">'exit'</span>
+        <span class="s3">if </span><span class="s1">bnrm2 == </span><span class="s5">0</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">tol</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">return </span><span class="s1">tol * float(bnrm2)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">max(float(atol)</span><span class="s3">, </span><span class="s1">tol * float(bnrm2))</span>
+
+
+<span class="s3">def </span><span class="s1">set_docstring(header</span><span class="s3">, </span><span class="s1">Ainfo</span><span class="s3">, </span><span class="s1">footer=</span><span class="s2">''</span><span class="s3">, </span><span class="s1">atol_default=</span><span class="s2">'0'</span><span class="s1">):</span>
+    <span class="s3">def </span><span class="s1">combine(fn):</span>
+        <span class="s1">fn.__doc__ = </span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s1">.join((header</span><span class="s3">, </span><span class="s1">common_doc1</span><span class="s3">,</span>
+                                <span class="s2">'    ' </span><span class="s1">+ Ainfo.replace(</span><span class="s2">'</span><span class="s3">\n</span><span class="s2">'</span><span class="s3">, </span><span class="s2">'</span><span class="s3">\n    </span><span class="s2">'</span><span class="s1">)</span><span class="s3">,</span>
+                                <span class="s1">common_doc2</span><span class="s3">, </span><span class="s1">dedent(footer)))</span>
+        <span class="s3">return </span><span class="s1">fn</span>
+    <span class="s3">return </span><span class="s1">combine</span>
+
+
+<span class="s1">@set_docstring(</span><span class="s2">'Use BIConjugate Gradient iteration to solve ``Ax = b``.'</span><span class="s3">,</span>
+               <span class="s2">'The real or complex N-by-N matrix of the linear system.</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'Alternatively, ``A`` can be a linear operator which can</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'produce ``Ax`` and ``A^T x`` using, e.g.,</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'``scipy.sparse.linalg.LinearOperator``.'</span><span class="s3">,</span>
+               <span class="s1">footer=</span><span class="s2">&quot;&quot;&quot;</span><span class="s3">\ 
+               </span><span class="s2">Examples 
+               -------- 
+               &gt;&gt;&gt; import numpy as np 
+               &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+               &gt;&gt;&gt; from scipy.sparse.linalg import bicg 
+               &gt;&gt;&gt; A = csc_matrix([[3, 2, 0], [1, -1, 0], [0, 5, 1]], dtype=float) 
+               &gt;&gt;&gt; b = np.array([2, 4, -1], dtype=float) 
+               &gt;&gt;&gt; x, exitCode = bicg(A, b) 
+               &gt;&gt;&gt; print(exitCode)            # 0 indicates successful convergence 
+               0 
+               &gt;&gt;&gt; np.allclose(A.dot(x), b) 
+               True 
+ 
+               &quot;&quot;&quot;</span>
+               <span class="s1">)</span>
+<span class="s1">@non_reentrant()</span>
+<span class="s3">def </span><span class="s1">bicg(A</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">x0=</span><span class="s3">None, </span><span class="s1">tol=</span><span class="s5">1e-5</span><span class="s3">, </span><span class="s1">maxiter=</span><span class="s3">None, </span><span class="s1">M=</span><span class="s3">None, </span><span class="s1">callback=</span><span class="s3">None, </span><span class="s1">atol=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s1">A</span><span class="s3">,</span><span class="s1">M</span><span class="s3">,</span><span class="s1">x</span><span class="s3">,</span><span class="s1">b</span><span class="s3">,</span><span class="s1">postprocess = make_system(A</span><span class="s3">, </span><span class="s1">M</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">b)</span>
+
+    <span class="s1">n = len(b)</span>
+    <span class="s3">if </span><span class="s1">maxiter </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">maxiter = n*</span><span class="s5">10</span>
+
+    <span class="s1">matvec</span><span class="s3">, </span><span class="s1">rmatvec = A.matvec</span><span class="s3">, </span><span class="s1">A.rmatvec</span>
+    <span class="s1">psolve</span><span class="s3">, </span><span class="s1">rpsolve = M.matvec</span><span class="s3">, </span><span class="s1">M.rmatvec</span>
+    <span class="s1">ltr = _type_conv[x.dtype.char]</span>
+    <span class="s1">revcom = getattr(_iterative</span><span class="s3">, </span><span class="s1">ltr + </span><span class="s2">'bicgrevcom'</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">get_residual():</span>
+        <span class="s3">return </span><span class="s1">np.linalg.norm(matvec(x) - b)</span>
+    <span class="s1">atol = _get_atol(tol</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">np.linalg.norm(b)</span><span class="s3">, </span><span class="s1">get_residual</span><span class="s3">, </span><span class="s2">'bicg'</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">atol == </span><span class="s2">'exit'</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s5">0</span>
+
+    <span class="s1">resid = atol</span>
+    <span class="s1">ndx1 = </span><span class="s5">1</span>
+    <span class="s1">ndx2 = -</span><span class="s5">1</span>
+    <span class="s4"># Use _aligned_zeros to work around a f2py bug in Numpy 1.9.1</span>
+    <span class="s1">work = _aligned_zeros(</span><span class="s5">6</span><span class="s1">*n</span><span class="s3">,</span><span class="s1">dtype=x.dtype)</span>
+    <span class="s1">ijob = </span><span class="s5">1</span>
+    <span class="s1">info = </span><span class="s5">0</span>
+    <span class="s1">ftflag = </span><span class="s3">True</span>
+    <span class="s1">iter_ = maxiter</span>
+    <span class="s3">while True</span><span class="s1">:</span>
+        <span class="s1">olditer = iter_</span>
+        <span class="s1">x</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">resid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">sclr1</span><span class="s3">, </span><span class="s1">sclr2</span><span class="s3">, </span><span class="s1">ijob = \</span>
+           <span class="s1">revcom(b</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">work</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">resid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">ijob)</span>
+        <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None and </span><span class="s1">iter_ &gt; olditer:</span>
+            <span class="s1">callback(x)</span>
+        <span class="s1">slice1 = slice(ndx1-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx1-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s1">slice2 = slice(ndx2-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx2-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s3">if </span><span class="s1">(ijob == -</span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">callback(x)</span>
+            <span class="s3">break</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*matvec(work[slice1])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">2</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*rmatvec(work[slice1])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">3</span><span class="s1">):</span>
+            <span class="s1">work[slice1] = psolve(work[slice2])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">4</span><span class="s1">):</span>
+            <span class="s1">work[slice1] = rpsolve(work[slice2])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">5</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*matvec(x)</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">6</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">ftflag:</span>
+                <span class="s1">info = -</span><span class="s5">1</span>
+                <span class="s1">ftflag = </span><span class="s3">False</span>
+            <span class="s1">resid</span><span class="s3">, </span><span class="s1">info = _stoptest(work[slice1]</span><span class="s3">, </span><span class="s1">atol)</span>
+        <span class="s1">ijob = </span><span class="s5">2</span>
+
+    <span class="s3">if </span><span class="s1">info &gt; </span><span class="s5">0 </span><span class="s3">and </span><span class="s1">iter_ == maxiter </span><span class="s3">and not </span><span class="s1">(resid &lt;= atol):</span>
+        <span class="s4"># info isn't set appropriately otherwise</span>
+        <span class="s1">info = iter_</span>
+
+    <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s1">info</span>
+
+
+<span class="s1">@set_docstring(</span><span class="s2">'Use BIConjugate Gradient STABilized iteration to solve '</span>
+               <span class="s2">'``Ax = b``.'</span><span class="s3">,</span>
+               <span class="s2">'The real or complex N-by-N matrix of the linear system.</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'Alternatively, ``A`` can be a linear operator which can</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'produce ``Ax`` using, e.g.,</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'``scipy.sparse.linalg.LinearOperator``.'</span><span class="s3">,</span>
+               <span class="s1">footer=</span><span class="s2">&quot;&quot;&quot;</span><span class="s3">\ 
+               </span><span class="s2">Examples 
+               -------- 
+               &gt;&gt;&gt; import numpy as np 
+               &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+               &gt;&gt;&gt; from scipy.sparse.linalg import bicgstab 
+               &gt;&gt;&gt; R = np.array([[4, 2, 0, 1], 
+               ...               [3, 0, 0, 2], 
+               ...               [0, 1, 1, 1], 
+               ...               [0, 2, 1, 0]]) 
+               &gt;&gt;&gt; A = csc_matrix(R) 
+               &gt;&gt;&gt; b = np.array([-1, -0.5, -1, 2]) 
+               &gt;&gt;&gt; x, exit_code = bicgstab(A, b) 
+               &gt;&gt;&gt; print(exit_code)  # 0 indicates successful convergence 
+               0 
+               &gt;&gt;&gt; np.allclose(A.dot(x), b) 
+               True 
+               &quot;&quot;&quot;</span><span class="s1">)</span>
+<span class="s1">@non_reentrant()</span>
+<span class="s3">def </span><span class="s1">bicgstab(A</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">x0=</span><span class="s3">None, </span><span class="s1">tol=</span><span class="s5">1e-5</span><span class="s3">, </span><span class="s1">maxiter=</span><span class="s3">None, </span><span class="s1">M=</span><span class="s3">None, </span><span class="s1">callback=</span><span class="s3">None, </span><span class="s1">atol=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s1">A</span><span class="s3">, </span><span class="s1">M</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">postprocess = make_system(A</span><span class="s3">, </span><span class="s1">M</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">b)</span>
+
+    <span class="s1">n = len(b)</span>
+    <span class="s3">if </span><span class="s1">maxiter </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">maxiter = n*</span><span class="s5">10</span>
+
+    <span class="s1">matvec = A.matvec</span>
+    <span class="s1">psolve = M.matvec</span>
+    <span class="s1">ltr = _type_conv[x.dtype.char]</span>
+    <span class="s1">revcom = getattr(_iterative</span><span class="s3">, </span><span class="s1">ltr + </span><span class="s2">'bicgstabrevcom'</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">get_residual():</span>
+        <span class="s3">return </span><span class="s1">np.linalg.norm(matvec(x) - b)</span>
+    <span class="s1">atol = _get_atol(tol</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">np.linalg.norm(b)</span><span class="s3">, </span><span class="s1">get_residual</span><span class="s3">, </span><span class="s2">'bicgstab'</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">atol == </span><span class="s2">'exit'</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s5">0</span>
+
+    <span class="s1">resid = atol</span>
+    <span class="s1">ndx1 = </span><span class="s5">1</span>
+    <span class="s1">ndx2 = -</span><span class="s5">1</span>
+    <span class="s4"># Use _aligned_zeros to work around a f2py bug in Numpy 1.9.1</span>
+    <span class="s1">work = _aligned_zeros(</span><span class="s5">7</span><span class="s1">*n</span><span class="s3">,</span><span class="s1">dtype=x.dtype)</span>
+    <span class="s1">ijob = </span><span class="s5">1</span>
+    <span class="s1">info = </span><span class="s5">0</span>
+    <span class="s1">ftflag = </span><span class="s3">True</span>
+    <span class="s1">iter_ = maxiter</span>
+    <span class="s3">while True</span><span class="s1">:</span>
+        <span class="s1">olditer = iter_</span>
+        <span class="s1">x</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">resid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">sclr1</span><span class="s3">, </span><span class="s1">sclr2</span><span class="s3">, </span><span class="s1">ijob = \</span>
+           <span class="s1">revcom(b</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">work</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">resid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">ijob)</span>
+        <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None and </span><span class="s1">iter_ &gt; olditer:</span>
+            <span class="s1">callback(x)</span>
+        <span class="s1">slice1 = slice(ndx1-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx1-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s1">slice2 = slice(ndx2-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx2-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s3">if </span><span class="s1">(ijob == -</span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">callback(x)</span>
+            <span class="s3">break</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*matvec(work[slice1])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">2</span><span class="s1">):</span>
+            <span class="s1">work[slice1] = psolve(work[slice2])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">3</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*matvec(x)</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">4</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">ftflag:</span>
+                <span class="s1">info = -</span><span class="s5">1</span>
+                <span class="s1">ftflag = </span><span class="s3">False</span>
+            <span class="s1">resid</span><span class="s3">, </span><span class="s1">info = _stoptest(work[slice1]</span><span class="s3">, </span><span class="s1">atol)</span>
+        <span class="s1">ijob = </span><span class="s5">2</span>
+
+    <span class="s3">if </span><span class="s1">info &gt; </span><span class="s5">0 </span><span class="s3">and </span><span class="s1">iter_ == maxiter </span><span class="s3">and not </span><span class="s1">(resid &lt;= atol):</span>
+        <span class="s4"># info isn't set appropriately otherwise</span>
+        <span class="s1">info = iter_</span>
+
+    <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s1">info</span>
+
+
+<span class="s1">@set_docstring(</span><span class="s2">'Use Conjugate Gradient iteration to solve ``Ax = b``.'</span><span class="s3">,</span>
+               <span class="s2">'The real or complex N-by-N matrix of the linear system.</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'``A`` must represent a hermitian, positive definite matrix.</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'Alternatively, ``A`` can be a linear operator which can</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'produce ``Ax`` using, e.g.,</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'``scipy.sparse.linalg.LinearOperator``.'</span><span class="s3">,</span>
+               <span class="s1">footer=</span><span class="s2">&quot;&quot;&quot;</span><span class="s3">\ 
+               </span><span class="s2">Examples 
+               -------- 
+               &gt;&gt;&gt; import numpy as np 
+               &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+               &gt;&gt;&gt; from scipy.sparse.linalg import cg 
+               &gt;&gt;&gt; P = np.array([[4, 0, 1, 0], 
+               ...               [0, 5, 0, 0], 
+               ...               [1, 0, 3, 2], 
+               ...               [0, 0, 2, 4]]) 
+               &gt;&gt;&gt; A = csc_matrix(P) 
+               &gt;&gt;&gt; b = np.array([-1, -0.5, -1, 2]) 
+               &gt;&gt;&gt; x, exit_code = cg(A, b) 
+               &gt;&gt;&gt; print(exit_code)    # 0 indicates successful convergence 
+               0 
+               &gt;&gt;&gt; np.allclose(A.dot(x), b) 
+               True 
+ 
+               &quot;&quot;&quot;</span><span class="s1">)</span>
+<span class="s1">@non_reentrant()</span>
+<span class="s3">def </span><span class="s1">cg(A</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">x0=</span><span class="s3">None, </span><span class="s1">tol=</span><span class="s5">1e-5</span><span class="s3">, </span><span class="s1">maxiter=</span><span class="s3">None, </span><span class="s1">M=</span><span class="s3">None, </span><span class="s1">callback=</span><span class="s3">None, </span><span class="s1">atol=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s1">A</span><span class="s3">, </span><span class="s1">M</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">postprocess = make_system(A</span><span class="s3">, </span><span class="s1">M</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">b)</span>
+
+    <span class="s1">n = len(b)</span>
+    <span class="s3">if </span><span class="s1">maxiter </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">maxiter = n*</span><span class="s5">10</span>
+
+    <span class="s1">matvec = A.matvec</span>
+    <span class="s1">psolve = M.matvec</span>
+    <span class="s1">ltr = _type_conv[x.dtype.char]</span>
+    <span class="s1">revcom = getattr(_iterative</span><span class="s3">, </span><span class="s1">ltr + </span><span class="s2">'cgrevcom'</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">get_residual():</span>
+        <span class="s3">return </span><span class="s1">np.linalg.norm(matvec(x) - b)</span>
+    <span class="s1">atol = _get_atol(tol</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">np.linalg.norm(b)</span><span class="s3">, </span><span class="s1">get_residual</span><span class="s3">, </span><span class="s2">'cg'</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">atol == </span><span class="s2">'exit'</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s5">0</span>
+
+    <span class="s1">resid = atol</span>
+    <span class="s1">ndx1 = </span><span class="s5">1</span>
+    <span class="s1">ndx2 = -</span><span class="s5">1</span>
+    <span class="s4"># Use _aligned_zeros to work around a f2py bug in Numpy 1.9.1</span>
+    <span class="s1">work = _aligned_zeros(</span><span class="s5">4</span><span class="s1">*n</span><span class="s3">,</span><span class="s1">dtype=x.dtype)</span>
+    <span class="s1">ijob = </span><span class="s5">1</span>
+    <span class="s1">info = </span><span class="s5">0</span>
+    <span class="s1">ftflag = </span><span class="s3">True</span>
+    <span class="s1">iter_ = maxiter</span>
+    <span class="s3">while True</span><span class="s1">:</span>
+        <span class="s1">olditer = iter_</span>
+        <span class="s1">x</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">resid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">sclr1</span><span class="s3">, </span><span class="s1">sclr2</span><span class="s3">, </span><span class="s1">ijob = \</span>
+           <span class="s1">revcom(b</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">work</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">resid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">ijob)</span>
+        <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None and </span><span class="s1">iter_ &gt; olditer:</span>
+            <span class="s1">callback(x)</span>
+        <span class="s1">slice1 = slice(ndx1-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx1-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s1">slice2 = slice(ndx2-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx2-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s3">if </span><span class="s1">(ijob == -</span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">callback(x)</span>
+            <span class="s3">break</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*matvec(work[slice1])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">2</span><span class="s1">):</span>
+            <span class="s1">work[slice1] = psolve(work[slice2])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">3</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*matvec(x)</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">4</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">ftflag:</span>
+                <span class="s1">info = -</span><span class="s5">1</span>
+                <span class="s1">ftflag = </span><span class="s3">False</span>
+            <span class="s1">resid</span><span class="s3">, </span><span class="s1">info = _stoptest(work[slice1]</span><span class="s3">, </span><span class="s1">atol)</span>
+            <span class="s3">if </span><span class="s1">info == </span><span class="s5">1 </span><span class="s3">and </span><span class="s1">iter_ &gt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s4"># recompute residual and recheck, to avoid</span>
+                <span class="s4"># accumulating rounding error</span>
+                <span class="s1">work[slice1] = b - matvec(x)</span>
+                <span class="s1">resid</span><span class="s3">, </span><span class="s1">info = _stoptest(work[slice1]</span><span class="s3">, </span><span class="s1">atol)</span>
+        <span class="s1">ijob = </span><span class="s5">2</span>
+
+    <span class="s3">if </span><span class="s1">info &gt; </span><span class="s5">0 </span><span class="s3">and </span><span class="s1">iter_ == maxiter </span><span class="s3">and not </span><span class="s1">(resid &lt;= atol):</span>
+        <span class="s4"># info isn't set appropriately otherwise</span>
+        <span class="s1">info = iter_</span>
+
+    <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s1">info</span>
+
+
+<span class="s1">@set_docstring(</span><span class="s2">'Use Conjugate Gradient Squared iteration to solve ``Ax = b``.'</span><span class="s3">,</span>
+               <span class="s2">'The real-valued N-by-N matrix of the linear system.</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'Alternatively, ``A`` can be a linear operator which can</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'produce ``Ax`` using, e.g.,</span><span class="s3">\n</span><span class="s2">'</span>
+               <span class="s2">'``scipy.sparse.linalg.LinearOperator``.'</span><span class="s3">,</span>
+               <span class="s1">footer=</span><span class="s2">&quot;&quot;&quot;</span><span class="s3">\ 
+               </span><span class="s2">Examples 
+               -------- 
+               &gt;&gt;&gt; import numpy as np 
+               &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+               &gt;&gt;&gt; from scipy.sparse.linalg import cgs 
+               &gt;&gt;&gt; R = np.array([[4, 2, 0, 1], 
+               ...               [3, 0, 0, 2], 
+               ...               [0, 1, 1, 1], 
+               ...               [0, 2, 1, 0]]) 
+               &gt;&gt;&gt; A = csc_matrix(R) 
+               &gt;&gt;&gt; b = np.array([-1, -0.5, -1, 2]) 
+               &gt;&gt;&gt; x, exit_code = cgs(A, b) 
+               &gt;&gt;&gt; print(exit_code)  # 0 indicates successful convergence 
+               0 
+               &gt;&gt;&gt; np.allclose(A.dot(x), b) 
+               True 
+               &quot;&quot;&quot;</span>
+               <span class="s1">)</span>
+<span class="s1">@non_reentrant()</span>
+<span class="s3">def </span><span class="s1">cgs(A</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">x0=</span><span class="s3">None, </span><span class="s1">tol=</span><span class="s5">1e-5</span><span class="s3">, </span><span class="s1">maxiter=</span><span class="s3">None, </span><span class="s1">M=</span><span class="s3">None, </span><span class="s1">callback=</span><span class="s3">None, </span><span class="s1">atol=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s1">A</span><span class="s3">, </span><span class="s1">M</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">postprocess = make_system(A</span><span class="s3">, </span><span class="s1">M</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">b)</span>
+
+    <span class="s1">n = len(b)</span>
+    <span class="s3">if </span><span class="s1">maxiter </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">maxiter = n*</span><span class="s5">10</span>
+
+    <span class="s1">matvec = A.matvec</span>
+    <span class="s1">psolve = M.matvec</span>
+    <span class="s1">ltr = _type_conv[x.dtype.char]</span>
+    <span class="s1">revcom = getattr(_iterative</span><span class="s3">, </span><span class="s1">ltr + </span><span class="s2">'cgsrevcom'</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">get_residual():</span>
+        <span class="s3">return </span><span class="s1">np.linalg.norm(matvec(x) - b)</span>
+    <span class="s1">atol = _get_atol(tol</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">np.linalg.norm(b)</span><span class="s3">, </span><span class="s1">get_residual</span><span class="s3">, </span><span class="s2">'cgs'</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">atol == </span><span class="s2">'exit'</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s5">0</span>
+
+    <span class="s1">resid = atol</span>
+    <span class="s1">ndx1 = </span><span class="s5">1</span>
+    <span class="s1">ndx2 = -</span><span class="s5">1</span>
+    <span class="s4"># Use _aligned_zeros to work around a f2py bug in Numpy 1.9.1</span>
+    <span class="s1">work = _aligned_zeros(</span><span class="s5">7</span><span class="s1">*n</span><span class="s3">,</span><span class="s1">dtype=x.dtype)</span>
+    <span class="s1">ijob = </span><span class="s5">1</span>
+    <span class="s1">info = </span><span class="s5">0</span>
+    <span class="s1">ftflag = </span><span class="s3">True</span>
+    <span class="s1">iter_ = maxiter</span>
+    <span class="s3">while True</span><span class="s1">:</span>
+        <span class="s1">olditer = iter_</span>
+        <span class="s1">x</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">resid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">sclr1</span><span class="s3">, </span><span class="s1">sclr2</span><span class="s3">, </span><span class="s1">ijob = \</span>
+           <span class="s1">revcom(b</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">work</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">resid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">ijob)</span>
+        <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None and </span><span class="s1">iter_ &gt; olditer:</span>
+            <span class="s1">callback(x)</span>
+        <span class="s1">slice1 = slice(ndx1-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx1-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s1">slice2 = slice(ndx2-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx2-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s3">if </span><span class="s1">(ijob == -</span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">callback(x)</span>
+            <span class="s3">break</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*matvec(work[slice1])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">2</span><span class="s1">):</span>
+            <span class="s1">work[slice1] = psolve(work[slice2])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">3</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*matvec(x)</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">4</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">ftflag:</span>
+                <span class="s1">info = -</span><span class="s5">1</span>
+                <span class="s1">ftflag = </span><span class="s3">False</span>
+            <span class="s1">resid</span><span class="s3">, </span><span class="s1">info = _stoptest(work[slice1]</span><span class="s3">, </span><span class="s1">atol)</span>
+            <span class="s3">if </span><span class="s1">info == </span><span class="s5">1 </span><span class="s3">and </span><span class="s1">iter_ &gt; </span><span class="s5">1</span><span class="s1">:</span>
+                <span class="s4"># recompute residual and recheck, to avoid</span>
+                <span class="s4"># accumulating rounding error</span>
+                <span class="s1">work[slice1] = b - matvec(x)</span>
+                <span class="s1">resid</span><span class="s3">, </span><span class="s1">info = _stoptest(work[slice1]</span><span class="s3">, </span><span class="s1">atol)</span>
+        <span class="s1">ijob = </span><span class="s5">2</span>
+
+    <span class="s3">if </span><span class="s1">info == -</span><span class="s5">10</span><span class="s1">:</span>
+        <span class="s4"># termination due to breakdown: check for convergence</span>
+        <span class="s1">resid</span><span class="s3">, </span><span class="s1">ok = _stoptest(b - matvec(x)</span><span class="s3">, </span><span class="s1">atol)</span>
+        <span class="s3">if </span><span class="s1">ok:</span>
+            <span class="s1">info = </span><span class="s5">0</span>
+
+    <span class="s3">if </span><span class="s1">info &gt; </span><span class="s5">0 </span><span class="s3">and </span><span class="s1">iter_ == maxiter </span><span class="s3">and not </span><span class="s1">(resid &lt;= atol):</span>
+        <span class="s4"># info isn't set appropriately otherwise</span>
+        <span class="s1">info = iter_</span>
+
+    <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s1">info</span>
+
+
+<span class="s1">@non_reentrant()</span>
+<span class="s3">def </span><span class="s1">gmres(A</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">x0=</span><span class="s3">None, </span><span class="s1">tol=</span><span class="s5">1e-5</span><span class="s3">, </span><span class="s1">restart=</span><span class="s3">None, </span><span class="s1">maxiter=</span><span class="s3">None, </span><span class="s1">M=</span><span class="s3">None, </span><span class="s1">callback=</span><span class="s3">None,</span>
+          <span class="s1">restrt=</span><span class="s3">None, </span><span class="s1">atol=</span><span class="s3">None, </span><span class="s1">callback_type=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Use Generalized Minimal RESidual iteration to solve ``Ax = b``. 
+ 
+    Parameters 
+    ---------- 
+    A : {sparse matrix, ndarray, LinearOperator} 
+        The real or complex N-by-N matrix of the linear system. 
+        Alternatively, ``A`` can be a linear operator which can 
+        produce ``Ax`` using, e.g., 
+        ``scipy.sparse.linalg.LinearOperator``. 
+    b : ndarray 
+        Right hand side of the linear system. Has shape (N,) or (N,1). 
+ 
+    Returns 
+    ------- 
+    x : ndarray 
+        The converged solution. 
+    info : int 
+        Provides convergence information: 
+          * 0  : successful exit 
+          * &gt;0 : convergence to tolerance not achieved, number of iterations 
+          * &lt;0 : illegal input or breakdown 
+ 
+    Other parameters 
+    ---------------- 
+    x0 : ndarray 
+        Starting guess for the solution (a vector of zeros by default). 
+    tol, atol : float, optional 
+        Tolerances for convergence, ``norm(residual) &lt;= max(tol*norm(b), atol)``. 
+        The default for ``atol`` is ``'legacy'``, which emulates 
+        a different legacy behavior. 
+ 
+        .. warning:: 
+ 
+           The default value for `atol` will be changed in a future release. 
+           For future compatibility, specify `atol` explicitly. 
+    restart : int, optional 
+        Number of iterations between restarts. Larger values increase 
+        iteration cost, but may be necessary for convergence. 
+        Default is 20. 
+    maxiter : int, optional 
+        Maximum number of iterations (restart cycles).  Iteration will stop 
+        after maxiter steps even if the specified tolerance has not been 
+        achieved. 
+    M : {sparse matrix, ndarray, LinearOperator} 
+        Inverse of the preconditioner of A.  M should approximate the 
+        inverse of A and be easy to solve for (see Notes).  Effective 
+        preconditioning dramatically improves the rate of convergence, 
+        which implies that fewer iterations are needed to reach a given 
+        error tolerance.  By default, no preconditioner is used. 
+        In this implementation, left preconditioning is used, 
+        and the preconditioned residual is minimized. 
+    callback : function 
+        User-supplied function to call after each iteration.  It is called 
+        as `callback(args)`, where `args` are selected by `callback_type`. 
+    callback_type : {'x', 'pr_norm', 'legacy'}, optional 
+        Callback function argument requested: 
+          - ``x``: current iterate (ndarray), called on every restart 
+          - ``pr_norm``: relative (preconditioned) residual norm (float), 
+            called on every inner iteration 
+          - ``legacy`` (default): same as ``pr_norm``, but also changes the 
+            meaning of 'maxiter' to count inner iterations instead of restart 
+            cycles. 
+    restrt : int, optional, deprecated 
+ 
+        .. deprecated:: 0.11.0 
+           `gmres` keyword argument `restrt` is deprecated infavour of 
+           `restart` and will be removed in SciPy 1.12.0. 
+ 
+    See Also 
+    -------- 
+    LinearOperator 
+ 
+    Notes 
+    ----- 
+    A preconditioner, P, is chosen such that P is close to A but easy to solve 
+    for. The preconditioner parameter required by this routine is 
+    ``M = P^-1``. The inverse should preferably not be calculated 
+    explicitly.  Rather, use the following template to produce M:: 
+ 
+      # Construct a linear operator that computes P^-1 @ x. 
+      import scipy.sparse.linalg as spla 
+      M_x = lambda x: spla.spsolve(P, x) 
+      M = spla.LinearOperator((n, n), M_x) 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+    &gt;&gt;&gt; from scipy.sparse.linalg import gmres 
+    &gt;&gt;&gt; A = csc_matrix([[3, 2, 0], [1, -1, 0], [0, 5, 1]], dtype=float) 
+    &gt;&gt;&gt; b = np.array([2, 4, -1], dtype=float) 
+    &gt;&gt;&gt; x, exitCode = gmres(A, b) 
+    &gt;&gt;&gt; print(exitCode)            # 0 indicates successful convergence 
+    0 
+    &gt;&gt;&gt; np.allclose(A.dot(x), b) 
+    True 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># Change 'restrt' keyword to 'restart'</span>
+    <span class="s3">if </span><span class="s1">restrt </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">restrt = restart</span>
+    <span class="s3">elif </span><span class="s1">restart </span><span class="s3">is not None</span><span class="s1">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;Cannot specify both restart and restrt keywords. &quot;</span>
+                         <span class="s2">&quot;Preferably use 'restart' only.&quot;</span><span class="s1">)</span>
+    <span class="s3">else</span><span class="s1">:</span>
+        <span class="s1">msg = (</span><span class="s2">&quot;'gmres' keyword argument 'restrt' is deprecated infavour of &quot;</span>
+               <span class="s2">&quot;'restart' and will be removed in SciPy 1.12.0.&quot;</span><span class="s1">)</span>
+        <span class="s1">warnings.warn(msg</span><span class="s3">, </span><span class="s1">DeprecationWarning</span><span class="s3">, </span><span class="s1">stacklevel=</span><span class="s5">2</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None and </span><span class="s1">callback_type </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s4"># Warn about 'callback_type' semantic changes.</span>
+        <span class="s4"># Probably should be removed only in far future, Scipy 2.0 or so.</span>
+        <span class="s1">warnings.warn(</span><span class="s2">&quot;scipy.sparse.linalg.gmres called without specifying `callback_type`. &quot;</span>
+                      <span class="s2">&quot;The default value will be changed in a future release. &quot;</span>
+                      <span class="s2">&quot;For compatibility, specify a value for `callback_type` explicitly, e.g., &quot;</span>
+                      <span class="s2">&quot;``{name}(..., callback_type='pr_norm')``, or to retain the old behavior &quot;</span>
+                      <span class="s2">&quot;``{name}(..., callback_type='legacy')``&quot;</span><span class="s3">,</span>
+                      <span class="s1">category=DeprecationWarning</span><span class="s3">, </span><span class="s1">stacklevel=</span><span class="s5">3</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s1">callback_type </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">callback_type = </span><span class="s2">'legacy'</span>
+
+    <span class="s3">if </span><span class="s1">callback_type </span><span class="s3">not in </span><span class="s1">(</span><span class="s2">'x'</span><span class="s3">, </span><span class="s2">'pr_norm'</span><span class="s3">, </span><span class="s2">'legacy'</span><span class="s1">):</span>
+        <span class="s3">raise </span><span class="s1">ValueError(</span><span class="s2">f&quot;Unknown callback_type: </span><span class="s3">{</span><span class="s1">callback_type</span><span class="s3">!r}</span><span class="s2">&quot;</span><span class="s1">)</span>
+
+    <span class="s3">if </span><span class="s1">callback </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">callback_type = </span><span class="s2">'none'</span>
+
+    <span class="s1">A</span><span class="s3">, </span><span class="s1">M</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">b</span><span class="s3">,</span><span class="s1">postprocess = make_system(A</span><span class="s3">, </span><span class="s1">M</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">b)</span>
+
+    <span class="s1">n = len(b)</span>
+    <span class="s3">if </span><span class="s1">maxiter </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">maxiter = n*</span><span class="s5">10</span>
+
+    <span class="s3">if </span><span class="s1">restrt </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">restrt = </span><span class="s5">20</span>
+    <span class="s1">restrt = min(restrt</span><span class="s3">, </span><span class="s1">n)</span>
+
+    <span class="s1">matvec = A.matvec</span>
+    <span class="s1">psolve = M.matvec</span>
+    <span class="s1">ltr = _type_conv[x.dtype.char]</span>
+    <span class="s1">revcom = getattr(_iterative</span><span class="s3">, </span><span class="s1">ltr + </span><span class="s2">'gmresrevcom'</span><span class="s1">)</span>
+
+    <span class="s1">bnrm2 = np.linalg.norm(b)</span>
+    <span class="s1">Mb_nrm2 = np.linalg.norm(psolve(b))</span>
+    <span class="s3">def </span><span class="s1">get_residual():</span>
+        <span class="s3">return </span><span class="s1">np.linalg.norm(matvec(x) - b)</span>
+    <span class="s1">atol = _get_atol(tol</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">bnrm2</span><span class="s3">, </span><span class="s1">get_residual</span><span class="s3">, </span><span class="s2">'gmres'</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">atol == </span><span class="s2">'exit'</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s5">0</span>
+
+    <span class="s3">if </span><span class="s1">bnrm2 == </span><span class="s5">0</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">postprocess(b)</span><span class="s3">, </span><span class="s5">0</span>
+
+    <span class="s4"># Tolerance passed to GMRESREVCOM applies to the inner iteration</span>
+    <span class="s4"># and deals with the left-preconditioned residual.</span>
+    <span class="s1">ptol_max_factor = </span><span class="s5">1.0</span>
+    <span class="s1">ptol = Mb_nrm2 * min(ptol_max_factor</span><span class="s3">, </span><span class="s1">atol / bnrm2)</span>
+    <span class="s1">resid = np.nan</span>
+    <span class="s1">presid = np.nan</span>
+    <span class="s1">ndx1 = </span><span class="s5">1</span>
+    <span class="s1">ndx2 = -</span><span class="s5">1</span>
+    <span class="s4"># Use _aligned_zeros to work around a f2py bug in Numpy 1.9.1</span>
+    <span class="s1">work = _aligned_zeros((</span><span class="s5">6</span><span class="s1">+restrt)*n</span><span class="s3">,</span><span class="s1">dtype=x.dtype)</span>
+    <span class="s1">work2 = _aligned_zeros((restrt+</span><span class="s5">1</span><span class="s1">)*(</span><span class="s5">2</span><span class="s1">*restrt+</span><span class="s5">2</span><span class="s1">)</span><span class="s3">,</span><span class="s1">dtype=x.dtype)</span>
+    <span class="s1">ijob = </span><span class="s5">1</span>
+    <span class="s1">info = </span><span class="s5">0</span>
+    <span class="s1">ftflag = </span><span class="s3">True</span>
+    <span class="s1">iter_ = maxiter</span>
+    <span class="s1">old_ijob = ijob</span>
+    <span class="s1">first_pass = </span><span class="s3">True</span>
+    <span class="s1">resid_ready = </span><span class="s3">False</span>
+    <span class="s1">iter_num = </span><span class="s5">1</span>
+    <span class="s3">while True</span><span class="s1">:</span>
+        <span class="s1">olditer = iter_</span>
+        <span class="s1">x</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">presid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">sclr1</span><span class="s3">, </span><span class="s1">sclr2</span><span class="s3">, </span><span class="s1">ijob = \</span>
+           <span class="s1">revcom(b</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">restrt</span><span class="s3">, </span><span class="s1">work</span><span class="s3">, </span><span class="s1">work2</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">presid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">ijob</span><span class="s3">, </span><span class="s1">ptol)</span>
+        <span class="s3">if </span><span class="s1">callback_type == </span><span class="s2">'x' </span><span class="s3">and </span><span class="s1">iter_ != olditer:</span>
+            <span class="s1">callback(x)</span>
+        <span class="s1">slice1 = slice(ndx1-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx1-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s1">slice2 = slice(ndx2-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx2-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s3">if </span><span class="s1">(ijob == -</span><span class="s5">1</span><span class="s1">):  </span><span class="s4"># gmres success, update last residual</span>
+            <span class="s3">if </span><span class="s1">callback_type </span><span class="s3">in </span><span class="s1">(</span><span class="s2">'pr_norm'</span><span class="s3">, </span><span class="s2">'legacy'</span><span class="s1">):</span>
+                <span class="s3">if </span><span class="s1">resid_ready:</span>
+                    <span class="s1">callback(presid / bnrm2)</span>
+            <span class="s3">elif </span><span class="s1">callback_type == </span><span class="s2">'x'</span><span class="s1">:</span>
+                <span class="s1">callback(x)</span>
+            <span class="s3">break</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*matvec(x)</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">2</span><span class="s1">):</span>
+            <span class="s1">work[slice1] = psolve(work[slice2])</span>
+            <span class="s3">if not </span><span class="s1">first_pass </span><span class="s3">and </span><span class="s1">old_ijob == </span><span class="s5">3</span><span class="s1">:</span>
+                <span class="s1">resid_ready = </span><span class="s3">True</span>
+
+            <span class="s1">first_pass = </span><span class="s3">False</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">3</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*matvec(work[slice1])</span>
+            <span class="s3">if </span><span class="s1">resid_ready:</span>
+                <span class="s3">if </span><span class="s1">callback_type </span><span class="s3">in </span><span class="s1">(</span><span class="s2">'pr_norm'</span><span class="s3">, </span><span class="s2">'legacy'</span><span class="s1">):</span>
+                    <span class="s1">callback(presid / bnrm2)</span>
+                <span class="s1">resid_ready = </span><span class="s3">False</span>
+                <span class="s1">iter_num = iter_num+</span><span class="s5">1</span>
+
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">4</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">ftflag:</span>
+                <span class="s1">info = -</span><span class="s5">1</span>
+                <span class="s1">ftflag = </span><span class="s3">False</span>
+            <span class="s1">resid</span><span class="s3">, </span><span class="s1">info = _stoptest(work[slice1]</span><span class="s3">, </span><span class="s1">atol)</span>
+
+            <span class="s4"># Inner loop tolerance control</span>
+            <span class="s3">if </span><span class="s1">info </span><span class="s3">or </span><span class="s1">presid &gt; ptol:</span>
+                <span class="s1">ptol_max_factor = min(</span><span class="s5">1.0</span><span class="s3">, </span><span class="s5">1.5 </span><span class="s1">* ptol_max_factor)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s4"># Inner loop tolerance OK, but outer loop not.</span>
+                <span class="s1">ptol_max_factor = max(</span><span class="s5">1e-16</span><span class="s3">, </span><span class="s5">0.25 </span><span class="s1">* ptol_max_factor)</span>
+
+            <span class="s3">if </span><span class="s1">resid != </span><span class="s5">0</span><span class="s1">:</span>
+                <span class="s1">ptol = presid * min(ptol_max_factor</span><span class="s3">, </span><span class="s1">atol / resid)</span>
+            <span class="s3">else</span><span class="s1">:</span>
+                <span class="s1">ptol = presid * ptol_max_factor</span>
+
+        <span class="s1">old_ijob = ijob</span>
+        <span class="s1">ijob = </span><span class="s5">2</span>
+
+        <span class="s3">if </span><span class="s1">callback_type == </span><span class="s2">'legacy'</span><span class="s1">:</span>
+            <span class="s4"># Legacy behavior</span>
+            <span class="s3">if </span><span class="s1">iter_num &gt; maxiter:</span>
+                <span class="s1">info = maxiter</span>
+                <span class="s3">break</span>
+
+    <span class="s3">if </span><span class="s1">info &gt;= </span><span class="s5">0 </span><span class="s3">and not </span><span class="s1">(resid &lt;= atol):</span>
+        <span class="s4"># info isn't set appropriately otherwise</span>
+        <span class="s1">info = maxiter</span>
+
+    <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s1">info</span>
+
+
+<span class="s1">@non_reentrant()</span>
+<span class="s3">def </span><span class="s1">qmr(A</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">x0=</span><span class="s3">None, </span><span class="s1">tol=</span><span class="s5">1e-5</span><span class="s3">, </span><span class="s1">maxiter=</span><span class="s3">None, </span><span class="s1">M1=</span><span class="s3">None, </span><span class="s1">M2=</span><span class="s3">None, </span><span class="s1">callback=</span><span class="s3">None,</span>
+        <span class="s1">atol=</span><span class="s3">None</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot;Use Quasi-Minimal Residual iteration to solve ``Ax = b``. 
+ 
+    Parameters 
+    ---------- 
+    A : {sparse matrix, ndarray, LinearOperator} 
+        The real-valued N-by-N matrix of the linear system. 
+        Alternatively, ``A`` can be a linear operator which can 
+        produce ``Ax`` and ``A^T x`` using, e.g., 
+        ``scipy.sparse.linalg.LinearOperator``. 
+    b : ndarray 
+        Right hand side of the linear system. Has shape (N,) or (N,1). 
+ 
+    Returns 
+    ------- 
+    x : ndarray 
+        The converged solution. 
+    info : integer 
+        Provides convergence information: 
+            0  : successful exit 
+            &gt;0 : convergence to tolerance not achieved, number of iterations 
+            &lt;0 : illegal input or breakdown 
+ 
+    Other Parameters 
+    ---------------- 
+    x0 : ndarray 
+        Starting guess for the solution. 
+    tol, atol : float, optional 
+        Tolerances for convergence, ``norm(residual) &lt;= max(tol*norm(b), atol)``. 
+        The default for ``atol`` is ``'legacy'``, which emulates 
+        a different legacy behavior. 
+ 
+        .. warning:: 
+ 
+           The default value for `atol` will be changed in a future release. 
+           For future compatibility, specify `atol` explicitly. 
+    maxiter : integer 
+        Maximum number of iterations.  Iteration will stop after maxiter 
+        steps even if the specified tolerance has not been achieved. 
+    M1 : {sparse matrix, ndarray, LinearOperator} 
+        Left preconditioner for A. 
+    M2 : {sparse matrix, ndarray, LinearOperator} 
+        Right preconditioner for A. Used together with the left 
+        preconditioner M1.  The matrix M1@A@M2 should have better 
+        conditioned than A alone. 
+    callback : function 
+        User-supplied function to call after each iteration.  It is called 
+        as callback(xk), where xk is the current solution vector. 
+ 
+    See Also 
+    -------- 
+    LinearOperator 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+    &gt;&gt;&gt; from scipy.sparse.linalg import qmr 
+    &gt;&gt;&gt; A = csc_matrix([[3, 2, 0], [1, -1, 0], [0, 5, 1]], dtype=float) 
+    &gt;&gt;&gt; b = np.array([2, 4, -1], dtype=float) 
+    &gt;&gt;&gt; x, exitCode = qmr(A, b) 
+    &gt;&gt;&gt; print(exitCode)            # 0 indicates successful convergence 
+    0 
+    &gt;&gt;&gt; np.allclose(A.dot(x), b) 
+    True 
+    &quot;&quot;&quot;</span>
+    <span class="s1">A_ = A</span>
+    <span class="s1">A</span><span class="s3">, </span><span class="s1">M</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">postprocess = make_system(A</span><span class="s3">, None, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">b)</span>
+
+    <span class="s3">if </span><span class="s1">M1 </span><span class="s3">is None and </span><span class="s1">M2 </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s3">if </span><span class="s1">hasattr(A_</span><span class="s3">,</span><span class="s2">'psolve'</span><span class="s1">):</span>
+            <span class="s3">def </span><span class="s1">left_psolve(b):</span>
+                <span class="s3">return </span><span class="s1">A_.psolve(b</span><span class="s3">,</span><span class="s2">'left'</span><span class="s1">)</span>
+
+            <span class="s3">def </span><span class="s1">right_psolve(b):</span>
+                <span class="s3">return </span><span class="s1">A_.psolve(b</span><span class="s3">,</span><span class="s2">'right'</span><span class="s1">)</span>
+
+            <span class="s3">def </span><span class="s1">left_rpsolve(b):</span>
+                <span class="s3">return </span><span class="s1">A_.rpsolve(b</span><span class="s3">,</span><span class="s2">'left'</span><span class="s1">)</span>
+
+            <span class="s3">def </span><span class="s1">right_rpsolve(b):</span>
+                <span class="s3">return </span><span class="s1">A_.rpsolve(b</span><span class="s3">,</span><span class="s2">'right'</span><span class="s1">)</span>
+            <span class="s1">M1 = LinearOperator(A.shape</span><span class="s3">, </span><span class="s1">matvec=left_psolve</span><span class="s3">, </span><span class="s1">rmatvec=left_rpsolve)</span>
+            <span class="s1">M2 = LinearOperator(A.shape</span><span class="s3">, </span><span class="s1">matvec=right_psolve</span><span class="s3">, </span><span class="s1">rmatvec=right_rpsolve)</span>
+        <span class="s3">else</span><span class="s1">:</span>
+            <span class="s3">def </span><span class="s1">id(b):</span>
+                <span class="s3">return </span><span class="s1">b</span>
+            <span class="s1">M1 = LinearOperator(A.shape</span><span class="s3">, </span><span class="s1">matvec=id</span><span class="s3">, </span><span class="s1">rmatvec=id)</span>
+            <span class="s1">M2 = LinearOperator(A.shape</span><span class="s3">, </span><span class="s1">matvec=id</span><span class="s3">, </span><span class="s1">rmatvec=id)</span>
+
+    <span class="s1">n = len(b)</span>
+    <span class="s3">if </span><span class="s1">maxiter </span><span class="s3">is None</span><span class="s1">:</span>
+        <span class="s1">maxiter = n*</span><span class="s5">10</span>
+
+    <span class="s1">ltr = _type_conv[x.dtype.char]</span>
+    <span class="s1">revcom = getattr(_iterative</span><span class="s3">, </span><span class="s1">ltr + </span><span class="s2">'qmrrevcom'</span><span class="s1">)</span>
+
+    <span class="s3">def </span><span class="s1">get_residual():</span>
+        <span class="s3">return </span><span class="s1">np.linalg.norm(A.matvec(x) - b)</span>
+    <span class="s1">atol = _get_atol(tol</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">np.linalg.norm(b)</span><span class="s3">, </span><span class="s1">get_residual</span><span class="s3">, </span><span class="s2">'qmr'</span><span class="s1">)</span>
+    <span class="s3">if </span><span class="s1">atol == </span><span class="s2">'exit'</span><span class="s1">:</span>
+        <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s5">0</span>
+
+    <span class="s1">resid = atol</span>
+    <span class="s1">ndx1 = </span><span class="s5">1</span>
+    <span class="s1">ndx2 = -</span><span class="s5">1</span>
+    <span class="s4"># Use _aligned_zeros to work around a f2py bug in Numpy 1.9.1</span>
+    <span class="s1">work = _aligned_zeros(</span><span class="s5">11</span><span class="s1">*n</span><span class="s3">,</span><span class="s1">x.dtype)</span>
+    <span class="s1">ijob = </span><span class="s5">1</span>
+    <span class="s1">info = </span><span class="s5">0</span>
+    <span class="s1">ftflag = </span><span class="s3">True</span>
+    <span class="s1">iter_ = maxiter</span>
+    <span class="s3">while True</span><span class="s1">:</span>
+        <span class="s1">olditer = iter_</span>
+        <span class="s1">x</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">resid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">sclr1</span><span class="s3">, </span><span class="s1">sclr2</span><span class="s3">, </span><span class="s1">ijob = \</span>
+           <span class="s1">revcom(b</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">work</span><span class="s3">, </span><span class="s1">iter_</span><span class="s3">, </span><span class="s1">resid</span><span class="s3">, </span><span class="s1">info</span><span class="s3">, </span><span class="s1">ndx1</span><span class="s3">, </span><span class="s1">ndx2</span><span class="s3">, </span><span class="s1">ijob)</span>
+        <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None and </span><span class="s1">iter_ &gt; olditer:</span>
+            <span class="s1">callback(x)</span>
+        <span class="s1">slice1 = slice(ndx1-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx1-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s1">slice2 = slice(ndx2-</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ndx2-</span><span class="s5">1</span><span class="s1">+n)</span>
+        <span class="s3">if </span><span class="s1">(ijob == -</span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None</span><span class="s1">:</span>
+                <span class="s1">callback(x)</span>
+            <span class="s3">break</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">1</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*A.matvec(work[slice1])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">2</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*A.rmatvec(work[slice1])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">3</span><span class="s1">):</span>
+            <span class="s1">work[slice1] = M1.matvec(work[slice2])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">4</span><span class="s1">):</span>
+            <span class="s1">work[slice1] = M2.matvec(work[slice2])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">5</span><span class="s1">):</span>
+            <span class="s1">work[slice1] = M1.rmatvec(work[slice2])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">6</span><span class="s1">):</span>
+            <span class="s1">work[slice1] = M2.rmatvec(work[slice2])</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">7</span><span class="s1">):</span>
+            <span class="s1">work[slice2] *= sclr2</span>
+            <span class="s1">work[slice2] += sclr1*A.matvec(x)</span>
+        <span class="s3">elif </span><span class="s1">(ijob == </span><span class="s5">8</span><span class="s1">):</span>
+            <span class="s3">if </span><span class="s1">ftflag:</span>
+                <span class="s1">info = -</span><span class="s5">1</span>
+                <span class="s1">ftflag = </span><span class="s3">False</span>
+            <span class="s1">resid</span><span class="s3">, </span><span class="s1">info = _stoptest(work[slice1]</span><span class="s3">, </span><span class="s1">atol)</span>
+        <span class="s1">ijob = </span><span class="s5">2</span>
+
+    <span class="s3">if </span><span class="s1">info &gt; </span><span class="s5">0 </span><span class="s3">and </span><span class="s1">iter_ == maxiter </span><span class="s3">and not </span><span class="s1">(resid &lt;= atol):</span>
+        <span class="s4"># info isn't set appropriately otherwise</span>
+        <span class="s1">info = iter_</span>
+
+    <span class="s3">return </span><span class="s1">postprocess(x)</span><span class="s3">, </span><span class="s1">info</span>
+</pre>
+</body>
+</html>

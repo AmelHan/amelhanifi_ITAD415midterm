@@ -1,0 +1,2505 @@
+<html>
+<head>
+<title>kalman_filter.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #808080;}
+.s4 { color: #6897bb;}
+.s5 { color: #6a8759;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+kalman_filter.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+State Space Representation and Kalman Filter 
+ 
+Author: Chad Fulton 
+License: Simplified-BSD 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">contextlib</span>
+<span class="s2">from </span><span class="s1">warnings </span><span class="s2">import </span><span class="s1">warn</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">.representation </span><span class="s2">import </span><span class="s1">OptionWrapper</span><span class="s2">, </span><span class="s1">Representation</span><span class="s2">, </span><span class="s1">FrozenRepresentation</span>
+<span class="s2">from </span><span class="s1">.tools </span><span class="s2">import </span><span class="s1">reorder_missing_matrix</span><span class="s2">, </span><span class="s1">reorder_missing_vector</span>
+<span class="s2">from </span><span class="s1">. </span><span class="s2">import </span><span class="s1">tools</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.sm_exceptions </span><span class="s2">import </span><span class="s1">ValueWarning</span>
+
+<span class="s3"># Define constants</span>
+<span class="s1">FILTER_CONVENTIONAL = </span><span class="s4">0x01     </span><span class="s3"># Durbin and Koopman (2012), Chapter 4</span>
+<span class="s1">FILTER_EXACT_INITIAL = </span><span class="s4">0x02    </span><span class="s3"># ibid., Chapter 5.6</span>
+<span class="s1">FILTER_AUGMENTED = </span><span class="s4">0x04        </span><span class="s3"># ibid., Chapter 5.7</span>
+<span class="s1">FILTER_SQUARE_ROOT = </span><span class="s4">0x08      </span><span class="s3"># ibid., Chapter 6.3</span>
+<span class="s1">FILTER_UNIVARIATE = </span><span class="s4">0x10       </span><span class="s3"># ibid., Chapter 6.4</span>
+<span class="s1">FILTER_COLLAPSED = </span><span class="s4">0x20        </span><span class="s3"># ibid., Chapter 6.5</span>
+<span class="s1">FILTER_EXTENDED = </span><span class="s4">0x40         </span><span class="s3"># ibid., Chapter 10.2</span>
+<span class="s1">FILTER_UNSCENTED = </span><span class="s4">0x80        </span><span class="s3"># ibid., Chapter 10.3</span>
+<span class="s1">FILTER_CONCENTRATED = </span><span class="s4">0x100    </span><span class="s3"># Harvey (1989), Chapter 3.4</span>
+<span class="s1">FILTER_CHANDRASEKHAR = </span><span class="s4">0x200   </span><span class="s3"># Herbst (2015)</span>
+
+<span class="s1">INVERT_UNIVARIATE = </span><span class="s4">0x01</span>
+<span class="s1">SOLVE_LU = </span><span class="s4">0x02</span>
+<span class="s1">INVERT_LU = </span><span class="s4">0x04</span>
+<span class="s1">SOLVE_CHOLESKY = </span><span class="s4">0x08</span>
+<span class="s1">INVERT_CHOLESKY = </span><span class="s4">0x10</span>
+
+<span class="s1">STABILITY_FORCE_SYMMETRY = </span><span class="s4">0x01</span>
+
+<span class="s1">MEMORY_STORE_ALL = </span><span class="s4">0</span>
+<span class="s1">MEMORY_NO_FORECAST_MEAN = </span><span class="s4">0x01</span>
+<span class="s1">MEMORY_NO_FORECAST_COV = </span><span class="s4">0x02</span>
+<span class="s1">MEMORY_NO_FORECAST = MEMORY_NO_FORECAST_MEAN | MEMORY_NO_FORECAST_COV</span>
+<span class="s1">MEMORY_NO_PREDICTED_MEAN = </span><span class="s4">0x04</span>
+<span class="s1">MEMORY_NO_PREDICTED_COV = </span><span class="s4">0x08</span>
+<span class="s1">MEMORY_NO_PREDICTED = MEMORY_NO_PREDICTED_MEAN | MEMORY_NO_PREDICTED_COV</span>
+<span class="s1">MEMORY_NO_FILTERED_MEAN = </span><span class="s4">0x10</span>
+<span class="s1">MEMORY_NO_FILTERED_COV = </span><span class="s4">0x20</span>
+<span class="s1">MEMORY_NO_FILTERED = MEMORY_NO_FILTERED_MEAN | MEMORY_NO_FILTERED_COV</span>
+<span class="s1">MEMORY_NO_LIKELIHOOD = </span><span class="s4">0x40</span>
+<span class="s1">MEMORY_NO_GAIN = </span><span class="s4">0x80</span>
+<span class="s1">MEMORY_NO_SMOOTHING = </span><span class="s4">0x100</span>
+<span class="s1">MEMORY_NO_STD_FORECAST = </span><span class="s4">0x200</span>
+<span class="s1">MEMORY_CONSERVE = (</span>
+    <span class="s1">MEMORY_NO_FORECAST_COV | MEMORY_NO_PREDICTED | MEMORY_NO_FILTERED |</span>
+    <span class="s1">MEMORY_NO_LIKELIHOOD | MEMORY_NO_GAIN | MEMORY_NO_SMOOTHING</span>
+<span class="s1">)</span>
+
+<span class="s1">TIMING_INIT_PREDICTED = </span><span class="s4">0</span>
+<span class="s1">TIMING_INIT_FILTERED = </span><span class="s4">1</span>
+
+
+<span class="s2">class </span><span class="s1">KalmanFilter(Representation):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    State space representation of a time series process, with Kalman filter 
+ 
+    Parameters 
+    ---------- 
+    k_endog : {array_like, int} 
+        The observed time-series process :math:`y` if array like or the 
+        number of variables in the process if an integer. 
+    k_states : int 
+        The dimension of the unobserved state process. 
+    k_posdef : int, optional 
+        The dimension of a guaranteed positive definite covariance matrix 
+        describing the shocks in the transition equation. Must be less than 
+        or equal to `k_states`. Default is `k_states`. 
+    loglikelihood_burn : int, optional 
+        The number of initial periods during which the loglikelihood is not 
+        recorded. Default is 0. 
+    tolerance : float, optional 
+        The tolerance at which the Kalman filter determines convergence to 
+        steady-state. Default is 1e-19. 
+    results_class : class, optional 
+        Default results class to use to save filtering output. Default is 
+        `FilterResults`. If specified, class must extend from `FilterResults`. 
+    **kwargs 
+        Keyword arguments may be used to provide values for the filter, 
+        inversion, and stability methods. See `set_filter_method`, 
+        `set_inversion_method`, and `set_stability_method`. 
+        Keyword arguments may be used to provide default values for state space 
+        matrices. See `Representation` for more details. 
+ 
+    See Also 
+    -------- 
+    FilterResults 
+    statsmodels.tsa.statespace.representation.Representation 
+ 
+    Notes 
+    ----- 
+    There are several types of options available for controlling the Kalman 
+    filter operation. All options are internally held as bitmasks, but can be 
+    manipulated by setting class attributes, which act like boolean flags. For 
+    more information, see the `set_*` class method documentation. The options 
+    are: 
+ 
+    filter_method 
+        The filtering method controls aspects of which 
+        Kalman filtering approach will be used. 
+    inversion_method 
+        The Kalman filter may contain one matrix inversion: that of the 
+        forecast error covariance matrix. The inversion method controls how and 
+        if that inverse is performed. 
+    stability_method 
+        The Kalman filter is a recursive algorithm that may in some cases 
+        suffer issues with numerical stability. The stability method controls 
+        what, if any, measures are taken to promote stability. 
+    conserve_memory 
+        By default, the Kalman filter computes a number of intermediate 
+        matrices at each iteration. The memory conservation options control 
+        which of those matrices are stored. 
+    filter_timing 
+        By default, the Kalman filter follows Durbin and Koopman, 2012, in 
+        initializing the filter with predicted values. Kim and Nelson, 1999, 
+        instead initialize the filter with filtered values, which is 
+        essentially just a different timing convention. 
+ 
+    The `filter_method` and `inversion_method` options intentionally allow 
+    the possibility that multiple methods will be indicated. In the case that 
+    multiple methods are selected, the underlying Kalman filter will attempt to 
+    select the optional method given the input data. 
+ 
+    For example, it may be that INVERT_UNIVARIATE and SOLVE_CHOLESKY are 
+    indicated (this is in fact the default case). In this case, if the 
+    endogenous vector is 1-dimensional (`k_endog` = 1), then INVERT_UNIVARIATE 
+    is used and inversion reduces to simple division, and if it has a larger 
+    dimension, the Cholesky decomposition along with linear solving (rather 
+    than explicit matrix inversion) is used. If only SOLVE_CHOLESKY had been 
+    set, then the Cholesky decomposition method would *always* be used, even in 
+    the case of 1-dimensional data. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">filter_methods = [</span>
+        <span class="s5">'filter_conventional'</span><span class="s2">, </span><span class="s5">'filter_exact_initial'</span><span class="s2">, </span><span class="s5">'filter_augmented'</span><span class="s2">,</span>
+        <span class="s5">'filter_square_root'</span><span class="s2">, </span><span class="s5">'filter_univariate'</span><span class="s2">, </span><span class="s5">'filter_collapsed'</span><span class="s2">,</span>
+        <span class="s5">'filter_extended'</span><span class="s2">, </span><span class="s5">'filter_unscented'</span><span class="s2">, </span><span class="s5">'filter_concentrated'</span><span class="s2">,</span>
+        <span class="s5">'filter_chandrasekhar'</span>
+    <span class="s1">]</span>
+
+    <span class="s1">filter_conventional = OptionWrapper(</span><span class="s5">'filter_method'</span><span class="s2">, </span><span class="s1">FILTER_CONVENTIONAL)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for conventional Kalman filtering. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">filter_exact_initial = OptionWrapper(</span><span class="s5">'filter_method'</span><span class="s2">, </span><span class="s1">FILTER_EXACT_INITIAL)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for exact initial Kalman filtering. Not implemented. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">filter_augmented = OptionWrapper(</span><span class="s5">'filter_method'</span><span class="s2">, </span><span class="s1">FILTER_AUGMENTED)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for augmented Kalman filtering. Not implemented. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">filter_square_root = OptionWrapper(</span><span class="s5">'filter_method'</span><span class="s2">, </span><span class="s1">FILTER_SQUARE_ROOT)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for square-root Kalman filtering. Not implemented. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">filter_univariate = OptionWrapper(</span><span class="s5">'filter_method'</span><span class="s2">, </span><span class="s1">FILTER_UNIVARIATE)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for univariate filtering of multivariate observation vector. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">filter_collapsed = OptionWrapper(</span><span class="s5">'filter_method'</span><span class="s2">, </span><span class="s1">FILTER_COLLAPSED)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for Kalman filtering with collapsed observation vector. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">filter_extended = OptionWrapper(</span><span class="s5">'filter_method'</span><span class="s2">, </span><span class="s1">FILTER_EXTENDED)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for extended Kalman filtering. Not implemented. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">filter_unscented = OptionWrapper(</span><span class="s5">'filter_method'</span><span class="s2">, </span><span class="s1">FILTER_UNSCENTED)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for unscented Kalman filtering. Not implemented. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">filter_concentrated = OptionWrapper(</span><span class="s5">'filter_method'</span><span class="s2">, </span><span class="s1">FILTER_CONCENTRATED)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for Kalman filtering with concentrated log-likelihood. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">filter_chandrasekhar = OptionWrapper(</span><span class="s5">'filter_method'</span><span class="s2">, </span><span class="s1">FILTER_CHANDRASEKHAR)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for filtering with Chandrasekhar recursions. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">inversion_methods = [</span>
+        <span class="s5">'invert_univariate'</span><span class="s2">, </span><span class="s5">'solve_lu'</span><span class="s2">, </span><span class="s5">'invert_lu'</span><span class="s2">, </span><span class="s5">'solve_cholesky'</span><span class="s2">,</span>
+        <span class="s5">'invert_cholesky'</span>
+    <span class="s1">]</span>
+
+    <span class="s1">invert_univariate = OptionWrapper(</span><span class="s5">'inversion_method'</span><span class="s2">, </span><span class="s1">INVERT_UNIVARIATE)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for univariate inversion method (recommended). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">solve_lu = OptionWrapper(</span><span class="s5">'inversion_method'</span><span class="s2">, </span><span class="s1">SOLVE_LU)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for LU and linear solver inversion method. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">invert_lu = OptionWrapper(</span><span class="s5">'inversion_method'</span><span class="s2">, </span><span class="s1">INVERT_LU)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for LU inversion method. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">solve_cholesky = OptionWrapper(</span><span class="s5">'inversion_method'</span><span class="s2">, </span><span class="s1">SOLVE_CHOLESKY)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for Cholesky and linear solver inversion method (recommended). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">invert_cholesky = OptionWrapper(</span><span class="s5">'inversion_method'</span><span class="s2">, </span><span class="s1">INVERT_CHOLESKY)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for Cholesky inversion method. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">stability_methods = [</span><span class="s5">'stability_force_symmetry'</span><span class="s1">]</span>
+
+    <span class="s1">stability_force_symmetry = (</span>
+        <span class="s1">OptionWrapper(</span><span class="s5">'stability_method'</span><span class="s2">, </span><span class="s1">STABILITY_FORCE_SYMMETRY)</span>
+    <span class="s1">)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for enforcing covariance matrix symmetry 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">memory_options = [</span>
+        <span class="s5">'memory_store_all'</span><span class="s2">, </span><span class="s5">'memory_no_forecast_mean'</span><span class="s2">,</span>
+        <span class="s5">'memory_no_forecast_cov'</span><span class="s2">, </span><span class="s5">'memory_no_forecast'</span><span class="s2">,</span>
+        <span class="s5">'memory_no_predicted_mean'</span><span class="s2">, </span><span class="s5">'memory_no_predicted_cov'</span><span class="s2">,</span>
+        <span class="s5">'memory_no_predicted'</span><span class="s2">, </span><span class="s5">'memory_no_filtered_mean'</span><span class="s2">,</span>
+        <span class="s5">'memory_no_filtered_cov'</span><span class="s2">, </span><span class="s5">'memory_no_filtered'</span><span class="s2">,</span>
+        <span class="s5">'memory_no_likelihood'</span><span class="s2">, </span><span class="s5">'memory_no_gain'</span><span class="s2">,</span>
+        <span class="s5">'memory_no_smoothing'</span><span class="s2">, </span><span class="s5">'memory_no_std_forecast'</span><span class="s2">, </span><span class="s5">'memory_conserve'</span>
+    <span class="s1">]</span>
+
+    <span class="s1">memory_store_all = OptionWrapper(</span><span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_STORE_ALL)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for storing all intermediate results in memory (default). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">memory_no_forecast_mean = OptionWrapper(</span>
+        <span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_NO_FORECAST_MEAN)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag to prevent storing forecasts and forecast errors. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">memory_no_forecast_cov = OptionWrapper(</span>
+        <span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_NO_FORECAST_COV)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag to prevent storing forecast error covariance matrices. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">memory_no_forecast(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        (bool) Flag to prevent storing all forecast-related output. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.memory_no_forecast_mean </span><span class="s2">or </span><span class="s1">self.memory_no_forecast_cov</span>
+
+    <span class="s1">@memory_no_forecast.setter</span>
+    <span class="s2">def </span><span class="s1">memory_no_forecast(self</span><span class="s2">, </span><span class="s1">value):</span>
+        <span class="s2">if </span><span class="s1">bool(value):</span>
+            <span class="s1">self.memory_no_forecast_mean = </span><span class="s2">True</span>
+            <span class="s1">self.memory_no_forecast_cov = </span><span class="s2">True</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.memory_no_forecast_mean = </span><span class="s2">False</span>
+            <span class="s1">self.memory_no_forecast_cov = </span><span class="s2">False</span>
+
+    <span class="s1">memory_no_predicted_mean = OptionWrapper(</span>
+        <span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_NO_PREDICTED_MEAN)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag to prevent storing predicted states. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">memory_no_predicted_cov = OptionWrapper(</span>
+        <span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_NO_PREDICTED_COV)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag to prevent storing predicted state covariance matrices. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">memory_no_predicted(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        (bool) Flag to prevent storing predicted state and covariance matrices. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.memory_no_predicted_mean </span><span class="s2">or </span><span class="s1">self.memory_no_predicted_cov</span>
+
+    <span class="s1">@memory_no_predicted.setter</span>
+    <span class="s2">def </span><span class="s1">memory_no_predicted(self</span><span class="s2">, </span><span class="s1">value):</span>
+        <span class="s2">if </span><span class="s1">bool(value):</span>
+            <span class="s1">self.memory_no_predicted_mean = </span><span class="s2">True</span>
+            <span class="s1">self.memory_no_predicted_cov = </span><span class="s2">True</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.memory_no_predicted_mean = </span><span class="s2">False</span>
+            <span class="s1">self.memory_no_predicted_cov = </span><span class="s2">False</span>
+
+    <span class="s1">memory_no_filtered_mean = OptionWrapper(</span>
+        <span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_NO_FILTERED_MEAN)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag to prevent storing filtered states. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">memory_no_filtered_cov = OptionWrapper(</span>
+        <span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_NO_FILTERED_COV)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag to prevent storing filtered state covariance matrices. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">memory_no_filtered(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        (bool) Flag to prevent storing filtered state and covariance matrices. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self.memory_no_filtered_mean </span><span class="s2">or </span><span class="s1">self.memory_no_filtered_cov</span>
+
+    <span class="s1">@memory_no_filtered.setter</span>
+    <span class="s2">def </span><span class="s1">memory_no_filtered(self</span><span class="s2">, </span><span class="s1">value):</span>
+        <span class="s2">if </span><span class="s1">bool(value):</span>
+            <span class="s1">self.memory_no_filtered_mean = </span><span class="s2">True</span>
+            <span class="s1">self.memory_no_filtered_cov = </span><span class="s2">True</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.memory_no_filtered_mean = </span><span class="s2">False</span>
+            <span class="s1">self.memory_no_filtered_cov = </span><span class="s2">False</span>
+
+    <span class="s1">memory_no_likelihood = (</span>
+        <span class="s1">OptionWrapper(</span><span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_NO_LIKELIHOOD)</span>
+    <span class="s1">)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag to prevent storing likelihood values for each observation. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">memory_no_gain = OptionWrapper(</span><span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_NO_GAIN)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag to prevent storing the Kalman gain matrices. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">memory_no_smoothing = OptionWrapper(</span><span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_NO_SMOOTHING)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag to prevent storing likelihood values for each observation. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">memory_no_std_forecast = (</span>
+        <span class="s1">OptionWrapper(</span><span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_NO_STD_FORECAST))</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag to prevent storing standardized forecast errors. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">memory_conserve = OptionWrapper(</span><span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">MEMORY_CONSERVE)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag to conserve the maximum amount of memory. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">timing_options = [</span>
+        <span class="s5">'timing_init_predicted'</span><span class="s2">, </span><span class="s5">'timing_init_filtered'</span>
+    <span class="s1">]</span>
+    <span class="s1">timing_init_predicted = OptionWrapper(</span><span class="s5">'filter_timing'</span><span class="s2">,</span>
+                                          <span class="s1">TIMING_INIT_PREDICTED)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for the default timing convention (Durbin and Koopman, 2012). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">timing_init_filtered = OptionWrapper(</span><span class="s5">'filter_timing'</span><span class="s2">, </span><span class="s1">TIMING_INIT_FILTERED)</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (bool) Flag for the alternate timing convention (Kim and Nelson, 2012). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3"># Default filter options</span>
+    <span class="s1">filter_method = FILTER_CONVENTIONAL</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (int) Filtering method bitmask. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">inversion_method = INVERT_UNIVARIATE | SOLVE_CHOLESKY</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (int) Inversion method bitmask. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">stability_method = STABILITY_FORCE_SYMMETRY</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (int) Stability method bitmask. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">conserve_memory = MEMORY_STORE_ALL</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (int) Memory conservation bitmask. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">filter_timing = TIMING_INIT_PREDICTED</span>
+    <span class="s5">&quot;&quot;&quot; 
+    (int) Filter timing. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">k_endog</span><span class="s2">, </span><span class="s1">k_states</span><span class="s2">, </span><span class="s1">k_posdef=</span><span class="s2">None,</span>
+                 <span class="s1">loglikelihood_burn=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">tolerance=</span><span class="s4">1e-19</span><span class="s2">, </span><span class="s1">results_class=</span><span class="s2">None,</span>
+                 <span class="s1">kalman_filter_classes=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># Extract keyword arguments to-be-used later</span>
+        <span class="s1">keys = [</span><span class="s5">'filter_method'</span><span class="s1">] + KalmanFilter.filter_methods</span>
+        <span class="s1">filter_method_kwargs = {key: kwargs.pop(key) </span><span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">keys</span>
+                                <span class="s2">if </span><span class="s1">key </span><span class="s2">in </span><span class="s1">kwargs}</span>
+        <span class="s1">keys = [</span><span class="s5">'inversion_method'</span><span class="s1">] + KalmanFilter.inversion_methods</span>
+        <span class="s1">inversion_method_kwargs = {key: kwargs.pop(key) </span><span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">keys</span>
+                                   <span class="s2">if </span><span class="s1">key </span><span class="s2">in </span><span class="s1">kwargs}</span>
+        <span class="s1">keys = [</span><span class="s5">'stability_method'</span><span class="s1">] + KalmanFilter.stability_methods</span>
+        <span class="s1">stability_method_kwargs = {key: kwargs.pop(key) </span><span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">keys</span>
+                                   <span class="s2">if </span><span class="s1">key </span><span class="s2">in </span><span class="s1">kwargs}</span>
+        <span class="s1">keys = [</span><span class="s5">'conserve_memory'</span><span class="s1">] + KalmanFilter.memory_options</span>
+        <span class="s1">conserve_memory_kwargs = {key: kwargs.pop(key) </span><span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">keys</span>
+                                  <span class="s2">if </span><span class="s1">key </span><span class="s2">in </span><span class="s1">kwargs}</span>
+        <span class="s1">keys = [</span><span class="s5">'alternate_timing'</span><span class="s1">] + KalmanFilter.timing_options</span>
+        <span class="s1">filter_timing_kwargs = {key: kwargs.pop(key) </span><span class="s2">for </span><span class="s1">key </span><span class="s2">in </span><span class="s1">keys</span>
+                                <span class="s2">if </span><span class="s1">key </span><span class="s2">in </span><span class="s1">kwargs}</span>
+
+        <span class="s3"># Initialize the base class</span>
+        <span class="s1">super(KalmanFilter</span><span class="s2">, </span><span class="s1">self).__init__(</span>
+            <span class="s1">k_endog</span><span class="s2">, </span><span class="s1">k_states</span><span class="s2">, </span><span class="s1">k_posdef</span><span class="s2">, </span><span class="s1">**kwargs</span>
+        <span class="s1">)</span>
+
+        <span class="s3"># Setup the underlying Kalman filter storage</span>
+        <span class="s1">self._kalman_filters = {}</span>
+
+        <span class="s3"># Filter options</span>
+        <span class="s1">self.loglikelihood_burn = loglikelihood_burn</span>
+        <span class="s1">self.results_class = (</span>
+            <span class="s1">results_class </span><span class="s2">if </span><span class="s1">results_class </span><span class="s2">is not None else </span><span class="s1">FilterResults</span>
+        <span class="s1">)</span>
+        <span class="s3"># Options</span>
+        <span class="s1">self.prefix_kalman_filter_map = (</span>
+            <span class="s1">kalman_filter_classes</span>
+            <span class="s2">if </span><span class="s1">kalman_filter_classes </span><span class="s2">is not None</span>
+            <span class="s2">else </span><span class="s1">tools.prefix_kalman_filter_map.copy())</span>
+
+        <span class="s1">self.set_filter_method(**filter_method_kwargs)</span>
+        <span class="s1">self.set_inversion_method(**inversion_method_kwargs)</span>
+        <span class="s1">self.set_stability_method(**stability_method_kwargs)</span>
+        <span class="s1">self.set_conserve_memory(**conserve_memory_kwargs)</span>
+        <span class="s1">self.set_filter_timing(**filter_timing_kwargs)</span>
+
+        <span class="s1">self.tolerance = tolerance</span>
+
+        <span class="s3"># Internal flags</span>
+        <span class="s3"># The _scale internal flag is used because we may want to</span>
+        <span class="s3"># use a fixed scale, in which case we want the flag to the Cython</span>
+        <span class="s3"># Kalman filter to indicate that the scale should not be concentrated</span>
+        <span class="s3"># out, so that self.filter_concentrated = False, but we still want to</span>
+        <span class="s3"># alert the results object that we are viewing the model as one in</span>
+        <span class="s3"># which the scale had been concentrated out for e.g. degree of freedom</span>
+        <span class="s3"># computations.</span>
+        <span class="s3"># This value should always be None, except within the fixed_scale</span>
+        <span class="s3"># context, and should not be modified by users or anywhere else.</span>
+        <span class="s1">self._scale = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_clone_kwargs(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s3"># See Representation._clone_kwargs for docstring</span>
+        <span class="s1">kwargs = super(KalmanFilter</span><span class="s2">, </span><span class="s1">self)._clone_kwargs(endog</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+
+        <span class="s3"># Get defaults for options</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'filter_method'</span><span class="s2">, </span><span class="s1">self.filter_method)</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'inversion_method'</span><span class="s2">, </span><span class="s1">self.inversion_method)</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'stability_method'</span><span class="s2">, </span><span class="s1">self.stability_method)</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s1">self.conserve_memory)</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'alternate_timing'</span><span class="s2">, </span><span class="s1">bool(self.filter_timing))</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'tolerance'</span><span class="s2">, </span><span class="s1">self.tolerance)</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'loglikelihood_burn'</span><span class="s2">, </span><span class="s1">self.loglikelihood_burn)</span>
+
+        <span class="s2">return </span><span class="s1">kwargs</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">_kalman_filter(self):</span>
+        <span class="s1">prefix = self.prefix</span>
+        <span class="s2">if </span><span class="s1">prefix </span><span class="s2">in </span><span class="s1">self._kalman_filters:</span>
+            <span class="s2">return </span><span class="s1">self._kalman_filters[prefix]</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">def </span><span class="s1">_initialize_filter(self</span><span class="s2">, </span><span class="s1">filter_method=</span><span class="s2">None, </span><span class="s1">inversion_method=</span><span class="s2">None,</span>
+                           <span class="s1">stability_method=</span><span class="s2">None, </span><span class="s1">conserve_memory=</span><span class="s2">None,</span>
+                           <span class="s1">tolerance=</span><span class="s2">None, </span><span class="s1">filter_timing=</span><span class="s2">None,</span>
+                           <span class="s1">loglikelihood_burn=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">filter_method </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">filter_method = self.filter_method</span>
+        <span class="s2">if </span><span class="s1">inversion_method </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">inversion_method = self.inversion_method</span>
+        <span class="s2">if </span><span class="s1">stability_method </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">stability_method = self.stability_method</span>
+        <span class="s2">if </span><span class="s1">conserve_memory </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">conserve_memory = self.conserve_memory</span>
+        <span class="s2">if </span><span class="s1">loglikelihood_burn </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">loglikelihood_burn = self.loglikelihood_burn</span>
+        <span class="s2">if </span><span class="s1">filter_timing </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">filter_timing = self.filter_timing</span>
+        <span class="s2">if </span><span class="s1">tolerance </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">tolerance = self.tolerance</span>
+
+        <span class="s3"># Make sure we have endog</span>
+        <span class="s2">if </span><span class="s1">self.endog </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s5">'Must bind a dataset to the model before'</span>
+                               <span class="s5">' filtering or smoothing.'</span><span class="s1">)</span>
+
+        <span class="s3"># Initialize the representation matrices</span>
+        <span class="s1">prefix</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">create_statespace = self._initialize_representation()</span>
+
+        <span class="s3"># Determine if we need to (re-)create the filter</span>
+        <span class="s3"># (definitely need to recreate if we recreated the _statespace object)</span>
+        <span class="s1">create_filter = create_statespace </span><span class="s2">or </span><span class="s1">prefix </span><span class="s2">not in </span><span class="s1">self._kalman_filters</span>
+        <span class="s2">if not </span><span class="s1">create_filter:</span>
+            <span class="s1">kalman_filter = self._kalman_filters[prefix]</span>
+
+            <span class="s1">create_filter = (</span>
+                <span class="s2">not </span><span class="s1">kalman_filter.conserve_memory == conserve_memory </span><span class="s2">or</span>
+                <span class="s2">not </span><span class="s1">kalman_filter.loglikelihood_burn == loglikelihood_burn</span>
+            <span class="s1">)</span>
+
+        <span class="s3"># If the dtype-specific _kalman_filter does not exist (or if we need</span>
+        <span class="s3"># to re-create it), create it</span>
+        <span class="s2">if </span><span class="s1">create_filter:</span>
+            <span class="s2">if </span><span class="s1">prefix </span><span class="s2">in </span><span class="s1">self._kalman_filters:</span>
+                <span class="s3"># Delete the old filter</span>
+                <span class="s2">del </span><span class="s1">self._kalman_filters[prefix]</span>
+            <span class="s3"># Setup the filter</span>
+            <span class="s1">cls = self.prefix_kalman_filter_map[prefix]</span>
+            <span class="s1">self._kalman_filters[prefix] = cls(</span>
+                <span class="s1">self._statespaces[prefix]</span><span class="s2">, </span><span class="s1">filter_method</span><span class="s2">, </span><span class="s1">inversion_method</span><span class="s2">,</span>
+                <span class="s1">stability_method</span><span class="s2">, </span><span class="s1">conserve_memory</span><span class="s2">, </span><span class="s1">filter_timing</span><span class="s2">, </span><span class="s1">tolerance</span><span class="s2">,</span>
+                <span class="s1">loglikelihood_burn</span>
+            <span class="s1">)</span>
+        <span class="s3"># Otherwise, update the filter parameters</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">kalman_filter = self._kalman_filters[prefix]</span>
+            <span class="s1">kalman_filter.set_filter_method(filter_method</span><span class="s2">, False</span><span class="s1">)</span>
+            <span class="s1">kalman_filter.inversion_method = inversion_method</span>
+            <span class="s1">kalman_filter.stability_method = stability_method</span>
+            <span class="s1">kalman_filter.filter_timing = filter_timing</span>
+            <span class="s1">kalman_filter.tolerance = tolerance</span>
+            <span class="s3"># conserve_memory and loglikelihood_burn changes always lead to</span>
+            <span class="s3"># re-created filters</span>
+
+        <span class="s2">return </span><span class="s1">prefix</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">create_filter</span><span class="s2">, </span><span class="s1">create_statespace</span>
+
+    <span class="s2">def </span><span class="s1">set_filter_method(self</span><span class="s2">, </span><span class="s1">filter_method=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Set the filtering method 
+ 
+        The filtering method controls aspects of which Kalman filtering 
+        approach will be used. 
+ 
+        Parameters 
+        ---------- 
+        filter_method : int, optional 
+            Bitmask value to set the filter method to. See notes for details. 
+        **kwargs 
+            Keyword arguments may be used to influence the filter method by 
+            setting individual boolean flags. See notes for details. 
+ 
+        Notes 
+        ----- 
+        The filtering method is defined by a collection of boolean flags, and 
+        is internally stored as a bitmask. The methods available are: 
+ 
+        FILTER_CONVENTIONAL 
+            Conventional Kalman filter. 
+        FILTER_UNIVARIATE 
+            Univariate approach to Kalman filtering. Overrides conventional 
+            method if both are specified. 
+        FILTER_COLLAPSED 
+            Collapsed approach to Kalman filtering. Will be used *in addition* 
+            to conventional or univariate filtering. 
+        FILTER_CONCENTRATED 
+            Use the concentrated log-likelihood function. Will be used 
+            *in addition* to the other options. 
+ 
+        Note that only the first method is available if using a Scipy version 
+        older than 0.16. 
+ 
+        If the bitmask is set directly via the `filter_method` argument, then 
+        the full method must be provided. 
+ 
+        If keyword arguments are used to set individual boolean flags, then 
+        the lowercase of the method must be used as an argument name, and the 
+        value is the desired value of the boolean flag (True or False). 
+ 
+        Note that the filter method may also be specified by directly modifying 
+        the class attributes which are defined similarly to the keyword 
+        arguments. 
+ 
+        The default filtering method is FILTER_CONVENTIONAL. 
+ 
+        Examples 
+        -------- 
+        &gt;&gt;&gt; mod = sm.tsa.statespace.SARIMAX(range(10)) 
+        &gt;&gt;&gt; mod.ssm.filter_method 
+        1 
+        &gt;&gt;&gt; mod.ssm.filter_conventional 
+        True 
+        &gt;&gt;&gt; mod.ssm.filter_univariate = True 
+        &gt;&gt;&gt; mod.ssm.filter_method 
+        17 
+        &gt;&gt;&gt; mod.ssm.set_filter_method(filter_univariate=False, 
+        ...                           filter_collapsed=True) 
+        &gt;&gt;&gt; mod.ssm.filter_method 
+        33 
+        &gt;&gt;&gt; mod.ssm.set_filter_method(filter_method=1) 
+        &gt;&gt;&gt; mod.ssm.filter_conventional 
+        True 
+        &gt;&gt;&gt; mod.ssm.filter_univariate 
+        False 
+        &gt;&gt;&gt; mod.ssm.filter_collapsed 
+        False 
+        &gt;&gt;&gt; mod.ssm.filter_univariate = True 
+        &gt;&gt;&gt; mod.ssm.filter_method 
+        17 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">filter_method </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.filter_method = filter_method</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">KalmanFilter.filter_methods:</span>
+            <span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">kwargs:</span>
+                <span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs[name])</span>
+
+    <span class="s2">def </span><span class="s1">set_inversion_method(self</span><span class="s2">, </span><span class="s1">inversion_method=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Set the inversion method 
+ 
+        The Kalman filter may contain one matrix inversion: that of the 
+        forecast error covariance matrix. The inversion method controls how and 
+        if that inverse is performed. 
+ 
+        Parameters 
+        ---------- 
+        inversion_method : int, optional 
+            Bitmask value to set the inversion method to. See notes for 
+            details. 
+        **kwargs 
+            Keyword arguments may be used to influence the inversion method by 
+            setting individual boolean flags. See notes for details. 
+ 
+        Notes 
+        ----- 
+        The inversion method is defined by a collection of boolean flags, and 
+        is internally stored as a bitmask. The methods available are: 
+ 
+        INVERT_UNIVARIATE 
+            If the endogenous time series is univariate, then inversion can be 
+            performed by simple division. If this flag is set and the time 
+            series is univariate, then division will always be used even if 
+            other flags are also set. 
+        SOLVE_LU 
+            Use an LU decomposition along with a linear solver (rather than 
+            ever actually inverting the matrix). 
+        INVERT_LU 
+            Use an LU decomposition along with typical matrix inversion. 
+        SOLVE_CHOLESKY 
+            Use a Cholesky decomposition along with a linear solver. 
+        INVERT_CHOLESKY 
+            Use an Cholesky decomposition along with typical matrix inversion. 
+ 
+        If the bitmask is set directly via the `inversion_method` argument, 
+        then the full method must be provided. 
+ 
+        If keyword arguments are used to set individual boolean flags, then 
+        the lowercase of the method must be used as an argument name, and the 
+        value is the desired value of the boolean flag (True or False). 
+ 
+        Note that the inversion method may also be specified by directly 
+        modifying the class attributes which are defined similarly to the 
+        keyword arguments. 
+ 
+        The default inversion method is `INVERT_UNIVARIATE | SOLVE_CHOLESKY` 
+ 
+        Several things to keep in mind are: 
+ 
+        - If the filtering method is specified to be univariate, then simple 
+          division is always used regardless of the dimension of the endogenous 
+          time series. 
+        - Cholesky decomposition is about twice as fast as LU decomposition, 
+          but it requires that the matrix be positive definite. While this 
+          should generally be true, it may not be in every case. 
+        - Using a linear solver rather than true matrix inversion is generally 
+          faster and is numerically more stable. 
+ 
+        Examples 
+        -------- 
+        &gt;&gt;&gt; mod = sm.tsa.statespace.SARIMAX(range(10)) 
+        &gt;&gt;&gt; mod.ssm.inversion_method 
+        1 
+        &gt;&gt;&gt; mod.ssm.solve_cholesky 
+        True 
+        &gt;&gt;&gt; mod.ssm.invert_univariate 
+        True 
+        &gt;&gt;&gt; mod.ssm.invert_lu 
+        False 
+        &gt;&gt;&gt; mod.ssm.invert_univariate = False 
+        &gt;&gt;&gt; mod.ssm.inversion_method 
+        8 
+        &gt;&gt;&gt; mod.ssm.set_inversion_method(solve_cholesky=False, 
+        ...                              invert_cholesky=True) 
+        &gt;&gt;&gt; mod.ssm.inversion_method 
+        16 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">inversion_method </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.inversion_method = inversion_method</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">KalmanFilter.inversion_methods:</span>
+            <span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">kwargs:</span>
+                <span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs[name])</span>
+
+    <span class="s2">def </span><span class="s1">set_stability_method(self</span><span class="s2">, </span><span class="s1">stability_method=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Set the numerical stability method 
+ 
+        The Kalman filter is a recursive algorithm that may in some cases 
+        suffer issues with numerical stability. The stability method controls 
+        what, if any, measures are taken to promote stability. 
+ 
+        Parameters 
+        ---------- 
+        stability_method : int, optional 
+            Bitmask value to set the stability method to. See notes for 
+            details. 
+        **kwargs 
+            Keyword arguments may be used to influence the stability method by 
+            setting individual boolean flags. See notes for details. 
+ 
+        Notes 
+        ----- 
+        The stability method is defined by a collection of boolean flags, and 
+        is internally stored as a bitmask. The methods available are: 
+ 
+        STABILITY_FORCE_SYMMETRY = 0x01 
+            If this flag is set, symmetry of the predicted state covariance 
+            matrix is enforced at each iteration of the filter, where each 
+            element is set to the average of the corresponding elements in the 
+            upper and lower triangle. 
+ 
+        If the bitmask is set directly via the `stability_method` argument, 
+        then the full method must be provided. 
+ 
+        If keyword arguments are used to set individual boolean flags, then 
+        the lowercase of the method must be used as an argument name, and the 
+        value is the desired value of the boolean flag (True or False). 
+ 
+        Note that the stability method may also be specified by directly 
+        modifying the class attributes which are defined similarly to the 
+        keyword arguments. 
+ 
+        The default stability method is `STABILITY_FORCE_SYMMETRY` 
+ 
+        Examples 
+        -------- 
+        &gt;&gt;&gt; mod = sm.tsa.statespace.SARIMAX(range(10)) 
+        &gt;&gt;&gt; mod.ssm.stability_method 
+        1 
+        &gt;&gt;&gt; mod.ssm.stability_force_symmetry 
+        True 
+        &gt;&gt;&gt; mod.ssm.stability_force_symmetry = False 
+        &gt;&gt;&gt; mod.ssm.stability_method 
+        0 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">stability_method </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.stability_method = stability_method</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">KalmanFilter.stability_methods:</span>
+            <span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">kwargs:</span>
+                <span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs[name])</span>
+
+    <span class="s2">def </span><span class="s1">set_conserve_memory(self</span><span class="s2">, </span><span class="s1">conserve_memory=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Set the memory conservation method 
+ 
+        By default, the Kalman filter computes a number of intermediate 
+        matrices at each iteration. The memory conservation options control 
+        which of those matrices are stored. 
+ 
+        Parameters 
+        ---------- 
+        conserve_memory : int, optional 
+            Bitmask value to set the memory conservation method to. See notes 
+            for details. 
+        **kwargs 
+            Keyword arguments may be used to influence the memory conservation 
+            method by setting individual boolean flags. See notes for details. 
+ 
+        Notes 
+        ----- 
+        The memory conservation method is defined by a collection of boolean 
+        flags, and is internally stored as a bitmask. The methods available 
+        are: 
+ 
+        MEMORY_STORE_ALL 
+            Store all intermediate matrices. This is the default value. 
+        MEMORY_NO_FORECAST_MEAN 
+            Do not store the forecast or forecast errors. If this option is 
+            used, the `predict` method from the results class is unavailable. 
+        MEMORY_NO_FORECAST_COV 
+            Do not store the forecast error covariance matrices. 
+        MEMORY_NO_FORECAST 
+            Do not store the forecast, forecast error, or forecast error 
+            covariance matrices. If this option is used, the `predict` method 
+            from the results class is unavailable. 
+        MEMORY_NO_PREDICTED_MEAN 
+            Do not store the predicted state. 
+        MEMORY_NO_PREDICTED_COV 
+            Do not store the predicted state covariance 
+            matrices. 
+        MEMORY_NO_PREDICTED 
+            Do not store the predicted state or predicted state covariance 
+            matrices. 
+        MEMORY_NO_FILTERED_MEAN 
+            Do not store the filtered state. 
+        MEMORY_NO_FILTERED_COV 
+            Do not store the filtered state covariance 
+            matrices. 
+        MEMORY_NO_FILTERED 
+            Do not store the filtered state or filtered state covariance 
+            matrices. 
+        MEMORY_NO_LIKELIHOOD 
+            Do not store the vector of loglikelihood values for each 
+            observation. Only the sum of the loglikelihood values is stored. 
+        MEMORY_NO_GAIN 
+            Do not store the Kalman gain matrices. 
+        MEMORY_NO_SMOOTHING 
+            Do not store temporary variables related to Kalman smoothing. If 
+            this option is used, smoothing is unavailable. 
+        MEMORY_NO_STD_FORECAST 
+            Do not store standardized forecast errors. 
+        MEMORY_CONSERVE 
+            Do not store any intermediate matrices. 
+ 
+        If the bitmask is set directly via the `conserve_memory` argument, 
+        then the full method must be provided. 
+ 
+        If keyword arguments are used to set individual boolean flags, then 
+        the lowercase of the method must be used as an argument name, and the 
+        value is the desired value of the boolean flag (True or False). 
+ 
+        Note that the memory conservation method may also be specified by 
+        directly modifying the class attributes which are defined similarly to 
+        the keyword arguments. 
+ 
+        The default memory conservation method is `MEMORY_STORE_ALL`, so that 
+        all intermediate matrices are stored. 
+ 
+        Examples 
+        -------- 
+        &gt;&gt;&gt; mod = sm.tsa.statespace.SARIMAX(range(10)) 
+        &gt;&gt;&gt; mod.ssm..conserve_memory 
+        0 
+        &gt;&gt;&gt; mod.ssm.memory_no_predicted 
+        False 
+        &gt;&gt;&gt; mod.ssm.memory_no_predicted = True 
+        &gt;&gt;&gt; mod.ssm.conserve_memory 
+        2 
+        &gt;&gt;&gt; mod.ssm.set_conserve_memory(memory_no_filtered=True, 
+        ...                             memory_no_forecast=True) 
+        &gt;&gt;&gt; mod.ssm.conserve_memory 
+        7 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">conserve_memory </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.conserve_memory = conserve_memory</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">KalmanFilter.memory_options:</span>
+            <span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">kwargs:</span>
+                <span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">kwargs[name])</span>
+
+    <span class="s2">def </span><span class="s1">set_filter_timing(self</span><span class="s2">, </span><span class="s1">alternate_timing=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Set the filter timing convention 
+ 
+        By default, the Kalman filter follows Durbin and Koopman, 2012, in 
+        initializing the filter with predicted values. Kim and Nelson, 1999, 
+        instead initialize the filter with filtered values, which is 
+        essentially just a different timing convention. 
+ 
+        Parameters 
+        ---------- 
+        alternate_timing : int, optional 
+            Whether or not to use the alternate timing convention. Default is 
+            unspecified. 
+        **kwargs 
+            Keyword arguments may be used to influence the memory conservation 
+            method by setting individual boolean flags. See notes for details. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">alternate_timing </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.filter_timing = int(alternate_timing)</span>
+        <span class="s2">if </span><span class="s5">'timing_init_predicted' </span><span class="s2">in </span><span class="s1">kwargs:</span>
+            <span class="s1">self.filter_timing = int(</span><span class="s2">not </span><span class="s1">kwargs[</span><span class="s5">'timing_init_predicted'</span><span class="s1">])</span>
+        <span class="s2">if </span><span class="s5">'timing_init_filtered' </span><span class="s2">in </span><span class="s1">kwargs:</span>
+            <span class="s1">self.filter_timing = int(kwargs[</span><span class="s5">'timing_init_filtered'</span><span class="s1">])</span>
+
+    <span class="s1">@contextlib.contextmanager</span>
+    <span class="s2">def </span><span class="s1">fixed_scale(self</span><span class="s2">, </span><span class="s1">scale):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        fixed_scale(scale) 
+ 
+        Context manager for fixing the scale when FILTER_CONCENTRATED is set 
+ 
+        Parameters 
+        ---------- 
+        scale : numeric 
+            Scale of the model. 
+ 
+        Notes 
+        ----- 
+        This a no-op if scale is None. 
+ 
+        This context manager is most useful in models which are explicitly 
+        concentrating out the scale, so that the set of parameters they are 
+        estimating does not include the scale. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># If a scale was provided, use it and do not concentrate it out of the</span>
+        <span class="s3"># loglikelihood</span>
+        <span class="s2">if </span><span class="s1">scale </span><span class="s2">is not None and </span><span class="s1">scale != </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s2">if not </span><span class="s1">self.filter_concentrated:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'Cannot provide scale if filter method does'</span>
+                                 <span class="s5">' not include FILTER_CONCENTRATED.'</span><span class="s1">)</span>
+            <span class="s1">self.filter_concentrated = </span><span class="s2">False</span>
+            <span class="s1">self._scale = scale</span>
+            <span class="s1">obs_cov = self[</span><span class="s5">'obs_cov'</span><span class="s1">]</span>
+            <span class="s1">state_cov = self[</span><span class="s5">'state_cov'</span><span class="s1">]</span>
+            <span class="s1">self[</span><span class="s5">'obs_cov'</span><span class="s1">] = scale * obs_cov</span>
+            <span class="s1">self[</span><span class="s5">'state_cov'</span><span class="s1">] = scale * state_cov</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">yield</span>
+        <span class="s2">finally</span><span class="s1">:</span>
+            <span class="s3"># If a scale was provided, reset the model</span>
+            <span class="s2">if </span><span class="s1">scale </span><span class="s2">is not None and </span><span class="s1">scale != </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">self[</span><span class="s5">'state_cov'</span><span class="s1">] = state_cov</span>
+                <span class="s1">self[</span><span class="s5">'obs_cov'</span><span class="s1">] = obs_cov</span>
+                <span class="s1">self.filter_concentrated = </span><span class="s2">True</span>
+                <span class="s1">self._scale = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_filter(self</span><span class="s2">, </span><span class="s1">filter_method=</span><span class="s2">None, </span><span class="s1">inversion_method=</span><span class="s2">None,</span>
+                <span class="s1">stability_method=</span><span class="s2">None, </span><span class="s1">conserve_memory=</span><span class="s2">None,</span>
+                <span class="s1">filter_timing=</span><span class="s2">None, </span><span class="s1">tolerance=</span><span class="s2">None, </span><span class="s1">loglikelihood_burn=</span><span class="s2">None,</span>
+                <span class="s1">complex_step=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s3"># Initialize the filter</span>
+        <span class="s1">prefix</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">create_filter</span><span class="s2">, </span><span class="s1">create_statespace = (</span>
+            <span class="s1">self._initialize_filter(</span>
+                <span class="s1">filter_method</span><span class="s2">, </span><span class="s1">inversion_method</span><span class="s2">, </span><span class="s1">stability_method</span><span class="s2">,</span>
+                <span class="s1">conserve_memory</span><span class="s2">, </span><span class="s1">filter_timing</span><span class="s2">, </span><span class="s1">tolerance</span><span class="s2">, </span><span class="s1">loglikelihood_burn</span>
+            <span class="s1">)</span>
+        <span class="s1">)</span>
+        <span class="s1">kfilter = self._kalman_filters[prefix]</span>
+
+        <span class="s3"># Initialize the state</span>
+        <span class="s1">self._initialize_state(prefix=prefix</span><span class="s2">, </span><span class="s1">complex_step=complex_step)</span>
+
+        <span class="s3"># Run the filter</span>
+        <span class="s1">kfilter()</span>
+
+        <span class="s2">return </span><span class="s1">kfilter</span>
+
+    <span class="s2">def </span><span class="s1">filter(self</span><span class="s2">, </span><span class="s1">filter_method=</span><span class="s2">None, </span><span class="s1">inversion_method=</span><span class="s2">None,</span>
+               <span class="s1">stability_method=</span><span class="s2">None, </span><span class="s1">conserve_memory=</span><span class="s2">None, </span><span class="s1">filter_timing=</span><span class="s2">None,</span>
+               <span class="s1">tolerance=</span><span class="s2">None, </span><span class="s1">loglikelihood_burn=</span><span class="s2">None, </span><span class="s1">complex_step=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Apply the Kalman filter to the statespace model. 
+ 
+        Parameters 
+        ---------- 
+        filter_method : int, optional 
+            Determines which Kalman filter to use. Default is conventional. 
+        inversion_method : int, optional 
+            Determines which inversion technique to use. Default is by Cholesky 
+            decomposition. 
+        stability_method : int, optional 
+            Determines which numerical stability techniques to use. Default is 
+            to enforce symmetry of the predicted state covariance matrix. 
+        conserve_memory : int, optional 
+            Determines what output from the filter to store. Default is to 
+            store everything. 
+        filter_timing : int, optional 
+            Determines the timing convention of the filter. Default is that 
+            from Durbin and Koopman (2012), in which the filter is initialized 
+            with predicted values. 
+        tolerance : float, optional 
+            The tolerance at which the Kalman filter determines convergence to 
+            steady-state. Default is 1e-19. 
+        loglikelihood_burn : int, optional 
+            The number of initial periods during which the loglikelihood is not 
+            recorded. Default is 0. 
+ 
+        Notes 
+        ----- 
+        This function by default does not compute variables required for 
+        smoothing. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Handle memory conservation</span>
+        <span class="s2">if </span><span class="s1">conserve_memory </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">conserve_memory = self.conserve_memory | MEMORY_NO_SMOOTHING</span>
+        <span class="s1">conserve_memory_cache = self.conserve_memory</span>
+        <span class="s1">self.set_conserve_memory(conserve_memory)</span>
+
+        <span class="s3"># Run the filter</span>
+        <span class="s1">kfilter = self._filter(</span>
+            <span class="s1">filter_method</span><span class="s2">, </span><span class="s1">inversion_method</span><span class="s2">, </span><span class="s1">stability_method</span><span class="s2">, </span><span class="s1">conserve_memory</span><span class="s2">,</span>
+            <span class="s1">filter_timing</span><span class="s2">, </span><span class="s1">tolerance</span><span class="s2">, </span><span class="s1">loglikelihood_burn</span><span class="s2">, </span><span class="s1">complex_step)</span>
+
+        <span class="s3"># Create the results object</span>
+        <span class="s1">results = self.results_class(self)</span>
+        <span class="s1">results.update_representation(self)</span>
+        <span class="s1">results.update_filter(kfilter)</span>
+
+        <span class="s3"># Resent memory conservation</span>
+        <span class="s1">self.set_conserve_memory(conserve_memory_cache)</span>
+
+        <span class="s2">return </span><span class="s1">results</span>
+
+    <span class="s2">def </span><span class="s1">loglike(self</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Calculate the loglikelihood associated with the statespace model. 
+ 
+        Parameters 
+        ---------- 
+        **kwargs 
+            Additional keyword arguments to pass to the Kalman filter. See 
+            `KalmanFilter.filter` for more details. 
+ 
+        Returns 
+        ------- 
+        loglike : float 
+            The joint loglikelihood. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">kwargs.setdefault(</span><span class="s5">'conserve_memory'</span><span class="s2">,</span>
+                          <span class="s1">MEMORY_CONSERVE ^ MEMORY_NO_LIKELIHOOD)</span>
+        <span class="s1">kfilter = self._filter(**kwargs)</span>
+        <span class="s1">loglikelihood_burn = kwargs.get(</span><span class="s5">'loglikelihood_burn'</span><span class="s2">,</span>
+                                        <span class="s1">self.loglikelihood_burn)</span>
+        <span class="s2">if not </span><span class="s1">(kwargs[</span><span class="s5">'conserve_memory'</span><span class="s1">] &amp; MEMORY_NO_LIKELIHOOD):</span>
+            <span class="s1">loglike = np.sum(kfilter.loglikelihood[loglikelihood_burn:])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">loglike = np.sum(kfilter.loglikelihood)</span>
+
+        <span class="s3"># Need to modify the computed log-likelihood to incorporate the</span>
+        <span class="s3"># MLE scale.</span>
+        <span class="s2">if </span><span class="s1">self.filter_method &amp; FILTER_CONCENTRATED:</span>
+            <span class="s1">d = max(loglikelihood_burn</span><span class="s2">, </span><span class="s1">kfilter.nobs_diffuse)</span>
+            <span class="s1">nobs_k_endog = np.sum(</span>
+                <span class="s1">self.k_endog -</span>
+                <span class="s1">np.array(self._statespace.nmissing)[d:])</span>
+
+            <span class="s3"># In the univariate case, we need to subtract observations</span>
+            <span class="s3"># associated with a singular forecast error covariance matrix</span>
+            <span class="s1">nobs_k_endog -= kfilter.nobs_kendog_univariate_singular</span>
+
+            <span class="s2">if not </span><span class="s1">(kwargs[</span><span class="s5">'conserve_memory'</span><span class="s1">] &amp; MEMORY_NO_LIKELIHOOD):</span>
+                <span class="s1">scale = np.sum(kfilter.scale[d:]) / nobs_k_endog</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">scale = kfilter.scale[</span><span class="s4">0</span><span class="s1">] / nobs_k_endog</span>
+
+            <span class="s1">loglike += -</span><span class="s4">0.5 </span><span class="s1">* nobs_k_endog</span>
+
+            <span class="s3"># Now need to modify this for diffuse initialization, since for</span>
+            <span class="s3"># diffuse periods we only need to add in the scale value part if</span>
+            <span class="s3"># the diffuse forecast error covariance matrix element was singular</span>
+            <span class="s2">if </span><span class="s1">kfilter.nobs_diffuse &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">nobs_k_endog -= kfilter.nobs_kendog_diffuse_nonsingular</span>
+
+            <span class="s1">loglike += -</span><span class="s4">0.5 </span><span class="s1">* nobs_k_endog * np.log(scale)</span>
+        <span class="s2">return </span><span class="s1">loglike</span>
+
+    <span class="s2">def </span><span class="s1">loglikeobs(self</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Calculate the loglikelihood for each observation associated with the 
+        statespace model. 
+ 
+        Parameters 
+        ---------- 
+        **kwargs 
+            Additional keyword arguments to pass to the Kalman filter. See 
+            `KalmanFilter.filter` for more details. 
+ 
+        Notes 
+        ----- 
+        If `loglikelihood_burn` is positive, then the entries in the returned 
+        loglikelihood vector are set to be zero for those initial time periods. 
+ 
+        Returns 
+        ------- 
+        loglike : array of float 
+            Array of loglikelihood values for each observation. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self.memory_no_likelihood:</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError(</span><span class="s5">'Cannot compute loglikelihood if'</span>
+                               <span class="s5">' MEMORY_NO_LIKELIHOOD option is selected.'</span><span class="s1">)</span>
+        <span class="s2">if not </span><span class="s1">self.filter_method &amp; FILTER_CONCENTRATED:</span>
+            <span class="s1">kwargs.setdefault(</span><span class="s5">'conserve_memory'</span><span class="s2">,</span>
+                              <span class="s1">MEMORY_CONSERVE ^ MEMORY_NO_LIKELIHOOD)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">kwargs.setdefault(</span>
+                <span class="s5">'conserve_memory'</span><span class="s2">,</span>
+                <span class="s1">MEMORY_CONSERVE ^ (MEMORY_NO_FORECAST | MEMORY_NO_LIKELIHOOD))</span>
+        <span class="s1">kfilter = self._filter(**kwargs)</span>
+        <span class="s1">llf_obs = np.array(kfilter.loglikelihood</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">loglikelihood_burn = kwargs.get(</span><span class="s5">'loglikelihood_burn'</span><span class="s2">,</span>
+                                        <span class="s1">self.loglikelihood_burn)</span>
+
+        <span class="s3"># If the scale was concentrated out of the log-likelihood function,</span>
+        <span class="s3"># then the llf_obs above is:</span>
+        <span class="s3"># -0.5 * k_endog * log 2 * pi - 0.5 * log |F_t|</span>
+        <span class="s3"># and we need to add in the effect of the scale:</span>
+        <span class="s3"># -0.5 * k_endog * log scale - 0.5 v' F_t^{-1} v / scale</span>
+        <span class="s3"># and note that v' F_t^{-1} is in the _kalman_filter.scale array</span>
+        <span class="s3"># Also note that we need to adjust the nobs and k_endog in both the</span>
+        <span class="s3"># denominator of the scale computation and in the llf_obs adjustment</span>
+        <span class="s3"># to take into account missing values.</span>
+        <span class="s2">if </span><span class="s1">self.filter_method &amp; FILTER_CONCENTRATED:</span>
+            <span class="s1">d = max(loglikelihood_burn</span><span class="s2">, </span><span class="s1">kfilter.nobs_diffuse)</span>
+            <span class="s1">nmissing = np.array(self._statespace.nmissing)</span>
+            <span class="s1">nobs_k_endog = np.sum(self.k_endog - nmissing[d:])</span>
+
+            <span class="s3"># In the univariate case, we need to subtract observations</span>
+            <span class="s3"># associated with a singular forecast error covariance matrix</span>
+            <span class="s1">nobs_k_endog -= kfilter.nobs_kendog_univariate_singular</span>
+
+            <span class="s1">scale = np.sum(kfilter.scale[d:]) / nobs_k_endog</span>
+
+            <span class="s3"># Need to modify this for diffuse initialization, since for</span>
+            <span class="s3"># diffuse periods we only need to add in the scale value if the</span>
+            <span class="s3"># diffuse forecast error covariance matrix element was singular</span>
+            <span class="s1">nsingular = </span><span class="s4">0</span>
+            <span class="s2">if </span><span class="s1">kfilter.nobs_diffuse &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">d = kfilter.nobs_diffuse</span>
+                <span class="s1">Finf = kfilter.forecast_error_diffuse_cov</span>
+                <span class="s1">singular = np.diagonal(Finf).real &lt;= kfilter.tolerance_diffuse</span>
+                <span class="s1">nsingular = np.sum(~singular</span><span class="s2">, </span><span class="s1">axis=</span><span class="s4">1</span><span class="s1">)</span>
+
+            <span class="s1">scale_obs = np.array(kfilter.scale</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">llf_obs += -</span><span class="s4">0.5 </span><span class="s1">* (</span>
+                <span class="s1">(self.k_endog - nmissing - nsingular) * np.log(scale) +</span>
+                <span class="s1">scale_obs / scale)</span>
+
+        <span class="s3"># Set any burned observations to have zero likelihood</span>
+        <span class="s1">llf_obs[:loglikelihood_burn] = </span><span class="s4">0</span>
+
+        <span class="s2">return </span><span class="s1">llf_obs</span>
+
+    <span class="s2">def </span><span class="s1">simulate(self</span><span class="s2">, </span><span class="s1">nsimulations</span><span class="s2">, </span><span class="s1">measurement_shocks=</span><span class="s2">None,</span>
+                 <span class="s1">state_shocks=</span><span class="s2">None, </span><span class="s1">initial_state=</span><span class="s2">None,</span>
+                 <span class="s1">pretransformed_measurement_shocks=</span><span class="s2">True,</span>
+                 <span class="s1">pretransformed_state_shocks=</span><span class="s2">True,</span>
+                 <span class="s1">pretransformed_initial_state=</span><span class="s2">True,</span>
+                 <span class="s1">simulator=</span><span class="s2">None, </span><span class="s1">return_simulator=</span><span class="s2">False,</span>
+                 <span class="s1">random_state=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Simulate a new time series following the state space model 
+ 
+        Parameters 
+        ---------- 
+        nsimulations : int 
+            The number of observations to simulate. If the model is 
+            time-invariant this can be any number. If the model is 
+            time-varying, then this number must be less than or equal to the 
+            number 
+        measurement_shocks : array_like, optional 
+            If specified, these are the shocks to the measurement equation, 
+            :math:`\varepsilon_t`. If unspecified, these are automatically 
+            generated using a pseudo-random number generator. If specified, 
+            must be shaped `nsimulations` x `k_endog`, where `k_endog` is the 
+            same as in the state space model. 
+        state_shocks : array_like, optional 
+            If specified, these are the shocks to the state equation, 
+            :math:`\eta_t`. If unspecified, these are automatically 
+            generated using a pseudo-random number generator. If specified, 
+            must be shaped `nsimulations` x `k_posdef` where `k_posdef` is the 
+            same as in the state space model. 
+        initial_state : array_like, optional 
+            If specified, this is the state vector at time zero, which should 
+            be shaped (`k_states` x 1), where `k_states` is the same as in the 
+            state space model. If unspecified, but the model has been 
+            initialized, then that initialization is used. If unspecified and 
+            the model has not been initialized, then a vector of zeros is used. 
+            Note that this is not included in the returned `simulated_states` 
+            array. 
+        pretransformed_measurement_shocks : bool, optional 
+            If `measurement_shocks` is provided, this flag indicates whether it 
+            should be directly used as the shocks. If False, then it is assumed 
+            to contain draws from the standard Normal distribution that must be 
+            transformed using the `obs_cov` covariance matrix. Default is True. 
+        pretransformed_state_shocks : bool, optional 
+            If `state_shocks` is provided, this flag indicates whether it 
+            should be directly used as the shocks. If False, then it is assumed 
+            to contain draws from the standard Normal distribution that must be 
+            transformed using the `state_cov` covariance matrix. Default is 
+            True. 
+        pretransformed_initial_state : bool, optional 
+            If `initial_state` is provided, this flag indicates whether it 
+            should be directly used as the initial_state. If False, then it is 
+            assumed to contain draws from the standard Normal distribution that 
+            must be transformed using the `initial_state_cov` covariance 
+            matrix. Default is True. 
+        return_simulator : bool, optional 
+            Whether or not to return the simulator object. Typically used to 
+            improve performance when performing repeated sampling. Default is 
+            False. 
+        random_state : {None, int, Generator, RandomState}, optionall 
+            If `seed` is None (or `np.random`), the `numpy.random.RandomState` 
+            singleton is used. 
+            If `seed` is an int, a new ``RandomState`` instance is used, 
+            seeded with `seed`. 
+            If `seed` is already a ``Generator`` or ``RandomState`` instance 
+            then that instance is used. 
+ 
+        Returns 
+        ------- 
+        simulated_obs : ndarray 
+            An (nsimulations x k_endog) array of simulated observations. 
+        simulated_states : ndarray 
+            An (nsimulations x k_states) array of simulated states. 
+        simulator : SimulationSmoothResults 
+            If `return_simulator=True`, then an instance of a simulator is 
+            returned, which can be reused for additional simulations of the 
+            same size. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">time_invariant = self.time_invariant</span>
+        <span class="s3"># Check for valid number of simulations</span>
+        <span class="s2">if not </span><span class="s1">time_invariant </span><span class="s2">and </span><span class="s1">nsimulations &gt; self.nobs:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'In a time-varying model, cannot create more'</span>
+                             <span class="s5">' simulations than there are observations.'</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">self._simulate(</span>
+            <span class="s1">nsimulations</span><span class="s2">,</span>
+            <span class="s1">measurement_disturbance_variates=measurement_shocks</span><span class="s2">,</span>
+            <span class="s1">state_disturbance_variates=state_shocks</span><span class="s2">,</span>
+            <span class="s1">initial_state_variates=initial_state</span><span class="s2">,</span>
+            <span class="s1">pretransformed_measurement_disturbance_variates=(</span>
+                <span class="s1">pretransformed_measurement_shocks)</span><span class="s2">,</span>
+            <span class="s1">pretransformed_state_disturbance_variates=(</span>
+                <span class="s1">pretransformed_state_shocks)</span><span class="s2">,</span>
+            <span class="s1">pretransformed_initial_state_variates=(</span>
+                <span class="s1">pretransformed_initial_state)</span><span class="s2">,</span>
+            <span class="s1">simulator=simulator</span><span class="s2">, </span><span class="s1">return_simulator=return_simulator</span><span class="s2">,</span>
+            <span class="s1">random_state=random_state)</span>
+
+    <span class="s2">def </span><span class="s1">_simulate(self</span><span class="s2">, </span><span class="s1">nsimulations</span><span class="s2">, </span><span class="s1">simulator=</span><span class="s2">None, </span><span class="s1">random_state=</span><span class="s2">None,</span>
+                  <span class="s1">**kwargs):</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError(</span><span class="s5">'Simulation only available through'</span>
+                                  <span class="s5">' the simulation smoother.'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">impulse_responses(self</span><span class="s2">, </span><span class="s1">steps=</span><span class="s4">10</span><span class="s2">, </span><span class="s1">impulse=</span><span class="s4">0</span><span class="s2">, </span><span class="s1">orthogonalized=</span><span class="s2">False,</span>
+                          <span class="s1">cumulative=</span><span class="s2">False, </span><span class="s1">direct=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Impulse response function 
+ 
+        Parameters 
+        ---------- 
+        steps : int, optional 
+            The number of steps for which impulse responses are calculated. 
+            Default is 10. Note that the initial impulse is not counted as a 
+            step, so if `steps=1`, the output will have 2 entries. 
+        impulse : int or array_like 
+            If an integer, the state innovation to pulse; must be between 0 
+            and `k_posdef-1` where `k_posdef` is the same as in the state 
+            space model. Alternatively, a custom impulse vector may be 
+            provided; must be a column vector with shape `(k_posdef, 1)`. 
+        orthogonalized : bool, optional 
+            Whether or not to perform impulse using orthogonalized innovations. 
+            Note that this will also affect custum `impulse` vectors. Default 
+            is False. 
+        cumulative : bool, optional 
+            Whether or not to return cumulative impulse responses. Default is 
+            False. 
+ 
+        Returns 
+        ------- 
+        impulse_responses : ndarray 
+            Responses for each endogenous variable due to the impulse 
+            given by the `impulse` argument. A (steps + 1 x k_endog) array. 
+ 
+        Notes 
+        ----- 
+        Intercepts in the measurement and state equation are ignored when 
+        calculating impulse responses. 
+ 
+        TODO: add note about how for time-varying systems this is - perhaps 
+        counter-intuitively - returning the impulse response within the given 
+        model (i.e. starting at period 0 defined by the model) and it is *not* 
+        doing impulse responses after the end of the model. To compute impulse 
+        responses from arbitrary time points, it is necessary to clone a new 
+        model with the appropriate system matrices. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># We need to add an additional step, since the first simulated value</span>
+        <span class="s3"># will always be zeros (note that we take this value out at the end).</span>
+        <span class="s1">steps += </span><span class="s4">1</span>
+
+        <span class="s3"># For time-invariant models, add an additional `step`. This is the</span>
+        <span class="s3"># default for time-invariant models based on the expected behavior for</span>
+        <span class="s3"># ARIMA and VAR models: we want to record the initial impulse and also</span>
+        <span class="s3"># `steps` values of the responses afterwards.</span>
+        <span class="s2">if </span><span class="s1">(self._design.shape[</span><span class="s4">2</span><span class="s1">] == </span><span class="s4">1 </span><span class="s2">and </span><span class="s1">self._transition.shape[</span><span class="s4">2</span><span class="s1">] == </span><span class="s4">1 </span><span class="s2">and</span>
+                <span class="s1">self._selection.shape[</span><span class="s4">2</span><span class="s1">] == </span><span class="s4">1</span><span class="s1">):</span>
+            <span class="s1">steps += </span><span class="s4">1</span>
+
+        <span class="s3"># Check for what kind of impulse we want</span>
+        <span class="s2">if </span><span class="s1">type(impulse) == int:</span>
+            <span class="s2">if </span><span class="s1">impulse &gt;= self.k_posdef </span><span class="s2">or </span><span class="s1">impulse &lt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'Invalid value for `impulse`. Must be the'</span>
+                                 <span class="s5">' index of one of the state innovations.'</span><span class="s1">)</span>
+
+            <span class="s3"># Create the (non-orthogonalized) impulse vector</span>
+            <span class="s1">idx = impulse</span>
+            <span class="s1">impulse = np.zeros(self.k_posdef)</span>
+            <span class="s1">impulse[idx] = </span><span class="s4">1</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">impulse = np.array(impulse)</span>
+            <span class="s2">if </span><span class="s1">impulse.ndim &gt; </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">impulse = np.squeeze(impulse)</span>
+            <span class="s2">if not </span><span class="s1">impulse.shape == (self.k_posdef</span><span class="s2">,</span><span class="s1">):</span>
+                <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'Invalid impulse vector. Must be shaped'</span>
+                                 <span class="s5">' (%d,)' </span><span class="s1">% self.k_posdef)</span>
+
+        <span class="s3"># Orthogonalize the impulses, if requested, using Cholesky on the</span>
+        <span class="s3"># first state covariance matrix</span>
+        <span class="s2">if </span><span class="s1">orthogonalized:</span>
+            <span class="s1">state_chol = np.linalg.cholesky(self.state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">])</span>
+            <span class="s1">impulse = np.dot(state_chol</span><span class="s2">, </span><span class="s1">impulse)</span>
+
+        <span class="s3"># If we have time-varying design, transition, or selection matrices,</span>
+        <span class="s3"># then we can't produce more IRFs than we have time points</span>
+        <span class="s1">time_invariant_irf = (</span>
+            <span class="s1">self._design.shape[</span><span class="s4">2</span><span class="s1">] == self._transition.shape[</span><span class="s4">2</span><span class="s1">] ==</span>
+            <span class="s1">self._selection.shape[</span><span class="s4">2</span><span class="s1">] == </span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s3"># Note: to generate impulse responses following the end of a</span>
+        <span class="s3"># time-varying model, one should `clone` the state space model with the</span>
+        <span class="s3"># new time-varying model, and then compute the IRFs using the cloned</span>
+        <span class="s3"># model</span>
+        <span class="s2">if not </span><span class="s1">time_invariant_irf </span><span class="s2">and </span><span class="s1">steps &gt; self.nobs:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'In a time-varying model, cannot create more'</span>
+                             <span class="s5">' impulse responses than there are'</span>
+                             <span class="s5">' observations'</span><span class="s1">)</span>
+
+        <span class="s3"># Impulse responses only depend on the design, transition, and</span>
+        <span class="s3"># selection matrices. We set the others to zeros because they must be</span>
+        <span class="s3"># set in the call to `clone`.</span>
+        <span class="s3"># Note: we don't even need selection after the first point, because</span>
+        <span class="s3"># the state shocks will be zeros in every period except the first.</span>
+        <span class="s1">sim_model = self.clone(</span>
+            <span class="s1">endog=np.zeros((steps</span><span class="s2">, </span><span class="s1">self.k_endog)</span><span class="s2">, </span><span class="s1">dtype=self.dtype)</span><span class="s2">,</span>
+            <span class="s1">obs_intercept=np.zeros(self.k_endog)</span><span class="s2">,</span>
+            <span class="s1">design=self[</span><span class="s5">'design'</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:steps]</span><span class="s2">,</span>
+            <span class="s1">obs_cov=np.zeros((self.k_endog</span><span class="s2">, </span><span class="s1">self.k_endog))</span><span class="s2">,</span>
+            <span class="s1">state_intercept=np.zeros(self.k_states)</span><span class="s2">,</span>
+            <span class="s1">transition=self[</span><span class="s5">'transition'</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:steps]</span><span class="s2">,</span>
+            <span class="s1">selection=self[</span><span class="s5">'selection'</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:steps]</span><span class="s2">,</span>
+            <span class="s1">state_cov=np.zeros((self.k_posdef</span><span class="s2">, </span><span class="s1">self.k_posdef)))</span>
+
+        <span class="s3"># Get the impulse response function via simulation of the state</span>
+        <span class="s3"># space model, but with other shocks set to zero</span>
+        <span class="s1">measurement_shocks = np.zeros((steps</span><span class="s2">, </span><span class="s1">self.k_endog))</span>
+        <span class="s1">state_shocks = np.zeros((steps</span><span class="s2">, </span><span class="s1">self.k_posdef))</span>
+        <span class="s1">state_shocks[</span><span class="s4">0</span><span class="s1">] = impulse</span>
+        <span class="s1">initial_state = np.zeros((self.k_states</span><span class="s2">,</span><span class="s1">))</span>
+        <span class="s1">irf</span><span class="s2">, </span><span class="s1">_ = sim_model.simulate(</span>
+            <span class="s1">steps</span><span class="s2">, </span><span class="s1">measurement_shocks=measurement_shocks</span><span class="s2">,</span>
+            <span class="s1">state_shocks=state_shocks</span><span class="s2">, </span><span class="s1">initial_state=initial_state)</span>
+
+        <span class="s3"># Get the cumulative response if requested</span>
+        <span class="s2">if </span><span class="s1">cumulative:</span>
+            <span class="s1">irf = np.cumsum(irf</span><span class="s2">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+
+        <span class="s3"># Here we ignore the first value, because it is always zeros (we added</span>
+        <span class="s3"># an additional `step` at the top to account for this).</span>
+        <span class="s2">return </span><span class="s1">irf[</span><span class="s4">1</span><span class="s1">:]</span>
+
+
+<span class="s2">class </span><span class="s1">FilterResults(FrozenRepresentation):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Results from applying the Kalman filter to a state space model. 
+ 
+    Parameters 
+    ---------- 
+    model : Representation 
+        A Statespace representation 
+ 
+    Attributes 
+    ---------- 
+    nobs : int 
+        Number of observations. 
+    nobs_diffuse : int 
+        Number of observations under the diffuse Kalman filter. 
+    k_endog : int 
+        The dimension of the observation series. 
+    k_states : int 
+        The dimension of the unobserved state process. 
+    k_posdef : int 
+        The dimension of a guaranteed positive definite 
+        covariance matrix describing the shocks in the 
+        measurement equation. 
+    dtype : dtype 
+        Datatype of representation matrices 
+    prefix : str 
+        BLAS prefix of representation matrices 
+    shapes : dictionary of name,tuple 
+        A dictionary recording the shapes of each of the 
+        representation matrices as tuples. 
+    endog : ndarray 
+        The observation vector. 
+    design : ndarray 
+        The design matrix, :math:`Z`. 
+    obs_intercept : ndarray 
+        The intercept for the observation equation, :math:`d`. 
+    obs_cov : ndarray 
+        The covariance matrix for the observation equation :math:`H`. 
+    transition : ndarray 
+        The transition matrix, :math:`T`. 
+    state_intercept : ndarray 
+        The intercept for the transition equation, :math:`c`. 
+    selection : ndarray 
+        The selection matrix, :math:`R`. 
+    state_cov : ndarray 
+        The covariance matrix for the state equation :math:`Q`. 
+    missing : array of bool 
+        An array of the same size as `endog`, filled 
+        with boolean values that are True if the 
+        corresponding entry in `endog` is NaN and False 
+        otherwise. 
+    nmissing : array of int 
+        An array of size `nobs`, where the ith entry 
+        is the number (between 0 and `k_endog`) of NaNs in 
+        the ith row of the `endog` array. 
+    time_invariant : bool 
+        Whether or not the representation matrices are time-invariant 
+    initialization : str 
+        Kalman filter initialization method. 
+    initial_state : array_like 
+        The state vector used to initialize the Kalamn filter. 
+    initial_state_cov : array_like 
+        The state covariance matrix used to initialize the Kalamn filter. 
+    initial_diffuse_state_cov : array_like 
+        Diffuse state covariance matrix used to initialize the Kalamn filter. 
+    filter_method : int 
+        Bitmask representing the Kalman filtering method 
+    inversion_method : int 
+        Bitmask representing the method used to 
+        invert the forecast error covariance matrix. 
+    stability_method : int 
+        Bitmask representing the methods used to promote 
+        numerical stability in the Kalman filter 
+        recursions. 
+    conserve_memory : int 
+        Bitmask representing the selected memory conservation method. 
+    filter_timing : int 
+        Whether or not to use the alternate timing convention. 
+    tolerance : float 
+        The tolerance at which the Kalman filter 
+        determines convergence to steady-state. 
+    loglikelihood_burn : int 
+        The number of initial periods during which 
+        the loglikelihood is not recorded. 
+    converged : bool 
+        Whether or not the Kalman filter converged. 
+    period_converged : int 
+        The time period in which the Kalman filter converged. 
+    filtered_state : ndarray 
+        The filtered state vector at each time period. 
+    filtered_state_cov : ndarray 
+        The filtered state covariance matrix at each time period. 
+    predicted_state : ndarray 
+        The predicted state vector at each time period. 
+    predicted_state_cov : ndarray 
+        The predicted state covariance matrix at each time period. 
+    forecast_error_diffuse_cov : ndarray 
+        Diffuse forecast error covariance matrix at each time period. 
+    predicted_diffuse_state_cov : ndarray 
+        The predicted diffuse state covariance matrix at each time period. 
+    kalman_gain : ndarray 
+        The Kalman gain at each time period. 
+    forecasts : ndarray 
+        The one-step-ahead forecasts of observations at each time period. 
+    forecasts_error : ndarray 
+        The forecast errors at each time period. 
+    forecasts_error_cov : ndarray 
+        The forecast error covariance matrices at each time period. 
+    llf_obs : ndarray 
+        The loglikelihood values at each time period. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_filter_attributes = [</span>
+        <span class="s5">'filter_method'</span><span class="s2">, </span><span class="s5">'inversion_method'</span><span class="s2">, </span><span class="s5">'stability_method'</span><span class="s2">,</span>
+        <span class="s5">'conserve_memory'</span><span class="s2">, </span><span class="s5">'filter_timing'</span><span class="s2">, </span><span class="s5">'tolerance'</span><span class="s2">, </span><span class="s5">'loglikelihood_burn'</span><span class="s2">,</span>
+        <span class="s5">'converged'</span><span class="s2">, </span><span class="s5">'period_converged'</span><span class="s2">, </span><span class="s5">'filtered_state'</span><span class="s2">,</span>
+        <span class="s5">'filtered_state_cov'</span><span class="s2">, </span><span class="s5">'predicted_state'</span><span class="s2">, </span><span class="s5">'predicted_state_cov'</span><span class="s2">,</span>
+        <span class="s5">'forecasts_error_diffuse_cov'</span><span class="s2">, </span><span class="s5">'predicted_diffuse_state_cov'</span><span class="s2">,</span>
+        <span class="s5">'tmp1'</span><span class="s2">, </span><span class="s5">'tmp2'</span><span class="s2">, </span><span class="s5">'tmp3'</span><span class="s2">, </span><span class="s5">'tmp4'</span><span class="s2">, </span><span class="s5">'forecasts'</span><span class="s2">,</span>
+        <span class="s5">'forecasts_error'</span><span class="s2">, </span><span class="s5">'forecasts_error_cov'</span><span class="s2">, </span><span class="s5">'llf'</span><span class="s2">, </span><span class="s5">'llf_obs'</span><span class="s2">,</span>
+        <span class="s5">'collapsed_forecasts'</span><span class="s2">, </span><span class="s5">'collapsed_forecasts_error'</span><span class="s2">,</span>
+        <span class="s5">'collapsed_forecasts_error_cov'</span><span class="s2">, </span><span class="s5">'scale'</span>
+    <span class="s1">]</span>
+
+    <span class="s1">_filter_options = (</span>
+        <span class="s1">KalmanFilter.filter_methods + KalmanFilter.stability_methods +</span>
+        <span class="s1">KalmanFilter.inversion_methods + KalmanFilter.memory_options</span>
+    <span class="s1">)</span>
+
+    <span class="s1">_attributes = FrozenRepresentation._model_attributes + _filter_attributes</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">model):</span>
+        <span class="s1">super(FilterResults</span><span class="s2">, </span><span class="s1">self).__init__(model)</span>
+
+        <span class="s3"># Setup caches for uninitialized objects</span>
+        <span class="s1">self._kalman_gain = </span><span class="s2">None</span>
+        <span class="s1">self._standardized_forecasts_error = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">update_representation(self</span><span class="s2">, </span><span class="s1">model</span><span class="s2">, </span><span class="s1">only_options=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Update the results to match a given model 
+ 
+        Parameters 
+        ---------- 
+        model : Representation 
+            The model object from which to take the updated values. 
+        only_options : bool, optional 
+            If set to true, only the filter options are updated, and the state 
+            space representation is not updated. Default is False. 
+ 
+        Notes 
+        ----- 
+        This method is rarely required except for internal usage. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">only_options:</span>
+            <span class="s1">super(FilterResults</span><span class="s2">, </span><span class="s1">self).update_representation(model)</span>
+
+        <span class="s3"># Save the options as boolean variables</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">self._filter_options:</span>
+            <span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, </span><span class="s1">getattr(model</span><span class="s2">, </span><span class="s1">name</span><span class="s2">, None</span><span class="s1">))</span>
+
+    <span class="s2">def </span><span class="s1">update_filter(self</span><span class="s2">, </span><span class="s1">kalman_filter):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Update the filter results 
+ 
+        Parameters 
+        ---------- 
+        kalman_filter : statespace.kalman_filter.KalmanFilter 
+            The model object from which to take the updated values. 
+ 
+        Notes 
+        ----- 
+        This method is rarely required except for internal usage. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># State initialization</span>
+        <span class="s1">self.initial_state = np.array(</span>
+            <span class="s1">kalman_filter.model.initial_state</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span>
+        <span class="s1">)</span>
+        <span class="s1">self.initial_state_cov = np.array(</span>
+            <span class="s1">kalman_filter.model.initial_state_cov</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span>
+        <span class="s1">)</span>
+
+        <span class="s3"># Save Kalman filter parameters</span>
+        <span class="s1">self.filter_method = kalman_filter.filter_method</span>
+        <span class="s1">self.inversion_method = kalman_filter.inversion_method</span>
+        <span class="s1">self.stability_method = kalman_filter.stability_method</span>
+        <span class="s1">self.conserve_memory = kalman_filter.conserve_memory</span>
+        <span class="s1">self.filter_timing = kalman_filter.filter_timing</span>
+        <span class="s1">self.tolerance = kalman_filter.tolerance</span>
+        <span class="s1">self.loglikelihood_burn = kalman_filter.loglikelihood_burn</span>
+
+        <span class="s3"># Save Kalman filter output</span>
+        <span class="s1">self.converged = bool(kalman_filter.converged)</span>
+        <span class="s1">self.period_converged = kalman_filter.period_converged</span>
+        <span class="s1">self.univariate_filter = np.array(kalman_filter.univariate_filter</span><span class="s2">,</span>
+                                          <span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s1">self.filtered_state = np.array(kalman_filter.filtered_state</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">self.filtered_state_cov = np.array(</span>
+            <span class="s1">kalman_filter.filtered_state_cov</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span>
+        <span class="s1">)</span>
+        <span class="s1">self.predicted_state = np.array(</span>
+            <span class="s1">kalman_filter.predicted_state</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span>
+        <span class="s1">)</span>
+        <span class="s1">self.predicted_state_cov = np.array(</span>
+            <span class="s1">kalman_filter.predicted_state_cov</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span>
+        <span class="s1">)</span>
+
+        <span class="s3"># Reset caches</span>
+        <span class="s1">has_missing = np.sum(self.nmissing) &gt; </span><span class="s4">0</span>
+        <span class="s2">if not </span><span class="s1">(self.memory_no_std_forecast </span><span class="s2">or </span><span class="s1">self.invert_lu </span><span class="s2">or</span>
+                <span class="s1">self.solve_lu </span><span class="s2">or </span><span class="s1">self.filter_collapsed):</span>
+            <span class="s2">if </span><span class="s1">has_missing:</span>
+                <span class="s1">self._standardized_forecasts_error = np.array(</span>
+                    <span class="s1">reorder_missing_vector(</span>
+                        <span class="s1">kalman_filter.standardized_forecast_error</span><span class="s2">,</span>
+                        <span class="s1">self.missing</span><span class="s2">, </span><span class="s1">prefix=self.prefix))</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">self._standardized_forecasts_error = np.array(</span>
+                    <span class="s1">kalman_filter.standardized_forecast_error</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self._standardized_forecasts_error = </span><span class="s2">None</span>
+
+        <span class="s3"># In the partially missing data case, all entries will</span>
+        <span class="s3"># be in the upper left submatrix rather than the correct placement</span>
+        <span class="s3"># Re-ordering does not make sense in the collapsed case.</span>
+        <span class="s2">if </span><span class="s1">has_missing </span><span class="s2">and </span><span class="s1">(</span><span class="s2">not </span><span class="s1">self.memory_no_gain </span><span class="s2">and</span>
+                            <span class="s2">not </span><span class="s1">self.filter_collapsed):</span>
+            <span class="s1">self._kalman_gain = np.array(reorder_missing_matrix(</span>
+                <span class="s1">kalman_filter.kalman_gain</span><span class="s2">, </span><span class="s1">self.missing</span><span class="s2">, </span><span class="s1">reorder_cols=</span><span class="s2">True,</span>
+                <span class="s1">prefix=self.prefix))</span>
+            <span class="s1">self.tmp1 = np.array(reorder_missing_matrix(</span>
+                <span class="s1">kalman_filter.tmp1</span><span class="s2">, </span><span class="s1">self.missing</span><span class="s2">, </span><span class="s1">reorder_cols=</span><span class="s2">True,</span>
+                <span class="s1">prefix=self.prefix))</span>
+            <span class="s1">self.tmp2 = np.array(reorder_missing_vector(</span>
+                <span class="s1">kalman_filter.tmp2</span><span class="s2">, </span><span class="s1">self.missing</span><span class="s2">, </span><span class="s1">prefix=self.prefix))</span>
+            <span class="s1">self.tmp3 = np.array(reorder_missing_matrix(</span>
+                <span class="s1">kalman_filter.tmp3</span><span class="s2">, </span><span class="s1">self.missing</span><span class="s2">, </span><span class="s1">reorder_rows=</span><span class="s2">True,</span>
+                <span class="s1">prefix=self.prefix))</span>
+            <span class="s1">self.tmp4 = np.array(reorder_missing_matrix(</span>
+                <span class="s1">kalman_filter.tmp4</span><span class="s2">, </span><span class="s1">self.missing</span><span class="s2">, </span><span class="s1">reorder_cols=</span><span class="s2">True,</span>
+                <span class="s1">reorder_rows=</span><span class="s2">True, </span><span class="s1">prefix=self.prefix))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if not </span><span class="s1">self.memory_no_gain:</span>
+                <span class="s1">self._kalman_gain = np.array(</span>
+                    <span class="s1">kalman_filter.kalman_gain</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">self.tmp1 = np.array(kalman_filter.tmp1</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">self.tmp2 = np.array(kalman_filter.tmp2</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">self.tmp3 = np.array(kalman_filter.tmp3</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">self.tmp4 = np.array(kalman_filter.tmp4</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">self.M = np.array(kalman_filter.M</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">self.M_diffuse = np.array(kalman_filter.M_inf</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s3"># Note: use forecasts rather than forecast, so as not to interfer</span>
+        <span class="s3"># with the `forecast` methods in subclasses</span>
+        <span class="s1">self.forecasts = np.array(kalman_filter.forecast</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">self.forecasts_error = np.array(</span>
+            <span class="s1">kalman_filter.forecast_error</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span>
+        <span class="s1">)</span>
+        <span class="s1">self.forecasts_error_cov = np.array(</span>
+            <span class="s1">kalman_filter.forecast_error_cov</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span>
+        <span class="s1">)</span>
+        <span class="s3"># Note: below we will set self.llf, and in the memory_no_likelihood</span>
+        <span class="s3"># case we will replace self.llf_obs = None at that time.</span>
+        <span class="s1">self.llf_obs = np.array(kalman_filter.loglikelihood</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s3"># Diffuse objects</span>
+        <span class="s1">self.nobs_diffuse = kalman_filter.nobs_diffuse</span>
+        <span class="s1">self.initial_diffuse_state_cov = </span><span class="s2">None</span>
+        <span class="s1">self.forecasts_error_diffuse_cov = </span><span class="s2">None</span>
+        <span class="s1">self.predicted_diffuse_state_cov = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">self.nobs_diffuse &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">self.initial_diffuse_state_cov = np.array(</span>
+                <span class="s1">kalman_filter.model.initial_diffuse_state_cov</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s1">self.predicted_diffuse_state_cov = np.array(</span>
+                    <span class="s1">kalman_filter.predicted_diffuse_state_cov</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s2">if </span><span class="s1">has_missing </span><span class="s2">and not </span><span class="s1">self.filter_collapsed:</span>
+                <span class="s1">self.forecasts_error_diffuse_cov = np.array(</span>
+                    <span class="s1">reorder_missing_matrix(</span>
+                        <span class="s1">kalman_filter.forecast_error_diffuse_cov</span><span class="s2">,</span>
+                        <span class="s1">self.missing</span><span class="s2">, </span><span class="s1">reorder_cols=</span><span class="s2">True, </span><span class="s1">reorder_rows=</span><span class="s2">True,</span>
+                        <span class="s1">prefix=self.prefix))</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">self.forecasts_error_diffuse_cov = np.array(</span>
+                    <span class="s1">kalman_filter.forecast_error_diffuse_cov</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+
+        <span class="s3"># If there was missing data, save the original values from the Kalman</span>
+        <span class="s3"># filter output, since below will set the values corresponding to</span>
+        <span class="s3"># the missing observations to nans.</span>
+        <span class="s1">self.missing_forecasts = </span><span class="s2">None</span>
+        <span class="s1">self.missing_forecasts_error = </span><span class="s2">None</span>
+        <span class="s1">self.missing_forecasts_error_cov = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">np.sum(self.nmissing) &gt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s3"># Copy the provided arrays (which are as the Kalman filter dataset)</span>
+            <span class="s3"># into new variables</span>
+            <span class="s1">self.missing_forecasts = np.copy(self.forecasts)</span>
+            <span class="s1">self.missing_forecasts_error = np.copy(self.forecasts_error)</span>
+            <span class="s1">self.missing_forecasts_error_cov = (</span>
+                <span class="s1">np.copy(self.forecasts_error_cov)</span>
+            <span class="s1">)</span>
+
+        <span class="s3"># Save the collapsed values</span>
+        <span class="s1">self.collapsed_forecasts = </span><span class="s2">None</span>
+        <span class="s1">self.collapsed_forecasts_error = </span><span class="s2">None</span>
+        <span class="s1">self.collapsed_forecasts_error_cov = </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">self.filter_collapsed:</span>
+            <span class="s3"># Copy the provided arrays (which are from the collapsed dataset)</span>
+            <span class="s3"># into new variables</span>
+            <span class="s1">self.collapsed_forecasts = self.forecasts[:self.k_states</span><span class="s2">, </span><span class="s1">:]</span>
+            <span class="s1">self.collapsed_forecasts_error = (</span>
+                <span class="s1">self.forecasts_error[:self.k_states</span><span class="s2">, </span><span class="s1">:]</span>
+            <span class="s1">)</span>
+            <span class="s1">self.collapsed_forecasts_error_cov = (</span>
+                <span class="s1">self.forecasts_error_cov[:self.k_states</span><span class="s2">, </span><span class="s1">:self.k_states</span><span class="s2">, </span><span class="s1">:]</span>
+            <span class="s1">)</span>
+            <span class="s3"># Recreate the original arrays (which should be from the original</span>
+            <span class="s3"># dataset) in the appropriate dimension</span>
+            <span class="s1">dtype = self.collapsed_forecasts.dtype</span>
+            <span class="s1">self.forecasts = np.zeros((self.k_endog</span><span class="s2">, </span><span class="s1">self.nobs)</span><span class="s2">, </span><span class="s1">dtype=dtype)</span>
+            <span class="s1">self.forecasts_error = np.zeros((self.k_endog</span><span class="s2">, </span><span class="s1">self.nobs)</span><span class="s2">,</span>
+                                            <span class="s1">dtype=dtype)</span>
+            <span class="s1">self.forecasts_error_cov = (</span>
+                <span class="s1">np.zeros((self.k_endog</span><span class="s2">, </span><span class="s1">self.k_endog</span><span class="s2">, </span><span class="s1">self.nobs)</span><span class="s2">, </span><span class="s1">dtype=dtype)</span>
+            <span class="s1">)</span>
+
+        <span class="s3"># Fill in missing values in the forecast, forecast error, and</span>
+        <span class="s3"># forecast error covariance matrix (this is required due to how the</span>
+        <span class="s3"># Kalman filter implements observations that are either partly or</span>
+        <span class="s3"># completely missing)</span>
+        <span class="s3"># Construct the predictions, forecasts</span>
+        <span class="s1">can_compute_mean = </span><span class="s2">not </span><span class="s1">(self.memory_no_forecast_mean </span><span class="s2">or</span>
+                                <span class="s1">self.memory_no_predicted_mean)</span>
+        <span class="s1">can_compute_cov = </span><span class="s2">not </span><span class="s1">(self.memory_no_forecast_cov </span><span class="s2">or</span>
+                               <span class="s1">self.memory_no_predicted_cov)</span>
+        <span class="s2">if </span><span class="s1">can_compute_mean </span><span class="s2">or </span><span class="s1">can_compute_cov:</span>
+            <span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">range(self.nobs):</span>
+                <span class="s1">design_t = </span><span class="s4">0 </span><span class="s2">if </span><span class="s1">self.design.shape[</span><span class="s4">2</span><span class="s1">] == </span><span class="s4">1 </span><span class="s2">else </span><span class="s1">t</span>
+                <span class="s1">obs_cov_t = </span><span class="s4">0 </span><span class="s2">if </span><span class="s1">self.obs_cov.shape[</span><span class="s4">2</span><span class="s1">] == </span><span class="s4">1 </span><span class="s2">else </span><span class="s1">t</span>
+                <span class="s1">obs_intercept_t = </span><span class="s4">0 </span><span class="s2">if </span><span class="s1">self.obs_intercept.shape[</span><span class="s4">1</span><span class="s1">] == </span><span class="s4">1 </span><span class="s2">else </span><span class="s1">t</span>
+
+                <span class="s3"># For completely missing observations, the Kalman filter will</span>
+                <span class="s3"># produce forecasts, but forecast errors and the forecast</span>
+                <span class="s3"># error covariance matrix will be zeros - make them nan to</span>
+                <span class="s3"># improve clarity of results.</span>
+                <span class="s2">if </span><span class="s1">self.nmissing[t] &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">mask = ~self.missing[:</span><span class="s2">, </span><span class="s1">t].astype(bool)</span>
+                    <span class="s3"># We can recover forecasts</span>
+                    <span class="s3"># For partially missing observations, the Kalman filter</span>
+                    <span class="s3"># will produce all elements (forecasts, forecast errors,</span>
+                    <span class="s3"># forecast error covariance matrices) as usual, but their</span>
+                    <span class="s3"># dimension will only be equal to the number of non-missing</span>
+                    <span class="s3"># elements, and their location in memory will be in the</span>
+                    <span class="s3"># first blocks (e.g. for the forecasts_error, the first</span>
+                    <span class="s3"># k_endog - nmissing[t] columns will be filled in),</span>
+                    <span class="s3"># regardless of which endogenous variables they refer to</span>
+                    <span class="s3"># (i.e. the non- missing endogenous variables for that</span>
+                    <span class="s3"># observation). Furthermore, the forecast error covariance</span>
+                    <span class="s3"># matrix is only valid for those elements. What is done is</span>
+                    <span class="s3"># to set all elements to nan for these observations so that</span>
+                    <span class="s3"># they are flagged as missing. The variables</span>
+                    <span class="s3"># missing_forecasts, etc. then provide the forecasts, etc.</span>
+                    <span class="s3"># provided by the Kalman filter, from which the data can be</span>
+                    <span class="s3"># retrieved if desired.</span>
+                    <span class="s2">if </span><span class="s1">can_compute_mean:</span>
+                        <span class="s1">self.forecasts[:</span><span class="s2">, </span><span class="s1">t] = np.dot(</span>
+                            <span class="s1">self.design[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">design_t]</span><span class="s2">,</span>
+                            <span class="s1">self.predicted_state[:</span><span class="s2">, </span><span class="s1">t]</span>
+                        <span class="s1">) + self.obs_intercept[:</span><span class="s2">, </span><span class="s1">obs_intercept_t]</span>
+                        <span class="s1">self.forecasts_error[:</span><span class="s2">, </span><span class="s1">t] = np.nan</span>
+                        <span class="s1">self.forecasts_error[mask</span><span class="s2">, </span><span class="s1">t] = (</span>
+                            <span class="s1">self.endog[mask</span><span class="s2">, </span><span class="s1">t] - self.forecasts[mask</span><span class="s2">, </span><span class="s1">t])</span>
+                    <span class="s3"># TODO: We should only fill in the non-masked elements of</span>
+                    <span class="s3"># this array. Also, this will give the multivariate version</span>
+                    <span class="s3"># even if univariate filtering was selected. Instead, we</span>
+                    <span class="s3"># should use the reordering methods and then replace the</span>
+                    <span class="s3"># masked values with NaNs</span>
+                    <span class="s2">if </span><span class="s1">can_compute_cov:</span>
+                        <span class="s1">self.forecasts_error_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">t] = np.dot(</span>
+                            <span class="s1">np.dot(self.design[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">design_t]</span><span class="s2">,</span>
+                                   <span class="s1">self.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">t])</span><span class="s2">,</span>
+                            <span class="s1">self.design[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">design_t].T</span>
+                        <span class="s1">) + self.obs_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">obs_cov_t]</span>
+                <span class="s3"># In the collapsed case, everything just needs to be rebuilt</span>
+                <span class="s3"># for the original observed data, since the Kalman filter</span>
+                <span class="s3"># produced these values for the collapsed data.</span>
+                <span class="s2">elif </span><span class="s1">self.filter_collapsed:</span>
+                    <span class="s2">if </span><span class="s1">can_compute_mean:</span>
+                        <span class="s1">self.forecasts[:</span><span class="s2">, </span><span class="s1">t] = np.dot(</span>
+                            <span class="s1">self.design[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">design_t]</span><span class="s2">,</span>
+                            <span class="s1">self.predicted_state[:</span><span class="s2">, </span><span class="s1">t]</span>
+                        <span class="s1">) + self.obs_intercept[:</span><span class="s2">, </span><span class="s1">obs_intercept_t]</span>
+
+                        <span class="s1">self.forecasts_error[:</span><span class="s2">, </span><span class="s1">t] = (</span>
+                            <span class="s1">self.endog[:</span><span class="s2">, </span><span class="s1">t] - self.forecasts[:</span><span class="s2">, </span><span class="s1">t]</span>
+                        <span class="s1">)</span>
+
+                    <span class="s2">if </span><span class="s1">can_compute_cov:</span>
+                        <span class="s1">self.forecasts_error_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">t] = np.dot(</span>
+                            <span class="s1">np.dot(self.design[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">design_t]</span><span class="s2">,</span>
+                                   <span class="s1">self.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">t])</span><span class="s2">,</span>
+                            <span class="s1">self.design[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">design_t].T</span>
+                        <span class="s1">) + self.obs_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">obs_cov_t]</span>
+
+        <span class="s3"># Note: if we concentrated out the scale, need to adjust the</span>
+        <span class="s3"># loglikelihood values and all of the covariance matrices and the</span>
+        <span class="s3"># values that depend on the covariance matrices</span>
+        <span class="s3"># Note: concentrated computation is not permitted with collapsed</span>
+        <span class="s3"># version, so we do not need to modify collapsed arrays.</span>
+        <span class="s1">self.scale = </span><span class="s4">1.</span>
+        <span class="s2">if </span><span class="s1">self.filter_concentrated </span><span class="s2">and </span><span class="s1">self.model._scale </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">d = max(self.loglikelihood_burn</span><span class="s2">, </span><span class="s1">self.nobs_diffuse)</span>
+            <span class="s3"># Compute the scale</span>
+            <span class="s1">nmissing = np.array(kalman_filter.model.nmissing)</span>
+            <span class="s1">nobs_k_endog = np.sum(self.k_endog - nmissing[d:])</span>
+
+            <span class="s3"># In the univariate case, we need to subtract observations</span>
+            <span class="s3"># associated with a singular forecast error covariance matrix</span>
+            <span class="s1">nobs_k_endog -= kalman_filter.nobs_kendog_univariate_singular</span>
+
+            <span class="s1">scale_obs = np.array(kalman_filter.scale</span><span class="s2">, </span><span class="s1">copy=</span><span class="s2">True</span><span class="s1">)</span>
+            <span class="s2">if not </span><span class="s1">self.memory_no_likelihood:</span>
+                <span class="s1">self.scale = np.sum(scale_obs[d:]) / nobs_k_endog</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">self.scale = scale_obs[</span><span class="s4">0</span><span class="s1">] / nobs_k_endog</span>
+
+            <span class="s3"># Need to modify this for diffuse initialization, since for</span>
+            <span class="s3"># diffuse periods we only need to add in the scale value if the</span>
+            <span class="s3"># diffuse forecast error covariance matrix element was singular</span>
+            <span class="s1">nsingular = </span><span class="s4">0</span>
+            <span class="s2">if </span><span class="s1">kalman_filter.nobs_diffuse &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">Finf = kalman_filter.forecast_error_diffuse_cov</span>
+                <span class="s1">singular = (np.diagonal(Finf).real &lt;=</span>
+                            <span class="s1">kalman_filter.tolerance_diffuse)</span>
+                <span class="s1">nsingular = np.sum(~singular</span><span class="s2">, </span><span class="s1">axis=</span><span class="s4">1</span><span class="s1">)</span>
+
+            <span class="s3"># Adjust the loglikelihood obs (see `KalmanFilter.loglikeobs` for</span>
+            <span class="s3"># defaults on the adjustment)</span>
+            <span class="s2">if not </span><span class="s1">self.memory_no_likelihood:</span>
+                <span class="s1">self.llf_obs += -</span><span class="s4">0.5 </span><span class="s1">* (</span>
+                    <span class="s1">(self.k_endog - nmissing - nsingular) * np.log(self.scale)</span>
+                    <span class="s1">+ scale_obs / self.scale)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">self.llf_obs[</span><span class="s4">0</span><span class="s1">] += -</span><span class="s4">0.5 </span><span class="s1">* np.squeeze(</span>
+                    <span class="s1">np.sum(</span>
+                        <span class="s1">(self.k_endog - nmissing - nsingular)</span>
+                        <span class="s1">* np.log(self.scale)</span>
+                    <span class="s1">)</span>
+                    <span class="s1">+ scale_obs / self.scale</span>
+                <span class="s1">)</span>
+
+            <span class="s3"># Scale the filter output</span>
+            <span class="s1">self.obs_cov = self.obs_cov * self.scale</span>
+            <span class="s1">self.state_cov = self.state_cov * self.scale</span>
+
+            <span class="s1">self.initial_state_cov = self.initial_state_cov * self.scale</span>
+            <span class="s1">self.predicted_state_cov = self.predicted_state_cov * self.scale</span>
+            <span class="s1">self.filtered_state_cov = self.filtered_state_cov * self.scale</span>
+            <span class="s1">self.forecasts_error_cov = self.forecasts_error_cov * self.scale</span>
+            <span class="s2">if </span><span class="s1">self.missing_forecasts_error_cov </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">self.missing_forecasts_error_cov = (</span>
+                    <span class="s1">self.missing_forecasts_error_cov * self.scale)</span>
+
+            <span class="s3"># Note: do not have to adjust the Kalman gain or tmp4</span>
+            <span class="s1">self.tmp1 = self.tmp1 * self.scale</span>
+            <span class="s1">self.tmp2 = self.tmp2 / self.scale</span>
+            <span class="s1">self.tmp3 = self.tmp3 / self.scale</span>
+            <span class="s2">if not </span><span class="s1">(self.memory_no_std_forecast </span><span class="s2">or</span>
+                    <span class="s1">self.invert_lu </span><span class="s2">or</span>
+                    <span class="s1">self.solve_lu </span><span class="s2">or</span>
+                    <span class="s1">self.filter_collapsed):</span>
+                <span class="s1">self._standardized_forecasts_error = (</span>
+                    <span class="s1">self._standardized_forecasts_error / self.scale**</span><span class="s4">0.5</span><span class="s1">)</span>
+        <span class="s3"># The self.model._scale value is only not None within a fixed_scale</span>
+        <span class="s3"># context, in which case it is set and indicates that we should</span>
+        <span class="s3"># generally view this results object as using a concentrated scale</span>
+        <span class="s3"># (e.g. for d.o.f. computations), but because the fixed scale was</span>
+        <span class="s3"># actually applied to the model prior to filtering, we do not need to</span>
+        <span class="s3"># make any adjustments to the filter output, etc.</span>
+        <span class="s2">elif </span><span class="s1">self.model._scale </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">self.filter_concentrated = </span><span class="s2">True</span>
+            <span class="s1">self.scale = self.model._scale</span>
+
+        <span class="s3"># Now, save self.llf, and handle the memory_no_likelihood case</span>
+        <span class="s2">if not </span><span class="s1">self.memory_no_likelihood:</span>
+            <span class="s1">self.llf = np.sum(self.llf_obs[self.loglikelihood_burn:])</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">self.llf = self.llf_obs[</span><span class="s4">0</span><span class="s1">]</span>
+            <span class="s1">self.llf_obs = </span><span class="s2">None</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">kalman_gain(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Kalman gain matrices 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self._kalman_gain </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s3"># k x n</span>
+            <span class="s1">self._kalman_gain = np.zeros(</span>
+                <span class="s1">(self.k_states</span><span class="s2">, </span><span class="s1">self.k_endog</span><span class="s2">, </span><span class="s1">self.nobs)</span><span class="s2">, </span><span class="s1">dtype=self.dtype)</span>
+            <span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">range(self.nobs):</span>
+                <span class="s3"># In the case of entirely missing observations, let the Kalman</span>
+                <span class="s3"># gain be zeros.</span>
+                <span class="s2">if </span><span class="s1">self.nmissing[t] == self.k_endog:</span>
+                    <span class="s2">continue</span>
+
+                <span class="s1">design_t = </span><span class="s4">0 </span><span class="s2">if </span><span class="s1">self.design.shape[</span><span class="s4">2</span><span class="s1">] == </span><span class="s4">1 </span><span class="s2">else </span><span class="s1">t</span>
+                <span class="s1">transition_t = </span><span class="s4">0 </span><span class="s2">if </span><span class="s1">self.transition.shape[</span><span class="s4">2</span><span class="s1">] == </span><span class="s4">1 </span><span class="s2">else </span><span class="s1">t</span>
+                <span class="s2">if </span><span class="s1">self.nmissing[t] == </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">self._kalman_gain[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">t] = np.dot(</span>
+                        <span class="s1">np.dot(</span>
+                            <span class="s1">self.transition[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">transition_t]</span><span class="s2">,</span>
+                            <span class="s1">self.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">t]</span>
+                        <span class="s1">)</span><span class="s2">,</span>
+                        <span class="s1">np.dot(</span>
+                            <span class="s1">np.transpose(self.design[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">design_t])</span><span class="s2">,</span>
+                            <span class="s1">np.linalg.inv(self.forecasts_error_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">t])</span>
+                        <span class="s1">)</span>
+                    <span class="s1">)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">mask = ~self.missing[:</span><span class="s2">, </span><span class="s1">t].astype(bool)</span>
+                    <span class="s1">F = self.forecasts_error_cov[np.ix_(mask</span><span class="s2">, </span><span class="s1">mask</span><span class="s2">, </span><span class="s1">[t])]</span>
+                    <span class="s1">self._kalman_gain[:</span><span class="s2">, </span><span class="s1">mask</span><span class="s2">, </span><span class="s1">t] = np.dot(</span>
+                        <span class="s1">np.dot(</span>
+                            <span class="s1">self.transition[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">transition_t]</span><span class="s2">,</span>
+                            <span class="s1">self.predicted_state_cov[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">t]</span>
+                        <span class="s1">)</span><span class="s2">,</span>
+                        <span class="s1">np.dot(</span>
+                            <span class="s1">np.transpose(self.design[mask</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">design_t])</span><span class="s2">,</span>
+                            <span class="s1">np.linalg.inv(F[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">])</span>
+                        <span class="s1">)</span>
+                    <span class="s1">)</span>
+        <span class="s2">return </span><span class="s1">self._kalman_gain</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">standardized_forecasts_error(self):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Standardized forecast errors 
+ 
+        Notes 
+        ----- 
+        The forecast errors produced by the Kalman filter are 
+ 
+        .. math:: 
+ 
+            v_t \sim N(0, F_t) 
+ 
+        Hypothesis tests are usually applied to the standardized residuals 
+ 
+        .. math:: 
+ 
+            v_t^s = B_t v_t \sim N(0, I) 
+ 
+        where :math:`B_t = L_t^{-1}` and :math:`F_t = L_t L_t'`; then 
+        :math:`F_t^{-1} = (L_t')^{-1} L_t^{-1} = B_t' B_t`; :math:`B_t` 
+        and :math:`L_t` are lower triangular. Finally, 
+        :math:`B_t v_t \sim N(0, B_t F_t B_t')` and 
+        :math:`B_t F_t B_t' = L_t^{-1} L_t L_t' (L_t')^{-1} = I`. 
+ 
+        Thus we can rewrite :math:`v_t^s = L_t^{-1} v_t` or 
+        :math:`L_t v_t^s = v_t`; the latter equation is the form required to 
+        use a linear solver to recover :math:`v_t^s`. Since :math:`L_t` is 
+        lower triangular, we can use a triangular solver (?TRTRS). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">(self._standardized_forecasts_error </span><span class="s2">is None</span>
+                <span class="s2">and not </span><span class="s1">self.memory_no_forecast):</span>
+            <span class="s2">if </span><span class="s1">self.k_endog == </span><span class="s4">1</span><span class="s1">:</span>
+                <span class="s1">self._standardized_forecasts_error = (</span>
+                    <span class="s1">self.forecasts_error /</span>
+                    <span class="s1">self.forecasts_error_cov[</span><span class="s4">0</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s1">:]**</span><span class="s4">0.5</span><span class="s1">)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">linalg</span>
+                <span class="s1">self._standardized_forecasts_error = np.zeros(</span>
+                    <span class="s1">self.forecasts_error.shape</span><span class="s2">, </span><span class="s1">dtype=self.dtype)</span>
+                <span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">range(self.forecasts_error_cov.shape[</span><span class="s4">2</span><span class="s1">]):</span>
+                    <span class="s2">if </span><span class="s1">self.nmissing[t] &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                        <span class="s1">self._standardized_forecasts_error[:</span><span class="s2">, </span><span class="s1">t] = np.nan</span>
+                    <span class="s2">if </span><span class="s1">self.nmissing[t] &lt; self.k_endog:</span>
+                        <span class="s1">mask = ~self.missing[:</span><span class="s2">, </span><span class="s1">t].astype(bool)</span>
+                        <span class="s1">F = self.forecasts_error_cov[np.ix_(mask</span><span class="s2">, </span><span class="s1">mask</span><span class="s2">, </span><span class="s1">[t])]</span>
+                        <span class="s2">try</span><span class="s1">:</span>
+                            <span class="s1">upper</span><span class="s2">, </span><span class="s1">_ = linalg.cho_factor(F[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">])</span>
+                            <span class="s1">self._standardized_forecasts_error[mask</span><span class="s2">, </span><span class="s1">t] = (</span>
+                                <span class="s1">linalg.solve_triangular(</span>
+                                    <span class="s1">upper</span><span class="s2">, </span><span class="s1">self.forecasts_error[mask</span><span class="s2">, </span><span class="s1">t]</span><span class="s2">,</span>
+                                    <span class="s1">trans=</span><span class="s4">1</span><span class="s1">))</span>
+                        <span class="s2">except </span><span class="s1">linalg.LinAlgError:</span>
+                            <span class="s1">self._standardized_forecasts_error[mask</span><span class="s2">, </span><span class="s1">t] = (</span>
+                                <span class="s1">np.nan)</span>
+
+        <span class="s2">return </span><span class="s1">self._standardized_forecasts_error</span>
+
+    <span class="s2">def </span><span class="s1">predict(self</span><span class="s2">, </span><span class="s1">start=</span><span class="s2">None, </span><span class="s1">end=</span><span class="s2">None, </span><span class="s1">dynamic=</span><span class="s2">None, </span><span class="s1">**kwargs):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        In-sample and out-of-sample prediction for state space models generally 
+ 
+        Parameters 
+        ---------- 
+        start : int, optional 
+            Zero-indexed observation number at which to start prediction, i.e., 
+            the first prediction will be at start. 
+        end : int, optional 
+            Zero-indexed observation number at which to end prediction, i.e., 
+            the last prediction will be at end. 
+        dynamic : int, optional 
+            Offset relative to `start` at which to begin dynamic prediction. 
+            Prior to this observation, true endogenous values will be used for 
+            prediction; starting with this observation and continuing through 
+            the end of prediction, predicted endogenous values will be used 
+            instead. 
+        **kwargs 
+            If the prediction range is outside of the sample range, any 
+            of the state space representation matrices that are time-varying 
+            must have updated values provided for the out-of-sample range. 
+            For example, of `obs_intercept` is a time-varying component and 
+            the prediction range extends 10 periods beyond the end of the 
+            sample, a (`k_endog` x 10) matrix must be provided with the new 
+            intercept values. 
+ 
+        Returns 
+        ------- 
+        results : kalman_filter.PredictionResults 
+            A PredictionResults object. 
+ 
+        Notes 
+        ----- 
+        All prediction is performed by applying the deterministic part of the 
+        measurement equation using the predicted state variables. 
+ 
+        Out-of-sample prediction first applies the Kalman filter to missing 
+        data for the number of periods desired to obtain the predicted states. 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Get the start and the end of the entire prediction range</span>
+        <span class="s2">if </span><span class="s1">start </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">start = </span><span class="s4">0</span>
+        <span class="s2">elif </span><span class="s1">start &lt; </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'Cannot predict values previous to the sample.'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">end </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">end = self.nobs</span>
+
+        <span class="s3"># Prediction and forecasting is performed by iterating the Kalman</span>
+        <span class="s3"># Kalman filter through the entire range [0, end]</span>
+        <span class="s3"># Then, everything is returned corresponding to the range [start, end].</span>
+        <span class="s3"># In order to perform the calculations, the range is separately split</span>
+        <span class="s3"># up into the following categories:</span>
+        <span class="s3"># - static:   (in-sample) the Kalman filter is run as usual</span>
+        <span class="s3"># - dynamic:  (in-sample) the Kalman filter is run, but on missing data</span>
+        <span class="s3"># - forecast: (out-of-sample) the Kalman filter is run, but on missing</span>
+        <span class="s3">#             data</span>
+
+        <span class="s3"># Short-circuit if end is before start</span>
+        <span class="s2">if </span><span class="s1">end &lt;= start:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'End of prediction must be after start.'</span><span class="s1">)</span>
+
+        <span class="s3"># Get the number of forecasts to make after the end of the sample</span>
+        <span class="s1">nforecast = max(</span><span class="s4">0</span><span class="s2">, </span><span class="s1">end - self.nobs)</span>
+
+        <span class="s3"># Get the number of dynamic prediction periods</span>
+
+        <span class="s3"># If `dynamic=True`, then assume that we want to begin dynamic</span>
+        <span class="s3"># prediction at the start of the sample prediction.</span>
+        <span class="s2">if </span><span class="s1">dynamic </span><span class="s2">is True</span><span class="s1">:</span>
+            <span class="s1">dynamic = </span><span class="s4">0</span>
+        <span class="s3"># If `dynamic=False`, then assume we want no dynamic prediction</span>
+        <span class="s2">if </span><span class="s1">dynamic </span><span class="s2">is False</span><span class="s1">:</span>
+            <span class="s1">dynamic = </span><span class="s2">None</span>
+
+        <span class="s3"># Check validity of dynamic and warn or error if issues</span>
+        <span class="s1">dynamic</span><span class="s2">, </span><span class="s1">ndynamic = _check_dynamic(dynamic</span><span class="s2">, </span><span class="s1">start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, </span><span class="s1">self.nobs)</span>
+
+        <span class="s3"># Get the number of in-sample static predictions</span>
+        <span class="s2">if </span><span class="s1">dynamic </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">nstatic = min(end</span><span class="s2">, </span><span class="s1">self.nobs) - min(start</span><span class="s2">, </span><span class="s1">self.nobs)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s3"># (use max(., 0), since dynamic can be prior to start)</span>
+            <span class="s1">nstatic = max(dynamic - start</span><span class="s2">, </span><span class="s4">0</span><span class="s1">)</span>
+
+        <span class="s3"># Cannot do in-sample prediction if we do not have appropriate</span>
+        <span class="s3"># arrays (we can do out-of-sample forecasting, however)</span>
+        <span class="s2">if </span><span class="s1">nstatic &gt; </span><span class="s4">0 </span><span class="s2">and </span><span class="s1">self.memory_no_forecast_mean:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'In-sample prediction is not available if memory'</span>
+                             <span class="s5">' conservation has been used to avoid storing'</span>
+                             <span class="s5">' forecast means.'</span><span class="s1">)</span>
+        <span class="s3"># Cannot do dynamic in-sample prediction if we do not have appropriate</span>
+        <span class="s3"># arrays (we can do out-of-sample forecasting, however)</span>
+        <span class="s2">if </span><span class="s1">ndynamic &gt; </span><span class="s4">0 </span><span class="s2">and </span><span class="s1">self.memory_no_predicted:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'In-sample dynamic prediction is not available if'</span>
+                             <span class="s5">' memory conservation has been used to avoid'</span>
+                             <span class="s5">' storing forecasted or predicted state means'</span>
+                             <span class="s5">' or covariances.'</span><span class="s1">)</span>
+
+        <span class="s3"># Construct the predicted state and covariance matrix for each time</span>
+        <span class="s3"># period depending on whether that time period corresponds to</span>
+        <span class="s3"># one-step-ahead prediction, dynamic prediction, or out-of-sample</span>
+        <span class="s3"># forecasting.</span>
+
+        <span class="s3"># If we only have simple prediction, then we can use the already saved</span>
+        <span class="s3"># Kalman filter output</span>
+        <span class="s2">if </span><span class="s1">ndynamic == </span><span class="s4">0 </span><span class="s2">and </span><span class="s1">nforecast == </span><span class="s4">0</span><span class="s1">:</span>
+            <span class="s1">results = self</span>
+            <span class="s1">oos_results = </span><span class="s2">None</span>
+        <span class="s3"># If we have dynamic prediction or forecasting, then we need to</span>
+        <span class="s3"># re-apply the Kalman filter</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s3"># Figure out the period for which we need to run the Kalman filter</span>
+            <span class="s2">if </span><span class="s1">dynamic </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">kf_start = min(dynamic</span><span class="s2">, </span><span class="s1">self.nobs)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">kf_start = self.nobs</span>
+            <span class="s1">kf_end = end</span>
+
+            <span class="s3"># Make start, end consistent with the results that we're generating</span>
+            <span class="s3"># start = max(start - kf_start, 0)</span>
+            <span class="s3"># end = kf_end - kf_start</span>
+
+            <span class="s3"># We must at least store forecasts and predictions</span>
+            <span class="s1">kwargs[</span><span class="s5">'conserve_memory'</span><span class="s1">] = (</span>
+                <span class="s1">self.conserve_memory &amp; ~MEMORY_NO_FORECAST &amp;</span>
+                <span class="s1">~MEMORY_NO_PREDICTED)</span>
+
+            <span class="s3"># Can't use Chandrasekhar recursions for prediction</span>
+            <span class="s1">kwargs[</span><span class="s5">'filter_method'</span><span class="s1">] = (</span>
+                <span class="s1">self.model.filter_method &amp; ~FILTER_CHANDRASEKHAR)</span>
+
+            <span class="s3"># TODO: there is a corner case here when the filter has not</span>
+            <span class="s3">#       exited the diffuse filter, in which case this known</span>
+            <span class="s3">#       initialization is not correct.</span>
+            <span class="s3"># Even if we have not stored all predicted values (means and covs),</span>
+            <span class="s3"># we can still do pure out-of-sample forecasting because we will</span>
+            <span class="s3"># always have stored the last predicted values. In this case, we</span>
+            <span class="s3"># will initialize the forecasting filter with these values</span>
+            <span class="s2">if </span><span class="s1">self.memory_no_predicted:</span>
+                <span class="s1">constant = self.predicted_state[...</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">]</span>
+                <span class="s1">stationary_cov = self.predicted_state_cov[...</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s3"># Otherwise initialize with the predicted state / cov from the</span>
+            <span class="s3"># existing results, at index kf_start (note that the time</span>
+            <span class="s3"># dimension of predicted_state and predicted_state_cov is</span>
+            <span class="s3"># self.nobs + 1; so e.g. in the case of pure forecasting we should</span>
+            <span class="s3"># be using the very last predicted state and predicted state cov</span>
+            <span class="s3"># elements, and kf_start will equal self.nobs which is correct)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">constant = self.predicted_state[...</span><span class="s2">, </span><span class="s1">kf_start]</span>
+                <span class="s1">stationary_cov = self.predicted_state_cov[...</span><span class="s2">, </span><span class="s1">kf_start]</span>
+
+            <span class="s1">kwargs.update({</span><span class="s5">'initialization'</span><span class="s1">: </span><span class="s5">'known'</span><span class="s2">,</span>
+                           <span class="s5">'constant'</span><span class="s1">: constant</span><span class="s2">,</span>
+                           <span class="s5">'stationary_cov'</span><span class="s1">: stationary_cov})</span>
+
+            <span class="s3"># Construct the new endogenous array.</span>
+            <span class="s1">endog = np.zeros((nforecast</span><span class="s2">, </span><span class="s1">self.k_endog)) * np.nan</span>
+            <span class="s1">model = self.model.extend(</span>
+                <span class="s1">endog</span><span class="s2">, </span><span class="s1">start=kf_start</span><span class="s2">, </span><span class="s1">end=kf_end - nforecast</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+            <span class="s3"># Have to retroactively modify the model's endog</span>
+            <span class="s2">if </span><span class="s1">ndynamic &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">model.endog[:</span><span class="s2">, </span><span class="s1">-(ndynamic + nforecast):] = np.nan</span>
+
+            <span class="s2">with </span><span class="s1">model.fixed_scale(self.scale):</span>
+                <span class="s1">oos_results = model.filter()</span>
+
+            <span class="s1">results = self</span>
+
+        <span class="s2">return </span><span class="s1">PredictionResults(results</span><span class="s2">, </span><span class="s1">start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, </span><span class="s1">nstatic</span><span class="s2">, </span><span class="s1">ndynamic</span><span class="s2">,</span>
+                                 <span class="s1">nforecast</span><span class="s2">, </span><span class="s1">oos_results=oos_results)</span>
+
+
+<span class="s2">class </span><span class="s1">PredictionResults(FilterResults):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Results of in-sample and out-of-sample prediction for state space models 
+    generally 
+ 
+    Parameters 
+    ---------- 
+    results : FilterResults 
+        Output from filtering, corresponding to the prediction desired 
+    start : int 
+        Zero-indexed observation number at which to start forecasting, 
+        i.e., the first forecast will be at start. 
+    end : int 
+        Zero-indexed observation number at which to end forecasting, i.e., 
+        the last forecast will be at end. 
+    nstatic : int 
+        Number of in-sample static predictions (these are always the first 
+        elements of the prediction output). 
+    ndynamic : int 
+        Number of in-sample dynamic predictions (these always follow the static 
+        predictions directly, and are directly followed by the forecasts). 
+    nforecast : int 
+        Number of in-sample forecasts (these always follow the dynamic 
+        predictions directly). 
+ 
+    Attributes 
+    ---------- 
+    npredictions : int 
+        Number of observations in the predicted series; this is not necessarily 
+        the same as the number of observations in the original model from which 
+        prediction was performed. 
+    start : int 
+        Zero-indexed observation number at which to start prediction, 
+        i.e., the first predict will be at `start`; this is relative to the 
+        original model from which prediction was performed. 
+    end : int 
+        Zero-indexed observation number at which to end prediction, 
+        i.e., the last predict will be at `end`; this is relative to the 
+        original model from which prediction was performed. 
+    nstatic : int 
+        Number of in-sample static predictions. 
+    ndynamic : int 
+        Number of in-sample dynamic predictions. 
+    nforecast : int 
+        Number of in-sample forecasts. 
+    endog : ndarray 
+        The observation vector. 
+    design : ndarray 
+        The design matrix, :math:`Z`. 
+    obs_intercept : ndarray 
+        The intercept for the observation equation, :math:`d`. 
+    obs_cov : ndarray 
+        The covariance matrix for the observation equation :math:`H`. 
+    transition : ndarray 
+        The transition matrix, :math:`T`. 
+    state_intercept : ndarray 
+        The intercept for the transition equation, :math:`c`. 
+    selection : ndarray 
+        The selection matrix, :math:`R`. 
+    state_cov : ndarray 
+        The covariance matrix for the state equation :math:`Q`. 
+    filtered_state : ndarray 
+        The filtered state vector at each time period. 
+    filtered_state_cov : ndarray 
+        The filtered state covariance matrix at each time period. 
+    predicted_state : ndarray 
+        The predicted state vector at each time period. 
+    predicted_state_cov : ndarray 
+        The predicted state covariance matrix at each time period. 
+    forecasts : ndarray 
+        The one-step-ahead forecasts of observations at each time period. 
+    forecasts_error : ndarray 
+        The forecast errors at each time period. 
+    forecasts_error_cov : ndarray 
+        The forecast error covariance matrices at each time period. 
+ 
+    Notes 
+    ----- 
+    The provided ranges must be conformable, meaning that it must be that 
+    `end - start == nstatic + ndynamic + nforecast`. 
+ 
+    This class is essentially a view to the FilterResults object, but 
+    returning the appropriate ranges for everything. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">representation_attributes = [</span>
+        <span class="s5">'endog'</span><span class="s2">, </span><span class="s5">'design'</span><span class="s2">, </span><span class="s5">'obs_intercept'</span><span class="s2">,</span>
+        <span class="s5">'obs_cov'</span><span class="s2">, </span><span class="s5">'transition'</span><span class="s2">, </span><span class="s5">'state_intercept'</span><span class="s2">, </span><span class="s5">'selection'</span><span class="s2">,</span>
+        <span class="s5">'state_cov'</span>
+    <span class="s1">]</span>
+    <span class="s1">filter_attributes = [</span>
+        <span class="s5">'filtered_state'</span><span class="s2">, </span><span class="s5">'filtered_state_cov'</span><span class="s2">,</span>
+        <span class="s5">'predicted_state'</span><span class="s2">, </span><span class="s5">'predicted_state_cov'</span><span class="s2">,</span>
+        <span class="s5">'forecasts'</span><span class="s2">, </span><span class="s5">'forecasts_error'</span><span class="s2">, </span><span class="s5">'forecasts_error_cov'</span>
+    <span class="s1">]</span>
+    <span class="s1">smoother_attributes = [</span>
+        <span class="s5">'smoothed_state'</span><span class="s2">, </span><span class="s5">'smoothed_state_cov'</span><span class="s2">,</span>
+    <span class="s1">]</span>
+
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">results</span><span class="s2">, </span><span class="s1">start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, </span><span class="s1">nstatic</span><span class="s2">, </span><span class="s1">ndynamic</span><span class="s2">, </span><span class="s1">nforecast</span><span class="s2">,</span>
+                 <span class="s1">oos_results=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s3"># Save the filter results object</span>
+        <span class="s1">self.results = results</span>
+        <span class="s1">self.oos_results = oos_results</span>
+
+        <span class="s3"># Save prediction ranges</span>
+        <span class="s1">self.npredictions = start - end</span>
+        <span class="s1">self.start = start</span>
+        <span class="s1">self.end = end</span>
+        <span class="s1">self.nstatic = nstatic</span>
+        <span class="s1">self.ndynamic = ndynamic</span>
+        <span class="s1">self.nforecast = nforecast</span>
+
+        <span class="s1">self._predicted_signal = </span><span class="s2">None</span>
+        <span class="s1">self._predicted_signal_cov = </span><span class="s2">None</span>
+        <span class="s1">self._filtered_signal = </span><span class="s2">None</span>
+        <span class="s1">self._filtered_signal_cov = </span><span class="s2">None</span>
+        <span class="s1">self._smoothed_signal = </span><span class="s2">None</span>
+        <span class="s1">self._smoothed_signal_cov = </span><span class="s2">None</span>
+        <span class="s1">self._filtered_forecasts = </span><span class="s2">None</span>
+        <span class="s1">self._filtered_forecasts_error_cov = </span><span class="s2">None</span>
+        <span class="s1">self._smoothed_forecasts = </span><span class="s2">None</span>
+        <span class="s1">self._smoothed_forecasts_error_cov = </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">clear(self):</span>
+        <span class="s1">attributes = ([</span><span class="s5">'endog'</span><span class="s1">] + self.representation_attributes</span>
+                      <span class="s1">+ self.filter_attributes)</span>
+        <span class="s2">for </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">attributes:</span>
+            <span class="s1">_attr = </span><span class="s5">'_' </span><span class="s1">+ attr</span>
+            <span class="s2">if </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s1">_attr):</span>
+                <span class="s1">delattr(self</span><span class="s2">, </span><span class="s1">_attr)</span>
+
+    <span class="s2">def </span><span class="s1">__getattr__(self</span><span class="s2">, </span><span class="s1">attr):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Provide access to the representation and filtered output in the 
+        appropriate range (`start` - `end`). 
+        &quot;&quot;&quot;</span>
+        <span class="s3"># Prevent infinite recursive lookups</span>
+        <span class="s2">if </span><span class="s1">attr[</span><span class="s4">0</span><span class="s1">] == </span><span class="s5">'_'</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">AttributeError(</span><span class="s5">&quot;'%s' object has no attribute '%s'&quot; </span><span class="s1">%</span>
+                                 <span class="s1">(self.__class__.__name__</span><span class="s2">, </span><span class="s1">attr))</span>
+
+        <span class="s1">_attr = </span><span class="s5">'_' </span><span class="s1">+ attr</span>
+
+        <span class="s3"># Cache the attribute</span>
+        <span class="s2">if not </span><span class="s1">hasattr(self</span><span class="s2">, </span><span class="s1">_attr):</span>
+            <span class="s2">if </span><span class="s1">attr == </span><span class="s5">'endog' </span><span class="s2">or </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">self.filter_attributes:</span>
+                <span class="s3"># Get a copy</span>
+                <span class="s1">value = getattr(self.results</span><span class="s2">, </span><span class="s1">attr).copy()</span>
+                <span class="s2">if </span><span class="s1">self.ndynamic &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s1">end = self.end - self.ndynamic - self.nforecast</span>
+                    <span class="s1">value = value[...</span><span class="s2">, </span><span class="s1">:end]</span>
+                <span class="s2">if </span><span class="s1">self.oos_results </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">oos_value = getattr(self.oos_results</span><span class="s2">, </span><span class="s1">attr).copy()</span>
+
+                    <span class="s3"># Note that the last element of the results predicted state</span>
+                    <span class="s3"># and state cov will overlap with the first element of the</span>
+                    <span class="s3"># oos predicted state and state cov, so eliminate the</span>
+                    <span class="s3"># last element of the results versions</span>
+                    <span class="s3"># But if we have dynamic prediction, then we have already</span>
+                    <span class="s3"># eliminated the last element of the predicted state, so</span>
+                    <span class="s3"># we do not need to do it here.</span>
+                    <span class="s2">if </span><span class="s1">self.ndynamic == </span><span class="s4">0 </span><span class="s2">and </span><span class="s1">attr[:</span><span class="s4">9</span><span class="s1">] == </span><span class="s5">'predicted'</span><span class="s1">:</span>
+                        <span class="s1">value = value[...</span><span class="s2">, </span><span class="s1">:-</span><span class="s4">1</span><span class="s1">]</span>
+
+                    <span class="s1">value = np.concatenate([value</span><span class="s2">, </span><span class="s1">oos_value]</span><span class="s2">, </span><span class="s1">axis=-</span><span class="s4">1</span><span class="s1">)</span>
+
+                <span class="s3"># Subset to the correct time frame</span>
+                <span class="s1">value = value[...</span><span class="s2">, </span><span class="s1">self.start:self.end]</span>
+            <span class="s2">elif </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">self.smoother_attributes:</span>
+                <span class="s2">if </span><span class="s1">self.ndynamic &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                    <span class="s2">raise </span><span class="s1">NotImplementedError(</span>
+                        <span class="s5">'Cannot retrieve smoothed attributes when using'</span>
+                        <span class="s5">' dynamic prediction, since the information set used'</span>
+                        <span class="s5">' to compute the smoothed results differs from the'</span>
+                        <span class="s5">' information set implied by the dynamic prediction.'</span><span class="s1">)</span>
+                <span class="s3"># Get a copy</span>
+                <span class="s1">value = getattr(self.results</span><span class="s2">, </span><span class="s1">attr).copy()</span>
+
+                <span class="s3"># The oos_results object is only dynamic or out-of-sample,</span>
+                <span class="s3"># so filtered == smoothed</span>
+                <span class="s2">if </span><span class="s1">self.oos_results </span><span class="s2">is not None</span><span class="s1">:</span>
+                    <span class="s1">filtered_attr = </span><span class="s5">'filtered' </span><span class="s1">+ attr[</span><span class="s4">8</span><span class="s1">:]</span>
+                    <span class="s1">oos_value = getattr(self.oos_results</span><span class="s2">, </span><span class="s1">filtered_attr).copy()</span>
+                    <span class="s1">value = np.concatenate([value</span><span class="s2">, </span><span class="s1">oos_value]</span><span class="s2">, </span><span class="s1">axis=-</span><span class="s4">1</span><span class="s1">)</span>
+
+                <span class="s3"># Subset to the correct time frame</span>
+                <span class="s1">value = value[...</span><span class="s2">, </span><span class="s1">self.start:self.end]</span>
+            <span class="s2">elif </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">self.representation_attributes:</span>
+                <span class="s1">value = getattr(self.results</span><span class="s2">, </span><span class="s1">attr).copy()</span>
+                <span class="s3"># If a time-invariant matrix, return it. Otherwise, subset to</span>
+                <span class="s3"># the correct period.</span>
+                <span class="s2">if </span><span class="s1">value.shape[-</span><span class="s4">1</span><span class="s1">] == </span><span class="s4">1</span><span class="s1">:</span>
+                    <span class="s1">value = value[...</span><span class="s2">, </span><span class="s4">0</span><span class="s1">]</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s2">if </span><span class="s1">self.ndynamic &gt; </span><span class="s4">0</span><span class="s1">:</span>
+                        <span class="s1">end = self.end - self.ndynamic - self.nforecast</span>
+                        <span class="s1">value = value[...</span><span class="s2">, </span><span class="s1">:end]</span>
+
+                    <span class="s2">if </span><span class="s1">self.oos_results </span><span class="s2">is not None</span><span class="s1">:</span>
+                        <span class="s1">oos_value = getattr(self.oos_results</span><span class="s2">, </span><span class="s1">attr).copy()</span>
+                        <span class="s1">value = np.concatenate([value</span><span class="s2">, </span><span class="s1">oos_value]</span><span class="s2">, </span><span class="s1">axis=-</span><span class="s4">1</span><span class="s1">)</span>
+                    <span class="s1">value = value[...</span><span class="s2">, </span><span class="s1">self.start:self.end]</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">raise </span><span class="s1">AttributeError(</span><span class="s5">&quot;'%s' object has no attribute '%s'&quot; </span><span class="s1">%</span>
+                                     <span class="s1">(self.__class__.__name__</span><span class="s2">, </span><span class="s1">attr))</span>
+
+            <span class="s1">setattr(self</span><span class="s2">, </span><span class="s1">_attr</span><span class="s2">, </span><span class="s1">value)</span>
+
+        <span class="s2">return </span><span class="s1">getattr(self</span><span class="s2">, </span><span class="s1">_attr)</span>
+
+    <span class="s2">def </span><span class="s1">_compute_forecasts(self</span><span class="s2">, </span><span class="s1">states</span><span class="s2">, </span><span class="s1">states_cov</span><span class="s2">, </span><span class="s1">signal_only=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s1">d = self.obs_intercept</span>
+        <span class="s1">Z = self.design</span>
+        <span class="s1">H = self.obs_cov</span>
+
+        <span class="s2">if </span><span class="s1">d.ndim == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s1">d = d[:</span><span class="s2">, None</span><span class="s1">]</span>
+
+        <span class="s2">if </span><span class="s1">Z.ndim == </span><span class="s4">2</span><span class="s1">:</span>
+            <span class="s2">if not </span><span class="s1">signal_only:</span>
+                <span class="s1">forecasts = d + Z @ states</span>
+                <span class="s1">forecasts_error_cov = (</span>
+                    <span class="s1">Z[</span><span class="s2">None, </span><span class="s1">...] @ states_cov.T @ Z.T[</span><span class="s2">None, </span><span class="s1">...] + H.T).T</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">forecasts = Z @ states</span>
+                <span class="s1">forecasts_error_cov = (</span>
+                    <span class="s1">Z[</span><span class="s2">None, </span><span class="s1">...] @ states_cov.T @ Z.T[</span><span class="s2">None, </span><span class="s1">...]).T</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if not </span><span class="s1">signal_only:</span>
+                <span class="s1">forecasts = d + (Z * states[</span><span class="s2">None, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:]).sum(axis=</span><span class="s4">1</span><span class="s1">)</span>
+                <span class="s1">tmp = Z[:</span><span class="s2">, None, </span><span class="s1">...] * states_cov[</span><span class="s2">None, </span><span class="s1">...]</span>
+                <span class="s1">tmp = (tmp[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, None, </span><span class="s1">:]</span>
+                       <span class="s1">* Z.transpose(</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)[</span><span class="s2">None, </span><span class="s1">:</span><span class="s2">, None, </span><span class="s1">...])</span>
+                <span class="s1">forecasts_error_cov = (tmp.sum(axis=</span><span class="s4">1</span><span class="s1">).sum(axis=</span><span class="s4">1</span><span class="s1">).T + H.T).T</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">forecasts = (Z * states[</span><span class="s2">None, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:]).sum(axis=</span><span class="s4">1</span><span class="s1">)</span>
+                <span class="s1">tmp = Z[:</span><span class="s2">, None, </span><span class="s1">...] * states_cov[</span><span class="s2">None, </span><span class="s1">...]</span>
+                <span class="s1">tmp = (tmp[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, None, </span><span class="s1">:]</span>
+                       <span class="s1">* Z.transpose(</span><span class="s4">1</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)[</span><span class="s2">None, </span><span class="s1">:</span><span class="s2">, None, </span><span class="s1">...])</span>
+                <span class="s1">forecasts_error_cov = tmp.sum(axis=</span><span class="s4">1</span><span class="s1">).sum(axis=</span><span class="s4">1</span><span class="s1">)</span>
+
+        <span class="s2">return </span><span class="s1">forecasts</span><span class="s2">, </span><span class="s1">forecasts_error_cov</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">predicted_signal(self):</span>
+        <span class="s2">if </span><span class="s1">self._predicted_signal </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._predicted_signal</span><span class="s2">, </span><span class="s1">self._predicted_signal_cov = (</span>
+                <span class="s1">self._compute_forecasts(self.predicted_state</span><span class="s2">,</span>
+                                        <span class="s1">self.predicted_state_cov</span><span class="s2">,</span>
+                                        <span class="s1">signal_only=</span><span class="s2">True</span><span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">self._predicted_signal</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">predicted_signal_cov(self):</span>
+        <span class="s2">if </span><span class="s1">self._predicted_signal_cov </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._predicted_signal</span><span class="s2">, </span><span class="s1">self._predicted_signal_cov = (</span>
+                <span class="s1">self._compute_forecasts(self.predicted_state</span><span class="s2">,</span>
+                                        <span class="s1">self.predicted_state_cov</span><span class="s2">,</span>
+                                        <span class="s1">signal_only=</span><span class="s2">True</span><span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">self._predicted_signal_cov</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">filtered_signal(self):</span>
+        <span class="s2">if </span><span class="s1">self._filtered_signal </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._filtered_signal</span><span class="s2">, </span><span class="s1">self._filtered_signal_cov = (</span>
+                <span class="s1">self._compute_forecasts(self.filtered_state</span><span class="s2">,</span>
+                                        <span class="s1">self.filtered_state_cov</span><span class="s2">,</span>
+                                        <span class="s1">signal_only=</span><span class="s2">True</span><span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">self._filtered_signal</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">filtered_signal_cov(self):</span>
+        <span class="s2">if </span><span class="s1">self._filtered_signal_cov </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._filtered_signal</span><span class="s2">, </span><span class="s1">self._filtered_signal_cov = (</span>
+                <span class="s1">self._compute_forecasts(self.filtered_state</span><span class="s2">,</span>
+                                        <span class="s1">self.filtered_state_cov</span><span class="s2">,</span>
+                                        <span class="s1">signal_only=</span><span class="s2">True</span><span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">self._filtered_signal_cov</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">smoothed_signal(self):</span>
+        <span class="s2">if </span><span class="s1">self._smoothed_signal </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._smoothed_signal</span><span class="s2">, </span><span class="s1">self._smoothed_signal_cov = (</span>
+                <span class="s1">self._compute_forecasts(self.smoothed_state</span><span class="s2">,</span>
+                                        <span class="s1">self.smoothed_state_cov</span><span class="s2">,</span>
+                                        <span class="s1">signal_only=</span><span class="s2">True</span><span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">self._smoothed_signal</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">smoothed_signal_cov(self):</span>
+        <span class="s2">if </span><span class="s1">self._smoothed_signal_cov </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._smoothed_signal</span><span class="s2">, </span><span class="s1">self._smoothed_signal_cov = (</span>
+                <span class="s1">self._compute_forecasts(self.smoothed_state</span><span class="s2">,</span>
+                                        <span class="s1">self.smoothed_state_cov</span><span class="s2">,</span>
+                                        <span class="s1">signal_only=</span><span class="s2">True</span><span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">self._smoothed_signal_cov</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">filtered_forecasts(self):</span>
+        <span class="s2">if </span><span class="s1">self._filtered_forecasts </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._filtered_forecasts</span><span class="s2">, </span><span class="s1">self._filtered_forecasts_cov = (</span>
+                <span class="s1">self._compute_forecasts(self.filtered_state</span><span class="s2">,</span>
+                                        <span class="s1">self.filtered_state_cov))</span>
+        <span class="s2">return </span><span class="s1">self._filtered_forecasts</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">filtered_forecasts_error_cov(self):</span>
+        <span class="s2">if </span><span class="s1">self._filtered_forecasts_cov </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._filtered_forecasts</span><span class="s2">, </span><span class="s1">self._filtered_forecasts_cov = (</span>
+                <span class="s1">self._compute_forecasts(self.filtered_state</span><span class="s2">,</span>
+                                        <span class="s1">self.filtered_state_cov))</span>
+        <span class="s2">return </span><span class="s1">self._filtered_forecasts_cov</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">smoothed_forecasts(self):</span>
+        <span class="s2">if </span><span class="s1">self._smoothed_forecasts </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._smoothed_forecasts</span><span class="s2">, </span><span class="s1">self._smoothed_forecasts_cov = (</span>
+                <span class="s1">self._compute_forecasts(self.smoothed_state</span><span class="s2">,</span>
+                                        <span class="s1">self.smoothed_state_cov))</span>
+        <span class="s2">return </span><span class="s1">self._smoothed_forecasts</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">smoothed_forecasts_error_cov(self):</span>
+        <span class="s2">if </span><span class="s1">self._smoothed_forecasts_cov </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">self._smoothed_forecasts</span><span class="s2">, </span><span class="s1">self._smoothed_forecasts_cov = (</span>
+                <span class="s1">self._compute_forecasts(self.smoothed_state</span><span class="s2">,</span>
+                                        <span class="s1">self.smoothed_state_cov))</span>
+        <span class="s2">return </span><span class="s1">self._smoothed_forecasts_cov</span>
+
+
+<span class="s2">def </span><span class="s1">_check_dynamic(dynamic</span><span class="s2">, </span><span class="s1">start</span><span class="s2">, </span><span class="s1">end</span><span class="s2">, </span><span class="s1">nobs):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Verify dynamic and warn or error if issues 
+ 
+    Parameters 
+    ---------- 
+    dynamic : {int, None} 
+        The offset relative to start of the dynamic forecasts. None if no 
+        dynamic forecasts are required. 
+    start : int 
+        The location of the first forecast. 
+    end : int 
+        The location of the final forecast (inclusive). 
+    nobs : int 
+        The number of observations in the time series. 
+ 
+    Returns 
+    ------- 
+    dynamic : {int, None} 
+        The start location of the first dynamic forecast. None if there 
+        are no in-sample dynamic forecasts. 
+    ndynamic : int 
+        The number of dynamic forecasts 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">dynamic </span><span class="s2">is None</span><span class="s1">:</span>
+        <span class="s2">return </span><span class="s1">dynamic</span><span class="s2">, </span><span class="s4">0</span>
+
+    <span class="s3"># Replace the relative dynamic offset with an absolute offset</span>
+    <span class="s1">dynamic = start + dynamic</span>
+
+    <span class="s3"># Validate the `dynamic` parameter</span>
+    <span class="s2">if </span><span class="s1">dynamic &lt; </span><span class="s4">0</span><span class="s1">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s5">'Dynamic prediction cannot begin prior to the'</span>
+                         <span class="s5">' first observation in the sample.'</span><span class="s1">)</span>
+    <span class="s2">elif </span><span class="s1">dynamic &gt; end:</span>
+        <span class="s1">warn(</span><span class="s5">'Dynamic prediction specified to begin after the end of'</span>
+             <span class="s5">' prediction, and so has no effect.'</span><span class="s2">, </span><span class="s1">ValueWarning)</span>
+        <span class="s2">return None, </span><span class="s4">0</span>
+    <span class="s2">elif </span><span class="s1">dynamic &gt; nobs:</span>
+        <span class="s1">warn(</span><span class="s5">'Dynamic prediction specified to begin during'</span>
+             <span class="s5">' out-of-sample forecasting period, and so has no'</span>
+             <span class="s5">' effect.'</span><span class="s2">, </span><span class="s1">ValueWarning)</span>
+        <span class="s2">return None, </span><span class="s4">0</span>
+
+    <span class="s3"># Get the total size of the desired dynamic forecasting component</span>
+    <span class="s3"># Note: the first `dynamic` periods of prediction are actually</span>
+    <span class="s3"># *not* dynamic, because dynamic prediction begins at observation</span>
+    <span class="s3"># `dynamic`.</span>
+    <span class="s1">ndynamic = max(</span><span class="s4">0</span><span class="s2">, </span><span class="s1">min(end</span><span class="s2">, </span><span class="s1">nobs) - dynamic)</span>
+    <span class="s2">return </span><span class="s1">dynamic</span><span class="s2">, </span><span class="s1">ndynamic</span>
+</pre>
+</body>
+</html>

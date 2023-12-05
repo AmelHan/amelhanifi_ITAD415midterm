@@ -1,0 +1,699 @@
+<html>
+<head>
+<title>distributed_estimation.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cc7832;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #6a8759;}
+.s3 { color: #629755; font-style: italic;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+distributed_estimation.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">statsmodels.base.elastic_net </span><span class="s0">import </span><span class="s1">RegularizedResults</span>
+<span class="s0">from </span><span class="s1">statsmodels.stats.regularized_covariance </span><span class="s0">import </span><span class="s1">_calc_nodewise_row</span><span class="s0">, </span><span class="s1">\</span>
+    <span class="s1">_calc_nodewise_weight</span><span class="s0">, </span><span class="s1">_calc_approx_inv_cov</span>
+<span class="s0">from </span><span class="s1">statsmodels.base.model </span><span class="s0">import </span><span class="s1">LikelihoodModelResults</span>
+<span class="s0">from </span><span class="s1">statsmodels.regression.linear_model </span><span class="s0">import </span><span class="s1">OLS</span>
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s2">&quot;&quot;&quot; 
+Distributed estimation routines. Currently, we support several 
+methods of distribution 
+ 
+- sequential, has no extra dependencies 
+- parallel 
+    - with joblib 
+        A variety of backends are supported through joblib 
+        This allows for different types of clusters besides 
+        standard local clusters.  Some examples of 
+        backends supported by joblib are 
+          - dask.distributed 
+          - yarn 
+          - ipyparallel 
+ 
+The framework is very general and allows for a variety of 
+estimation methods.  Currently, these include 
+ 
+- debiased regularized estimation 
+- simple coefficient averaging (naive) 
+    - regularized 
+    - unregularized 
+ 
+Currently, the default is regularized estimation with debiasing 
+which follows the methods outlined in 
+ 
+Jason D. Lee, Qiang Liu, Yuekai Sun and Jonathan E. Taylor. 
+&quot;Communication-Efficient Sparse Regression: A One-Shot Approach.&quot; 
+arXiv:1503.04337. 2015. https://arxiv.org/abs/1503.04337. 
+ 
+There are several variables that are taken from the source paper 
+for which the interpretation may not be directly clear from the 
+code, these are mostly used to help form the estimate of the 
+approximate inverse covariance matrix as part of the 
+debiasing procedure. 
+ 
+    wexog 
+ 
+    A weighted design matrix used to perform the node-wise 
+    regression procedure. 
+ 
+    nodewise_row 
+ 
+    nodewise_row is produced as part of the node-wise regression 
+    procedure used to produce the approximate inverse covariance 
+    matrix.  One is produced for each variable using the 
+    LASSO. 
+ 
+    nodewise_weight 
+ 
+    nodewise_weight is produced using the gamma_hat values for 
+    each p to produce weights to reweight the gamma_hat values which 
+    are ultimately used to form approx_inv_cov. 
+ 
+    approx_inv_cov 
+ 
+    This is the estimate of the approximate inverse covariance 
+    matrix.  This is used to debiase the coefficient average 
+    along with the average gradient.  For the OLS case, 
+    approx_inv_cov is an approximation for 
+ 
+        n * (X^T X)^{-1} 
+ 
+    formed by node-wise regression. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s0">def </span><span class="s1">_est_regularized_naive(mod</span><span class="s0">, </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">partitions</span><span class="s0">, </span><span class="s1">fit_kwds=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;estimates the regularized fitted parameters. 
+ 
+    Parameters 
+    ---------- 
+    mod : statsmodels model class instance 
+        The model for the current partition. 
+    pnum : scalar 
+        Index of current partition 
+    partitions : scalar 
+        Total number of partitions 
+    fit_kwds : dict-like or None 
+        Keyword arguments to be given to fit_regularized 
+ 
+    Returns 
+    ------- 
+    An array of the parameters for the regularized fit 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">if </span><span class="s1">fit_kwds </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;_est_regularized_naive currently &quot; </span><span class="s1">+</span>
+                         <span class="s2">&quot;requires that fit_kwds not be None.&quot;</span><span class="s1">)</span>
+
+    <span class="s0">return </span><span class="s1">mod.fit_regularized(**fit_kwds).params</span>
+
+
+<span class="s0">def </span><span class="s1">_est_unregularized_naive(mod</span><span class="s0">, </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">partitions</span><span class="s0">, </span><span class="s1">fit_kwds=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;estimates the unregularized fitted parameters. 
+ 
+    Parameters 
+    ---------- 
+    mod : statsmodels model class instance 
+        The model for the current partition. 
+    pnum : scalar 
+        Index of current partition 
+    partitions : scalar 
+        Total number of partitions 
+    fit_kwds : dict-like or None 
+        Keyword arguments to be given to fit 
+ 
+    Returns 
+    ------- 
+    An array of the parameters for the fit 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">if </span><span class="s1">fit_kwds </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;_est_unregularized_naive currently &quot; </span><span class="s1">+</span>
+                         <span class="s2">&quot;requires that fit_kwds not be None.&quot;</span><span class="s1">)</span>
+
+    <span class="s0">return </span><span class="s1">mod.fit(**fit_kwds).params</span>
+
+
+<span class="s0">def </span><span class="s1">_join_naive(params_l</span><span class="s0">, </span><span class="s1">threshold=</span><span class="s4">0</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;joins the results from each run of _est_&lt;type&gt;_naive 
+    and returns the mean estimate of the coefficients 
+ 
+    Parameters 
+    ---------- 
+    params_l : list 
+        A list of arrays of coefficients. 
+    threshold : scalar 
+        The threshold at which the coefficients will be cut. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">p = len(params_l[</span><span class="s4">0</span><span class="s1">])</span>
+    <span class="s1">partitions = len(params_l)</span>
+
+    <span class="s1">params_mn = np.zeros(p)</span>
+    <span class="s0">for </span><span class="s1">params </span><span class="s0">in </span><span class="s1">params_l:</span>
+        <span class="s1">params_mn += params</span>
+    <span class="s1">params_mn /= partitions</span>
+
+    <span class="s1">params_mn[np.abs(params_mn) &lt; threshold] = </span><span class="s4">0</span>
+
+    <span class="s0">return </span><span class="s1">params_mn</span>
+
+
+<span class="s0">def </span><span class="s1">_calc_grad(mod</span><span class="s0">, </span><span class="s1">params</span><span class="s0">, </span><span class="s1">alpha</span><span class="s0">, </span><span class="s1">L1_wt</span><span class="s0">, </span><span class="s1">score_kwds):</span>
+    <span class="s3">&quot;&quot;&quot;calculates the log-likelihood gradient for the debiasing 
+ 
+    Parameters 
+    ---------- 
+    mod : statsmodels model class instance 
+        The model for the current partition. 
+    params : array_like 
+        The estimated coefficients for the current partition. 
+    alpha : scalar or array_like 
+        The penalty weight.  If a scalar, the same penalty weight 
+        applies to all variables in the model.  If a vector, it 
+        must have the same length as `params`, and contains a 
+        penalty weight for each coefficient. 
+    L1_wt : scalar 
+        The fraction of the penalty given to the L1 penalty term. 
+        Must be between 0 and 1 (inclusive).  If 0, the fit is 
+        a ridge fit, if 1 it is a lasso fit. 
+    score_kwds : dict-like or None 
+        Keyword arguments for the score function. 
+ 
+    Returns 
+    ------- 
+    An array-like object of the same dimension as params 
+ 
+    Notes 
+    ----- 
+    In general: 
+ 
+    gradient l_k(params) 
+ 
+    where k corresponds to the index of the partition 
+ 
+    For OLS: 
+ 
+    X^T(y - X^T params) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">grad = -mod.score(np.asarray(params)</span><span class="s0">, </span><span class="s1">**score_kwds)</span>
+    <span class="s1">grad += alpha * (</span><span class="s4">1 </span><span class="s1">- L1_wt)</span>
+    <span class="s0">return </span><span class="s1">grad</span>
+
+
+<span class="s0">def </span><span class="s1">_calc_wdesign_mat(mod</span><span class="s0">, </span><span class="s1">params</span><span class="s0">, </span><span class="s1">hess_kwds):</span>
+    <span class="s3">&quot;&quot;&quot;calculates the weighted design matrix necessary to generate 
+    the approximate inverse covariance matrix 
+ 
+    Parameters 
+    ---------- 
+    mod : statsmodels model class instance 
+        The model for the current partition. 
+    params : array_like 
+        The estimated coefficients for the current partition. 
+    hess_kwds : dict-like or None 
+        Keyword arguments for the hessian function. 
+ 
+    Returns 
+    ------- 
+    An array-like object, updated design matrix, same dimension 
+    as mod.exog 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">rhess = np.sqrt(mod.hessian_factor(np.asarray(params)</span><span class="s0">, </span><span class="s1">**hess_kwds))</span>
+    <span class="s0">return </span><span class="s1">rhess[:</span><span class="s0">, None</span><span class="s1">] * mod.exog</span>
+
+
+<span class="s0">def </span><span class="s1">_est_regularized_debiased(mod</span><span class="s0">, </span><span class="s1">mnum</span><span class="s0">, </span><span class="s1">partitions</span><span class="s0">, </span><span class="s1">fit_kwds=</span><span class="s0">None,</span>
+                              <span class="s1">score_kwds=</span><span class="s0">None, </span><span class="s1">hess_kwds=</span><span class="s0">None</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;estimates the regularized fitted parameters, is the default 
+    estimation_method for class DistributedModel. 
+ 
+    Parameters 
+    ---------- 
+    mod : statsmodels model class instance 
+        The model for the current partition. 
+    mnum : scalar 
+        Index of current partition. 
+    partitions : scalar 
+        Total number of partitions. 
+    fit_kwds : dict-like or None 
+        Keyword arguments to be given to fit_regularized 
+    score_kwds : dict-like or None 
+        Keyword arguments for the score function. 
+    hess_kwds : dict-like or None 
+        Keyword arguments for the Hessian function. 
+ 
+    Returns 
+    ------- 
+    A tuple of parameters for regularized fit 
+        An array-like object of the fitted parameters, params 
+        An array-like object for the gradient 
+        A list of array like objects for nodewise_row 
+        A list of array like objects for nodewise_weight 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">score_kwds = {} </span><span class="s0">if </span><span class="s1">score_kwds </span><span class="s0">is None else </span><span class="s1">score_kwds</span>
+    <span class="s1">hess_kwds = {} </span><span class="s0">if </span><span class="s1">hess_kwds </span><span class="s0">is None else </span><span class="s1">hess_kwds</span>
+
+    <span class="s0">if </span><span class="s1">fit_kwds </span><span class="s0">is None</span><span class="s1">:</span>
+        <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;_est_regularized_debiased currently &quot; </span><span class="s1">+</span>
+                         <span class="s2">&quot;requires that fit_kwds not be None.&quot;</span><span class="s1">)</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">alpha = fit_kwds[</span><span class="s2">&quot;alpha&quot;</span><span class="s1">]</span>
+
+    <span class="s0">if </span><span class="s2">&quot;L1_wt&quot; </span><span class="s0">in </span><span class="s1">fit_kwds:</span>
+        <span class="s1">L1_wt = fit_kwds[</span><span class="s2">&quot;L1_wt&quot;</span><span class="s1">]</span>
+    <span class="s0">else</span><span class="s1">:</span>
+        <span class="s1">L1_wt = </span><span class="s4">1</span>
+
+    <span class="s1">nobs</span><span class="s0">, </span><span class="s1">p = mod.exog.shape</span>
+    <span class="s1">p_part = int(np.ceil((</span><span class="s4">1. </span><span class="s1">* p) / partitions))</span>
+
+    <span class="s1">params = mod.fit_regularized(**fit_kwds).params</span>
+    <span class="s1">grad = _calc_grad(mod</span><span class="s0">, </span><span class="s1">params</span><span class="s0">, </span><span class="s1">alpha</span><span class="s0">, </span><span class="s1">L1_wt</span><span class="s0">, </span><span class="s1">score_kwds) / nobs</span>
+
+    <span class="s1">wexog = _calc_wdesign_mat(mod</span><span class="s0">, </span><span class="s1">params</span><span class="s0">, </span><span class="s1">hess_kwds)</span>
+
+    <span class="s1">nodewise_row_l = []</span>
+    <span class="s1">nodewise_weight_l = []</span>
+    <span class="s0">for </span><span class="s1">idx </span><span class="s0">in </span><span class="s1">range(mnum * p_part</span><span class="s0">, </span><span class="s1">min((mnum + </span><span class="s4">1</span><span class="s1">) * p_part</span><span class="s0">, </span><span class="s1">p)):</span>
+
+        <span class="s1">nodewise_row = _calc_nodewise_row(wexog</span><span class="s0">, </span><span class="s1">idx</span><span class="s0">, </span><span class="s1">alpha)</span>
+        <span class="s1">nodewise_row_l.append(nodewise_row)</span>
+
+        <span class="s1">nodewise_weight = _calc_nodewise_weight(wexog</span><span class="s0">, </span><span class="s1">nodewise_row</span><span class="s0">, </span><span class="s1">idx</span><span class="s0">,</span>
+                                                <span class="s1">alpha)</span>
+        <span class="s1">nodewise_weight_l.append(nodewise_weight)</span>
+
+    <span class="s0">return </span><span class="s1">params</span><span class="s0">, </span><span class="s1">grad</span><span class="s0">, </span><span class="s1">nodewise_row_l</span><span class="s0">, </span><span class="s1">nodewise_weight_l</span>
+
+
+<span class="s0">def </span><span class="s1">_join_debiased(results_l</span><span class="s0">, </span><span class="s1">threshold=</span><span class="s4">0</span><span class="s1">):</span>
+    <span class="s3">&quot;&quot;&quot;joins the results from each run of _est_regularized_debiased 
+    and returns the debiased estimate of the coefficients 
+ 
+    Parameters 
+    ---------- 
+    results_l : list 
+        A list of tuples each one containing the params, grad, 
+        nodewise_row and nodewise_weight values for each partition. 
+    threshold : scalar 
+        The threshold at which the coefficients will be cut. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">p = len(results_l[</span><span class="s4">0</span><span class="s1">][</span><span class="s4">0</span><span class="s1">])</span>
+    <span class="s1">partitions = len(results_l)</span>
+
+    <span class="s1">params_mn = np.zeros(p)</span>
+    <span class="s1">grad_mn = np.zeros(p)</span>
+
+    <span class="s1">nodewise_row_l = []</span>
+    <span class="s1">nodewise_weight_l = []</span>
+
+    <span class="s0">for </span><span class="s1">r </span><span class="s0">in </span><span class="s1">results_l:</span>
+
+        <span class="s1">params_mn += r[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">grad_mn += r[</span><span class="s4">1</span><span class="s1">]</span>
+
+        <span class="s1">nodewise_row_l.extend(r[</span><span class="s4">2</span><span class="s1">])</span>
+        <span class="s1">nodewise_weight_l.extend(r[</span><span class="s4">3</span><span class="s1">])</span>
+
+    <span class="s1">nodewise_row_l = np.array(nodewise_row_l)</span>
+    <span class="s1">nodewise_weight_l = np.array(nodewise_weight_l)</span>
+
+    <span class="s1">params_mn /= partitions</span>
+    <span class="s1">grad_mn *= -</span><span class="s4">1. </span><span class="s1">/ partitions</span>
+
+    <span class="s1">approx_inv_cov = _calc_approx_inv_cov(nodewise_row_l</span><span class="s0">, </span><span class="s1">nodewise_weight_l)</span>
+
+    <span class="s1">debiased_params = params_mn + approx_inv_cov.dot(grad_mn)</span>
+
+    <span class="s1">debiased_params[np.abs(debiased_params) &lt; threshold] = </span><span class="s4">0</span>
+
+    <span class="s0">return </span><span class="s1">debiased_params</span>
+
+
+<span class="s0">def </span><span class="s1">_helper_fit_partition(self</span><span class="s0">, </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">endog</span><span class="s0">, </span><span class="s1">exog</span><span class="s0">, </span><span class="s1">fit_kwds</span><span class="s0">,</span>
+                          <span class="s1">init_kwds_e={}):</span>
+    <span class="s3">&quot;&quot;&quot;handles the model fitting for each machine. NOTE: this 
+    is primarily handled outside of DistributedModel because 
+    joblib cannot handle class methods. 
+ 
+    Parameters 
+    ---------- 
+    self : DistributedModel class instance 
+        An instance of DistributedModel. 
+    pnum : scalar 
+        index of current partition. 
+    endog : array_like 
+        endogenous data for current partition. 
+    exog : array_like 
+        exogenous data for current partition. 
+    fit_kwds : dict-like 
+        Keywords needed for the model fitting. 
+    init_kwds_e : dict-like 
+        Additional init_kwds to add for each partition. 
+ 
+    Returns 
+    ------- 
+    estimation_method result.  For the default, 
+    _est_regularized_debiased, a tuple. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">temp_init_kwds = self.init_kwds.copy()</span>
+    <span class="s1">temp_init_kwds.update(init_kwds_e)</span>
+
+    <span class="s1">model = self.model_class(endog</span><span class="s0">, </span><span class="s1">exog</span><span class="s0">, </span><span class="s1">**temp_init_kwds)</span>
+    <span class="s1">results = self.estimation_method(model</span><span class="s0">, </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">self.partitions</span><span class="s0">,</span>
+                                     <span class="s1">fit_kwds=fit_kwds</span><span class="s0">,</span>
+                                     <span class="s1">**self.estimation_kwds)</span>
+    <span class="s0">return </span><span class="s1">results</span>
+
+
+<span class="s0">class </span><span class="s1">DistributedModel:</span>
+    <span class="s1">__doc__ = </span><span class="s2">&quot;&quot;&quot; 
+    Distributed model class 
+ 
+    Parameters 
+    ---------- 
+    partitions : scalar 
+        The number of partitions that the data will be split into. 
+    model_class : statsmodels model class 
+        The model class which will be used for estimation. If None 
+        this defaults to OLS. 
+    init_kwds : dict-like or None 
+        Keywords needed for initializing the model, in addition to 
+        endog and exog. 
+    init_kwds_generator : generator or None 
+        Additional keyword generator that produces model init_kwds 
+        that may vary based on data partition.  The current usecase 
+        is for WLS and GLS 
+    estimation_method : function or None 
+        The method that performs the estimation for each partition. 
+        If None this defaults to _est_regularized_debiased. 
+    estimation_kwds : dict-like or None 
+        Keywords to be passed to estimation_method. 
+    join_method : function or None 
+        The method used to recombine the results from each partition. 
+        If None this defaults to _join_debiased. 
+    join_kwds : dict-like or None 
+        Keywords to be passed to join_method. 
+    results_class : results class or None 
+        The class of results that should be returned.  If None this 
+        defaults to RegularizedResults. 
+    results_kwds : dict-like or None 
+        Keywords to be passed to results class. 
+ 
+    Attributes 
+    ---------- 
+    partitions : scalar 
+        See Parameters. 
+    model_class : statsmodels model class 
+        See Parameters. 
+    init_kwds : dict-like 
+        See Parameters. 
+    init_kwds_generator : generator or None 
+        See Parameters. 
+    estimation_method : function 
+        See Parameters. 
+    estimation_kwds : dict-like 
+        See Parameters. 
+    join_method : function 
+        See Parameters. 
+    join_kwds : dict-like 
+        See Parameters. 
+    results_class : results class 
+        See Parameters. 
+    results_kwds : dict-like 
+        See Parameters. 
+ 
+    Notes 
+    ----- 
+ 
+    Examples 
+    -------- 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">partitions</span><span class="s0">, </span><span class="s1">model_class=</span><span class="s0">None,</span>
+                 <span class="s1">init_kwds=</span><span class="s0">None, </span><span class="s1">estimation_method=</span><span class="s0">None,</span>
+                 <span class="s1">estimation_kwds=</span><span class="s0">None, </span><span class="s1">join_method=</span><span class="s0">None, </span><span class="s1">join_kwds=</span><span class="s0">None,</span>
+                 <span class="s1">results_class=</span><span class="s0">None, </span><span class="s1">results_kwds=</span><span class="s0">None</span><span class="s1">):</span>
+
+        <span class="s1">self.partitions = partitions</span>
+
+        <span class="s0">if </span><span class="s1">model_class </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self.model_class = OLS</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.model_class = model_class</span>
+
+        <span class="s0">if </span><span class="s1">init_kwds </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self.init_kwds = {}</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.init_kwds = init_kwds</span>
+
+        <span class="s0">if </span><span class="s1">estimation_method </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self.estimation_method = _est_regularized_debiased</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.estimation_method = estimation_method</span>
+
+        <span class="s0">if </span><span class="s1">estimation_kwds </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self.estimation_kwds = {}</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.estimation_kwds = estimation_kwds</span>
+
+        <span class="s0">if </span><span class="s1">join_method </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self.join_method = _join_debiased</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.join_method = join_method</span>
+
+        <span class="s0">if </span><span class="s1">join_kwds </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self.join_kwds = {}</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.join_kwds = join_kwds</span>
+
+        <span class="s0">if </span><span class="s1">results_class </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self.results_class = RegularizedResults</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.results_class = results_class</span>
+
+        <span class="s0">if </span><span class="s1">results_kwds </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">self.results_kwds = {}</span>
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s1">self.results_kwds = results_kwds</span>
+
+    <span class="s0">def </span><span class="s1">fit(self</span><span class="s0">, </span><span class="s1">data_generator</span><span class="s0">, </span><span class="s1">fit_kwds=</span><span class="s0">None, </span><span class="s1">parallel_method=</span><span class="s2">&quot;sequential&quot;</span><span class="s0">,</span>
+            <span class="s1">parallel_backend=</span><span class="s0">None, </span><span class="s1">init_kwds_generator=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Performs the distributed estimation using the corresponding 
+        DistributedModel 
+ 
+        Parameters 
+        ---------- 
+        data_generator : generator 
+            A generator that produces a sequence of tuples where the first 
+            element in the tuple corresponds to an endog array and the 
+            element corresponds to an exog array. 
+        fit_kwds : dict-like or None 
+            Keywords needed for the model fitting. 
+        parallel_method : str 
+            type of distributed estimation to be used, currently 
+            &quot;sequential&quot;, &quot;joblib&quot; and &quot;dask&quot; are supported. 
+        parallel_backend : None or joblib parallel_backend object 
+            used to allow support for more complicated backends, 
+            ex: dask.distributed 
+        init_kwds_generator : generator or None 
+            Additional keyword generator that produces model init_kwds 
+            that may vary based on data partition.  The current usecase 
+            is for WLS and GLS 
+ 
+        Returns 
+        ------- 
+        join_method result.  For the default, _join_debiased, it returns a 
+        p length array. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">if </span><span class="s1">fit_kwds </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">fit_kwds = {}</span>
+
+        <span class="s0">if </span><span class="s1">parallel_method == </span><span class="s2">&quot;sequential&quot;</span><span class="s1">:</span>
+            <span class="s1">results_l = self.fit_sequential(data_generator</span><span class="s0">, </span><span class="s1">fit_kwds</span><span class="s0">,</span>
+                                            <span class="s1">init_kwds_generator)</span>
+
+        <span class="s0">elif </span><span class="s1">parallel_method == </span><span class="s2">&quot;joblib&quot;</span><span class="s1">:</span>
+            <span class="s1">results_l = self.fit_joblib(data_generator</span><span class="s0">, </span><span class="s1">fit_kwds</span><span class="s0">,</span>
+                                        <span class="s1">parallel_backend</span><span class="s0">,</span>
+                                        <span class="s1">init_kwds_generator)</span>
+
+        <span class="s0">else</span><span class="s1">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError(</span><span class="s2">&quot;parallel_method: %s is currently not supported&quot;</span>
+                             <span class="s1">% parallel_method)</span>
+
+        <span class="s1">params = self.join_method(results_l</span><span class="s0">, </span><span class="s1">**self.join_kwds)</span>
+
+        <span class="s5"># NOTE that currently, the dummy result model that is initialized</span>
+        <span class="s5"># here does not use any init_kwds from the init_kwds_generator event</span>
+        <span class="s5"># if it is provided.  It is possible to imagine an edge case where</span>
+        <span class="s5"># this might be a problem but given that the results model instance</span>
+        <span class="s5"># does not correspond to any data partition this seems reasonable.</span>
+        <span class="s1">res_mod = self.model_class([</span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">[</span><span class="s4">0</span><span class="s1">]</span><span class="s0">, </span><span class="s1">**self.init_kwds)</span>
+
+        <span class="s0">return </span><span class="s1">self.results_class(res_mod</span><span class="s0">, </span><span class="s1">params</span><span class="s0">, </span><span class="s1">**self.results_kwds)</span>
+
+    <span class="s0">def </span><span class="s1">fit_sequential(self</span><span class="s0">, </span><span class="s1">data_generator</span><span class="s0">, </span><span class="s1">fit_kwds</span><span class="s0">,</span>
+                       <span class="s1">init_kwds_generator=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Sequentially performs the distributed estimation using 
+        the corresponding DistributedModel 
+ 
+        Parameters 
+        ---------- 
+        data_generator : generator 
+            A generator that produces a sequence of tuples where the first 
+            element in the tuple corresponds to an endog array and the 
+            element corresponds to an exog array. 
+        fit_kwds : dict-like 
+            Keywords needed for the model fitting. 
+        init_kwds_generator : generator or None 
+            Additional keyword generator that produces model init_kwds 
+            that may vary based on data partition.  The current usecase 
+            is for WLS and GLS 
+ 
+        Returns 
+        ------- 
+        join_method result.  For the default, _join_debiased, it returns a 
+        p length array. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">results_l = []</span>
+
+        <span class="s0">if </span><span class="s1">init_kwds_generator </span><span class="s0">is None</span><span class="s1">:</span>
+
+            <span class="s0">for </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">(endog</span><span class="s0">, </span><span class="s1">exog) </span><span class="s0">in </span><span class="s1">enumerate(data_generator):</span>
+
+                <span class="s1">results = _helper_fit_partition(self</span><span class="s0">, </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">endog</span><span class="s0">, </span><span class="s1">exog</span><span class="s0">,</span>
+                                                <span class="s1">fit_kwds)</span>
+                <span class="s1">results_l.append(results)</span>
+
+        <span class="s0">else</span><span class="s1">:</span>
+
+            <span class="s1">tup_gen = enumerate(zip(data_generator</span><span class="s0">,</span>
+                                    <span class="s1">init_kwds_generator))</span>
+
+            <span class="s0">for </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">((endog</span><span class="s0">, </span><span class="s1">exog)</span><span class="s0">, </span><span class="s1">init_kwds_e) </span><span class="s0">in </span><span class="s1">tup_gen:</span>
+
+                <span class="s1">results = _helper_fit_partition(self</span><span class="s0">, </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">endog</span><span class="s0">, </span><span class="s1">exog</span><span class="s0">,</span>
+                                                <span class="s1">fit_kwds</span><span class="s0">, </span><span class="s1">init_kwds_e)</span>
+                <span class="s1">results_l.append(results)</span>
+
+        <span class="s0">return </span><span class="s1">results_l</span>
+
+    <span class="s0">def </span><span class="s1">fit_joblib(self</span><span class="s0">, </span><span class="s1">data_generator</span><span class="s0">, </span><span class="s1">fit_kwds</span><span class="s0">, </span><span class="s1">parallel_backend</span><span class="s0">,</span>
+                   <span class="s1">init_kwds_generator=</span><span class="s0">None</span><span class="s1">):</span>
+        <span class="s3">&quot;&quot;&quot;Performs the distributed estimation in parallel using joblib 
+ 
+        Parameters 
+        ---------- 
+        data_generator : generator 
+            A generator that produces a sequence of tuples where the first 
+            element in the tuple corresponds to an endog array and the 
+            element corresponds to an exog array. 
+        fit_kwds : dict-like 
+            Keywords needed for the model fitting. 
+        parallel_backend : None or joblib parallel_backend object 
+            used to allow support for more complicated backends, 
+            ex: dask.distributed 
+        init_kwds_generator : generator or None 
+            Additional keyword generator that produces model init_kwds 
+            that may vary based on data partition.  The current usecase 
+            is for WLS and GLS 
+ 
+        Returns 
+        ------- 
+        join_method result.  For the default, _join_debiased, it returns a 
+        p length array. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">from </span><span class="s1">statsmodels.tools.parallel </span><span class="s0">import </span><span class="s1">parallel_func</span>
+
+        <span class="s1">par</span><span class="s0">, </span><span class="s1">f</span><span class="s0">, </span><span class="s1">n_jobs = parallel_func(_helper_fit_partition</span><span class="s0">, </span><span class="s1">self.partitions)</span>
+
+        <span class="s0">if </span><span class="s1">parallel_backend </span><span class="s0">is None and </span><span class="s1">init_kwds_generator </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s1">results_l = par(f(self</span><span class="s0">, </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">endog</span><span class="s0">, </span><span class="s1">exog</span><span class="s0">, </span><span class="s1">fit_kwds)</span>
+                            <span class="s0">for </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">(endog</span><span class="s0">, </span><span class="s1">exog)</span>
+                            <span class="s0">in </span><span class="s1">enumerate(data_generator))</span>
+
+        <span class="s0">elif </span><span class="s1">parallel_backend </span><span class="s0">is not None and </span><span class="s1">init_kwds_generator </span><span class="s0">is None</span><span class="s1">:</span>
+            <span class="s0">with </span><span class="s1">parallel_backend:</span>
+                <span class="s1">results_l = par(f(self</span><span class="s0">, </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">endog</span><span class="s0">, </span><span class="s1">exog</span><span class="s0">, </span><span class="s1">fit_kwds)</span>
+                                <span class="s0">for </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">(endog</span><span class="s0">, </span><span class="s1">exog)</span>
+                                <span class="s0">in </span><span class="s1">enumerate(data_generator))</span>
+
+        <span class="s0">elif </span><span class="s1">parallel_backend </span><span class="s0">is None and </span><span class="s1">init_kwds_generator </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">tup_gen = enumerate(zip(data_generator</span><span class="s0">, </span><span class="s1">init_kwds_generator))</span>
+            <span class="s1">results_l = par(f(self</span><span class="s0">, </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">endog</span><span class="s0">, </span><span class="s1">exog</span><span class="s0">, </span><span class="s1">fit_kwds</span><span class="s0">, </span><span class="s1">init_kwds)</span>
+                            <span class="s0">for </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">((endog</span><span class="s0">, </span><span class="s1">exog)</span><span class="s0">, </span><span class="s1">init_kwds)</span>
+                            <span class="s0">in </span><span class="s1">tup_gen)</span>
+
+        <span class="s0">elif </span><span class="s1">parallel_backend </span><span class="s0">is not None and </span><span class="s1">init_kwds_generator </span><span class="s0">is not None</span><span class="s1">:</span>
+            <span class="s1">tup_gen = enumerate(zip(data_generator</span><span class="s0">, </span><span class="s1">init_kwds_generator))</span>
+            <span class="s0">with </span><span class="s1">parallel_backend:</span>
+                <span class="s1">results_l = par(f(self</span><span class="s0">, </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">endog</span><span class="s0">, </span><span class="s1">exog</span><span class="s0">, </span><span class="s1">fit_kwds</span><span class="s0">, </span><span class="s1">init_kwds)</span>
+                                <span class="s0">for </span><span class="s1">pnum</span><span class="s0">, </span><span class="s1">((endog</span><span class="s0">, </span><span class="s1">exog)</span><span class="s0">, </span><span class="s1">init_kwds)</span>
+                                <span class="s0">in </span><span class="s1">tup_gen)</span>
+
+        <span class="s0">return </span><span class="s1">results_l</span>
+
+
+<span class="s0">class </span><span class="s1">DistributedResults(LikelihoodModelResults):</span>
+    <span class="s3">&quot;&quot;&quot; 
+    Class to contain model results 
+ 
+    Parameters 
+    ---------- 
+    model : class instance 
+        Class instance for model used for distributed data, 
+        this particular instance uses fake data and is really 
+        only to allow use of methods like predict. 
+    params : ndarray 
+        Parameter estimates from the fit model. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__(self</span><span class="s0">, </span><span class="s1">model</span><span class="s0">, </span><span class="s1">params):</span>
+        <span class="s1">super(DistributedResults</span><span class="s0">, </span><span class="s1">self).__init__(model</span><span class="s0">, </span><span class="s1">params)</span>
+
+    <span class="s0">def </span><span class="s1">predict(self</span><span class="s0">, </span><span class="s1">exog</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs):</span>
+        <span class="s3">&quot;&quot;&quot;Calls self.model.predict for the provided exog.  See 
+        Results.predict. 
+ 
+        Parameters 
+        ---------- 
+        exog : array_like NOT optional 
+            The values for which we want to predict, unlike standard 
+            predict this is NOT optional since the data in self.model 
+            is fake. 
+        *args : 
+            Some models can take additional arguments. See the 
+            predict method of the model for the details. 
+        **kwargs : 
+            Some models can take additional keywords arguments. See the 
+            predict method of the model for the details. 
+ 
+        Returns 
+        ------- 
+            prediction : ndarray, pandas.Series or pandas.DataFrame 
+            See self.model.predict 
+        &quot;&quot;&quot;</span>
+
+        <span class="s0">return </span><span class="s1">self.model.predict(self.params</span><span class="s0">, </span><span class="s1">exog</span><span class="s0">, </span><span class="s1">*args</span><span class="s0">, </span><span class="s1">**kwargs)</span>
+</pre>
+</body>
+</html>

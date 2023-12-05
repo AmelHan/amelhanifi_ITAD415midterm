@@ -1,0 +1,876 @@
+<html>
+<head>
+<title>rolling.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6a8759;}
+.s4 { color: #6897bb;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+rolling.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Rolling OLS and WLS 
+ 
+Implements an efficient rolling estimator that avoids repeated matrix 
+multiplication. 
+ 
+Copyright (c) 2019 Kevin Sheppard 
+License: 3-clause BSD 
+&quot;&quot;&quot;</span>
+<span class="s2">from </span><span class="s1">statsmodels.compat.numpy </span><span class="s2">import </span><span class="s1">lstsq</span>
+<span class="s2">from </span><span class="s1">statsmodels.compat.pandas </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">Appender</span><span class="s2">,</span>
+    <span class="s1">Substitution</span><span class="s2">,</span>
+    <span class="s1">cache_readonly</span><span class="s2">,</span>
+    <span class="s1">call_cached_func</span><span class="s2">,</span>
+    <span class="s1">get_cached_doc</span><span class="s2">,</span>
+<span class="s1">)</span>
+
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">namedtuple</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">pandas </span><span class="s2">import </span><span class="s1">DataFrame</span><span class="s2">, </span><span class="s1">MultiIndex</span><span class="s2">, </span><span class="s1">Series</span>
+<span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">stats</span>
+
+<span class="s2">from </span><span class="s1">statsmodels.base </span><span class="s2">import </span><span class="s1">model</span>
+<span class="s2">from </span><span class="s1">statsmodels.base.model </span><span class="s2">import </span><span class="s1">LikelihoodModelResults</span><span class="s2">, </span><span class="s1">Model</span>
+<span class="s2">from </span><span class="s1">statsmodels.regression.linear_model </span><span class="s2">import </span><span class="s1">(</span>
+    <span class="s1">RegressionModel</span><span class="s2">,</span>
+    <span class="s1">RegressionResults</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s2">from </span><span class="s1">statsmodels.tools.validation </span><span class="s2">import </span><span class="s1">array_like</span><span class="s2">, </span><span class="s1">int_like</span><span class="s2">, </span><span class="s1">string_like</span>
+
+
+<span class="s2">def </span><span class="s1">strip4(line):</span>
+    <span class="s2">if </span><span class="s1">line.startswith(</span><span class="s3">&quot; &quot;</span><span class="s1">):</span>
+        <span class="s2">return </span><span class="s1">line[</span><span class="s4">4</span><span class="s1">:]</span>
+    <span class="s2">return </span><span class="s1">line</span>
+
+
+<span class="s1">RollingStore = namedtuple(</span>
+    <span class="s3">&quot;RollingStore&quot;</span><span class="s2">,</span>
+    <span class="s1">[</span>
+        <span class="s3">&quot;params&quot;</span><span class="s2">,</span>
+        <span class="s3">&quot;ssr&quot;</span><span class="s2">,</span>
+        <span class="s3">&quot;llf&quot;</span><span class="s2">,</span>
+        <span class="s3">&quot;nobs&quot;</span><span class="s2">,</span>
+        <span class="s3">&quot;s2&quot;</span><span class="s2">,</span>
+        <span class="s3">&quot;xpxi&quot;</span><span class="s2">,</span>
+        <span class="s3">&quot;xeex&quot;</span><span class="s2">,</span>
+        <span class="s3">&quot;centered_tss&quot;</span><span class="s2">,</span>
+        <span class="s3">&quot;uncentered_tss&quot;</span><span class="s2">,</span>
+    <span class="s1">]</span><span class="s2">,</span>
+<span class="s1">)</span>
+
+<span class="s1">common_params = </span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">.join(map(strip4</span><span class="s2">, </span><span class="s1">model._model_params_doc.split(</span><span class="s3">&quot;</span><span class="s2">\n</span><span class="s3">&quot;</span><span class="s1">)))</span>
+<span class="s1">window_parameters = </span><span class="s3">&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">window : int 
+    Length of the rolling window. Must be strictly larger than the number 
+    of variables in the model. 
+&quot;&quot;&quot;</span>
+
+<span class="s1">weight_parameters = </span><span class="s3">&quot;&quot;&quot; 
+weights : array_like, optional 
+    A 1d array of weights.  If you supply 1/W then the variables are 
+    pre- multiplied by 1/sqrt(W).  If no weights are supplied the 
+    default value is 1 and WLS results are the same as OLS. 
+&quot;&quot;&quot;</span>
+
+<span class="s1">_missing_param_doc = </span><span class="s3">&quot;&quot;&quot;</span><span class="s2">\ 
+</span><span class="s3">min_nobs : {int, None} 
+    Minimum number of observations required to estimate a model when 
+    data are missing.  If None, the minimum depends on the number of 
+    regressors in the model. Must be smaller than window. 
+missing : str, default &quot;drop&quot; 
+    Available options are &quot;drop&quot;, &quot;skip&quot; and &quot;raise&quot;. If &quot;drop&quot;, any 
+    observations with nans are dropped and the estimates are computed using 
+    only the non-missing values in each window. If 'skip' blocks containing 
+    missing values are skipped and the corresponding results contains NaN. 
+    If 'raise', an error is raised. Default is 'drop'. 
+expanding : bool, default False 
+    If True, then the initial observations after min_nobs are filled using 
+    an expanding scheme until ``window`` observations are available, after 
+    which rolling is used. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s1">extra_base = _missing_param_doc</span>
+<span class="s1">extra_parameters = window_parameters + weight_parameters + extra_base</span>
+
+<span class="s1">_doc = </span><span class="s3">&quot;&quot;&quot; 
+Rolling %(model_type)s Least Squares 
+ 
+%(parameters)s 
+%(extra_parameters)s 
+ 
+See Also 
+-------- 
+statsmodels.regression.linear_model.%(model)s 
+    %(model)s estimation and parameter testing. 
+ 
+Notes 
+----- 
+Tested against %(model)s for accuracy. 
+ 
+Results may differ from %(model)s applied to windows of data if this 
+model contains an implicit constant (i.e., includes dummies for all 
+categories) rather than an explicit constant (e.g., a column of 1s). 
+ 
+Examples 
+-------- 
+&gt;&gt;&gt; from statsmodels.regression.rolling import Rolling%(model)s 
+&gt;&gt;&gt; from statsmodels.datasets import longley 
+&gt;&gt;&gt; data = longley.load() 
+&gt;&gt;&gt; exog = add_constant(data.exog, prepend=False) 
+&gt;&gt;&gt; mod = Rolling%(model)s(data.endog, exog) 
+&gt;&gt;&gt; rolling_res = mod.fit(reset=50) 
+ 
+Use params_only to skip all calculations except parameter estimation 
+ 
+&gt;&gt;&gt; rolling_params = mod.fit(params_only=True) 
+ 
+Use expanding and min_nobs to fill the initial results using an 
+expanding scheme until window observation, and the roll. 
+ 
+&gt;&gt;&gt; mod = Rolling%(model)s(data.endog, exog, window=60, min_nobs=12, 
+... expanding=True) 
+&gt;&gt;&gt; rolling_res = mod.fit() 
+&quot;&quot;&quot;</span>
+
+
+<span class="s1">@Substitution(</span>
+    <span class="s1">model_type=</span><span class="s3">&quot;Weighted&quot;</span><span class="s2">,</span>
+    <span class="s1">model=</span><span class="s3">&quot;WLS&quot;</span><span class="s2">,</span>
+    <span class="s1">parameters=common_params</span><span class="s2">,</span>
+    <span class="s1">extra_parameters=extra_parameters</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s1">@Appender(_doc)</span>
+<span class="s2">class </span><span class="s1">RollingWLS:</span>
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">endog</span><span class="s2">,</span>
+        <span class="s1">exog</span><span class="s2">,</span>
+        <span class="s1">window=</span><span class="s2">None,</span>
+        <span class="s1">*</span><span class="s2">,</span>
+        <span class="s1">weights=</span><span class="s2">None,</span>
+        <span class="s1">min_nobs=</span><span class="s2">None,</span>
+        <span class="s1">missing=</span><span class="s3">&quot;drop&quot;</span><span class="s2">,</span>
+        <span class="s1">expanding=</span><span class="s2">False</span>
+    <span class="s1">):</span>
+        <span class="s5"># Call Model.__init__ twice to use const detection in first pass</span>
+        <span class="s5"># But to not drop in the second pass</span>
+        <span class="s1">missing = string_like(</span>
+            <span class="s1">missing</span><span class="s2">, </span><span class="s3">&quot;missing&quot;</span><span class="s2">, </span><span class="s1">options=(</span><span class="s3">&quot;drop&quot;</span><span class="s2">, </span><span class="s3">&quot;raise&quot;</span><span class="s2">, </span><span class="s3">&quot;skip&quot;</span><span class="s1">)</span>
+        <span class="s1">)</span>
+        <span class="s1">temp_msng = </span><span class="s3">&quot;drop&quot; </span><span class="s2">if </span><span class="s1">missing != </span><span class="s3">&quot;raise&quot; </span><span class="s2">else </span><span class="s3">&quot;raise&quot;</span>
+        <span class="s1">Model.__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">missing=temp_msng</span><span class="s2">, </span><span class="s1">hasconst=</span><span class="s2">None</span><span class="s1">)</span>
+        <span class="s1">k_const = self.k_constant</span>
+        <span class="s1">const_idx = self.data.const_idx</span>
+        <span class="s1">Model.__init__(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">missing=</span><span class="s3">&quot;none&quot;</span><span class="s2">, </span><span class="s1">hasconst=</span><span class="s2">False</span><span class="s1">)</span>
+        <span class="s1">self.k_constant = k_const</span>
+        <span class="s1">self.data.const_idx = const_idx</span>
+        <span class="s1">self._y = array_like(endog</span><span class="s2">, </span><span class="s3">&quot;endog&quot;</span><span class="s1">)</span>
+        <span class="s1">nobs = self._y.shape[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">self._x = array_like(exog</span><span class="s2">, </span><span class="s3">&quot;endog&quot;</span><span class="s2">, </span><span class="s1">ndim=</span><span class="s4">2</span><span class="s2">, </span><span class="s1">shape=(nobs</span><span class="s2">, None</span><span class="s1">))</span>
+        <span class="s1">window = int_like(window</span><span class="s2">, </span><span class="s3">&quot;window&quot;</span><span class="s2">, </span><span class="s1">optional=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">weights = array_like(weights</span><span class="s2">, </span><span class="s3">&quot;weights&quot;</span><span class="s2">, </span><span class="s1">optional=</span><span class="s2">True, </span><span class="s1">shape=(nobs</span><span class="s2">,</span><span class="s1">))</span>
+        <span class="s1">self._window = window </span><span class="s2">if </span><span class="s1">window </span><span class="s2">is not None else </span><span class="s1">self._y.shape[</span><span class="s4">0</span><span class="s1">]</span>
+        <span class="s1">self._weighted = weights </span><span class="s2">is not None</span>
+        <span class="s1">self._weights = np.ones(nobs) </span><span class="s2">if </span><span class="s1">weights </span><span class="s2">is None else </span><span class="s1">weights</span>
+        <span class="s1">w12 = np.sqrt(self._weights)</span>
+        <span class="s1">self._wy = w12 * self._y</span>
+        <span class="s1">self._wx = w12[:</span><span class="s2">, None</span><span class="s1">] * self._x</span>
+
+        <span class="s1">min_nobs = int_like(min_nobs</span><span class="s2">, </span><span class="s3">&quot;min_nobs&quot;</span><span class="s2">, </span><span class="s1">optional=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">self._min_nobs = min_nobs </span><span class="s2">if </span><span class="s1">min_nobs </span><span class="s2">is not None else </span><span class="s1">self._x.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">self._min_nobs &lt; self._x.shape[</span><span class="s4">1</span><span class="s1">] </span><span class="s2">or </span><span class="s1">self._min_nobs &gt; self._window:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">&quot;min_nobs must be larger than the number of &quot;</span>
+                <span class="s3">&quot;regressors in the model and less than window&quot;</span>
+            <span class="s1">)</span>
+
+        <span class="s1">self._expanding = expanding</span>
+
+        <span class="s1">self._is_nan = np.zeros_like(self._y</span><span class="s2">, </span><span class="s1">dtype=bool)</span>
+        <span class="s1">self._has_nan = self._find_nans()</span>
+        <span class="s1">self.const_idx = self.data.const_idx</span>
+        <span class="s1">self._skip_missing = missing == </span><span class="s3">&quot;skip&quot;</span>
+
+    <span class="s2">def </span><span class="s1">_handle_data(self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">missing</span><span class="s2">, </span><span class="s1">hasconst</span><span class="s2">, </span><span class="s1">**kwargs):</span>
+        <span class="s2">return </span><span class="s1">Model._handle_data(</span>
+            <span class="s1">self</span><span class="s2">, </span><span class="s1">endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">missing</span><span class="s2">, </span><span class="s1">hasconst</span><span class="s2">, </span><span class="s1">**kwargs</span>
+        <span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">_find_nans(self):</span>
+        <span class="s1">nans = np.isnan(self._y)</span>
+        <span class="s1">nans |= np.any(np.isnan(self._x)</span><span class="s2">, </span><span class="s1">axis=</span><span class="s4">1</span><span class="s1">)</span>
+        <span class="s1">nans |= np.isnan(self._weights)</span>
+        <span class="s1">self._is_nan[:] = nans</span>
+        <span class="s1">has_nan = np.cumsum(nans)</span>
+        <span class="s1">w = self._window</span>
+        <span class="s1">has_nan[w - </span><span class="s4">1 </span><span class="s1">:] = has_nan[w - </span><span class="s4">1 </span><span class="s1">:] - has_nan[: -(w - </span><span class="s4">1</span><span class="s1">)]</span>
+        <span class="s2">if </span><span class="s1">self._expanding:</span>
+            <span class="s1">has_nan[: self._min_nobs] = </span><span class="s2">False</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">has_nan[: w - </span><span class="s4">1</span><span class="s1">] = </span><span class="s2">False</span>
+
+        <span class="s2">return </span><span class="s1">has_nan.astype(bool)</span>
+
+    <span class="s2">def </span><span class="s1">_get_data(self</span><span class="s2">, </span><span class="s1">idx):</span>
+        <span class="s1">window = self._window</span>
+        <span class="s2">if </span><span class="s1">idx &gt;= window:</span>
+            <span class="s1">loc = slice(idx - window</span><span class="s2">, </span><span class="s1">idx)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">loc = slice(idx)</span>
+        <span class="s1">y = self._y[loc]</span>
+        <span class="s1">wy = self._wy[loc]</span>
+        <span class="s1">wx = self._wx[loc]</span>
+        <span class="s1">weights = self._weights[loc]</span>
+        <span class="s1">missing = self._is_nan[loc]</span>
+        <span class="s1">not_missing = ~missing</span>
+        <span class="s2">if </span><span class="s1">np.any(missing):</span>
+            <span class="s1">y = y[not_missing]</span>
+            <span class="s1">wy = wy[not_missing]</span>
+            <span class="s1">wx = wx[not_missing]</span>
+            <span class="s1">weights = weights[not_missing]</span>
+        <span class="s2">return </span><span class="s1">y</span><span class="s2">, </span><span class="s1">wy</span><span class="s2">, </span><span class="s1">wx</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">not_missing</span>
+
+    <span class="s2">def </span><span class="s1">_fit_single(self</span><span class="s2">, </span><span class="s1">idx</span><span class="s2">, </span><span class="s1">wxpwx</span><span class="s2">, </span><span class="s1">wxpwy</span><span class="s2">, </span><span class="s1">nobs</span><span class="s2">, </span><span class="s1">store</span><span class="s2">, </span><span class="s1">params_only</span><span class="s2">, </span><span class="s1">method):</span>
+        <span class="s2">if </span><span class="s1">nobs &lt; self._min_nobs:</span>
+            <span class="s2">return</span>
+        <span class="s2">try</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">(method == </span><span class="s3">&quot;inv&quot;</span><span class="s1">) </span><span class="s2">or not </span><span class="s1">params_only:</span>
+                <span class="s1">wxpwxi = np.linalg.inv(wxpwx)</span>
+            <span class="s2">if </span><span class="s1">method == </span><span class="s3">&quot;inv&quot;</span><span class="s1">:</span>
+                <span class="s1">params = wxpwxi @ wxpwy</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s1">_</span><span class="s2">, </span><span class="s1">wy</span><span class="s2">, </span><span class="s1">wx</span><span class="s2">, </span><span class="s1">_</span><span class="s2">, </span><span class="s1">_ = self._get_data(idx)</span>
+                <span class="s2">if </span><span class="s1">method == </span><span class="s3">&quot;lstsq&quot;</span><span class="s1">:</span>
+                    <span class="s1">params = lstsq(wx</span><span class="s2">, </span><span class="s1">wy)[</span><span class="s4">0</span><span class="s1">]</span>
+                <span class="s2">else</span><span class="s1">:  </span><span class="s5"># 'pinv'</span>
+                    <span class="s1">wxpwxiwxp = np.linalg.pinv(wx)</span>
+                    <span class="s1">params = wxpwxiwxp @ wy</span>
+
+        <span class="s2">except </span><span class="s1">np.linalg.LinAlgError:</span>
+            <span class="s2">return</span>
+        <span class="s1">store.params[idx - </span><span class="s4">1</span><span class="s1">] = params</span>
+        <span class="s2">if </span><span class="s1">params_only:</span>
+            <span class="s2">return</span>
+        <span class="s1">y</span><span class="s2">, </span><span class="s1">wy</span><span class="s2">, </span><span class="s1">wx</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">_ = self._get_data(idx)</span>
+
+        <span class="s1">wresid</span><span class="s2">, </span><span class="s1">ssr</span><span class="s2">, </span><span class="s1">llf = self._loglike(params</span><span class="s2">, </span><span class="s1">wy</span><span class="s2">, </span><span class="s1">wx</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">nobs)</span>
+        <span class="s1">wxwresid = wx * wresid[:</span><span class="s2">, None</span><span class="s1">]</span>
+        <span class="s1">wxepwxe = wxwresid.T @ wxwresid</span>
+        <span class="s1">tot_params = wx.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">s2 = ssr / (nobs - tot_params)</span>
+
+        <span class="s1">centered_tss</span><span class="s2">, </span><span class="s1">uncentered_tss = self._sum_of_squares(y</span><span class="s2">, </span><span class="s1">wy</span><span class="s2">, </span><span class="s1">weights)</span>
+
+        <span class="s1">store.ssr[idx - </span><span class="s4">1</span><span class="s1">] = ssr</span>
+        <span class="s1">store.llf[idx - </span><span class="s4">1</span><span class="s1">] = llf</span>
+        <span class="s1">store.nobs[idx - </span><span class="s4">1</span><span class="s1">] = nobs</span>
+        <span class="s1">store.s2[idx - </span><span class="s4">1</span><span class="s1">] = s2</span>
+        <span class="s1">store.xpxi[idx - </span><span class="s4">1</span><span class="s1">] = wxpwxi</span>
+        <span class="s1">store.xeex[idx - </span><span class="s4">1</span><span class="s1">] = wxepwxe</span>
+        <span class="s1">store.centered_tss[idx - </span><span class="s4">1</span><span class="s1">] = centered_tss</span>
+        <span class="s1">store.uncentered_tss[idx - </span><span class="s4">1</span><span class="s1">] = uncentered_tss</span>
+
+    <span class="s2">def </span><span class="s1">_loglike(self</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">wy</span><span class="s2">, </span><span class="s1">wx</span><span class="s2">, </span><span class="s1">weights</span><span class="s2">, </span><span class="s1">nobs):</span>
+        <span class="s1">nobs2 = nobs / </span><span class="s4">2.0</span>
+        <span class="s1">wresid = wy - wx @ params</span>
+        <span class="s1">ssr = np.sum(wresid ** </span><span class="s4">2</span><span class="s2">, </span><span class="s1">axis=</span><span class="s4">0</span><span class="s1">)</span>
+        <span class="s1">llf = -np.log(ssr) * nobs2  </span><span class="s5"># concentrated likelihood</span>
+        <span class="s1">llf -= (</span><span class="s4">1 </span><span class="s1">+ np.log(np.pi / nobs2)) * nobs2  </span><span class="s5"># with constant</span>
+        <span class="s1">llf += </span><span class="s4">0.5 </span><span class="s1">* np.sum(np.log(weights))</span>
+        <span class="s2">return </span><span class="s1">wresid</span><span class="s2">, </span><span class="s1">ssr</span><span class="s2">, </span><span class="s1">llf</span>
+
+    <span class="s2">def </span><span class="s1">_sum_of_squares(self</span><span class="s2">, </span><span class="s1">y</span><span class="s2">, </span><span class="s1">wy</span><span class="s2">, </span><span class="s1">weights):</span>
+        <span class="s1">mean = np.average(y</span><span class="s2">, </span><span class="s1">weights=weights)</span>
+        <span class="s1">centered_tss = np.sum(weights * (y - mean) ** </span><span class="s4">2</span><span class="s1">)</span>
+        <span class="s1">uncentered_tss = np.dot(wy</span><span class="s2">, </span><span class="s1">wy)</span>
+        <span class="s2">return </span><span class="s1">centered_tss</span><span class="s2">, </span><span class="s1">uncentered_tss</span>
+
+    <span class="s2">def </span><span class="s1">_reset(self</span><span class="s2">, </span><span class="s1">idx):</span>
+        <span class="s0">&quot;&quot;&quot;Compute xpx and xpy using a single dot product&quot;&quot;&quot;</span>
+        <span class="s1">_</span><span class="s2">, </span><span class="s1">wy</span><span class="s2">, </span><span class="s1">wx</span><span class="s2">, </span><span class="s1">_</span><span class="s2">, </span><span class="s1">not_missing = self._get_data(idx)</span>
+        <span class="s1">nobs = not_missing.sum()</span>
+        <span class="s1">xpx = wx.T @ wx</span>
+        <span class="s1">xpy = wx.T @ wy</span>
+        <span class="s2">return </span><span class="s1">xpx</span><span class="s2">, </span><span class="s1">xpy</span><span class="s2">, </span><span class="s1">nobs</span>
+
+    <span class="s2">def </span><span class="s1">fit(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">method=</span><span class="s3">&quot;inv&quot;</span><span class="s2">,</span>
+        <span class="s1">cov_type=</span><span class="s3">&quot;nonrobust&quot;</span><span class="s2">,</span>
+        <span class="s1">cov_kwds=</span><span class="s2">None,</span>
+        <span class="s1">reset=</span><span class="s2">None,</span>
+        <span class="s1">use_t=</span><span class="s2">False,</span>
+        <span class="s1">params_only=</span><span class="s2">False,</span>
+    <span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimate model parameters. 
+ 
+        Parameters 
+        ---------- 
+        method : {'inv', 'lstsq', 'pinv'} 
+            Method to use when computing the the model parameters. 
+ 
+            * 'inv' - use moving windows inner-products and matrix inversion. 
+              This method is the fastest, but may be less accurate than the 
+              other methods. 
+            * 'lstsq' - Use numpy.linalg.lstsq 
+            * 'pinv' - Use numpy.linalg.pinv. This method matches the default 
+              estimator in non-moving regression estimators. 
+        cov_type : {'nonrobust', 'HCCM', 'HC0'} 
+            Covariance estimator: 
+ 
+            * nonrobust - The classic OLS covariance estimator 
+            * HCCM, HC0 - White heteroskedasticity robust covariance 
+        cov_kwds : dict 
+            Unused 
+        reset : int, optional 
+            Interval to recompute the moving window inner products used to 
+            estimate the model parameters. Smaller values improve accuracy, 
+            although in practice this setting is not required to be set. 
+        use_t : bool, optional 
+            Flag indicating to use the Student's t distribution when computing 
+            p-values. 
+        params_only : bool, optional 
+            Flag indicating that only parameters should be computed. Avoids 
+            calculating all other statistics or performing inference. 
+ 
+        Returns 
+        ------- 
+        RollingRegressionResults 
+            Estimation results where all pre-sample values are nan-filled. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">method = string_like(</span>
+            <span class="s1">method</span><span class="s2">, </span><span class="s3">&quot;method&quot;</span><span class="s2">, </span><span class="s1">options=(</span><span class="s3">&quot;inv&quot;</span><span class="s2">, </span><span class="s3">&quot;lstsq&quot;</span><span class="s2">, </span><span class="s3">&quot;pinv&quot;</span><span class="s1">)</span>
+        <span class="s1">)</span>
+        <span class="s1">reset = int_like(reset</span><span class="s2">, </span><span class="s3">&quot;reset&quot;</span><span class="s2">, </span><span class="s1">optional=</span><span class="s2">True</span><span class="s1">)</span>
+        <span class="s1">reset = self._y.shape[</span><span class="s4">0</span><span class="s1">] </span><span class="s2">if </span><span class="s1">reset </span><span class="s2">is None else </span><span class="s1">reset</span>
+        <span class="s2">if </span><span class="s1">reset &lt; </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span><span class="s3">&quot;reset must be a positive integer&quot;</span><span class="s1">)</span>
+
+        <span class="s1">nobs</span><span class="s2">, </span><span class="s1">k = self._x.shape</span>
+        <span class="s1">store = RollingStore(</span>
+            <span class="s1">params=np.full((nobs</span><span class="s2">, </span><span class="s1">k)</span><span class="s2">, </span><span class="s1">np.nan)</span><span class="s2">,</span>
+            <span class="s1">ssr=np.full(nobs</span><span class="s2">, </span><span class="s1">np.nan)</span><span class="s2">,</span>
+            <span class="s1">llf=np.full(nobs</span><span class="s2">, </span><span class="s1">np.nan)</span><span class="s2">,</span>
+            <span class="s1">nobs=np.zeros(nobs</span><span class="s2">, </span><span class="s1">dtype=int)</span><span class="s2">,</span>
+            <span class="s1">s2=np.full(nobs</span><span class="s2">, </span><span class="s1">np.nan)</span><span class="s2">,</span>
+            <span class="s1">xpxi=np.full((nobs</span><span class="s2">, </span><span class="s1">k</span><span class="s2">, </span><span class="s1">k)</span><span class="s2">, </span><span class="s1">np.nan)</span><span class="s2">,</span>
+            <span class="s1">xeex=np.full((nobs</span><span class="s2">, </span><span class="s1">k</span><span class="s2">, </span><span class="s1">k)</span><span class="s2">, </span><span class="s1">np.nan)</span><span class="s2">,</span>
+            <span class="s1">centered_tss=np.full(nobs</span><span class="s2">, </span><span class="s1">np.nan)</span><span class="s2">,</span>
+            <span class="s1">uncentered_tss=np.full(nobs</span><span class="s2">, </span><span class="s1">np.nan)</span><span class="s2">,</span>
+        <span class="s1">)</span>
+        <span class="s1">w = self._window</span>
+        <span class="s1">first = self._min_nobs </span><span class="s2">if </span><span class="s1">self._expanding </span><span class="s2">else </span><span class="s1">w</span>
+        <span class="s1">xpx</span><span class="s2">, </span><span class="s1">xpy</span><span class="s2">, </span><span class="s1">nobs = self._reset(first)</span>
+        <span class="s2">if not </span><span class="s1">(self._has_nan[first - </span><span class="s4">1</span><span class="s1">] </span><span class="s2">and </span><span class="s1">self._skip_missing):</span>
+            <span class="s1">self._fit_single(first</span><span class="s2">, </span><span class="s1">xpx</span><span class="s2">, </span><span class="s1">xpy</span><span class="s2">, </span><span class="s1">nobs</span><span class="s2">, </span><span class="s1">store</span><span class="s2">, </span><span class="s1">params_only</span><span class="s2">, </span><span class="s1">method)</span>
+        <span class="s1">wx</span><span class="s2">, </span><span class="s1">wy = self._wx</span><span class="s2">, </span><span class="s1">self._wy</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(first + </span><span class="s4">1</span><span class="s2">, </span><span class="s1">self._x.shape[</span><span class="s4">0</span><span class="s1">] + </span><span class="s4">1</span><span class="s1">):</span>
+            <span class="s2">if </span><span class="s1">self._has_nan[i - </span><span class="s4">1</span><span class="s1">] </span><span class="s2">and </span><span class="s1">self._skip_missing:</span>
+                <span class="s2">continue</span>
+            <span class="s2">if </span><span class="s1">i % reset == </span><span class="s4">0</span><span class="s1">:</span>
+                <span class="s1">xpx</span><span class="s2">, </span><span class="s1">xpy</span><span class="s2">, </span><span class="s1">nobs = self._reset(i)</span>
+            <span class="s2">else</span><span class="s1">:</span>
+                <span class="s2">if not </span><span class="s1">self._is_nan[i - w - </span><span class="s4">1</span><span class="s1">] </span><span class="s2">and </span><span class="s1">i &gt; w:</span>
+                    <span class="s1">remove_x = wx[i - w - </span><span class="s4">1 </span><span class="s1">: i - w]</span>
+                    <span class="s1">xpx -= remove_x.T @ remove_x</span>
+                    <span class="s1">xpy -= remove_x.T @ wy[i - w - </span><span class="s4">1 </span><span class="s1">: i - w]</span>
+                    <span class="s1">nobs -= </span><span class="s4">1</span>
+                <span class="s2">if not </span><span class="s1">self._is_nan[i - </span><span class="s4">1</span><span class="s1">]:</span>
+                    <span class="s1">add_x = wx[i - </span><span class="s4">1 </span><span class="s1">: i]</span>
+                    <span class="s1">xpx += add_x.T @ add_x</span>
+                    <span class="s1">xpy += add_x.T @ wy[i - </span><span class="s4">1 </span><span class="s1">: i]</span>
+                    <span class="s1">nobs += </span><span class="s4">1</span>
+
+            <span class="s1">self._fit_single(i</span><span class="s2">, </span><span class="s1">xpx</span><span class="s2">, </span><span class="s1">xpy</span><span class="s2">, </span><span class="s1">nobs</span><span class="s2">, </span><span class="s1">store</span><span class="s2">, </span><span class="s1">params_only</span><span class="s2">, </span><span class="s1">method)</span>
+
+        <span class="s2">return </span><span class="s1">RollingRegressionResults(</span>
+            <span class="s1">self</span><span class="s2">, </span><span class="s1">store</span><span class="s2">, </span><span class="s1">self.k_constant</span><span class="s2">, </span><span class="s1">use_t</span><span class="s2">, </span><span class="s1">cov_type</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s1">@Appender(Model.from_formula.__doc__)</span>
+    <span class="s2">def </span><span class="s1">from_formula(</span>
+        <span class="s1">cls</span><span class="s2">, </span><span class="s1">formula</span><span class="s2">, </span><span class="s1">data</span><span class="s2">, </span><span class="s1">window</span><span class="s2">, </span><span class="s1">weights=</span><span class="s2">None, </span><span class="s1">subset=</span><span class="s2">None, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs</span>
+    <span class="s1">):</span>
+        <span class="s2">if </span><span class="s1">subset </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">data = data.loc[subset]</span>
+        <span class="s1">eval_env = kwargs.pop(</span><span class="s3">&quot;eval_env&quot;</span><span class="s2">, None</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">eval_env </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">eval_env = </span><span class="s4">2</span>
+        <span class="s2">elif </span><span class="s1">eval_env == -</span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s2">from </span><span class="s1">patsy </span><span class="s2">import </span><span class="s1">EvalEnvironment</span>
+
+            <span class="s1">eval_env = EvalEnvironment({})</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">eval_env += </span><span class="s4">1  </span><span class="s5"># we're going down the stack again</span>
+        <span class="s1">missing = kwargs.get(</span><span class="s3">&quot;missing&quot;</span><span class="s2">, </span><span class="s3">&quot;skip&quot;</span><span class="s1">)</span>
+        <span class="s2">from </span><span class="s1">patsy </span><span class="s2">import </span><span class="s1">NAAction</span><span class="s2">, </span><span class="s1">dmatrices</span>
+
+        <span class="s1">na_action = NAAction(on_NA=</span><span class="s3">&quot;raise&quot;</span><span class="s2">, </span><span class="s1">NA_types=[])</span>
+        <span class="s1">result = dmatrices(</span>
+            <span class="s1">formula</span><span class="s2">,</span>
+            <span class="s1">data</span><span class="s2">,</span>
+            <span class="s1">eval_env</span><span class="s2">,</span>
+            <span class="s1">return_type=</span><span class="s3">&quot;dataframe&quot;</span><span class="s2">,</span>
+            <span class="s1">NA_action=na_action</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+        <span class="s1">endog</span><span class="s2">, </span><span class="s1">exog = result</span>
+        <span class="s2">if </span><span class="s1">(endog.ndim &gt; </span><span class="s4">1 </span><span class="s2">and </span><span class="s1">endog.shape[</span><span class="s4">1</span><span class="s1">] &gt; </span><span class="s4">1</span><span class="s1">) </span><span class="s2">or </span><span class="s1">endog.ndim &gt; </span><span class="s4">2</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError(</span>
+                <span class="s3">&quot;endog has evaluated to an array with multiple &quot;</span>
+                <span class="s3">&quot;columns that has shape {0}. This occurs when &quot;</span>
+                <span class="s3">&quot;the variable converted to endog is non-numeric&quot;</span>
+                <span class="s3">&quot; (e.g., bool or str).&quot;</span><span class="s1">.format(endog.shape)</span>
+            <span class="s1">)</span>
+
+        <span class="s1">kwargs.update({</span><span class="s3">&quot;missing&quot;</span><span class="s1">: missing</span><span class="s2">, </span><span class="s3">&quot;window&quot;</span><span class="s1">: window})</span>
+        <span class="s2">if </span><span class="s1">weights </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">kwargs[</span><span class="s3">&quot;weights&quot;</span><span class="s1">] = weights</span>
+        <span class="s1">mod = cls(endog</span><span class="s2">, </span><span class="s1">exog</span><span class="s2">, </span><span class="s1">*args</span><span class="s2">, </span><span class="s1">**kwargs)</span>
+        <span class="s1">mod.formula = formula</span>
+        <span class="s5"># since we got a dataframe, attach the original</span>
+        <span class="s1">mod.data.frame = data</span>
+        <span class="s2">return </span><span class="s1">mod</span>
+
+
+<span class="s1">extra_parameters = window_parameters + extra_base</span>
+
+
+<span class="s1">@Substitution(</span>
+    <span class="s1">model_type=</span><span class="s3">&quot;Ordinary&quot;</span><span class="s2">,</span>
+    <span class="s1">model=</span><span class="s3">&quot;OLS&quot;</span><span class="s2">,</span>
+    <span class="s1">parameters=common_params</span><span class="s2">,</span>
+    <span class="s1">extra_parameters=extra_parameters</span><span class="s2">,</span>
+<span class="s1">)</span>
+<span class="s1">@Appender(_doc)</span>
+<span class="s2">class </span><span class="s1">RollingOLS(RollingWLS):</span>
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">endog</span><span class="s2">,</span>
+        <span class="s1">exog</span><span class="s2">,</span>
+        <span class="s1">window=</span><span class="s2">None,</span>
+        <span class="s1">*</span><span class="s2">,</span>
+        <span class="s1">min_nobs=</span><span class="s2">None,</span>
+        <span class="s1">missing=</span><span class="s3">&quot;drop&quot;</span><span class="s2">,</span>
+        <span class="s1">expanding=</span><span class="s2">False</span>
+    <span class="s1">):</span>
+        <span class="s1">super().__init__(</span>
+            <span class="s1">endog</span><span class="s2">,</span>
+            <span class="s1">exog</span><span class="s2">,</span>
+            <span class="s1">window</span><span class="s2">,</span>
+            <span class="s1">weights=</span><span class="s2">None,</span>
+            <span class="s1">min_nobs=min_nobs</span><span class="s2">,</span>
+            <span class="s1">missing=missing</span><span class="s2">,</span>
+            <span class="s1">expanding=expanding</span><span class="s2">,</span>
+        <span class="s1">)</span>
+
+
+<span class="s2">class </span><span class="s1">RollingRegressionResults:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Results from rolling regressions 
+ 
+    Parameters 
+    ---------- 
+    model : RollingWLS 
+        Model instance 
+    store : RollingStore 
+        Container for raw moving window results 
+    k_constant : bool 
+        Flag indicating that the model contains a constant 
+    use_t : bool 
+        Flag indicating to use the Student's t distribution when computing 
+        p-values. 
+    cov_type : str 
+        Name of covariance estimator 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_data_in_cache = tuple()</span>
+
+    <span class="s2">def </span><span class="s1">__init__(</span>
+        <span class="s1">self</span><span class="s2">, </span><span class="s1">model</span><span class="s2">, </span><span class="s1">store: RollingStore</span><span class="s2">, </span><span class="s1">k_constant</span><span class="s2">, </span><span class="s1">use_t</span><span class="s2">, </span><span class="s1">cov_type</span>
+    <span class="s1">):</span>
+        <span class="s1">self.model = model</span>
+        <span class="s1">self._params = store.params</span>
+        <span class="s1">self._ssr = store.ssr</span>
+        <span class="s1">self._llf = store.llf</span>
+        <span class="s1">self._nobs = store.nobs</span>
+        <span class="s1">self._s2 = store.s2</span>
+        <span class="s1">self._xpxi = store.xpxi</span>
+        <span class="s1">self._xepxe = store.xeex</span>
+        <span class="s1">self._centered_tss = store.centered_tss</span>
+        <span class="s1">self._uncentered_tss = store.uncentered_tss</span>
+        <span class="s1">self._k_constant = k_constant</span>
+        <span class="s1">self._nvar = self._xpxi.shape[-</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s2">if </span><span class="s1">use_t </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">use_t = cov_type == </span><span class="s3">&quot;nonrobust&quot;</span>
+        <span class="s1">self._use_t = use_t</span>
+        <span class="s1">self._cov_type = cov_type</span>
+        <span class="s1">self._use_pandas = self.model.data.row_labels </span><span class="s2">is not None</span>
+        <span class="s1">self._data_attr = []</span>
+        <span class="s1">self._cache = {}</span>
+
+    <span class="s2">def </span><span class="s1">_wrap(self</span><span class="s2">, </span><span class="s1">val):</span>
+        <span class="s0">&quot;&quot;&quot;Wrap output as pandas Series or DataFrames as needed&quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">self._use_pandas:</span>
+            <span class="s2">return </span><span class="s1">val</span>
+        <span class="s1">col_names = self.model.data.param_names</span>
+        <span class="s1">row_names = self.model.data.row_labels</span>
+        <span class="s2">if </span><span class="s1">val.ndim == </span><span class="s4">1</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">Series(val</span><span class="s2">, </span><span class="s1">index=row_names)</span>
+        <span class="s2">if </span><span class="s1">val.ndim == </span><span class="s4">2</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">DataFrame(val</span><span class="s2">, </span><span class="s1">columns=col_names</span><span class="s2">, </span><span class="s1">index=row_names)</span>
+        <span class="s2">else</span><span class="s1">:  </span><span class="s5"># ndim == 3</span>
+            <span class="s1">mi = MultiIndex.from_product((row_names</span><span class="s2">, </span><span class="s1">col_names))</span>
+            <span class="s1">val = np.reshape(val</span><span class="s2">, </span><span class="s1">(-</span><span class="s4">1</span><span class="s2">, </span><span class="s1">val.shape[-</span><span class="s4">1</span><span class="s1">]))</span>
+            <span class="s2">return </span><span class="s1">DataFrame(val</span><span class="s2">, </span><span class="s1">columns=col_names</span><span class="s2">, </span><span class="s1">index=mi)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.aic))</span>
+    <span class="s2">def </span><span class="s1">aic(self):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(call_cached_func(RegressionResults.aic</span><span class="s2">, </span><span class="s1">self))</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.bic))</span>
+    <span class="s2">def </span><span class="s1">bic(self):</span>
+        <span class="s2">with </span><span class="s1">np.errstate(divide=</span><span class="s3">&quot;ignore&quot;</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s1">self._wrap(call_cached_func(RegressionResults.bic</span><span class="s2">, </span><span class="s1">self))</span>
+
+    <span class="s2">def </span><span class="s1">info_criteria(self</span><span class="s2">, </span><span class="s1">crit</span><span class="s2">, </span><span class="s1">dk_params=</span><span class="s4">0</span><span class="s1">):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(</span>
+            <span class="s1">RegressionResults.info_criteria(self</span><span class="s2">, </span><span class="s1">crit</span><span class="s2">, </span><span class="s1">dk_params=dk_params)</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">params(self):</span>
+        <span class="s0">&quot;&quot;&quot;Estimated model parameters&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._wrap(self._params)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.ssr))</span>
+    <span class="s2">def </span><span class="s1">ssr(self):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(self._ssr)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.llf))</span>
+    <span class="s2">def </span><span class="s1">llf(self):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(self._llf)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(RegressionModel.df_model.__doc__)</span>
+    <span class="s2">def </span><span class="s1">df_model(self):</span>
+        <span class="s2">return </span><span class="s1">self._nvar - self._k_constant</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">k_constant(self):</span>
+        <span class="s0">&quot;&quot;&quot;Flag indicating whether the model contains a constant&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._k_constant</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.centered_tss))</span>
+    <span class="s2">def </span><span class="s1">centered_tss(self):</span>
+        <span class="s2">return </span><span class="s1">self._centered_tss</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.uncentered_tss))</span>
+    <span class="s2">def </span><span class="s1">uncentered_tss(self):</span>
+        <span class="s2">return </span><span class="s1">self._uncentered_tss</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.rsquared))</span>
+    <span class="s2">def </span><span class="s1">rsquared(self):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(call_cached_func(RegressionResults.rsquared</span><span class="s2">, </span><span class="s1">self))</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.rsquared_adj))</span>
+    <span class="s2">def </span><span class="s1">rsquared_adj(self):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(</span>
+            <span class="s1">call_cached_func(RegressionResults.rsquared_adj</span><span class="s2">, </span><span class="s1">self)</span>
+        <span class="s1">)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.nobs))</span>
+    <span class="s2">def </span><span class="s1">nobs(self):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(self._nobs)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(RegressionModel.df_resid.__doc__)</span>
+    <span class="s2">def </span><span class="s1">df_resid(self):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(self._nobs - self.df_model - self._k_constant)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(RegressionResults.use_t.__doc__)</span>
+    <span class="s2">def </span><span class="s1">use_t(self):</span>
+        <span class="s2">return </span><span class="s1">self._use_t</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.ess))</span>
+    <span class="s2">def </span><span class="s1">ess(self):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(call_cached_func(RegressionResults.ess</span><span class="s2">, </span><span class="s1">self))</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.mse_model))</span>
+    <span class="s2">def </span><span class="s1">mse_model(self):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(call_cached_func(RegressionResults.mse_model</span><span class="s2">, </span><span class="s1">self))</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.mse_resid))</span>
+    <span class="s2">def </span><span class="s1">mse_resid(self):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(call_cached_func(RegressionResults.mse_resid</span><span class="s2">, </span><span class="s1">self))</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.mse_total))</span>
+    <span class="s2">def </span><span class="s1">mse_total(self):</span>
+        <span class="s2">return </span><span class="s1">self._wrap(call_cached_func(RegressionResults.mse_total</span><span class="s2">, </span><span class="s1">self))</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s2">def </span><span class="s1">_cov_params(self):</span>
+        <span class="s2">if </span><span class="s1">self._cov_type == </span><span class="s3">&quot;nonrobust&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._s2[:</span><span class="s2">, None, None</span><span class="s1">] * self._xpxi</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self._xpxi @ self._xepxe @ self._xpxi</span>
+
+    <span class="s2">def </span><span class="s1">cov_params(self):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Estimated parameter covariance 
+ 
+        Returns 
+        ------- 
+        array_like 
+            The estimated model covariances. If the original input is a numpy 
+            array, the returned covariance is a 3-d array with shape 
+            (nobs, nvar, nvar). If the original inputs are pandas types, then 
+            the returned covariance is a DataFrame with a MultiIndex with 
+            key (observation, variable), so that the covariance for 
+            observation with index i is cov.loc[i]. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._wrap(self._cov_params)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.f_pvalue))</span>
+    <span class="s2">def </span><span class="s1">f_pvalue(self):</span>
+        <span class="s2">with </span><span class="s1">np.errstate(invalid=</span><span class="s3">&quot;ignore&quot;</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s1">self._wrap(</span>
+                <span class="s1">call_cached_func(RegressionResults.f_pvalue</span><span class="s2">, </span><span class="s1">self)</span>
+            <span class="s1">)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.fvalue))</span>
+    <span class="s2">def </span><span class="s1">fvalue(self):</span>
+        <span class="s2">if </span><span class="s1">self._cov_type == </span><span class="s3">&quot;nonrobust&quot;</span><span class="s1">:</span>
+            <span class="s2">return </span><span class="s1">self.mse_model / self.mse_resid</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">nobs = self._params.shape[</span><span class="s4">0</span><span class="s1">]</span>
+            <span class="s1">stat = np.full(nobs</span><span class="s2">, </span><span class="s1">np.nan)</span>
+            <span class="s1">k = self._params.shape[</span><span class="s4">1</span><span class="s1">]</span>
+            <span class="s1">r = np.eye(k)</span>
+            <span class="s1">locs = list(range(k))</span>
+            <span class="s2">if </span><span class="s1">self.k_constant:</span>
+                <span class="s1">locs.pop(self.model.const_idx)</span>
+            <span class="s2">if not </span><span class="s1">locs:</span>
+                <span class="s2">return </span><span class="s1">stat</span>
+            <span class="s1">r = r[locs]</span>
+            <span class="s1">vcv = self._cov_params</span>
+            <span class="s1">rvcvr = r @ vcv @ r.T</span>
+            <span class="s1">p = self._params</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(nobs):</span>
+                <span class="s1">rp = p[i : i + </span><span class="s4">1</span><span class="s1">] @ r.T</span>
+                <span class="s1">denom = rp.shape[</span><span class="s4">1</span><span class="s1">]</span>
+                <span class="s1">inv_cov = np.linalg.inv(rvcvr[i])</span>
+                <span class="s1">stat[i] = np.squeeze(rp @ inv_cov @ rp.T) / denom</span>
+            <span class="s2">return </span><span class="s1">stat</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(RegressionResults.bse))</span>
+    <span class="s2">def </span><span class="s1">bse(self):</span>
+        <span class="s2">with </span><span class="s1">np.errstate(invalid=</span><span class="s3">&quot;ignore&quot;</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s1">self._wrap(np.sqrt(np.diagonal(self._cov_params</span><span class="s2">, </span><span class="s4">0</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)))</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(LikelihoodModelResults.tvalues))</span>
+    <span class="s2">def </span><span class="s1">tvalues(self):</span>
+        <span class="s2">with </span><span class="s1">np.errstate(invalid=</span><span class="s3">&quot;ignore&quot;</span><span class="s1">):</span>
+            <span class="s2">return </span><span class="s1">self._wrap(</span>
+                <span class="s1">call_cached_func(LikelihoodModelResults.tvalues</span><span class="s2">, </span><span class="s1">self)</span>
+            <span class="s1">)</span>
+
+    <span class="s1">@cache_readonly</span>
+    <span class="s1">@Appender(get_cached_doc(LikelihoodModelResults.pvalues))</span>
+    <span class="s2">def </span><span class="s1">pvalues(self):</span>
+        <span class="s2">if </span><span class="s1">self.use_t:</span>
+            <span class="s1">df_resid = getattr(self</span><span class="s2">, </span><span class="s3">&quot;df_resid_inference&quot;</span><span class="s2">, </span><span class="s1">self.df_resid)</span>
+            <span class="s1">df_resid = np.asarray(df_resid)[:</span><span class="s2">, None</span><span class="s1">]</span>
+            <span class="s2">with </span><span class="s1">np.errstate(invalid=</span><span class="s3">&quot;ignore&quot;</span><span class="s1">):</span>
+                <span class="s2">return </span><span class="s1">stats.t.sf(np.abs(self.tvalues)</span><span class="s2">, </span><span class="s1">df_resid) * </span><span class="s4">2</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">with </span><span class="s1">np.errstate(invalid=</span><span class="s3">&quot;ignore&quot;</span><span class="s1">):</span>
+                <span class="s2">return </span><span class="s1">stats.norm.sf(np.abs(self.tvalues)) * </span><span class="s4">2</span>
+
+    <span class="s2">def </span><span class="s1">_conf_int(self</span><span class="s2">, </span><span class="s1">alpha</span><span class="s2">, </span><span class="s1">cols):</span>
+        <span class="s1">bse = np.asarray(self.bse)</span>
+
+        <span class="s2">if </span><span class="s1">self.use_t:</span>
+            <span class="s1">dist = stats.t</span>
+            <span class="s1">df_resid = getattr(self</span><span class="s2">, </span><span class="s3">&quot;df_resid_inference&quot;</span><span class="s2">, </span><span class="s1">self.df_resid)</span>
+            <span class="s1">df_resid = np.asarray(df_resid)[:</span><span class="s2">, None</span><span class="s1">]</span>
+            <span class="s1">q = dist.ppf(</span><span class="s4">1 </span><span class="s1">- alpha / </span><span class="s4">2</span><span class="s2">, </span><span class="s1">df_resid)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s1">dist = stats.norm</span>
+            <span class="s1">q = dist.ppf(</span><span class="s4">1 </span><span class="s1">- alpha / </span><span class="s4">2</span><span class="s1">)</span>
+
+        <span class="s1">params = np.asarray(self.params)</span>
+        <span class="s1">lower = params - q * bse</span>
+        <span class="s1">upper = params + q * bse</span>
+        <span class="s2">if </span><span class="s1">cols </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">cols = np.asarray(cols)</span>
+            <span class="s1">lower = lower[:</span><span class="s2">, </span><span class="s1">cols]</span>
+            <span class="s1">upper = upper[:</span><span class="s2">, </span><span class="s1">cols]</span>
+        <span class="s2">return </span><span class="s1">np.asarray(list(zip(lower</span><span class="s2">, </span><span class="s1">upper)))</span>
+
+    <span class="s1">@Appender(LikelihoodModelResults.conf_int.__doc__)</span>
+    <span class="s2">def </span><span class="s1">conf_int(self</span><span class="s2">, </span><span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">, </span><span class="s1">cols=</span><span class="s2">None</span><span class="s1">):</span>
+        <span class="s1">ci = self._conf_int(alpha</span><span class="s2">, </span><span class="s1">cols)</span>
+        <span class="s2">if not </span><span class="s1">self._use_pandas:</span>
+            <span class="s2">return </span><span class="s1">ci</span>
+        <span class="s1">ci_names = (</span><span class="s3">&quot;lower&quot;</span><span class="s2">, </span><span class="s3">&quot;upper&quot;</span><span class="s1">)</span>
+        <span class="s1">row_names = self.model.data.row_labels</span>
+        <span class="s1">col_names = self.model.data.param_names</span>
+        <span class="s2">if </span><span class="s1">cols </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">col_names = [col_names[i] </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">cols]</span>
+        <span class="s1">mi = MultiIndex.from_product((col_names</span><span class="s2">, </span><span class="s1">ci_names))</span>
+        <span class="s1">ci = np.reshape(np.swapaxes(ci</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s4">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">(ci.shape[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">-</span><span class="s4">1</span><span class="s1">))</span>
+        <span class="s2">return </span><span class="s1">DataFrame(ci</span><span class="s2">, </span><span class="s1">columns=mi</span><span class="s2">, </span><span class="s1">index=row_names)</span>
+
+    <span class="s1">@property</span>
+    <span class="s2">def </span><span class="s1">cov_type(self):</span>
+        <span class="s0">&quot;&quot;&quot;Name of covariance estimator&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self._cov_type</span>
+
+    <span class="s1">@classmethod</span>
+    <span class="s1">@Appender(LikelihoodModelResults.load.__doc__)</span>
+    <span class="s2">def </span><span class="s1">load(cls</span><span class="s2">, </span><span class="s1">fname):</span>
+        <span class="s2">return </span><span class="s1">LikelihoodModelResults.load(fname)</span>
+
+    <span class="s1">remove_data = LikelihoodModelResults.remove_data</span>
+
+    <span class="s1">@Appender(LikelihoodModelResults.save.__doc__)</span>
+    <span class="s2">def </span><span class="s1">save(self</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">, </span><span class="s1">remove_data=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s2">return </span><span class="s1">LikelihoodModelResults.save(self</span><span class="s2">, </span><span class="s1">fname</span><span class="s2">, </span><span class="s1">remove_data)</span>
+
+    <span class="s2">def </span><span class="s1">plot_recursive_coefficient(</span>
+        <span class="s1">self</span><span class="s2">,</span>
+        <span class="s1">variables=</span><span class="s2">None,</span>
+        <span class="s1">alpha=</span><span class="s4">0.05</span><span class="s2">,</span>
+        <span class="s1">legend_loc=</span><span class="s3">&quot;upper left&quot;</span><span class="s2">,</span>
+        <span class="s1">fig=</span><span class="s2">None,</span>
+        <span class="s1">figsize=</span><span class="s2">None,</span>
+    <span class="s1">):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Plot the recursively estimated coefficients on a given variable 
+ 
+        Parameters 
+        ---------- 
+        variables : {int, str, Iterable[int], Iterable[str], None}, optional 
+            Integer index or string name of the variables whose coefficients 
+            to plot. Can also be an iterable of integers or strings. Default 
+            plots all coefficients. 
+        alpha : float, optional 
+            The confidence intervals for the coefficient are (1 - alpha)%. Set 
+            to None to exclude confidence intervals. 
+        legend_loc : str, optional 
+            The location of the legend in the plot. Default is upper left. 
+        fig : Figure, optional 
+            If given, subplots are created in this figure instead of in a new 
+            figure. Note that the grid will be created in the provided 
+            figure using `fig.add_subplot()`. 
+        figsize : tuple, optional 
+            If a figure is created, this argument allows specifying a size. 
+            The tuple is (width, height). 
+ 
+        Returns 
+        ------- 
+        Figure 
+            The matplotlib Figure object. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">from </span><span class="s1">statsmodels.graphics.utils </span><span class="s2">import </span><span class="s1">_import_mpl</span><span class="s2">, </span><span class="s1">create_mpl_fig</span>
+
+        <span class="s2">if </span><span class="s1">alpha </span><span class="s2">is not None</span><span class="s1">:</span>
+            <span class="s1">ci = self._conf_int(alpha</span><span class="s2">, None</span><span class="s1">)</span>
+
+        <span class="s1">row_labels = self.model.data.row_labels</span>
+        <span class="s2">if </span><span class="s1">row_labels </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">row_labels = np.arange(self._params.shape[</span><span class="s4">0</span><span class="s1">])</span>
+        <span class="s1">k_variables = self._params.shape[</span><span class="s4">1</span><span class="s1">]</span>
+        <span class="s1">param_names = self.model.data.param_names</span>
+        <span class="s2">if </span><span class="s1">variables </span><span class="s2">is None</span><span class="s1">:</span>
+            <span class="s1">variable_idx = list(range(k_variables))</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">if </span><span class="s1">isinstance(variables</span><span class="s2">, </span><span class="s1">(int</span><span class="s2">, </span><span class="s1">str)):</span>
+                <span class="s1">variables = [variables]</span>
+            <span class="s1">variable_idx = []</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(len(variables)):</span>
+                <span class="s1">variable = variables[i]</span>
+                <span class="s2">if </span><span class="s1">variable </span><span class="s2">in </span><span class="s1">param_names:</span>
+                    <span class="s1">variable_idx.append(param_names.index(variable))</span>
+                <span class="s2">elif </span><span class="s1">isinstance(variable</span><span class="s2">, </span><span class="s1">int):</span>
+                    <span class="s1">variable_idx.append(variable)</span>
+                <span class="s2">else</span><span class="s1">:</span>
+                    <span class="s1">msg = (</span>
+                        <span class="s3">&quot;variable {0} is not an integer and was not found &quot;</span>
+                        <span class="s3">&quot;in the list of variable &quot;</span>
+                        <span class="s3">&quot;names: {1}&quot;</span><span class="s1">.format(</span>
+                            <span class="s1">variables[i]</span><span class="s2">, </span><span class="s3">&quot;, &quot;</span><span class="s1">.join(param_names)</span>
+                        <span class="s1">)</span>
+                    <span class="s1">)</span>
+                    <span class="s2">raise </span><span class="s1">ValueError(msg)</span>
+
+        <span class="s1">_import_mpl()</span>
+        <span class="s1">fig = create_mpl_fig(fig</span><span class="s2">, </span><span class="s1">figsize)</span>
+
+        <span class="s1">loc = </span><span class="s4">0</span>
+        <span class="s2">import </span><span class="s1">pandas </span><span class="s2">as </span><span class="s1">pd</span>
+
+        <span class="s2">if </span><span class="s1">isinstance(row_labels</span><span class="s2">, </span><span class="s1">pd.PeriodIndex):</span>
+            <span class="s1">row_labels = row_labels.to_timestamp()</span>
+        <span class="s1">row_labels = np.asarray(row_labels)</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">variable_idx:</span>
+            <span class="s1">ax = fig.add_subplot(len(variable_idx)</span><span class="s2">, </span><span class="s4">1</span><span class="s2">, </span><span class="s1">loc + </span><span class="s4">1</span><span class="s1">)</span>
+            <span class="s1">params = self._params[:</span><span class="s2">, </span><span class="s1">i]</span>
+            <span class="s1">valid = ~np.isnan(self._params[:</span><span class="s2">, </span><span class="s1">i])</span>
+            <span class="s1">row_lbl = row_labels[valid]</span>
+            <span class="s1">ax.plot(row_lbl</span><span class="s2">, </span><span class="s1">params[valid])</span>
+            <span class="s2">if </span><span class="s1">alpha </span><span class="s2">is not None</span><span class="s1">:</span>
+                <span class="s1">this_ci = np.reshape(ci[:</span><span class="s2">, </span><span class="s1">:</span><span class="s2">, </span><span class="s1">i]</span><span class="s2">, </span><span class="s1">(-</span><span class="s4">1</span><span class="s2">, </span><span class="s4">2</span><span class="s1">))</span>
+                <span class="s2">if not </span><span class="s1">np.all(np.isnan(this_ci)):</span>
+                    <span class="s1">ax.plot(</span>
+                        <span class="s1">row_lbl</span><span class="s2">, </span><span class="s1">this_ci[:</span><span class="s2">, </span><span class="s4">0</span><span class="s1">][valid]</span><span class="s2">, </span><span class="s3">&quot;k:&quot;</span><span class="s2">, </span><span class="s1">label=</span><span class="s3">&quot;Lower CI&quot;</span>
+                    <span class="s1">)</span>
+                    <span class="s1">ax.plot(</span>
+                        <span class="s1">row_lbl</span><span class="s2">, </span><span class="s1">this_ci[:</span><span class="s2">, </span><span class="s4">1</span><span class="s1">][valid]</span><span class="s2">, </span><span class="s3">&quot;k:&quot;</span><span class="s2">, </span><span class="s1">label=</span><span class="s3">&quot;Upper CI&quot;</span>
+                    <span class="s1">)</span>
+                    <span class="s2">if </span><span class="s1">loc == </span><span class="s4">0</span><span class="s1">:</span>
+                        <span class="s1">ax.legend(loc=legend_loc)</span>
+            <span class="s1">ax.set_xlim(row_lbl[</span><span class="s4">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">row_lbl[-</span><span class="s4">1</span><span class="s1">])</span>
+            <span class="s1">ax.set_title(param_names[i])</span>
+            <span class="s1">loc += </span><span class="s4">1</span>
+
+        <span class="s1">fig.tight_layout()</span>
+        <span class="s2">return </span><span class="s1">fig</span>
+</pre>
+</body>
+</html>
